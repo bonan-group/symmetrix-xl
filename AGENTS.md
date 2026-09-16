@@ -250,3 +250,6 @@ substitute for this gate.
 ## Commit & Pull Request Guidelines
 
 Follow the history’s short, imperative, sentence-case subjects, for example `Harden indexing for million-atom models`. Keep commits cohesive. Pull requests should explain the behavior and backend impact, list commands run, link relevant issues, and include benchmark evidence for performance changes. Note CPU/CUDA and precision coverage explicitly; attach screenshots only for documentation or user-visible output changes.
+
+Do not include transient agent planning files, scratch notes, or task-state
+files in commits.

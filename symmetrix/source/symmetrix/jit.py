@@ -1270,7 +1270,8 @@ def _directory_key_lock(
     timeout: float,
     stale_age: float,
     diagnostics: list[str],
-) -> Iterator[None]:  # pragma: no cover - fallback for non-POSIX platforms
+) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_directory = path.with_suffix(path.suffix + ".d")
     owner_path = lock_directory / "owner.json"
     token = uuid.uuid4().hex
@@ -1278,30 +1279,42 @@ def _directory_key_lock(
     while True:
         try:
             lock_directory.mkdir(mode=0o700)
-            owner_path.write_text(
-                json.dumps(
-                    {
-                        "pid": os.getpid(),
-                        "hostname": socket.gethostname(),
-                        "created_at": time.time(),
-                        "token": token,
-                    },
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
+            try:
+                owner_path.write_text(
+                    json.dumps(
+                        {
+                            "pid": os.getpid(),
+                            "hostname": socket.gethostname(),
+                            "created_at": time.time(),
+                            "token": token,
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError:
+                shutil.rmtree(lock_directory, ignore_errors=True)
+                raise
             break
         except FileExistsError:
             owner = _read_owner(owner_path)
-            if owner is None or _owner_is_stale(owner, stale_age):
-                stale = lock_directory.with_name(
+            try:
+                stale = (
+                    _owner_is_stale(owner, stale_age)
+                    if owner is not None
+                    else time.time() - lock_directory.stat().st_mtime >= stale_age
+                )
+            except FileNotFoundError:
+                continue
+            if stale:
+                stale_path = lock_directory.with_name(
                     lock_directory.name + ".stale-" + uuid.uuid4().hex
                 )
                 try:
-                    os.replace(lock_directory, stale)
+                    os.replace(lock_directory, stale_path)
                 except OSError:
                     continue
-                shutil.rmtree(stale, ignore_errors=True)
+                shutil.rmtree(stale_path, ignore_errors=True)
                 diagnostics.append(
                     "recovered stale JIT lock owner: " + _owner_description(owner)
                 )
@@ -1475,6 +1488,34 @@ def _publish_directory_no_replace(source: Path, destination: Path) -> bool:
             "the JIT cache filesystem does not support atomic no-replace rename"
         )
     raise OSError(error, os.strerror(error), destination)
+
+
+def _publish_directory_with_mkdir_lock(
+    source: Path,
+    destination: Path,
+    lock_path: Path,
+    *,
+    timeout: float,
+    stale_age: float,
+    diagnostics: list[str],
+) -> bool:
+    """Publish a complete directory while holding a portable key lock."""
+
+    with _directory_key_lock(
+        lock_path,
+        timeout=timeout,
+        stale_age=stale_age,
+        diagnostics=diagnostics,
+    ):
+        if destination.exists() or destination.is_symlink():
+            return False
+        try:
+            os.rename(source, destination)
+        except OSError as exc:
+            if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                return False
+            raise
+        return True
 
 
 def _validated_entry(
@@ -1795,7 +1836,21 @@ def _prepare_compiled_artifact(
         _write_json(temporary_directory / "manifest.json", manifest)
         _validated_entry(temporary_directory, cache_key, inputs)
         _fsync_directory(temporary_directory)
-        published = _publish_directory_no_replace(temporary_directory, entry)
+        try:
+            published = _publish_directory_no_replace(temporary_directory, entry)
+        except JitPublicationUnsupported as exc:
+            diagnostics.append(
+                f"atomic no-replace JIT publication is unavailable: {exc}; "
+                "using mkdir-locked publication"
+            )
+            published = _publish_directory_with_mkdir_lock(
+                temporary_directory,
+                entry,
+                lock_path,
+                timeout=lock_timeout,
+                stale_age=stale_lock_age,
+                diagnostics=diagnostics,
+            )
         if published:
             temporary_directory = None
             _fsync_directory(entry.parent)

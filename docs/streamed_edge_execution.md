@@ -821,19 +821,19 @@ without replacing an existing entry. Exactly one process publishes; other
 processes discard their staging directories after validating and reusing the
 winner. This avoids a build-duration lock at the cost of duplicate compilation
 when several jobs encounter the same cold key simultaneously. A short per-key
-lock is used only to quarantine an invalid or load-broken entry. Atomic
-no-replace directory rename is currently required, so JIT preparation falls
-back internally on non-Linux systems or cache filesystems that do not provide
-it. Calculator initialization then raises under the required policy when
-`direct` was requested. Only debug-only `SYMMETRIX_JIT_POLICY=none` skips
-cache preparation.
+lock is used to quarantine an invalid or load-broken entry.
 
 On Linux, publication prefers the libc `renameat2` wrapper. When an older libc
 does not export it, Symmetrix-XL issues the kernel syscall directly with
 `RENAME_NOREPLACE`; syscall numbers are selected for x86-64 and AArch64.
-Unsupported architectures, kernels, or filesystems raise explicitly. There is
-no race-prone check-then-rename fallback, and `EEXIST` still means that another
-clean publisher won the same content-addressed entry.
+Unsupported architectures, kernels, or filesystems activate a portable
+fallback rather than disabling JIT. The fallback acquires an atomic `mkdir`
+lock for the cache key, revalidates any winner, and uses ordinary atomic
+directory rename only while holding that lock. Compilation remains concurrent
+and outside the lock. This supports shared HPC filesystems that implement
+ordinary rename and atomic directory creation but not `RENAME_NOREPLACE`.
+`EEXIST` still means that another clean publisher won the same
+content-addressed entry.
 
 A process removes its own staging directory after a handled build failure or a
 lost publication race. A process killed during compilation can leave an

@@ -1236,31 +1236,43 @@ def test_clean_build_validates_quarantine_options(jit, tmp_path, kwargs, reason)
     assert compile_calls == 0
 
 
-def test_unsupported_no_replace_cleans_staging(jit, monkeypatch, tmp_path):
+def test_unsupported_no_replace_uses_mkdir_locked_publication(
+    jit, monkeypatch, tmp_path
+):
     def unsupported(source, destination):
         raise jit.JitPublicationUnsupported("synthetic unsupported filesystem")
 
+    def unexpected_lock(*args, **kwargs):
+        raise AssertionError("publication fallback must not rely on flock")
+
     monkeypatch.setattr(jit, "_publish_directory_no_replace", unsupported)
+    monkeypatch.setattr(jit, "_cache_key_lock", unexpected_lock)
     result = _prepare_nvrtc(
         jit,
         tmp_path,
-        lambda source, options: (b"unpublished cubin", ""),
+        lambda source, options: (b"mkdir-locked cubin", ""),
     )
 
-    assert result.status == "fallback"
-    assert "synthetic unsupported filesystem" in result.reason
-    assert list((tmp_path / "nvrtc-cache" / "artifacts").iterdir()) == []
+    assert result.status == "built"
+    assert result.available
+    assert any("using mkdir-locked publication" in item for item in result.diagnostics)
+    assert result.artifact_path.read_bytes() == b"mkdir-locked cubin"
     assert list((tmp_path / "nvrtc-cache" / ".staging").iterdir()) == []
+    assert not list((tmp_path / "nvrtc-cache" / "locks").glob("*.lock.d"))
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux renameat2 coverage")
-def test_fresh_processes_converge_on_one_publication(jit, tmp_path):
+@pytest.mark.parametrize("force_locked_fallback", [False, True])
+def test_fresh_processes_converge_on_one_publication(
+    jit, tmp_path, force_locked_fallback
+):
     module_path = Path(jit.__file__).resolve()
     cache_root = tmp_path / "race-cache"
     gate = tmp_path / "start"
     worker = r"""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -1268,16 +1280,21 @@ import time
 module_path = Path(sys.argv[1])
 cache_root = Path(sys.argv[2])
 gate = Path(sys.argv[3])
+force_locked_fallback = sys.argv[4] == "true"
 spec = importlib.util.spec_from_file_location("jit_race_worker", module_path)
 jit = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = jit
 spec.loader.exec_module(jit)
+if force_locked_fallback:
+    def unsupported(source, destination):
+        raise jit.JitPublicationUnsupported("synthetic unsupported filesystem")
+    jit._publish_directory_no_replace = unsupported
 while not gate.exists():
     time.sleep(0.005)
 
 def compile_source(source, options):
     time.sleep(0.2)
-    return b"shared race cubin", ""
+    return f"race cubin from {os.getpid()}".encode(), ""
 
 result = jit.prepare_nvrtc_jit_artifact(
     'extern "C" __global__ void kernel() {}\n',
@@ -1311,6 +1328,7 @@ print(json.dumps({
                 str(module_path),
                 str(cache_root),
                 str(gate),
+                str(force_locked_fallback).lower(),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1335,6 +1353,7 @@ print(json.dumps({
     entries = list((cache_root / "artifacts").iterdir())
     assert len(entries) == 1
     jit.validate_jit_manifest(entries[0])
+    assert not list((cache_root / "locks").glob("*.lock.d"))
 
 
 def test_missing_compiler_returns_fallback_with_reason(jit, tmp_path):
@@ -1393,3 +1412,42 @@ def test_per_key_lock_recovers_stale_owner_metadata(jit, tmp_path):
     ):
         assert any("recovered stale JIT lock owner" in item for item in diagnostics)
     assert lock_path.read_text() == ""
+
+
+def test_directory_key_lock_serializes_publishers(jit, tmp_path):
+    lock_path = tmp_path / "locks" / ("c" * 64 + ".lock")
+    first_diagnostics = []
+
+    with (
+        jit._directory_key_lock(
+            lock_path, timeout=0.1, stale_age=60.0, diagnostics=first_diagnostics
+        ),
+        pytest.raises(jit.JitLockTimeout, match="timed out") as error,
+        jit._directory_key_lock(
+            lock_path,
+            timeout=0.05,
+            stale_age=60.0,
+            diagnostics=[],
+        ),
+    ):
+        pass
+
+    assert f"pid={os.getpid()}" in str(error.value)
+    assert not lock_path.with_suffix(".lock.d").exists()
+
+
+def test_directory_key_lock_does_not_steal_fresh_ownerless_lock(jit, tmp_path):
+    lock_path = tmp_path / "locks" / ("d" * 64 + ".lock")
+    lock_directory = lock_path.with_suffix(".lock.d")
+    lock_directory.mkdir(parents=True)
+
+    with pytest.raises(jit.JitLockTimeout, match="unknown owner"):
+        with jit._directory_key_lock(
+            lock_path,
+            timeout=0.01,
+            stale_age=60.0,
+            diagnostics=[],
+        ):
+            pass
+
+    assert lock_directory.is_dir()
