@@ -593,10 +593,15 @@ void bind_tools_kokkos(py::module_ &m)
                 Kokkos::HostSpace(), graph.sources);
             const auto host_shifts = Kokkos::create_mirror_view_and_copy(
                 Kokkos::HostSpace(), graph.shifts);
+            const auto host_fractional_xyz = Kokkos::create_mirror_view_and_copy(
+                Kokkos::HostSpace(), graph.fractional_xyz);
             py::array_t<int> num_neigh(graph.num_nodes);
             py::array_t<int> offsets(graph.num_nodes+1);
             py::array_t<int> sources(graph.num_edges);
             py::array_t<int> shifts(
+                std::vector<py::ssize_t>{
+                    static_cast<py::ssize_t>(graph.num_edges), 3});
+            py::array_t<double> fractional_xyz(
                 std::vector<py::ssize_t>{
                     static_cast<py::ssize_t>(graph.num_edges), 3});
             std::copy(
@@ -611,15 +616,21 @@ void bind_tools_kokkos(py::module_ &m)
                 host_sources.data(),
                 host_sources.data()+graph.num_edges,
                 sources.mutable_data());
-            for (std::size_t edge=0; edge<graph.num_edges; ++edge)
-                for (int component=0; component<3; ++component)
-                    shifts.mutable_at(edge,component) =
-                        host_shifts(edge,component);
+            const std::size_t coordinate_count =
+                std::size_t(3)*graph.num_edges;
+            std::copy(
+                host_shifts.data(), host_shifts.data()+coordinate_count,
+                shifts.mutable_data());
+            std::copy(
+                host_fractional_xyz.data(),
+                host_fractional_xyz.data()+coordinate_count,
+                fractional_xyz.mutable_data());
             py::dict result;
             result["num_neigh"] = std::move(num_neigh);
             result["receiver_offsets"] = std::move(offsets);
             result["sources"] = std::move(sources);
             result["shifts"] = std::move(shifts);
+            result["fractional_xyz"] = std::move(fractional_xyz);
             return result;
         },
         py::arg("positions"), py::arg("cell"), py::arg("inverse_cell"),

@@ -66,6 +66,38 @@ def test_cuda_response_recompute_and_widened_offsets_remain_available():
     assert "macefield_response_m1_recompute_reverse_launch_count += 1;" in response
 
 
+def test_neighbor_graph_coordinate_offsets_remain_widened_and_flat():
+    source = (NATIVE / "neighbor_graph_kokkos.cpp").read_text()
+    assert "const std::size_t flattened =" in source
+    assert "static_cast<std::size_t>(z)*static_cast<std::size_t>(ny)" in source
+    assert "const std::size_t bins_xy = static_cast<std::size_t>(bins_x)" in source
+    assert "*static_cast<std::size_t>(bins_y);" in source
+
+    fill_start = source.index("if (fill) {")
+    fill = source[fill_start : source.index("++local_edge;", fill_start)]
+
+    assert "const std::size_t edge = static_cast<std::size_t>(" in fill
+    assert "+static_cast<std::size_t>(local_edge);" in fill
+    assert "const std::size_t coordinate_offset =" in fill
+    assert "std::size_t(3)*edge;" in fill
+    assert "output_shifts.data()[coordinate_offset+axis]" in fill
+    assert "output_fractional_xyz.data()[" in fill
+    assert "coordinate_offset+axis]" in fill
+    assert "output_shifts(edge," not in fill
+    assert "output_fractional_xyz(edge," not in fill
+
+    edge_count_check = source.index("if (host_edge_count()")
+    rejection = source[
+        edge_count_check : source.index("graph.num_edges", edge_count_check)
+    ]
+    assert "> static_cast<long long>(std::numeric_limits<int>::max())" in rejection
+    assert "exceeds 32-bit edge indexing" in rejection
+
+    edge = (2**31 - 1) // 3 + 1
+    assert edge < 2**31 - 1
+    assert 3 * edge > 2**31 - 1
+
+
 def test_cuda_m1_recompute_admission_distinguishes_adjoint_overlap():
     header = (NATIVE / "mace_kokkos.hpp").read_text()
     runtime = (NATIVE / "mace_kokkos_runtime.cpp").read_text()

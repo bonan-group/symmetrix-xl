@@ -26,7 +26,11 @@ int flatten_bin(
     const int x, const int y, const int z,
     const int nx, const int ny)
 {
-    return (z*ny+y)*nx+x;
+    const std::size_t flattened =
+        (static_cast<std::size_t>(z)*static_cast<std::size_t>(ny)
+            +static_cast<std::size_t>(y))*static_cast<std::size_t>(nx)
+        +static_cast<std::size_t>(x);
+    return static_cast<int>(flattened);
 }
 
 } // namespace
@@ -260,7 +264,10 @@ KokkosNeighborGraph build_periodic_neighbor_graph_kokkos(
         const int receiver_bin = atom_bins(receiver);
         const int receiver_x = receiver_bin%bins_x;
         const int receiver_y = (receiver_bin/bins_x)%bins_y;
-        const int receiver_z = receiver_bin/(bins_x*bins_y);
+        const std::size_t bins_xy = static_cast<std::size_t>(bins_x)
+            *static_cast<std::size_t>(bins_y);
+        const int receiver_z = static_cast<int>(
+            static_cast<std::size_t>(receiver_bin)/bins_xy);
         long long local_edge = 0;
         for (int dz=-reach_z; dz<=reach_z; ++dz) {
             const int raw_z = receiver_z+dz;
@@ -296,20 +303,21 @@ KokkosNeighborGraph build_periodic_neighbor_graph_kokkos(
                         if (distance_squared > cutoff_squared)
                             continue;
                         if (fill) {
-                            const int edge = graph.receiver_offsets(receiver)
-                                +static_cast<int>(local_edge);
+                            const std::size_t edge = static_cast<std::size_t>(
+                                graph.receiver_offsets(receiver))
+                                +static_cast<std::size_t>(local_edge);
+                            const std::size_t coordinate_offset =
+                                std::size_t(3)*edge;
                             output_sources(edge) = source;
-                            if (output_shifts.extent(0) != 0) {
-                                output_shifts(edge,0) = shift_x
-                                    -wrap_shifts(source,0)+wrap_shifts(receiver,0);
-                                output_shifts(edge,1) = shift_y
-                                    -wrap_shifts(source,1)+wrap_shifts(receiver,1);
-                                output_shifts(edge,2) = shift_z
-                                    -wrap_shifts(source,2)+wrap_shifts(receiver,2);
-                            }
+                            if (output_shifts.extent(0) != 0)
+                                for (int axis=0; axis<3; ++axis)
+                                    output_shifts.data()[coordinate_offset+axis] =
+                                        image[axis]-wrap_shifts(source,axis)
+                                        +wrap_shifts(receiver,axis);
                             if (output_fractional_xyz.extent(0) != 0)
                                 for (int axis=0; axis<3; ++axis)
-                                    output_fractional_xyz(edge,axis) =
+                                    output_fractional_xyz.data()[
+                                        coordinate_offset+axis] =
                                         wrapped_fractional_positions(source,axis)
                                         -wrapped_fractional_positions(receiver,axis)
                                         +image[axis];

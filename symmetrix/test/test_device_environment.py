@@ -154,6 +154,47 @@ def test_kokkos_periodic_neighbor_graph_matches_matscipy(
     )
     np.testing.assert_array_equal(repeated["sources"], graph["sources"])
     np.testing.assert_array_equal(repeated["shifts"], graph["shifts"])
+    np.testing.assert_array_equal(repeated["fractional_xyz"], graph["fractional_xyz"])
+    fractional_positions = atoms.positions @ np.linalg.inv(atoms.cell.array)
+    np.testing.assert_allclose(
+        graph["fractional_xyz"],
+        fractional_positions[graph["sources"]]
+        - fractional_positions[receivers]
+        + graph["shifts"],
+        atol=1e-15,
+    )
+
+
+def test_kokkos_periodic_neighbor_graph_preserves_small_graph_ordering(
+    accelerator_capabilities,
+):
+    import numpy as np
+    import symmetrix
+
+    cell = np.eye(3) * 4.0
+    positions = np.array([[0.1, 0.0, 0.0], [0.3, 0.0, 0.0], [3.9, 0.0, 0.0]])
+    graph = symmetrix._kokkos_periodic_neighbor_graph(
+        positions, cell, np.linalg.inv(cell), 0.5
+    )
+
+    np.testing.assert_array_equal(graph["receiver_offsets"], [0, 2, 4, 6])
+    np.testing.assert_array_equal(graph["sources"], [2, 1, 2, 0, 0, 1])
+    np.testing.assert_array_equal(
+        graph["shifts"],
+        [[-1, 0, 0], [0, 0, 0], [-1, 0, 0], [0, 0, 0], [1, 0, 0], [1, 0, 0]],
+    )
+    np.testing.assert_allclose(
+        graph["fractional_xyz"],
+        [
+            [-0.05, 0.0, 0.0],
+            [0.05, 0.0, 0.0],
+            [-0.1, 0.0, 0.0],
+            [-0.05, 0.0, 0.0],
+            [0.05, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+        ],
+        atol=1e-15,
+    )
 
 
 def test_kokkos_periodic_neighbor_graph_handles_zero_edges(
@@ -170,6 +211,7 @@ def test_kokkos_periodic_neighbor_graph_handles_zero_edges(
 
     assert graph["sources"].size == 0
     assert graph["shifts"].shape == (0, 3)
+    assert graph["fractional_xyz"].shape == (0, 3)
     np.testing.assert_array_equal(graph["num_neigh"], [0, 0])
     np.testing.assert_array_equal(graph["receiver_offsets"], [0, 0, 0])
 
@@ -178,6 +220,7 @@ def test_kokkos_periodic_neighbor_graph_handles_zero_edges(
     )
     assert empty_graph["sources"].size == 0
     assert empty_graph["shifts"].shape == (0, 3)
+    assert empty_graph["fractional_xyz"].shape == (0, 3)
     np.testing.assert_array_equal(empty_graph["num_neigh"], [])
     np.testing.assert_array_equal(empty_graph["receiver_offsets"], [0])
 
