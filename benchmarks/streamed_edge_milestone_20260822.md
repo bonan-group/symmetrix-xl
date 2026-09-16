@@ -45,7 +45,34 @@ cutoff. Develop and PyTorch rebuilt the exact 6.0 A graph. This gives the
 current implementation more edges and is therefore a conservative timing
 comparison, but the graph policies are not identical.
 
-## Build and machine
+## Superseding CUDA paper qualification (2026-09-14)
+
+A later matched rerun supersedes the CUDA performance values below. It used
+the same standard OMAT-0-medium checkpoint, perturbed periodic wurtzite AlN,
+FP32 energy, forces, and stress, three warmups, and ten measured complete ASE
+calls per row on the same 32,607 MiB NVIDIA RTX 5090. Compilation, model
+conversion, and initial neighbor-list construction were outside the measured
+region.
+
+| Atoms | Directed edges: MACE-Torch / Symmetrix | MACE-Torch + cuEquivariance (us/atom) | Symmetrix direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix (MiB) |
+|---:|---:|---:|---:|---:|---:|
+| 864 | 78,624 / 97,762 | 44.487 | 4.241 | 10.489x | 2,136 / 924 |
+| 4,000 | 364,000 / 452,342 | 31.011 | 3.248 | 9.547x | 7,136 / 1,386 |
+
+MACE-Torch 0.3.15 with cuEquivariance 0.11.0 rebuilt the exact 6.0 A graph.
+Symmetrix used the 6.0 A model cutoff with a 0.5 A skin and processed the
+candidate graph with an effective cutoff of 6.5 A. The comparison is matched
+by checkpoint, structure, properties, precision, device, warmups, samples, and
+timing boundary, but not by graph policy; Symmetrix processed 24.3% more
+directed candidates at 864 atoms and 24.3% more at 4,000 atoms.
+
+The Symmetrix source revision was
+`a28f0f5f34bea734f0ea493446f0e008bb308f67`, the CUDA extension SHA-256 was
+`1c74d60fca376a4ec9223338c0b9a1975df07e1c056404ae00af45016f1422b2`, and
+the compact model SHA-256 was
+`c0fe152521f8734200ae87381c45c233547167da0921b40d2374445ddb4ea018`.
+
+## Earlier build and machine (2026-08-22)
 
 - Host: AMD Ryzen 9 9950X3D2, 16 physical cores, Linux 7.0.0.
 - GPU: NVIDIA GeForce RTX 5090, 32,607 MiB, driver 610.43.02.
@@ -85,7 +112,7 @@ Direct low-memory is 18.13x faster than origin/develop and 21.35x faster than
 the compiler-free current generic path. Generic is retained as a portability
 and correctness fallback, not the optimized CPU production path.
 
-## CUDA
+## Earlier CUDA results (2026-08-22)
 
 | Implementation | Mode | Atoms | Cutoff / skin / effective (A) | Directed edges | us/atom | Process VRAM (MiB) | Speedup vs PyTorch |
 |---|---|---:|---|---:|---:|---:|---:|

@@ -1,6 +1,6 @@
 # Backends and Diagnostics
 
-The `symmetrix` distribution includes CPU/OpenMP. Detect the local supported
+The `symmetrix-xl` distribution includes CPU/OpenMP. Detect the local supported
 backend first, then install an accelerator extension whose architecture exactly
 matches the deployment GPU:
 
@@ -30,6 +30,6 @@ thread count, OpenMP runtime compatibility, and maximum active levels, just like
 `symmetrix doctor`.
 
 An OpenMP-enabled OpenBLAS build using the same OpenMP runtime as Kokkos is
-preferred for CPU Kokkos deployments. Symmetrix selects compatible builds
+preferred for CPU Kokkos deployments. Symmetrix-XL selects compatible builds
 automatically for host GEMMs and prints a runtime warning when the loaded
 OpenBLAS build uses pthreads instead.

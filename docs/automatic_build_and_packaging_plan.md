@@ -19,13 +19,13 @@ qualification, and `lammps-prepare-model` remain planned release work.
 
 ## Objective
 
-Make a backend-correct Symmetrix installation a short, explicit operation while
+Make a backend-correct Symmetrix-XL installation a short, explicit operation while
 preserving the backend and architecture constraints imposed by Kokkos.
 
 The implementation must support three related workflows from one configuration
 model:
 
-1. build and install Symmetrix from a source checkout;
+1. build and install Symmetrix-XL from a source checkout;
 2. build architecture-specific Python wheels for release;
 3. integrate and build `pair_symmetrix` with a compatible LAMMPS source tree.
 
@@ -37,8 +37,8 @@ python tools/symmetrix_build.py install --backend cpu --cpu-target native
 python tools/symmetrix_build.py install --backend cuda --arch sm120
 ```
 
-It is build tooling, not a Symmetrix runtime command. It must not be installed
-by any Symmetrix wheel, must not be registered in `[project.scripts]`, and must
+It is build tooling, not a Symmetrix-XL runtime command. It must not be installed
+by any Symmetrix-XL wheel, must not be registered in `[project.scripts]`, and must
 not import the `symmetrix` package. Model conversion, runtime diagnostics, and
 JIT artifact preparation remain installed runtime commands because those
 operations require the native evaluator.
@@ -54,7 +54,7 @@ Every native build selects exactly one of:
 - HIP plus one exact AMD ISA, such as `gfx90a` or `gfx1151`.
 
 The bundled Kokkos configuration permits one GPU architecture per build. A
-single "fat" CUDA/HIP Symmetrix wheel is therefore not a supported release
+single "fat" CUDA/HIP Symmetrix-XL wheel is therefore not a supported release
 unit. CPU, CUDA, and HIP builds never share a CMake cache.
 
 ### Detection before CMake compiler initialization
@@ -461,7 +461,7 @@ build tool.
 Every release publishes a machine-readable index containing:
 
 - distribution and wheel filenames;
-- Symmetrix version, commit, and native ABI generation;
+- Symmetrix-XL version, commit, and native ABI generation;
 - backend, toolkit generation, device target, and Kokkos trait;
 - Python and platform tags;
 - compiler/toolkit versions;
@@ -515,14 +515,14 @@ manifest. The LAMMPS adapter additionally sets:
 - `PKG_KOKKOS=ON`;
 - the matching LAMMPS Kokkos host/device backend;
 - `BUILD_MPI` and `MPI_CXX_COMPILER` from explicit or detected MPI policy;
-- the matching Symmetrix SpheriCart and BLAS policies.
+- the matching Symmetrix-XL SpheriCart and BLAS policies.
 
 For CUDA, use the `nvcc_wrapper` belonging to the Kokkos source used by LAMMPS
 and the manifest's host compiler and compute capability. For HIP, use the
 manifest's hipcc, exact offload ISA, and Kokkos Serial host execution space.
 
 Before adding `libsymmetrix`, verify that LAMMPS exposes an existing compatible
-Kokkos target. Do not add the bundled Symmetrix Kokkos as a second runtime.
+Kokkos target. Do not add the bundled Symmetrix-XL Kokkos as a second runtime.
 
 ### MPI policy
 

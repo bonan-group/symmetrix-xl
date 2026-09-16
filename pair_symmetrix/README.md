@@ -1,12 +1,12 @@
 # Using `pair_symmetrix`
 
 > [!WARNING]
-> Symmetrix requires the 10 December 2025 LAMMPS release, or newer, matching
+> Symmetrix-XL requires the 10 December 2025 LAMMPS release, or newer, matching
 > the version check enforced by the installer and build helper.
 
 ### Generating a model
 
-First, extract your model in `.json` form. See the `symmetrix` [Python package documentation](../symmetrix/README.md) for details.
+First, extract your model in `.json` form. See the Symmetrix-XL [Python package documentation](../symmetrix/README.md) for details.
 You will need a Python environment with a compatible `mace` module installed.
 
 The appropriate LAMMPS pair style commands are
@@ -33,9 +33,9 @@ types `1`, `2`, and `3`, respectively. A compact universal JSON can be reused by
 different input with another element mapping; active radial tables are built
 once during `pair_coeff` for that mapping.
 
-Compact universal files use Symmetrix format version 2 and require an updated
+Compact universal files use Symmetrix-XL format version 2 and require an updated
 pair style. Existing unversioned version 1 JSON remains supported. When an
-artifact must also work with an older Symmetrix/LAMMPS installation, generate
+artifact must also work with an older Symmetrix-XL/LAMMPS installation, generate
 it with `symmetrix_extract_mace --radial-format pair-splines` and an explicit
 element subset.
 
@@ -149,7 +149,7 @@ which some MPI launchers suppress. Active counts are the kernel ranges;
 planned counts are allocation high-water marks and must not be interpreted as
 additional atoms or edges in the current graph.
 
-When LAMMPS selects its legacy pair callbacks, Symmetrix gathers and stages only
+When LAMMPS selects its legacy pair callbacks, Symmetrix-XL gathers and stages only
 the boundary H1 or H1-adjoint packet. It does not mirror the complete
 local-plus-ghost feature tensor. Reusable packet and index buffers avoid
 per-swap allocation after their first use. The pair `extract` interface exposes
@@ -161,7 +161,7 @@ but zero alone is not a positive transport diagnostic because it also occurs
 when no pair communication callback runs.
 
 LAMMPS does not run the JIT compiler. Prepare a host artifact in the same
-Symmetrix CPU environment before launching CPU LAMMPS:
+Symmetrix-XL CPU environment before launching CPU LAMMPS:
 
 ```bash
 jit_artifact=$(symmetrix_prepare_jit_host_artifact \
@@ -250,11 +250,11 @@ per GPU. When the scheduler masks one physical GPU into each rank, as in the
 qualified scheduler jobs, each rank sees one logical device and must use `g 1`.
 
 GPU-aware selection is owned by the linked LAMMPS Kokkos runtime, not by
-Symmetrix. OpenMPI/HPC-X builds are queried through `MPIX_Query_cuda_support()`;
+Symmetrix-XL. OpenMPI/HPC-X builds are queried through `MPIX_Query_cuda_support()`;
 the qualified logs contain no LAMMPS fallback warning. Other MPI providers may
 require an explicit `-pk kokkos gpu/aware off` if their device-buffer support is
 unknown or fails at runtime. Same-node success does not qualify cross-node
-GPUDirect transport, and Symmetrix does not provide an NCCL communication path.
+GPUDirect transport, and Symmetrix-XL does not provide an NCCL communication path.
 
 For `pair_style symmetrix/mace/float32/kk`, prepare with
 `--precision float32`. The command emits JSON by default. `--path-only`
@@ -262,7 +262,7 @@ retains the legacy R1-only output, while `--lammps-arguments` emits the complete
 R1/M0/R0 settings and requires exactly one precision. It constructs only the
 native evaluator and loads each cached module once to validate the ABI, model
 contract, precision, and active CUDA/HIP target before LAMMPS starts. The
-artifacts remain in the content-addressed Symmetrix JIT cache and can be reused
+artifacts remain in the content-addressed Symmetrix-XL JIT cache and can be reused
 by later runs.
 Eight persistent blocks per compute unit is the qualified default and is part
 of CUDA artifact validation. If a
@@ -275,7 +275,7 @@ descriptor.
 
 ### Building LAMMPS
 
-From a recursive Symmetrix checkout, the standalone build frontend applies the
+From a recursive Symmetrix-XL checkout, the standalone build frontend applies the
 same detected backend and architecture policy to LAMMPS:
 
 ```bash
@@ -292,7 +292,7 @@ by `symmetrix_build.py detect --output target.json` can be replayed with
 `--target-manifest target.json`. The tool validates LAMMPS 10 Dec 2025 or
 newer, installs the pair sources, creates a fingerprinted build directory,
 uses LAMMPS's own Kokkos runtime, and checks that the installed executable
-reports both Symmetrix pair styles. The build identity includes Symmetrix and
+reports both Symmetrix-XL pair styles. The build identity includes Symmetrix-XL and
 LAMMPS source identities, the install prefix, and the selected MPI wrapper and
 provider. A matching qualified executable is verified and reused without
 reconfiguring its CMake cache. Failed or stale attempts retain their logs and
@@ -303,7 +303,7 @@ retry in a fresh directory.
 when falling back to a non-MPI executable is intentional. CPU builds require a
 Fortran compiler and optimized OpenBLAS because the KokkosKernels BLAS check
 uses the Fortran ABI. CUDA and HIP builds use Kokkos Serial for host execution
-and disable Kokkos OpenMP; this is the qualified Symmetrix configuration, not a
+and disable Kokkos OpenMP; this is the qualified Symmetrix-XL configuration, not a
 general Kokkos limitation.
 
 The manual recipes below are retained for site-specific MPI and module
@@ -348,7 +348,7 @@ not currently qualified for the pair style.
 
 #### Building LAMMPS on ARCHER2
 ```
-# download lammps and symmetrix
+# download lammps and Symmetrix-XL
 mkdir lammps-symmetrix && cd lammps-symmetrix
 git clone -b release https://github.com/lammps/lammps
 git clone --recursive https://github.com/bonan-group/symmetrix-xl
@@ -388,7 +388,7 @@ cd ../..
 #### Building LAMMPS on FASRC Cannon
 
 ```
-# download lammps and patch with symmetrix
+# download lammps and patch with Symmetrix-XL
 mkdir lammps-symmetrix && cd lammps-symmetrix
 git clone --branch release --depth 1 https://github.com/lammps/lammps
 git clone --recursive https://github.com/bonan-group/symmetrix-xl

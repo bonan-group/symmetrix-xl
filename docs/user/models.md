@@ -7,7 +7,7 @@
 - **MACE-MH-1** supports generated direct execution for admitted nonlinear
   contracts. Its matching graph-time execution-plan resolver is still pending.
 
-Compact Symmetrix JSON is the preferred interchange format. Loading an
+Compact Symmetrix-XL JSON is the preferred interchange format. Loading an
 ordinary MACE checkpoint can require the optional `mace-torch` dependency.
 MACEField checkpoints should be exported to compact JSON because the
 field-aware upstream modules are not yet present in upstream MACE.

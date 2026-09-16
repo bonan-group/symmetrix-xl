@@ -29,7 +29,7 @@ symmetrix bench
 The benchmark uses direct execution and the capacity profile, defaults to
 FP32, and reports median `us/atom` and atoms per second. `--model` accepts a
 local checkpoint or extracted JSON path, as well as a name recognized by
-MACE's `mace_mp` downloader. Symmetrix caches a compact extraction restricted
+MACE's `mace_mp` downloader. Symmetrix-XL caches a compact extraction restricted
 to the benchmark species and reuses it on subsequent runs. When the original
 checkpoint and MACE-Torch are available, an untimed reference evaluation also
 validates energy, forces, and stress; JSON-only inputs report an explicit skip.
@@ -42,7 +42,7 @@ symmetrix bench --supercell-repeat 20 --skip-validation
 ```
 
 Timing is finalized before reference validation begins. If the reference
-calculation runs out of memory, Symmetrix retains and reports the benchmark
+calculation runs out of memory, Symmetrix-XL retains and reports the benchmark
 result and marks validation unavailable.
 It fails clearly if the selected direct backend or required JIT artifact is
 not available; it does not silently benchmark the slower generic path.

@@ -1,6 +1,6 @@
-# Symmetrix Documentation
+# Symmetrix-XL Documentation
 
-Symmetrix provides compact MACE and MACEField inference through Python, ASE,
+Symmetrix-XL provides compact MACE and MACEField inference through Python, ASE,
 Kokkos CPU/GPU backends, and LAMMPS pair styles. Start with the user guide for
 installation and evaluation; implementation contracts and benchmark evidence
 are intentionally kept separate.

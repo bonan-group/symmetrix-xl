@@ -725,12 +725,6 @@ The principal implementation and qualification entry points are:
 - `benchmarks/standard_mace_streamed_benchmark.py`: run reproducible prepared
   direct benchmarks.
 - `docs/radial_spline_qualification.md`: detailed radial convergence protocol.
-- `docs/mh1_pair_spline_implementation_plan.md`: ordered-pair spline contract
-  and initial CPU implementation history.
-- `docs/mh1_spline_gpu_direct_implementation_plan.md`: accelerator ownership,
-  portability, and qualification history.
-- `docs/mh1_factorized_gpu_capacity.md`: retained-primal, recompute, and
-  adjoint-reuse memory formulas and measured capacity boundaries.
 - `docs/streamed_edge_execution.md`: broader direct-execution architecture.
 
 ## 13. Transferable conclusion

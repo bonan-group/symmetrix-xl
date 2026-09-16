@@ -43,7 +43,7 @@ artifact. `non-compiled` is an explicit compiler-free fallback/diagnostic mode w
 no performance guarantee.
 
 Set `dispersion=True` to add the D3 correction from the optional `torch-dftd`
-package. Symmetrix evaluates the neural model and D3 calculator together and
+package. Symmetrix-XL evaluates the neural model and D3 calculator together and
 adds their energy, forces, and stress. Install it with
 `uv pip install 'symmetrix-xl[dispersion]'`.
 

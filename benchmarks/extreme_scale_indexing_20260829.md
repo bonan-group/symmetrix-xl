@@ -107,7 +107,39 @@ calculator, capacity-driver, and JIT-generation suite passed 131 tests with 19
 dependency skips. On the RTX 5090, 8 CUDA guard/prepared/indexing tests passed,
 and the compact NVRTC direct-versus-generic energy/force regression passed.
 
-## A100 capacity result
+## Superseding A100 capacity result (2026-09-15)
+
+A later paper qualification supersedes the August boundary below. It used a
+standard two-layer OMAT-0-medium Al-N model in FP32 on one NVIDIA
+A100-SXM4-80GB with 81,920 MiB, driver 535.129.03, and compute capability 8.0.
+The workload was unperturbed periodic wurtzite AlN and requested energy,
+forces, and stress with a 6.0 A model cutoff, 0.5 A skin, and an effective
+neighbor cutoff of 6.5 A. Each trial ran in a fresh process with required
+direct NVRTC JIT, one warmup, and one measured complete ASE calculation.
+
+| Repeat | Atoms | Directed edges | Result | us/atom |
+|---:|---:|---:|---|---:|
+| `n68` | 1,257,728 | 137,092,352 | success twice after index fix; memcheck 0 errors | 7.006, 6.893 |
+| `n69` | 1,314,036 | 143,229,924 | success | 6.931 |
+| `n70` | 1,372,000 | 149,548,000 | success twice | 6.931, 6.983 |
+| `n71` | 1,431,644 | 156,049,196 | CUDA OOM twice | n/a |
+
+The `n70` trials selected `capacity-y-only`, used the required
+`jit-r1-gen10-f32-6fdf3e63624a0e45` artifact, reported zero factorized
+fallbacks, and reached 80,411 MiB sampled peak device memory. The adjacent
+`n71` case reached 81,017 MiB before failing to allocate 2.731 GiB for the
+MACE H1 adjoint. Thus `n70` is the largest demonstrated success and `n71` is a
+repeated allocator upper bound for this exact hardware, model, and graph
+contract.
+
+The qualification used source revision
+`a28f0f5f34bea734f0ea493446f0e008bb308f67` with the reviewed widened
+spherical-harmonic indexing patch. The CUDA extension SHA-256 was
+`5cde901baec03961d316e13cdc56912a7002122b1758c6e89c49e4fd00ac9195`, and
+the compact model SHA-256 was
+`c0fe152521f8734200ae87381c45c233547167da0921b40d2374445ddb4ea018`.
+
+## Earlier A100 capacity result (2026-08-29)
 
 The qualification used one NVIDIA A100-SXM4-80GB, OMAT-0-medium FP32,
 `low_memory=True`, energy, forces, and stress, a 6.0 A model cutoff, a 0.5 A

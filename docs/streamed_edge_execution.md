@@ -1,6 +1,6 @@
 # Streamed-Edge Execution
 
-Symmetrix defaults to `streamed_edges="direct"` and
+Symmetrix-XL defaults to `streamed_edges="direct"` and
 `execution_profile="capacity"` for supported compact two-layer MACE models.
 `direct` is the model-specialized RTC path and never falls back to another
 algorithm. `non-compiled` is compiler-free; `materialized` is frozen legacy
@@ -13,7 +13,7 @@ internal `generic` identifier for this compatibility mode.
 Standard M0/R0 modules, runtime JIT specialization, kernel-launch calibration,
 and prepared device artifacts are separate implementation features.
 
-The direct factorized mathematics is implemented inside Symmetrix and does not
+The direct factorized mathematics is implemented inside Symmetrix-XL and does not
 depend on the upstream direct execution package.
 
 The initial production `receiver_factorized` selector covers FP32 ordinary
@@ -25,11 +25,11 @@ as the compatible MH-1 family; R1 is not a separate public execution mode.
 Kokkos HIP
 supports the generic path, ordinary-R1 hipRTC modules and hipcc plugins, and
 the standard M0 module. The
-implementation lives inside Symmetrix: the upstream direct execution package, Python
+implementation lives inside Symmetrix-XL: the upstream direct execution package, Python
 module, and source tree are not build or runtime dependencies. The upstream
 project is used only as an algorithmic reference and validation oracle.
 Upstream direct execution's generated tensor-product boundary starts from a precomputed
-compact `phi` tensor plus the runtime final radial affine. For MH-1, Symmetrix
+compact `phi` tensor plus the runtime final radial affine. For MH-1, Symmetrix-XL
 extends that paper-aligned core with generated pair-conditioned prefix and
 density programs; this extension is required by the supported MH-1 model
 architecture and is not supplied by the upstream direct execution package.
@@ -40,7 +40,7 @@ the documented backend and domain-decomposition qualification boundaries.
 
 ## Build a Kokkos backend
 
-The streamed-edge execution requires a Symmetrix build with Kokkos. Its CPU execution
+The streamed-edge execution requires a Symmetrix-XL build with Kokkos. Its CPU execution
 space may be OpenMP or Serial, and fresh CPU-only Kokkos builds default to
 OpenMP. The non-Kokkos serial evaluator remains available in the same package
 with `use_kokkos=False`, but it does not implement streamed-edge execution.
@@ -136,11 +136,11 @@ slower for medium and large graphs.
 
 Use a C++20-capable compiler with OpenMP support. An OpenMP-enabled OpenBLAS
 build is preferred for CPU deployments because it uses the same OpenMP runtime
-as Kokkos. Symmetrix detects the loaded OpenBLAS threading mode at runtime and
+as Kokkos. Symmetrix-XL detects the loaded OpenBLAS threading mode at runtime and
 prints a warning for pthread builds. OpenMP OpenBLAS is also selected
 automatically for MH-0's owner-local host GEMMs; pthread or unidentified BLAS
 retains the native Kokkos worker path. Identified pthread OpenBLAS is restricted
-to one host-BLAS thread outside that path; Symmetrix cannot control an
+to one host-BLAS thread outside that path; Symmetrix-XL cannot control an
 unidentified BLAS provider. Set `OMP_NUM_THREADS` and, optionally,
 `KOKKOS_NUM_THREADS` before starting Python. Use `symmetrix doctor --json` to
 verify `openblas_openmp_enabled`, `openblas_openmp_runtime_compatible`,
@@ -154,7 +154,7 @@ execution space, initialized concurrency, an actual parallel worker team,
 per-worker CPU affinity, host BLAS provenance, and the selected host-worker
 contraction backend. Set `SYMMETRIX_OPENMP_RUNTIME_CHECK=strict` to repeat a
 native byte-identity and duplicate-runtime preflight immediately before
-Symmetrix initializes Kokkos. Static
+Symmetrix-XL initializes Kokkos. Static
 `ldd` output alone is not a deployment qualification because the Python
 executable's loader policy participates in runtime selection.
 
@@ -187,7 +187,7 @@ or loading failure raises rather than silently selecting a different algorithm.
 `streamed_edges="generic"` for compiler-free execution.
 
 For Serial and OpenMP plugins, `SYMMETRIX_JIT_HOST_TARGET=automatic` probes
-`-march=native` first. If the compiler rejects it, Symmetrix verifies the
+`-march=native` first. If the compiler rejects it, Symmetrix-XL verifies the
 running CPU's complete x86-64-v3 feature set and probes
 `-march=x86-64-v3`. The accepted target can be pinned with `native`,
 `portable`, or a safe compiler target name. `portable` specifically means
@@ -212,7 +212,7 @@ be confused.
 On Kokkos CUDA, ordinary-MACE R1 contracts compile in-process with NVRTC
 to exact-compute-capability cubins. The generated source is self-contained:
 Kokkos headers, CUDA toolkit headers, PyTorch, upstream direct execution, and
-`nvcc_wrapper` are not runtime requirements. Symmetrix first probes a library
+`nvcc_wrapper` are not runtime requirements. Symmetrix-XL first probes a library
 named by `SYMMETRIX_JIT_NVRTC_LIBRARY`, then an NVRTC library installed by
 NVIDIA's Python package, then normal system-library locations.
 Generated CUDA R1 edge kernels default to cooperative wave32 ownership with 32
@@ -257,14 +257,14 @@ Nsight tools are optional and never inference requirements.
 
 This deployment follows the same broad split used by NVIDIA cuequivariance:
 CUDA-major binary packages provide the prebuilt host integration and NVRTC
-supplies runtime specialization. Symmetrix temporarily keeps explicit nvcc as
+supplies runtime specialization. Symmetrix-XL temporarily keeps explicit nvcc as
 a deprecated compatibility path while the generated paths are qualified
 independently; automatic selection never uses it.
 
 ## Select and verify an execution algorithm
 
 For ordinary MACE, the calculator accepts either a raw `.model` checkpoint or
-a compact Symmetrix JSON produced by `symmetrix_extract_mace`:
+a compact Symmetrix-XL JSON produced by `symmetrix_extract_mace`:
 
 ```python
 from ase.build import bulk
@@ -416,12 +416,12 @@ Contract version 3 records the conditioned density-network topology and the
 explicit channel-contiguous irrep layout used by graph-wide generated kernels.
 Exact version-1 and version-2 contracts remain loadable: the calculator
 validates them against the model and upgrades their identity in memory before
-compiling or loading a version-3 artifact. No model file rewrite or Symmetrix
+compiling or loading a version-3 artifact. No model file rewrite or Symmetrix-XL
 rebuild is required.
 This is current implementation behavior, not a generated-contract stability
 guarantee. The generated interface is pre-production: contract versions,
 plugin ABIs, and cached artifact identities may be broken when correctness or
-performance requires it. Symmetrix model schema versions 1 and 2 remain
+performance requires it. Symmetrix-XL model schema versions 1 and 2 remain
 supported independently; regenerate contracts and plugins with the active
 version when the generated interface changes.
 On Kokkos Serial and OpenMP, direct execution generates a host plugin; on
@@ -429,7 +429,7 @@ Kokkos CUDA it generates a CUDA plugin for the active compute capability. The
 plugin is compiled, cached, and loaded for that exact contract. Channel counts,
 radial widths, angular limits, and tensor-product paths are part of the cache
 key, so changing them creates a new artifact automatically and does not require
-rebuilding the Symmetrix extension. The required policy raises if the model
+rebuilding the Symmetrix-XL extension. The required policy raises if the model
 lacks the contract or the backend-specific plugin cannot be compiled or loaded.
 
 `streamed_edges="direct"` selects generated execution and requires a
@@ -780,7 +780,7 @@ generator, compiler, flags, execution target, and ABI still match. Host cache
 entries include CPU identity; CUDA entries include the exact active compute
 capability, CUDA runtime identity, NVRTC version, and compile options. Changing
 the model dimensions or tensor-product program automatically produces a
-different cache entry and does not require rebuilding the Symmetrix extension.
+different cache entry and does not require rebuilding the Symmetrix-XL extension.
 
 Every generated artifact is additionally bound to an integer JIT generation
 version. It appears in the content-addressed key, manifest, physical library or
@@ -829,7 +829,7 @@ it. Calculator initialization then raises under the required policy when
 cache preparation.
 
 On Linux, publication prefers the libc `renameat2` wrapper. When an older libc
-does not export it, Symmetrix issues the kernel syscall directly with
+does not export it, Symmetrix-XL issues the kernel syscall directly with
 `RENAME_NOREPLACE`; syscall numbers are selected for x86-64 and AArch64.
 Unsupported architectures, kernels, or filesystems raise explicitly. There is
 no race-prone check-then-rename fallback, and `EEXIST` still means that another
@@ -885,7 +885,7 @@ qualification targets.
 The model-specialized implementation currently supports:
 
 - ordinary, compact standard-MACE architectures already supported by the
-  Symmetrix MACE extractor/evaluator and carrying a factorized R1 contract;
+  Symmetrix-XL MACE extractor/evaluator and carrying a factorized R1 contract;
 - compact MACEField architectures carrying the same R1 contract; field
   conditioning remains outside the generated edge kernel and is differentiated
   by the native field-aware stages;
@@ -941,7 +941,7 @@ family.
 An eligible ordinary-MACE, MACEField, or compatible MH-1 contract receives its
 own cached backend-specific JIT artifact. JIT compilation or loading failure
 raises for direct execution. Changing supported channels or other contract
-dimensions therefore does not require rebuilding Symmetrix.
+dimensions therefore does not require rebuilding Symmetrix-XL.
 
 Specialization does not currently provide:
 
@@ -959,4 +959,4 @@ architectures remain outside the current ordinary-MACE specialization boundary;
 this specialization does not claim support for those architectures.
 
 These specialization restrictions do not narrow the generic algorithm or the
-normal Symmetrix model support matrix.
+normal Symmetrix-XL model support matrix.

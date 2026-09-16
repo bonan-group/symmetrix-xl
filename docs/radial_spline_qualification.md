@@ -10,7 +10,7 @@ The driver changes only `compact_radial.num_spline_points`. For every requested
 table size, it evaluates R0 and R1 for every ordered species pair on a combined
 linear and logarithmic radius grid. The reference is the exact Bessel basis,
 distance transform, cutoff, and extracted PyTorch radial MLP stored in the
-compact model. The tested path is the actual Symmetrix runtime spline. A nodal
+compact model. The tested path is the actual Symmetrix-XL runtime spline. A nodal
 consistency check first requires the two implementations to agree at every
 spline node within `1e-9`; this distinguishes a faulty reference implementation
 from interpolation error between nodes.
