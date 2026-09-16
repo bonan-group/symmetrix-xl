@@ -101,7 +101,6 @@ STREAMED_EDGE_MODES = (
     "materialized",
     "generic",
     "direct",
-    "receiver_factorized",
 )
 
 
@@ -623,8 +622,8 @@ def main():
         for mode in requested_modes
     ):
         parser.error(
-            "--modes must contain only materialized,generic,direct,"
-            "receiver_factorized or a compatibility alias"
+            "--modes must contain only materialized,generic,direct or a "
+            "compatibility alias"
         )
     modes = [STREAMED_EDGE_ALIASES.get(mode, mode) for mode in requested_modes]
     if args.factorized_r0_executor is not None and not (set(modes) - {"materialized"}):

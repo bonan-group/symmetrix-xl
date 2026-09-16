@@ -2,6 +2,12 @@
 
 Date: 2026-08-06
 
+Status: historical architecture record, superseded by
+`docs/reference/execution_support_matrix.md` and
+`docs/streamed_edge_execution.md`. Selector names, defaults, and recommendations
+below describe the recorded revision and are not current API documentation. The
+source map at the end points to current successor files for follow-up work.
+
 Committed tree: `86fdfc2` (`Merge branch 'field-aware' into direct-opt`)
 
 Working-tree scope: this report also includes the pending structural
@@ -660,7 +666,7 @@ automatically admitted inside `all` because it is JIT-free and has an explicit
 runtime rollback; generated R0/R1 specialization remains inside explicitly
 selected direct execution mode.
 
-## Source map
+## Current successor source map
 
 - Public calculator modes and JIT policy: `symmetrix/source/symmetrix/calculator.py`
 - Public mode parser: `libsymmetrix/source/mace_streamed_edges.hpp`
@@ -669,19 +675,17 @@ selected direct execution mode.
   `libsymmetrix/source/mace_kokkos_evaluate.cpp`, and the semantic owners in
   `docs/mace_kokkos_source_layout.md`
 - MACEField analytic response: `libsymmetrix/source/mace_kokkos_response.tpp`
-- Generated artifact registry:
-  `libsymmetrix/source/generated/direct_artifact_registry.hpp`
-- CUDA plugin and Driver launch paths: `libsymmetrix/source/direct_cuda_plugin.cpp`
-- NVRTC runtime loader/compiler: `libsymmetrix/source/direct_nvrtc.cpp`
+- CUDA plugin and Driver launch paths: `libsymmetrix/source/jit_cuda_plugin.cpp`
+- NVRTC runtime loader/compiler: `libsymmetrix/source/jit_nvrtc.cpp`
 - Nonlinear MH-1 execution: `libsymmetrix/source/mace_nonlinear_kokkos_impl.tpp`
-- Nonlinear CUDA plugin: `libsymmetrix/source/direct_mh1_cuda_plugin.cpp`
+- Nonlinear CUDA plugin: `libsymmetrix/source/jit_mh1_cuda_plugin.cpp`
 - CUDA/backend build selection: `symmetrix/CMakeLists.txt`
 - Library dependencies and AOT option: `libsymmetrix/CMakeLists.txt`
 - CUDA runtime extras: `symmetrix/pyproject.toml`
-- Backend contract and support matrix: `docs/direct_backend.md`
+- Current backend contract and support matrix:
+  `docs/reference/execution_support_matrix.md`
 - JIT-free AOT M0/M1 record: `benchmarks/all_aot_m0_m1.md`
 - MACEField generated M0/R0-v2 record:
   `benchmarks/macefield_mh0_generated_benchmark.md`
-- NVRTC qualification: `benchmarks/direct_nvrtc_migration.md`
 - MACEField standard/field scale comparison:
   `benchmarks/macefield_standard_aln_scale.md`

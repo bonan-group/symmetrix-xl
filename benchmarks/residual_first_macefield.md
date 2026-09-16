@@ -1,5 +1,10 @@
 # Residual-first MACEField qualification
 
+> **Historical record (superseded).** This report preserves the former
+> `legacy`, `r1`, and `all` selector names used by its qualification. They are
+> no longer public requests; see the
+> [execution support matrix](../docs/reference/execution_support_matrix.md).
+
 Qualification date: 2026-08-06
 
 ## Provenance

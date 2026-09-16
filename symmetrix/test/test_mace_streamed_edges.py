@@ -1275,7 +1275,7 @@ def test_calculator_rejects_unknown_streamed_mode(streamed_model_paths):
 
 
 @pytest.mark.parametrize(
-    "mode", ["legacy", "r1", "all", "second_interaction"]
+    "mode", ["legacy", "r1", "all", "second_interaction", "receiver_factorized"]
 )
 def test_calculator_rejects_removed_streamed_modes(streamed_model_paths, mode):
     standard_path, _ = streamed_model_paths

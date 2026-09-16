@@ -89,7 +89,6 @@ from every table and decision in this report.
 
 ## Artifacts
 
-- Generated direct R1 execution CUDA follow-up: `benchmarks/direct_medium_cuda_optimization.md`
 - Driver: `benchmarks/macefield_standard_aln_scale.py`
 - CPU policy screen: `benchmarks/.artifacts/macefield_standard_aln/openmp-policy-screen-corrected.json`
 - CPU final: `benchmarks/.artifacts/macefield_standard_aln/openmp-small-medium-corrected.json`
@@ -99,4 +98,6 @@ from every table and decision in this report.
 - GPU n30: `benchmarks/.artifacts/macefield_standard_aln/gpu-n30-final.json`
 
 The adjacent `*-logs` directories contain fresh-process stdout and stderr for
-each record, including explicit selector and failure provenance.
+each record, including explicit selector and failure provenance. These
+`.artifacts` paths and adjacent logs were local ignored outputs and are not
+included in a repository checkout.

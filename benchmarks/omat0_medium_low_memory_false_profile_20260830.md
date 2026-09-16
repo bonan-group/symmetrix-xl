@@ -338,8 +338,9 @@ Reports and the staged candidate were retained with the
 
 ## Direct active-edge cutoff masking
 
-The next experiment implemented the zero-allocation cutoff-sentinel design in
-`plans/2026-08-29-direct-active-edge-masking-v1.md`. Prepared direct geometry
+The next experiment implemented a zero-allocation cutoff-sentinel design from
+a local implementation plan that was not retained in the repository. Prepared
+direct geometry
 retains every cutoff-plus-skin candidate edge and the existing receiver/source
 schedules, but stores the exact model cutoff as the radius for inactive edges.
 Standard and RTC R0 plus every generated R1 owner skip those candidates before

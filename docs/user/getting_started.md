@@ -63,11 +63,14 @@ print(atoms.get_potential_energy())
 ```
 
 This is the first-class path: FP32, `direct`, and capacity-aware plan selection
-are the defaults. It requires an admitted model and a usable FP32 host or
-device JIT artifact; prepare one as shown in {doc}`execution`. Request
-`dtype="float64"` explicitly for high-precision evaluation and prepare the
-matching FP64 artifact. `non-compiled` is only a compiler-free fallback/diagnostic
-mode and has no performance guarantee:
+are the defaults. Two-interaction models require an admitted contract and a
+usable FP32 host or device JIT artifact; prepare one as shown in
+{doc}`execution`. Admitted single-layer models use built-in direct execution.
+They do not need an R1 artifact, although capacity planning may specialize
+their M0/R0 operators.
+Request `dtype="float64"` explicitly for high-precision evaluation and prepare
+the matching FP64 artifact when specialization is required. `non-compiled` is
+only a compiler-free fallback/diagnostic mode and has no performance guarantee:
 
 ```python
 atoms.calc = Symmetrix("srtio3-mace.json", streamed_edges="non-compiled")

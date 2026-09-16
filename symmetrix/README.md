@@ -22,47 +22,13 @@ CUDA and HIP backends are installed as separate, architecture-qualified
 packages so that they can coexist without overwriting the frontend or CPU
 extension.
 
-## Demonstrated scale
+## Qualification evidence
 
-Capacity depends on the model, precision, requested properties, graph density,
-and hardware. Two exact FP32 qualifications illustrate the current range:
-
-- A standard two-layer OMAT-0-medium MACE model evaluated 1,372,000 atoms and
-  149,548,000 directed edges on one NVIDIA A100-SXM4-80GB. Two fresh-process
-  trials took 6.931 and 6.983 us/atom and reached 80,411 MiB sampled peak
-  device memory; the adjacent 1,431,644-atom case failed twice with CUDA OOM.
-  The workload requested energy, forces, and stress with a 6.0 A model cutoff
-  and 0.5 A neighbor-list skin, giving an effective cutoff of 6.5 A.
-- A purpose-built, nonstandard single-layer qualification model
-  (`single-v2`) evaluated 11,943,936 atoms and 1,301,889,024 directed edges on
-  one NVIDIA RTX 5090 with 32,607 MiB at 1.830 us/atom and 22,414 MiB peak
-  device memory. This result used
-  the separately enabled fixed-workspace plan and requested energy, per-atom
-  energies, forces, and stress with the same 6.0 A model cutoff, 0.5 A skin,
-  and an effective cutoff of 6.5 A. It was the largest host-feasible ASE
-  construction tested, not a general GPU capacity limit.
-
-These results are workload-specific demonstrations, not capacity guarantees.
-The full records are the
-[A100 qualification](https://github.com/bonan-group/symmetrix-xl/blob/main/benchmarks/extreme_scale_indexing_20260829.md#superseding-a100-capacity-result-2026-09-15)
-and the
-[single-layer fixed-workspace qualification](https://github.com/bonan-group/symmetrix-xl/blob/main/benchmarks/single_layer_fixed_workspace_cuda_20260910.md#capacity-result).
-
-## Demonstrated speed
-
-A matched FP32 RTX 5090 qualification compared complete warmed ASE
-energy/forces/stress calls for the standard OMAT-0-medium checkpoint:
-
-| Atoms | Directed edges: MACE-Torch / Symmetrix-XL | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
-|---:|---:|---:|---:|---:|---:|
-| 864 | 78,624 / 97,762 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
-| 4,000 | 364,000 / 452,342 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
-
-MACE-Torch 0.3.15 with cuEquivariance 0.11.0 used the exact 6.0 A graph.
-Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving a
-candidate graph with an effective cutoff of 6.5 A; the graph policies are not
-identical, and Symmetrix-XL processed more directed candidates. See the
-[matched speed qualification](https://github.com/bonan-group/symmetrix-xl/blob/main/benchmarks/streamed_edge_milestone_20260822.md#superseding-cuda-paper-qualification-2026-09-14).
+Capacity and performance depend on model, precision, requested properties,
+graph density, cutoff policy, and hardware. The maintained
+[user overview](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/overview.md)
+summarizes current headline results and links to the dated benchmark records
+that contain exact workloads, memory measurements, and failure boundaries.
 
 ## Installation
 
@@ -213,9 +179,11 @@ Model evaluation defaults to FP32. Request FP64 explicitly when needed:
 atoms.calc = Symmetrix("srtio3-mace.json", dtype="float64")
 ```
 
-Direct model-specialized execution is the default for supported compact
-models. It compiles or reuses a precision- and backend-specific artifact and
-fails clearly when the required artifact cannot be produced or loaded. Use
+Direct execution is the default for supported compact models. Two-interaction
+models compile or reuse a precision- and backend-specific artifact and fail
+clearly when it cannot be produced or loaded. Admitted single-layer models use
+built-in direct execution without an R1 artifact; capacity planning may still
+compile or load specialized M0/R0 operator modules. Use
 `streamed_edges="non-compiled"` only as a compiler-free compatibility or
 diagnostic mode.
 

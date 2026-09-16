@@ -18,8 +18,10 @@ also select Y-only storage when the estimated device-memory budget requires it.
 Debug plan identifiers remain exact even on hosts where no device-memory query
 exists.
 
-The complete direct-execution support matrix, internal candidates, and debug
-pins are maintained in {doc}`/streamed_edge_execution`.
+The public direct-execution matrix is maintained in
+{doc}`/reference/execution_support_matrix`; architecture and planner invariants
+are described in {doc}`/streamed_edge_execution`. Exact debug-plan identifiers
+remain private implementation details in `symmetrix.calculator`.
 
 ```{toctree}
 :hidden:

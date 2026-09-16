@@ -191,11 +191,6 @@ The report is
 Raw JSON records are under
 `/tmp/symmetrix-mh0-md-random-20260911/`. The tested binary is
 `/tmp/symmetrix-mh0-md-microbench`.
-
-Build:
-
-```bash
-/usr/local/cuda-13.3/bin/nvcc -O3 -std=c++20 -arch=sm_120 -lineinfo \
-  -Xptxas=-v benchmarks/mh0_radial_point_microbench.cu \
-  -o /tmp/symmetrix-mh0-md-microbench
-```
+The microbenchmark source and raw artifacts were local experiment outputs and
+were not retained in the repository, so this record is not independently
+reproducible from a checkout.

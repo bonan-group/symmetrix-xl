@@ -1,5 +1,11 @@
 # MACEField streamed-edge benchmark and support matrix
 
+> **Historical record (superseded).** This report preserves the selector names
+> and support decisions used for its 2026-08-14 measurements. The current
+> public modes are documented in
+> [`docs/reference/execution_support_matrix.md`](../docs/reference/execution_support_matrix.md);
+> `streamed_edges="all"` is no longer accepted.
+
 ## `streamed_edges="all"` support matrix
 
 | Backend | Model | `all` | Qualified precision | Energy/forces/stress | Polarization | Polarizability/BEC | Edge-memory behavior |
@@ -193,9 +199,10 @@ with HIP 7.14.60850 from `/opt/rocm` and a Python 3.14 extension compiled for
 the actual `gfx1151` ISA.
 
 In this earlier small-system qualification, the generated R1 serial-edge
-policy was faster than the wave-per-edge policy. The later 10,976-atom thermal
-MH-0 retest in `direct_gpu_schedule_portability.md` reverses that conclusion,
-so native-wave/t64/b8 is now the portable HIP default. The retained
+policy was faster than the wave-per-edge policy. A later 10,976-atom thermal
+MH-0 retest reversed that conclusion, so native-wave/t64/b8 became the portable
+HIP default. The later raw portability report was not retained in the
+repository; this paragraph records only the resulting selection. The retained
 field-adjoint path uses a
 component-local entry schedule and a 64-bit `channels x channels` reduction
 range. HIP also admits the checked-in generated M0 contraction. It replaces
