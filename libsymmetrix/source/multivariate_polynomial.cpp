@@ -7,9 +7,10 @@
 
 #include "multivariate_polynomial.hpp"
 
-MultivariatePolynomial::MultivariatePolynomial(
+template <typename Precision>
+MultivariatePolynomialT<Precision>::MultivariatePolynomialT(
     int num_variables,
-    std::vector<double> coefficients,
+    std::vector<Precision> coefficients,
     std::vector<std::vector<int>> monomials)
     : num_variables(num_variables),
       coefficients(coefficients),
@@ -21,7 +22,8 @@ MultivariatePolynomial::MultivariatePolynomial(
     //      * check for repeated monomials
 
     // comparison function governing lexographic ordering for monomial vectors
-    auto lex_less = [](std::vector<int> v1, std::vector<int> v2) {
+    auto lex_less = [](
+            const std::vector<int>& v1, const std::vector<int>& v2) {
         if (v1.size() < v2.size()) {
             return true;
         } else if (v1.size() > v2.size()) {
@@ -33,12 +35,12 @@ MultivariatePolynomial::MultivariatePolynomial(
 
     // store coefficients and monomials in lexographic order
     // (ordering ensured because the map sorts by key)
-    std::map<std::vector<int>,double,decltype(lex_less)> map;
+    std::map<std::vector<int>,Precision,decltype(lex_less)> map;
     for (int i=0; i<monomials.size(); ++i)
         map.insert({monomials[i], coefficients[i]});
     coefficients.clear();
     monomials.clear();
-    for (auto [m,c] : map) {
+    for (const auto& [m,c] : map) {
         monomials.push_back(m);
         coefficients.push_back(c);
     }
@@ -47,9 +49,9 @@ MultivariatePolynomial::MultivariatePolynomial(
     std::set<std::vector<int>,decltype(lex_less)> node_set;
     for (int i=0; i<num_variables; ++i)
         node_set.insert({i});
-    for (auto monomial : monomials)
+    for (const auto& monomial : monomials)
         node_set.insert(monomial);
-    
+
     // add auxiliary nodes until all nodes have two upstream factors
     num_auxiliary_nodes = 0;
     auto find_parents = [](const std::vector<int>& node,
@@ -72,7 +74,7 @@ MultivariatePolynomial::MultivariatePolynomial(
         }
     }
     nodes = std::vector<std::vector<int>>(node_set.begin(), node_set.end());
-    
+
     // find edges
     for (auto node : node_set) {
         if (node.size() == 1)
@@ -88,7 +90,7 @@ MultivariatePolynomial::MultivariatePolynomial(
     }
 
     // initialize node coefficients, values, and adjoints
-    node_coefficients = std::vector<double>(nodes.size(), 0.0);
+    node_coefficients = std::vector<Precision>(nodes.size(), 0.0);
     int j = 0;
     for (int i=0; i<coefficients.size(); ++i) {
         while (monomials[i] != nodes[j]) {
@@ -96,28 +98,30 @@ MultivariatePolynomial::MultivariatePolynomial(
         }
         node_coefficients[j] = coefficients[i];
     }
-    node_values = std::vector<double>(nodes.size());
-    node_adjoints = std::vector<double>(nodes.size());
+    node_values = std::vector<Precision>(nodes.size());
+    node_adjoints = std::vector<Precision>(nodes.size());
 }
 
-auto MultivariatePolynomial::evaluate(
-    const std::vector<double>& x)
-    -> double
+template <typename Precision>
+auto MultivariatePolynomialT<Precision>::evaluate(
+    const std::vector<Precision>& x)
+    -> Precision
 {
     initialize_forward_pass(x);
     forward_pass();
-    return cblas_ddot(node_coefficients.size(),
+    return symmetrix_blas_dot<Precision>(node_coefficients.size(),
                       node_coefficients.data(), 1,
                       node_values.data(), 1);
 }
 
-auto MultivariatePolynomial::evaluate_gradient(
-    const std::vector<double>& x)
-    -> std::tuple<double,std::vector<double>>
+template <typename Precision>
+auto MultivariatePolynomialT<Precision>::evaluate_gradient(
+    const std::vector<Precision>& x)
+    -> std::tuple<Precision,std::vector<Precision>>
 {
     initialize_forward_pass(x);
     forward_pass();
-    auto f = cblas_ddot(node_coefficients.size(),
+    auto f = symmetrix_blas_dot<Precision>(node_coefficients.size(),
                         node_coefficients.data(), 1,
                         node_values.data(), 1);
     initialize_backward_pass();
@@ -126,16 +130,63 @@ auto MultivariatePolynomial::evaluate_gradient(
     return {f, g};
 }
 
-auto MultivariatePolynomial::evaluate_batch(
-    const std::vector<double>& x,
+template <typename Precision>
+auto MultivariatePolynomialT<Precision>::evaluate_gradient_directional(
+    const std::vector<Precision>& x,
+    const std::vector<Precision>& x_dot)
+    -> std::tuple<Precision,std::vector<Precision>,std::vector<Precision>>
+{
+    initialize_forward_pass(x);
+    auto node_value_dots = std::vector<Precision>(nodes.size(), 0.0);
+    for (int i=0; i<num_variables; ++i)
+        node_value_dots[i] = x_dot[i];
+
+    for (int i=0; i<edges.size(); ++i) {
+        const auto [i0, i1] = edges[i];
+        const int output_node = num_variables+i;
+        node_values[output_node] = node_values[i0] * node_values[i1];
+        node_value_dots[output_node] =
+            node_value_dots[i0] * node_values[i1]
+            + node_values[i0] * node_value_dots[i1];
+    }
+
+    auto f = symmetrix_blas_dot<Precision>(node_coefficients.size(),
+                        node_coefficients.data(), 1,
+                        node_values.data(), 1);
+
+    initialize_backward_pass();
+    auto node_adjoints_dots = std::vector<Precision>(nodes.size(), 0.0);
+    for (int i=edges.size()-1; i>=0; --i) {
+        const auto [i0, i1] = edges[i];
+        const int output_node = num_variables+i;
+        node_adjoints[i0] += node_adjoints[output_node]*node_values[i1];
+        node_adjoints[i1] += node_adjoints[output_node]*node_values[i0];
+        node_adjoints_dots[i0] +=
+            node_adjoints_dots[output_node]*node_values[i1]
+            + node_adjoints[output_node]*node_value_dots[i1];
+        node_adjoints_dots[i1] +=
+            node_adjoints_dots[output_node]*node_values[i0]
+            + node_adjoints[output_node]*node_value_dots[i0];
+    }
+
+    auto g = extract_gradient_from_graph();
+    auto g_dot = std::vector<Precision>(num_variables, 0.0);
+    for (int i=0; i<num_variables; ++i)
+        g_dot[i] = node_adjoints_dots[i];
+    return {f, g, g_dot};
+}
+
+template <typename Precision>
+auto MultivariatePolynomialT<Precision>::evaluate_batch(
+    const std::vector<Precision>& x,
     const int batch_size)
-    -> std::tuple<std::vector<double>,std::vector<double>>
+    -> std::tuple<std::vector<Precision>,std::vector<Precision>>
 {
     batched_initialize_forward_pass(x, batch_size);
     batched_forward_pass(batch_size);
-    auto f = std::vector<double>(batch_size, 0.0);
+    auto f = std::vector<Precision>(batch_size, 0.0);
     for (int i=0; i<nodes.size(); ++i) {
-        const double c = node_coefficients[i];
+        const Precision c = node_coefficients[i];
         for (int j=0; j<batch_size; ++j) {
             f[j] += c*node_values[i*batch_size+j];
         }
@@ -146,14 +197,16 @@ auto MultivariatePolynomial::evaluate_batch(
     return {f, g};
 }
 
-void MultivariatePolynomial::initialize_forward_pass(
-    const std::vector<double>& x)
+template <typename Precision>
+void MultivariatePolynomialT<Precision>::initialize_forward_pass(
+    const std::vector<Precision>& x)
 {
     for (int i=0; i<num_variables; ++i)
         node_values[i] = x[i];
 }
 
-void MultivariatePolynomial::forward_pass()
+template <typename Precision>
+void MultivariatePolynomialT<Precision>::forward_pass()
 {
     for (int i=0; i<edges.size(); ++i) {
         const auto [i0, i1] = edges[i];
@@ -161,14 +214,16 @@ void MultivariatePolynomial::forward_pass()
     }
 }
 
-void MultivariatePolynomial::initialize_backward_pass()
+template <typename Precision>
+void MultivariatePolynomialT<Precision>::initialize_backward_pass()
 {
-    cblas_dcopy(node_coefficients.size(),
+    symmetrix_blas_copy<Precision>(node_coefficients.size(),
                 node_coefficients.data(), 1,
                 node_adjoints.data(), 1);
 }
 
-void MultivariatePolynomial::backward_pass()
+template <typename Precision>
+void MultivariatePolynomialT<Precision>::backward_pass()
 {
     for (int i=edges.size()-1; i>=0; --i) {
         const auto [i0, i1] = edges[i];
@@ -177,17 +232,19 @@ void MultivariatePolynomial::backward_pass()
     }
 }
 
-auto MultivariatePolynomial::extract_gradient_from_graph()
-    -> std::vector<double>
+template <typename Precision>
+auto MultivariatePolynomialT<Precision>::extract_gradient_from_graph()
+    -> std::vector<Precision>
 {
-    std::vector<double> g(num_variables, 0.0);
+    std::vector<Precision> g(num_variables, 0.0);
     for (int i=0; i<num_variables; ++i)
         g[i] = node_adjoints[i];
     return g;
 }
 
-void MultivariatePolynomial::batched_initialize_forward_pass(
-    const std::vector<double>& x,
+template <typename Precision>
+void MultivariatePolynomialT<Precision>::batched_initialize_forward_pass(
+    const std::vector<Precision>& x,
     const int batch_size)
 {
     node_values.resize(batch_size * nodes.size());
@@ -196,21 +253,23 @@ void MultivariatePolynomial::batched_initialize_forward_pass(
             node_values[i*batch_size+j] = x[j*num_variables+i];
 }
 
-void MultivariatePolynomial::batched_forward_pass(
+template <typename Precision>
+void MultivariatePolynomialT<Precision>::batched_forward_pass(
     const int batch_size)
 {
     for (int i=0; i<edges.size(); ++i) {
         const auto [i0, i1] = edges[i];
-        double* node_val = node_values.data() + (num_variables+i)*batch_size;
-        const double* node_val_0 = node_values.data() + i0*batch_size;
-        const double* node_val_1 = node_values.data() + i1*batch_size;
+        Precision* node_val = node_values.data() + (num_variables+i)*batch_size;
+        const Precision* node_val_0 = node_values.data() + i0*batch_size;
+        const Precision* node_val_1 = node_values.data() + i1*batch_size;
         for (int j=0; j<batch_size; ++j) {
             node_val[j] = node_val_0[j] * node_val_1[j];
         }
     }
 }
 
-void MultivariatePolynomial::batched_initialize_backward_pass(
+template <typename Precision>
+void MultivariatePolynomialT<Precision>::batched_initialize_backward_pass(
     const int batch_size)
 {
     node_adjoints.resize(batch_size * nodes.size());
@@ -221,16 +280,17 @@ void MultivariatePolynomial::batched_initialize_backward_pass(
     }
 }
 
-void MultivariatePolynomial::batched_backward_pass(
+template <typename Precision>
+void MultivariatePolynomialT<Precision>::batched_backward_pass(
     const int batch_size)
 {
     for (int i=edges.size()-1; i>=0; --i) {
         const auto [i0, i1] = edges[i];
-        double* node_adj = node_adjoints.data() + (num_variables+i)*batch_size;
-        double* node_val_0 = node_values.data() + i0*batch_size;
-        double* node_val_1 = node_values.data() + i1*batch_size;
-        double* node_adj_0 = node_adjoints.data() + i0*batch_size;
-        double* node_adj_1 = node_adjoints.data() + i1*batch_size;
+        Precision* node_adj = node_adjoints.data() + (num_variables+i)*batch_size;
+        Precision* node_val_0 = node_values.data() + i0*batch_size;
+        Precision* node_val_1 = node_values.data() + i1*batch_size;
+        Precision* node_adj_0 = node_adjoints.data() + i0*batch_size;
+        Precision* node_adj_1 = node_adjoints.data() + i1*batch_size;
         for (int j=0; j<batch_size; ++j)
             node_adj_0[j] += node_adj[j] * node_val_1[j];
         for (int j=0; j<batch_size; ++j)
@@ -238,22 +298,24 @@ void MultivariatePolynomial::batched_backward_pass(
     }
 }
 
-auto MultivariatePolynomial::batched_extract_gradient_from_graph(
+template <typename Precision>
+auto MultivariatePolynomialT<Precision>::batched_extract_gradient_from_graph(
     const int batch_size)
-    -> std::vector<double>
+    -> std::vector<Precision>
 {
-    std::vector<double> g(num_variables*batch_size, 0.0);
+    std::vector<Precision> g(num_variables*batch_size, 0.0);
     for (int i=0; i<num_variables; ++i)
         for (int j=0; j<batch_size; ++j)
             g[j*num_variables+i] = node_adjoints[i*batch_size+j];
     return g;
 }
 
-auto MultivariatePolynomial::evaluate_simple(const std::vector<double>& x) -> double
+template <typename Precision>
+auto MultivariatePolynomialT<Precision>::evaluate_simple(const std::vector<Precision>& x) -> Precision
 {
-    double f = 0.0;
+    Precision f = 0.0;
     for (int i=0; i<coefficients.size(); ++i) {
-        double monomial = x[monomials[i][0]];
+        Precision monomial = x[monomials[i][0]];
         for (int j=1; j<monomials[i].size(); ++j) {
             monomial *= x[monomials[i][j]];
         }
@@ -262,22 +324,23 @@ auto MultivariatePolynomial::evaluate_simple(const std::vector<double>& x) -> do
     return f;
 }
 
-auto MultivariatePolynomial::evaluate_gradient_simple(
-    const std::vector<double>& x)
-    -> std::tuple<double,std::vector<double>>
+template <typename Precision>
+auto MultivariatePolynomialT<Precision>::evaluate_gradient_simple(
+    const std::vector<Precision>& x)
+    -> std::tuple<Precision,std::vector<Precision>>
 {
-    double f = 0.0;
+    Precision f = 0.0;
     for (int i=0; i<coefficients.size(); ++i) {
-        double monomial = x[monomials[i][0]];
+        Precision monomial = x[monomials[i][0]];
         for (int j=1; j<monomials[i].size(); ++j) {
             monomial *= x[monomials[i][j]];
         }
         f += coefficients[i] * monomial;
     }
-    auto g = std::vector<double>(num_variables, 0.0);
+    auto g = std::vector<Precision>(num_variables, 0.0);
     for (int i=0; i<coefficients.size(); ++i) {
         for (int j=0; j<monomials[i].size(); ++j) {
-            double monomial_deriv = 1.0;
+            Precision monomial_deriv = 1.0;
             for (int k=0; k<monomials[i].size(); ++k) {
                 if (k==j) continue;
                 monomial_deriv *= x[monomials[i][k]];
@@ -287,3 +350,6 @@ auto MultivariatePolynomial::evaluate_gradient_simple(
     }
     return {f,g};
 }
+
+template class MultivariatePolynomialT<float>;
+template class MultivariatePolynomialT<double>;

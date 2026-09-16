@@ -1,0 +1,246 @@
+{
+  "accumulator": {
+    "fallback": [
+      "float32",
+      "float64"
+    ],
+    "mode": "runtime_precision",
+    "native_generated": [
+      "float32"
+    ]
+  },
+  "channels": 96,
+  "derivatives": [
+    "forward",
+    "state_adjoint",
+    "source_adjoint",
+    "coordinate"
+  ],
+  "edge_harmonics": {
+    "l_max": 3,
+    "layout": "lm=l*l+l+m"
+  },
+  "fingerprint": "sha256:e1373bdcd26ce06d4947d680c9e04dbda27d4ab23478bea7d122a21e5fa728fe",
+  "generation_fingerprint": "sha256:83a3b22ce7335ea8472b49bc80ddcde4548bfe5e79472efd8503e3bb9f85e934",
+  "groups": [
+    {
+      "components": 1,
+      "l": 0,
+      "path_indices": [
+        0
+      ]
+    },
+    {
+      "components": 3,
+      "l": 1,
+      "path_indices": [
+        1
+      ]
+    },
+    {
+      "components": 5,
+      "l": 2,
+      "path_indices": [
+        2
+      ]
+    },
+    {
+      "components": 7,
+      "l": 3,
+      "path_indices": [
+        3
+      ]
+    }
+  ],
+  "interaction": "R1",
+  "irreps": {
+    "edge": "1x0e+1x1o+1x2e+1x3o",
+    "output": "96x0e+96x1o+96x2e+96x3o",
+    "source": "96x0e"
+  },
+  "layouts": {
+    "aggregate": "receiver,radial_embedding,path_component_channel",
+    "message": "receiver_component,path_channel",
+    "output": "receiver,lm,channel",
+    "source_adjoint": "source,lm,channel"
+  },
+  "paths": [
+    {
+      "connection_mode": "uvu",
+      "edge_l": 0,
+      "has_weight": true,
+      "index": 0,
+      "output_l": 0,
+      "path_shape": [
+        96,
+        1
+      ],
+      "source_l": 0
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 1,
+      "has_weight": true,
+      "index": 1,
+      "output_l": 1,
+      "path_shape": [
+        96,
+        1
+      ],
+      "source_l": 0
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 2,
+      "has_weight": true,
+      "index": 2,
+      "output_l": 2,
+      "path_shape": [
+        96,
+        1
+      ],
+      "source_l": 0
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 3,
+      "has_weight": true,
+      "index": 3,
+      "output_l": 3,
+      "path_shape": [
+        96,
+        1
+      ],
+      "source_l": 0
+    }
+  ],
+  "radial_embedding": 64,
+  "schema": "symmetrix.execution.tensor_product",
+  "source_harmonics": {
+    "l_max": 0,
+    "layout": "lm=l*l+l+m"
+  },
+  "sparse_coupling": {
+    "coefficients_fingerprint": "sha256:f8b519c907394980463982727954db849e5f8cd41037fa4b68c52c2da11f1804",
+    "lme_fingerprint": "sha256:4939a292c2f5164ddcf27a07ddc7ef96928baa3e8967453a7294a9ecebf0a5c3",
+    "ordering": "edge_lm,source_lm,path,output_m",
+    "rows_fingerprint": "sha256:4939a292c2f5164ddcf27a07ddc7ef96928baa3e8967453a7294a9ecebf0a5c3",
+    "term_count": 16,
+    "terms": [
+      {
+        "coefficient": 1.0,
+        "lm1": 0,
+        "lm2": 0,
+        "lme": 0,
+        "row": 0
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 1,
+        "lm2": 0,
+        "lme": 1,
+        "row": 1
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 2,
+        "lm2": 0,
+        "lme": 2,
+        "row": 2
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 3,
+        "lm2": 0,
+        "lme": 3,
+        "row": 3
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 4,
+        "lm2": 0,
+        "lme": 4,
+        "row": 4
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 5,
+        "lm2": 0,
+        "lme": 5,
+        "row": 5
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 6,
+        "lm2": 0,
+        "lme": 6,
+        "row": 6
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 7,
+        "lm2": 0,
+        "lme": 7,
+        "row": 7
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 8,
+        "lm2": 0,
+        "lme": 8,
+        "row": 8
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 9,
+        "lm2": 0,
+        "lme": 9,
+        "row": 9
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 10,
+        "lm2": 0,
+        "lme": 10,
+        "row": 10
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 11,
+        "lm2": 0,
+        "lme": 11,
+        "row": 11
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 12,
+        "lm2": 0,
+        "lme": 12,
+        "row": 12
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 13,
+        "lm2": 0,
+        "lme": 13,
+        "row": 13
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 14,
+        "lm2": 0,
+        "lme": 14,
+        "row": 14
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 15,
+        "lm2": 0,
+        "lme": 15,
+        "row": 15
+      }
+    ]
+  },
+  "structure_fingerprint": "sha256:963963a85b9316a79f901a9b9e63eb953bcd4abccfe80e74687305e58a492c0f",
+  "version": 1
+}

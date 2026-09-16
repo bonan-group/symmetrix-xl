@@ -3,26 +3,34 @@
 #include <tuple>
 #include <vector>
 
-class CubicSpline {
+template <typename Precision>
+class CubicSplineT {
 
 public:
 
-CubicSpline(double h,
-            std::vector<double> nodal_values,
-            std::vector<double> nodal_derivs);
+CubicSplineT(Precision h,
+             std::vector<Precision> nodal_values,
+             std::vector<Precision> nodal_derivs,
+             Precision x0 = 0.0);
 
-auto evaluate(double r) -> double;
-auto evaluate_deriv(double r) -> std::tuple<double,double>;
-auto evaluate_deriv_divided(double r) -> std::tuple<double,double>;
+auto evaluate(Precision r) -> Precision;
+auto evaluate_deriv(Precision r) -> std::tuple<Precision,Precision>;
+auto evaluate_deriv_divided(Precision r) -> std::tuple<Precision,Precision>;
 
 private:
 
-double h;
-std::vector<double> c;
+Precision h;
+Precision x0;
+std::vector<Precision> c;
 
 auto generate_coefficients(
-    double h,
-    std::vector<double> nodal_values,
-    std::vector<double> nodal_derivs)
-    -> std::vector<double>;
+    Precision h,
+    std::vector<Precision> nodal_values,
+    std::vector<Precision> nodal_derivs)
+    -> std::vector<Precision>;
 };
+
+using CubicSpline = CubicSplineT<double>;
+
+extern template class CubicSplineT<float>;
+extern template class CubicSplineT<double>;

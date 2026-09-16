@@ -1,0 +1,137 @@
+name: HIP qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hip-qualification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hip-smoke:
+    runs-on: [self-hosted, linux, x64, hip, gfx1151]
+    timeout-minutes: 120
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      CXX: /opt/rocm/bin/hipcc
+      HIPCXX: /opt/rocm/bin/hipcc
+      HIP_PATH: /opt/rocm
+      ROCM_PATH: /opt/rocm
+      LD_LIBRARY_PATH: /opt/rocm/lib
+      KOKKOS_NUM_THREADS: 1
+      SYMMETRIX_REQUIRED_TEST_MANIFEST: hip_required_tests.json
+    steps:
+      - name: Clone trusted repository revision
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Record device and ROCm inventory
+        run: |
+          /opt/rocm/bin/rocminfo
+          amd-smi static --gpu 0
+          /opt/rocm/bin/hipcc --version
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          python-version: "3.12"
+
+      - name: Build clean HIP extension
+        run: |
+          uv venv --clear
+          source .venv/bin/activate
+          uv pip install --verbose "./symmetrix[test]" \
+            --config-settings=cmake.define.CMAKE_C_COMPILER=/usr/bin/gcc \
+            --config-settings=cmake.define.CMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc \
+            --config-settings=cmake.define.CMAKE_PREFIX_PATH=/opt/rocm \
+            --config-settings=cmake.define.SYMMETRIX_DEVICE_BACKEND=HIP \
+            --config-settings=cmake.define.Kokkos_ARCH_AMD_GFX1100=ON \
+            --config-settings=cmake.define.Kokkos_IMPL_AMDGPU_FLAGS=--offload-arch=gfx1151 \
+            --config-settings=cmake.define.Kokkos_IMPL_AMDGPU_LINK=--offload-arch=gfx1151
+
+      - name: Compile ordinary R1 with required hipRTC
+        env:
+          SYMMETRIX_REQUIRED_TEST_MANIFEST: hip_compiler_required_tests.json
+        run: |
+          source .venv/bin/activate
+          cd symmetrix/test
+          pytest -q \
+            'test_jit_compiler_qualification.py::test_hip_forced_compiler_produces_expected_artifact[hiprtc]'
+
+      - name: Exercise deprecated hipcc runtime compatibility
+        continue-on-error: true
+        env:
+          SYMMETRIX_JIT_HIPCC: /opt/rocm/bin/hipcc
+          SYMMETRIX_REQUIRED_TEST_MANIFEST: ""
+        run: |
+          source .venv/bin/activate
+          cd symmetrix/test
+          pytest -q \
+            'test_jit_compiler_qualification.py::test_hip_forced_compiler_produces_expected_artifact[hipcc]'
+
+      - name: Run mandatory HIP smoke
+        run: |
+          source .venv/bin/activate
+          cd symmetrix/test
+          pytest -q -m hip test_hip_runtime.py
+
+      - name: Gate ordinary R1 JIT at 50 us per atom
+        env:
+          SYMMETRIX_JIT_HIP_JIT_BACKEND: hiprtc
+        run: |
+          source .venv/bin/activate
+          mkdir -p benchmarks/.artifacts/hip-gfx1151
+          MODEL_PATH=benchmarks/.artifacts/hip-gfx1151/compact-r1.json
+          python symmetrix/test/compact_r1_model.py \
+            symmetrix/test/data/execution_contracts/jit_r1_mace_off23_small_contract.json \
+            "$MODEL_PATH" \
+            --atomic-numbers 7,13
+          SYMMETRIX_JIT_HIP_R1_EDGE_STRATEGY=wave \
+            python benchmarks/standard_mace_streamed_benchmark.py \
+              "$MODEL_PATH" \
+              --backend kokkos \
+              --dtype float32 \
+              --modes factorized \
+              --sizes 4 \
+              --warmups 20 \
+              --repeats 20 \
+              --max-us-per-atom 50 \
+              --output benchmarks/.artifacts/hip-gfx1151/r1-wave.json
+          jq -e '
+            .systems | all(
+              .modes.factorized.factorized.jit.hip_plugin_ready == true and
+              .modes.factorized.factorized.jit.compiler_backend == "hiprtc" and
+              .modes.factorized.factorized.jit.edge_policy.strategy == "wave"
+            )' benchmarks/.artifacts/hip-gfx1151/r1-wave.json
+          SYMMETRIX_JIT_HIP_R1_EDGE_STRATEGY=serial \
+            python benchmarks/standard_mace_streamed_benchmark.py \
+              "$MODEL_PATH" \
+              --backend kokkos \
+              --dtype float32 \
+              --modes factorized \
+              --sizes 4 \
+              --warmups 20 \
+              --repeats 20 \
+              --output benchmarks/.artifacts/hip-gfx1151/r1-serial.json
+          jq -e '
+            .systems | all(
+              .modes.factorized.factorized.jit.hip_plugin_ready == true and
+              .modes.factorized.factorized.jit.compiler_backend == "hiprtc" and
+              .modes.factorized.factorized.jit.edge_policy.strategy == "serial"
+            )' benchmarks/.artifacts/hip-gfx1151/r1-serial.json
+
+      - name: Upload HIP benchmark records
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hip-gfx1151-r1-benchmarks
+          path: benchmarks/.artifacts/hip-gfx1151
+          if-no-files-found: error
+
+      - name: Record final device health
+        if: always()
+        run: amd-smi metric --gpu 0

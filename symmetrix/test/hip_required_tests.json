@@ -1,0 +1,19 @@
+{
+  "schema": "symmetrix.hip-required-tests",
+  "version": 1,
+  "required_capabilities": [
+    "hip_environment",
+    "hip_sentinel"
+  ],
+  "required_nodes": [
+    "test/test_hip_runtime.py::test_hip_execution_environment",
+    "test/test_hip_runtime.py::test_hip_rocblas_link_reports_batched_blas",
+    "test/test_hip_runtime.py::test_hip_device_sentinel",
+    "test/test_hip_runtime.py::test_hip_r1_jit_wave_and_serial_match_generic",
+    "test/test_hip_runtime.py::test_hip_r1_hiprtc_module_matches_generic[float32]",
+    "test/test_hip_runtime.py::test_hip_r1_hiprtc_module_matches_generic[float64]",
+    "test/test_hip_runtime.py::test_hip_generated_m0_matches_runtime",
+    "test/test_hip_runtime.py::test_hip_generated_m0_float64_matches_runtime",
+    "test/test_hip_runtime.py::test_hip_generated_r0_v2_matches_runtime"
+  ]
+}

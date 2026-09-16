@@ -1,0 +1,10 @@
+{
+  "schema": "symmetrix.cuda-compiler-required-tests",
+  "version": 1,
+  "required_capabilities": [
+    "cuda_environment"
+  ],
+  "required_nodes": [
+    "test/test_jit_compiler_qualification.py::test_cuda_forced_compiler_produces_expected_artifact[nvrtc]"
+  ]
+}

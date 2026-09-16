@@ -19,12 +19,6 @@ CubicSplineSetKokkos(double h,
 CubicSplineSetKokkos(double h,
                      std::vector<std::vector<double>> nodal_values,
                      std::vector<std::vector<double>> nodal_derivs);
-static void initialize_coefficients(double h_local,
-                                    int num_nodes_local,
-                                    int num_splines_local,
-                                    Kokkos::View<double**> nodal_values,
-                                    Kokkos::View<double**> nodal_derivs,
-                                    Kokkos::View<double***> c_local);
 void evaluate(double r, Kokkos::View<double*> values);
 void evaluate_derivs(double r, Kokkos::View<double*> values, Kokkos::View<double*> derivs) const;
 void evaluate_derivs(Kokkos::View<const double*> r,

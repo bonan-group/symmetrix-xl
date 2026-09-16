@@ -55,6 +55,7 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   void coeff(int, char **) override;
   double init_one(int, int) override;
   void init_style() override;
+  void *extract(const char *, int &) override;
   int pack_forward_comm(int, int *, double *, int, int *) override;
   int pack_forward_comm_kokkos(int, DAT::tdual_int_1d, DAT::tdual_double_1d&, int, int*) override;
   void unpack_forward_comm(int, int, double *) override;
@@ -69,13 +70,45 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
 
  protected:
   std::string mode;
+  std::string prediction_head;
+  std::string streamed_edges;
+  std::string execution_profile = "capacity";
+  bool execution_profile_set = false;
+  bool low_memory_alias_set = false;
+  bool low_memory_alias_value = false;
+  bool allow_fixed_workspace = false;
+  std::string debug_execution_plan;
+  int debug_single_layer_workspace_receivers = 0;
+  std::string jit_host_artifact;
+  std::string jit_device_artifact;
+  std::string jit_m0_device_artifact;
+  std::string jit_r0_device_artifact;
+  std::string jit_m0_device_schedule = "chunk32";
+  bool jit_m0_device_schedule_set = false;
+  int jit_device_blocks_per_compute_unit = 8;
+  std::uint64_t execution_graph_generation = 0;
+  int execution_num_nodes = 0;
+  int execution_num_feature_nodes = 0;
+  int execution_num_edges = 0;
+  std::uint64_t execution_topology_fingerprint = 0;
+  double execution_pair_evaluation_count = 0.0;
+  double execution_graph_rebuild_count = 0.0;
+  double execution_geometry_refresh_count = 0.0;
+  double execution_geometry_only_update_count = 0.0;
+  double execution_h1_allocation_count = 0.0;
+  double execution_mpi_staged_packet_d2h_bytes = 0.0;
+  double execution_mpi_staged_packet_h2d_bytes = 0.0;
+  double execution_mpi_staged_index_h2d_bytes = 0.0;
+  bool electric_field_set;
   std::unique_ptr<MACEKokkos<Precision>> mace;
   Kokkos::View<int*> mace_types;
+  Kokkos::View<double*> electric_field;
   Kokkos::View<Precision***,Kokkos::LayoutRight> H1, H1_adj;
 
   // neighbor list variables
   Kokkos::View<int*> node_indices;
   Kokkos::View<int*> node_types;
+  Kokkos::View<int*> feature_types;
   Kokkos::View<int*> num_neigh;
   Kokkos::View<int*> first_neigh;
   Kokkos::View<int*> neigh_types;
@@ -83,6 +116,9 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   Kokkos::View<int*> neigh_ii_indices;
   Kokkos::View<double*> xyz;
   Kokkos::View<double*> r;
+  Kokkos::View<double*> feature_positions;
+  Kokkos::View<int*> legacy_comm_indices;
+  Kokkos::View<double*> legacy_comm_packet;
 
   const std::array<std::string,118> periodic_table =
     { "H", "He",
@@ -96,11 +132,23 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
                        "Rf", "Db", "Sg", "Bh", "Hs", "Mt", "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og"};
 
   virtual void allocate();
+  void ensure_legacy_comm_capacity(std::size_t, std::size_t);
+  int checked_comm_value_count(std::size_t, const char *);
 
  private:
   DAT::ttransform_kkacc_1d k_eatom;
 
 };
+
+using PairSymmetrixMACEKokkosDeviceDouble =
+    PairSymmetrixMACEKokkos<LMPDeviceType, double>;
+using PairSymmetrixMACEKokkosHostDouble =
+    PairSymmetrixMACEKokkos<LMPHostType, double>;
+using PairSymmetrixMACEKokkosDeviceFloat =
+    PairSymmetrixMACEKokkos<LMPDeviceType, float>;
+using PairSymmetrixMACEKokkosHostFloat =
+    PairSymmetrixMACEKokkos<LMPHostType, float>;
+
 }    // namespace LAMMPS_NS
 
 #endif

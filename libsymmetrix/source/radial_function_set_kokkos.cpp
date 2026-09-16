@@ -1,5 +1,6 @@
 #include <vector>
 #include <cmath>
+#include <cstddef>
 
 #include "radial_function_set_kokkos.hpp"
 
@@ -12,13 +13,18 @@ template <typename Precision>
 RadialFunctionSetKokkos<Precision>::RadialFunctionSetKokkos(
     double h,
     std::vector<std::vector<std::vector<double>>> node_values,
-    std::vector<std::vector<std::vector<double>>> node_derivatives)
+    std::vector<std::vector<std::vector<double>>> node_derivatives,
+    double x0,
+    double cutoff)
 {
     // TODO: sanitize input
     this->h = h;
+    this->x0 = x0;
     num_edge_types = node_values.size();
     num_functions = node_values[0].size();
     num_nodes = node_values[0][0].size();
+    this->cutoff = std::isfinite(cutoff)
+        ? cutoff : x0+h*(num_nodes-1);
 
     auto c = Kokkos::View<Precision****, Kokkos::LayoutRight>(
         "coefficients", num_edge_types, num_nodes-1, 4, num_functions);
@@ -42,97 +48,23 @@ RadialFunctionSetKokkos<Precision>::RadialFunctionSetKokkos(
 }
 
 
-// This older, cleaner version of the function lacks edge-type dependence
-#if 0
 template <typename Precision>
 void RadialFunctionSetKokkos<Precision>::evaluate(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
     Kokkos::View<const int*> num_neigh,
     Kokkos::View<const int*> neigh_types,
+    Kokkos::View<const int*> type_to_active,
+    int num_active_types,
     Kokkos::View<const double*> r,
     Kokkos::View<Precision**,Kokkos::LayoutRight> R,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> R_deriv) const
+    Kokkos::View<Precision**,Kokkos::LayoutRight> R_deriv,
+    const bool evaluate_derivatives) const
 {
     const auto h = this->h;
+    const auto x0 = this->x0;
     const auto num_functions = this->num_functions;
-    const auto c = this->coefficients;
-
-    Kokkos::parallel_for(
-        "RadialFunctionSetKokkos::evaluate",
-        // TODO: empirically, this vector_length appears to be the best choice,
-        //       provided num_functions is sufficiently large, and from what i understand
-        //       this parameter is essentially ignored on cpu, making it okay there too.
-        //       but it would be nice to have something smarter.
-        Kokkos::TeamPolicy<>(r.size(), 1, 32),
-        KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
-            const int i = team_member.league_rank();
-            const int j = static_cast<int>(r(i)/h); // TODO: bounds checking?
-            const double x = r(i) - h*j;
-            const double xx = x*x;
-            const double xxx = xx*x;
-            const double two_x = 2*x;
-            const double three_xx = 3*xx;
-            // compute function values
-            Kokkos::parallel_for(
-                Kokkos::ThreadVectorRange(team_member, num_functions),
-                [&] (const int k) {
-                    R(i,k) = c(0,j,0,k);
-                });
-            team_member.team_barrier();
-            Kokkos::parallel_for(
-                Kokkos::ThreadVectorRange(team_member, num_functions),
-                [&] (const int k) {
-                    R(i,k) += c(0,j,1,k)*x;
-                });
-            team_member.team_barrier();
-            Kokkos::parallel_for(
-                Kokkos::ThreadVectorRange(team_member, num_functions),
-                [&] (const int k) {
-                    R(i,k) += c(0,j,2,k)*xx;
-                });
-            team_member.team_barrier();
-            Kokkos::parallel_for(
-                Kokkos::ThreadVectorRange(team_member, num_functions),
-                [&] (const int k) {
-                    R(i,k) += c(0,j,3,k)*xxx;
-                });
-            // compute derivatives
-            Kokkos::parallel_for(
-                Kokkos::ThreadVectorRange(team_member, num_functions),
-                [&] (const int k) {
-                    R_deriv(i,k) = c(0,j,1,k);
-                });
-            team_member.team_barrier();
-            Kokkos::parallel_for(
-                Kokkos::ThreadVectorRange(team_member, num_functions),
-                [&] (const int k) {
-                    R_deriv(i,k) += c(0,j,2,k)*two_x;
-                });
-            team_member.team_barrier();
-            Kokkos::parallel_for(
-                Kokkos::ThreadVectorRange(team_member, num_functions),
-                [&] (const int k) {
-                    R_deriv(i,k) += c(0,j,3,k)*three_xx;
-                });
-        });
-        Kokkos::fence();
-}
-#endif
-
-
-template <typename Precision>
-void RadialFunctionSetKokkos<Precision>::evaluate(
-    const int num_nodes,
-    Kokkos::View<const int*> node_types,
-    Kokkos::View<const int*> num_neigh,
-    Kokkos::View<const int*> neigh_types,
-    Kokkos::View<const double*> r,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> R,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> R_deriv) const
-{
-    const auto h = this->h;
-    const auto num_functions = this->num_functions;
+    const auto num_intervals = this->num_nodes-1;
     const auto c = this->coefficients;
 
     // TODO: shouldn't need all this
@@ -141,7 +73,7 @@ void RadialFunctionSetKokkos<Precision>::evaluate(
     Kokkos::parallel_scan("first_neigh",
         num_nodes,
         KOKKOS_LAMBDA (const int i, int& update, const bool final) {
-            const int num_neigh_i = num_neigh(i); 
+            const int num_neigh_i = num_neigh(i);
             if (final)
                 first_neigh(i) = update;
             update += num_neigh_i;
@@ -159,8 +91,6 @@ void RadialFunctionSetKokkos<Precision>::evaluate(
         });
     Kokkos::fence();
 
-    const int num_unique_types = (std::sqrt(8*num_edge_types+1)-1)/2;
-
     Kokkos::parallel_for(
         "RadialFunctionSetKokkos::evaluate",
         // TODO: empirically, this vector_length appears to be the best choice,
@@ -169,16 +99,24 @@ void RadialFunctionSetKokkos<Precision>::evaluate(
         //       but it would be nice to have something smarter.
         Kokkos::TeamPolicy<>(r.size(), Kokkos::AUTO, 32),
         KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
-            const int ij = team_member.league_rank();
+            const std::size_t ij = static_cast<std::size_t>(
+                team_member.league_rank());
             // determine edge type
-            const int type_i = node_types(i_list(ij));
-            const int type_j = neigh_types(ij);
+            const int type_i = type_to_active(node_types(i_list(ij)));
+            const int type_j = type_to_active(neigh_types(ij));
             const int type_ij = (type_i <= type_j)
-                ? type_i*(2*num_unique_types-type_i-1)/2 + type_j
-                : type_j*(2*num_unique_types-type_j-1)/2 + type_i;
+                ? type_i*(2*num_active_types-type_i-1)/2 + type_j
+                : type_j*(2*num_active_types-type_j-1)/2 + type_i;
             // compute x, x^2, x^3
-            const int n = static_cast<int>(r(ij)/h); // TODO: bounds checking?
-            const double x = r(ij) - h*n;
+            int n = static_cast<int>(Kokkos::floor((r(ij)-x0)/h));
+            double x = r(ij)-x0-h*n;
+            if (n < 0) {
+                n = 0;
+                x = 0.0;
+            } else if (n >= num_intervals) {
+                n = num_intervals-1;
+                x = h;
+            }
             const double xx = x*x;
             const double xxx = xx*x;
             const double two_x = 2*x;
@@ -194,9 +132,11 @@ void RadialFunctionSetKokkos<Precision>::evaluate(
                     R(ij,k) = c0 + c1*static_cast<Precision>(x)
                         + c2*static_cast<Precision>(xx)
                         + c3*static_cast<Precision>(xxx);
-                    R_deriv(ij,k) = c1
-                        + c2*static_cast<Precision>(two_x)
-                        + c3*static_cast<Precision>(three_xx);
+                    if (evaluate_derivatives) {
+                        R_deriv(ij,k) = c1
+                            + c2*static_cast<Precision>(two_x)
+                            + c3*static_cast<Precision>(three_xx);
+                    }
                 });
         });
         Kokkos::fence();

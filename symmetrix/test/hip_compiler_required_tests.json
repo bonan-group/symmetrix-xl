@@ -1,0 +1,10 @@
+{
+  "schema": "symmetrix.hip-compiler-required-tests",
+  "version": 1,
+  "required_capabilities": [
+    "hip_environment"
+  ],
+  "required_nodes": [
+    "test/test_jit_compiler_qualification.py::test_hip_forced_compiler_produces_expected_artifact[hiprtc]"
+  ]
+}

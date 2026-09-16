@@ -1,0 +1,945 @@
+diff --git a/sphericart/CMakeLists.txt b/sphericart/CMakeLists.txt
+index c5d015b..320c058 100644
+--- a/sphericart/CMakeLists.txt
++++ b/sphericart/CMakeLists.txt
+@@ -16,8 +16,16 @@ function(make_includeable INPUT_FILE OUTPUT_FILE)
+     file(READ ${INPUT_FILE} content)
+     # Format the content to be included as a raw string in C++
+     set(content "R\"======(\n${content}\n)======\"")
+-    # Write the formatted content to the output file
+-    file(WRITE ${OUTPUT_FILE} "${content}")
++    set(write_output TRUE)
++    if(EXISTS ${OUTPUT_FILE})
++        file(READ ${OUTPUT_FILE} existing_content)
++        if(existing_content STREQUAL content)
++            set(write_output FALSE)
++        endif()
++    endif()
++    if(write_output)
++        file(WRITE ${OUTPUT_FILE} "${content}")
++    endif()
+ endfunction()
+
+ #[[
+@@ -42,8 +50,16 @@ function(prepend_headers_to_source INPUT_FILE OUTPUT_FILE HEADERS)
+     endforeach()
+     # Prepend the accumulated headers to the original source file content
+     set(NEW_CONTENTS "${HEADER_CONTENTS}\n${CONTENTS}")
+-    # Write the new contents back to the source file
+-    file(WRITE ${OUTPUT_FILE} "${NEW_CONTENTS}")
++    set(write_output TRUE)
++    if(EXISTS ${OUTPUT_FILE})
++        file(READ ${OUTPUT_FILE} existing_content)
++        if(existing_content STREQUAL NEW_CONTENTS)
++            set(write_output FALSE)
++        endif()
++    endif()
++    if(write_output)
++        file(WRITE ${OUTPUT_FILE} "${NEW_CONTENTS}")
++    endif()
+ endfunction()
+
+ file(READ ${PROJECT_SOURCE_DIR}/VERSION SPHERICART_VERSION)
+diff --git a/sphericart/include/cuda_base.hpp b/sphericart/include/cuda_base.hpp
+index 1c938f7..76eff00 100644
+--- a/sphericart/include/cuda_base.hpp
++++ b/sphericart/include/cuda_base.hpp
+@@ -69,6 +69,29 @@ void spherical_harmonics_cuda_base(
+     void* cuda_stream = nullptr
+ );
+
++/** Internal overload controlling whether the launch synchronizes the CUDA
++ * context before returning. The overload without `synchronize` preserves the
++ * original synchronous behavior.
++ */
++template <typename scalar_t>
++void spherical_harmonics_cuda_base(
++    const scalar_t* xyz,
++    const int nedges,
++    const scalar_t* prefactors,
++    const int nprefactors,
++    const int64_t l_max,
++    const bool normalize,
++    const int64_t GRID_DIM_X,
++    const int64_t GRID_DIM_Y,
++    const bool gradients,
++    const bool hessian,
++    scalar_t* sph,
++    scalar_t* dsph,
++    scalar_t* ddsph,
++    void* cuda_stream,
++    bool synchronize
++);
++
+ template <typename scalar_t>
+ void spherical_harmonics_backward_cuda_base(
+     const scalar_t* dsph,
+diff --git a/sphericart/include/sphericart_cuda.hpp b/sphericart/include/sphericart_cuda.hpp
+index b50c50a..2c9f664 100644
+--- a/sphericart/include/sphericart_cuda.hpp
++++ b/sphericart/include/sphericart_cuda.hpp
+@@ -29,6 +29,11 @@ namespace cuda {
+  * It handles initialization of the prefactors upon initialization and it
+  * stores the buffers that are necessary to compute the spherical harmonics
+  * efficiently.
++ *
++ * The CUDA kernel cache currently supports a single CUDA device per process.
++ * A calculator becomes permanently bound to the device used by its first
++ * non-empty compute call. Releasing device resources does not permit migrating
++ * the calculator to another device.
+  */
+ template <typename T> class SphericalHarmonics {
+   public:
+@@ -103,6 +108,34 @@ template <typename T> class SphericalHarmonics {
+         const T* xyz, const size_t n_samples, T* sph, T* dsph, void* cuda_stream = nullptr
+     );
+
++    /** Asynchronously computes the spherical harmonics and their first
++     * derivatives on the supplied CUDA stream.
++     *
++     * This method has the same input and output contract as
++     * `compute_with_gradients`, but it returns after enqueueing the CUDA kernel.
++     * The caller owns stream synchronization and must keep all input and output
++     * buffers alive until the work has completed.
++     *
++     * @param xyz A pre-allocated device-side array of size `n_samples x 3`.
++     * @param n_samples Number of samples contained within `xyz`.
++     * @param sph A pre-allocated device-side spherical-harmonics array.
++     * @param dsph A pre-allocated device-side first-derivatives array.
++     * @param cuda_stream Pointer to a cudaStream_t or nullptr. If this is
++     * nullptr, the kernel launch will be performed on the default stream.
++     */
++    void compute_with_gradients_async(
++        const T* xyz, const size_t n_samples, T* sph, T* dsph, void* cuda_stream = nullptr
++    );
++
++    /** Explicitly releases lazily allocated device resources.
++     *
++     * This operation is idempotent. The caller must ensure that all work using
++     * this calculator has completed before calling it. A later compute call
++     * recreates the resources on demand on the same CUDA device. CUDA runtime
++     * failures are reported with `std::runtime_error`.
++     */
++    void release_device_resources();
++
+     /** Computes the spherical harmonics and their first and second derivatives
+      *  for one or more 3D points, using pre-allocated device-side pointers
+      *
+@@ -149,6 +182,7 @@ template <typename T> class SphericalHarmonics {
+     bool normalized;              // should we normalize the input vectors?
+     T* prefactors_cpu = nullptr;  // host prefactors buffer
+     T* prefactors_cuda = nullptr; // storage space for prefactors
++    int bound_device = -1;        // permanent device binding after first compute
+     int device_count = 0;         // number of visible GPU devices
+     int64_t CUDA_GRID_DIM_X_ = 8;
+     int64_t CUDA_GRID_DIM_Y_ = 8;
+@@ -164,7 +198,8 @@ template <typename T> class SphericalHarmonics {
+         T* sph,
+         T* dsph,
+         T* ddsph,
+-        void* cuda_stream
++        void* cuda_stream,
++        bool synchronize
+     );
+     /* @endcond */
+ };
+diff --git a/sphericart/src/cuda_base.cpp b/sphericart/src/cuda_base.cpp
+index 49c4b2c..f1fc3d8 100644
+--- a/sphericart/src/cuda_base.cpp
++++ b/sphericart/src/cuda_base.cpp
+@@ -71,6 +71,43 @@ void sphericart::cuda::spherical_harmonics_cuda_base(
+     scalar_t* ddsph,
+     void* cuda_stream
+ ) {
++    sphericart::cuda::spherical_harmonics_cuda_base(
++        xyz,
++        nedges,
++        prefactors,
++        nprefactors,
++        l_max,
++        normalize,
++        GRID_DIM_X,
++        GRID_DIM_Y,
++        gradients,
++        hessian,
++        sph,
++        dsph,
++        ddsph,
++        cuda_stream,
++        true
++    );
++}
++
++template <typename scalar_t>
++void sphericart::cuda::spherical_harmonics_cuda_base(
++    const scalar_t* xyz,
++    const int nedges,
++    const scalar_t* prefactors,
++    const int nprefactors,
++    const int64_t l_max,
++    const bool normalize,
++    const int64_t GRID_DIM_X,
++    const int64_t GRID_DIM_Y,
++    const bool gradients,
++    const bool hessian,
++    scalar_t* sph,
++    scalar_t* dsph,
++    scalar_t* ddsph,
++    void* cuda_stream,
++    bool synchronize
++) {
+
+     static const char* CUDA_CODE =
+ #include "generated/wrapped_sphericart_impl.cu"
+@@ -78,7 +115,7 @@ void sphericart::cuda::spherical_harmonics_cuda_base(
+
+     int n_total = (l_max + 1) * (l_max + 1);
+     dim3 block_dim(GRID_DIM_X, GRID_DIM_Y);
+-    auto find_num_blocks = [](int x, int bdim) { return (x + bdim - 1) / bdim; };
++    auto find_num_blocks = [](int x, int bdim) { return x / bdim + (x % bdim != 0); };
+     cudaStream_t cstream = reinterpret_cast<cudaStream_t>(cuda_stream);
+     dim3 grid_dim(find_num_blocks(nedges, GRID_DIM_Y));
+
+@@ -116,7 +153,7 @@ void sphericart::cuda::spherical_harmonics_cuda_base(
+         kernel_name, std::string(CUDA_CODE), "wrapped_sphericart_impl.cu", {"--std=c++17"}
+     );
+
+-    kernel->launch(grid_dim, block_dim, smem_size, cstream, args);
++    kernel->launch(grid_dim, block_dim, smem_size, cstream, args, synchronize);
+ }
+
+ template void sphericart::cuda::spherical_harmonics_cuda_base<float>(
+@@ -153,6 +190,42 @@ template void sphericart::cuda::spherical_harmonics_cuda_base<double>(
+     void* cuda_stream
+ );
+
++template void sphericart::cuda::spherical_harmonics_cuda_base<float>(
++    const float* xyz,
++    const int nedges,
++    const float* prefactors,
++    const int nprefactors,
++    const int64_t l_max,
++    const bool normalize,
++    const int64_t GRID_DIM_X,
++    const int64_t GRID_DIM_Y,
++    const bool gradients,
++    const bool hessian,
++    float* sph,
++    float* dsph,
++    float* ddsph,
++    void* cuda_stream,
++    bool synchronize
++);
++
++template void sphericart::cuda::spherical_harmonics_cuda_base<double>(
++    const double* xyz,
++    const int nedges,
++    const double* prefactors,
++    const int nprefactors,
++    const int64_t l_max,
++    const bool normalize,
++    const int64_t GRID_DIM_X,
++    const int64_t GRID_DIM_Y,
++    const bool gradients,
++    const bool hessian,
++    double* sph,
++    double* dsph,
++    double* ddsph,
++    void* cuda_stream,
++    bool synchronize
++);
++
+ template <typename scalar_t>
+ void sphericart::cuda::spherical_harmonics_backward_cuda_base(
+     const scalar_t* dsph,
+@@ -171,7 +244,7 @@ void sphericart::cuda::spherical_harmonics_backward_cuda_base(
+     auto& kernel_factory = KernelFactory::instance();
+
+     dim3 block_dim(4, 32);
+-    auto find_num_blocks = [](int x, int bdim) { return (x + bdim - 1) / bdim; };
++    auto find_num_blocks = [](int x, int bdim) { return x / bdim + (x % bdim != 0); };
+     dim3 grid_dim(find_num_blocks(nedges, 32), 3);
+     cudaStream_t cstream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+diff --git a/sphericart/src/cuda_stub.cpp b/sphericart/src/cuda_stub.cpp
+index 525c715..ac89fdd 100644
+--- a/sphericart/src/cuda_stub.cpp
++++ b/sphericart/src/cuda_stub.cpp
+@@ -23,6 +23,27 @@ void sphericart::cuda::spherical_harmonics_cuda_base(
+     throw std::runtime_error("sphericart was not compiled with CUDA support");
+ }
+
++template <typename scalar_t>
++void sphericart::cuda::spherical_harmonics_cuda_base(
++    const scalar_t* /*xyz*/,
++    const int /*nedges*/,
++    const scalar_t* /*prefactors*/,
++    const int /*nprefactors*/,
++    const int64_t /*l_max*/,
++    const bool /*normalize*/,
++    const int64_t /*GRID_DIM_X*/,
++    const int64_t /*GRID_DIM_Y*/,
++    const bool /*gradients*/,
++    const bool /*hessian*/,
++    scalar_t* /*sph*/,
++    scalar_t* /*dsph*/,
++    scalar_t* /*ddsph*/,
++    void* /*cuda_stream*/,
++    bool /*synchronize*/
++) {
++    throw std::runtime_error("sphericart was not compiled with CUDA support");
++}
++
+ template void sphericart::cuda::spherical_harmonics_cuda_base<double>(
+     const double* xyz,
+     const int nedges,
+@@ -57,6 +78,42 @@ template void sphericart::cuda::spherical_harmonics_cuda_base<float>(
+     void* cuda_stream
+ );
+
++template void sphericart::cuda::spherical_harmonics_cuda_base<double>(
++    const double* xyz,
++    const int nedges,
++    const double* prefactors,
++    const int nprefactors,
++    const int64_t l_max,
++    const bool normalize,
++    const int64_t GRID_DIM_X,
++    const int64_t GRID_DIM_Y,
++    const bool gradients,
++    const bool hessian,
++    double* sph,
++    double* dsph,
++    double* ddsph,
++    void* cuda_stream,
++    bool synchronize
++);
++
++template void sphericart::cuda::spherical_harmonics_cuda_base<float>(
++    const float* xyz,
++    const int nedges,
++    const float* prefactors,
++    const int nprefactors,
++    const int64_t l_max,
++    const bool normalize,
++    const int64_t GRID_DIM_X,
++    const int64_t GRID_DIM_Y,
++    const bool gradients,
++    const bool hessian,
++    float* sph,
++    float* dsph,
++    float* ddsph,
++    void* cuda_stream,
++    bool synchronize
++);
++
+ template <typename scalar_t>
+ void sphericart::cuda::spherical_harmonics_backward_cuda_base(
+     const scalar_t* /*dsph*/,
+@@ -85,4 +142,4 @@ template void sphericart::cuda::spherical_harmonics_backward_cuda_base<double>(
+     const int ntotal,
+     double* __restrict__ xyz_grad,
+     void* cuda_stream
+-);
+\ No newline at end of file
++);
+diff --git a/sphericart/src/sphericart_cuda.cpp b/sphericart/src/sphericart_cuda.cpp
+index 6fcc595..77bbaf3 100644
+--- a/sphericart/src/sphericart_cuda.cpp
++++ b/sphericart/src/sphericart_cuda.cpp
+@@ -71,6 +71,38 @@ template <typename T> SphericalHarmonics<T>::~SphericalHarmonics() {
+     */
+ }
+
++template <typename T> void SphericalHarmonics<T>::release_device_resources() {
++    if (this->prefactors_cuda == nullptr) {
++        return;
++    }
++
++    int current_device;
++    CUDART_SAFE_CALL(CUDART_INSTANCE.cudaGetDevice(&current_device));
++    if (this->bound_device < 0) {
++        throw std::runtime_error(
++            "sphericart CUDA calculator has allocated prefactors without a bound device"
++        );
++    }
++
++    const bool restore_device = current_device != this->bound_device;
++    if (restore_device) {
++        CUDART_SAFE_CALL(CUDART_INSTANCE.cudaSetDevice(this->bound_device));
++    }
++
++    const cudaError_t free_status = CUDART_INSTANCE.cudaFree(this->prefactors_cuda);
++    if (free_status == cudaSuccess) {
++        this->prefactors_cuda = nullptr;
++    }
++
++    cudaError_t restore_status = cudaSuccess;
++    if (restore_device) {
++        restore_status = CUDART_INSTANCE.cudaSetDevice(current_device);
++    }
++
++    CUDART_SAFE_CALL(free_status);
++    CUDART_SAFE_CALL(restore_status);
++}
++
+ template <typename T>
+ void SphericalHarmonics<T>::compute_internal(
+     const T* xyz,
+@@ -80,7 +112,8 @@ void SphericalHarmonics<T>::compute_internal(
+     T* sph,
+     T* dsph,
+     T* ddsph,
+-    void* cuda_stream
++    void* cuda_stream,
++    bool synchronize
+ ) {
+     if (n_samples == 0) {
+         // nothing to compute; we return here because some libraries (e.g. torch)
+@@ -120,6 +153,13 @@ void SphericalHarmonics<T>::compute_internal(
+
+     CUDART_SAFE_CALL(CUDART_INSTANCE.cudaGetDevice(&current_device));
+
++    if (this->bound_device >= 0 && this->bound_device != attributes.device) {
++        throw std::runtime_error(
++            "sphericart CUDA calculator device migration is unsupported; the CUDA backend "
++            "supports a single CUDA device per process"
++        );
++    }
++
+     if (current_device != attributes.device) {
+         CUDART_SAFE_CALL(CUDART_INSTANCE.cudaSetDevice(attributes.device));
+     }
+@@ -128,6 +168,7 @@ void SphericalHarmonics<T>::compute_internal(
+         CUDART_SAFE_CALL(
+             CUDART_INSTANCE.cudaMalloc((void**)&this->prefactors_cuda, this->nprefactors * sizeof(T))
+         );
++        this->bound_device = attributes.device;
+
+         CUDART_SAFE_CALL(CUDART_INSTANCE.cudaMemcpy(
+             this->prefactors_cuda,
+@@ -151,7 +192,8 @@ void SphericalHarmonics<T>::compute_internal(
+         sph,
+         dsph,
+         ddsph,
+-        cuda_stream
++        cuda_stream,
++        synchronize
+     );
+
+     if (current_device != attributes.device) {
+@@ -161,7 +203,7 @@ void SphericalHarmonics<T>::compute_internal(
+ template <typename T>
+ void SphericalHarmonics<T>::compute(const T* xyz, const size_t n_samples, T* sph, void* cuda_stream) {
+     SphericalHarmonics<T>::compute_internal(
+-        xyz, n_samples, false, false, sph, nullptr, nullptr, cuda_stream
++        xyz, n_samples, false, false, sph, nullptr, nullptr, cuda_stream, true
+     );
+ }
+
+@@ -170,7 +212,16 @@ void SphericalHarmonics<T>::compute_with_gradients(
+     const T* xyz, const size_t n_samples, T* sph, T* dsph, void* cuda_stream
+ ) {
+     SphericalHarmonics<T>::compute_internal(
+-        xyz, n_samples, true, false, sph, dsph, nullptr, cuda_stream
++        xyz, n_samples, true, false, sph, dsph, nullptr, cuda_stream, true
++    );
++}
++
++template <typename T>
++void SphericalHarmonics<T>::compute_with_gradients_async(
++    const T* xyz, const size_t n_samples, T* sph, T* dsph, void* cuda_stream
++) {
++    SphericalHarmonics<T>::compute_internal(
++        xyz, n_samples, true, false, sph, dsph, nullptr, cuda_stream, false
+     );
+ }
+
+@@ -179,7 +230,7 @@ void SphericalHarmonics<T>::compute_with_hessians(
+     const T* xyz, const size_t n_samples, T* sph, T* dsph, T* ddsph, void* cuda_stream
+ ) {
+     SphericalHarmonics<T>::compute_internal(
+-        xyz, n_samples, true, true, sph, dsph, ddsph, cuda_stream
++        xyz, n_samples, true, true, sph, dsph, ddsph, cuda_stream, true
+     );
+ }
+
+diff --git a/sphericart/src/sphericart_cuda_stub.cpp b/sphericart/src/sphericart_cuda_stub.cpp
+index f6f1e2c..313d441 100644
+--- a/sphericart/src/sphericart_cuda_stub.cpp
++++ b/sphericart/src/sphericart_cuda_stub.cpp
+@@ -17,7 +17,8 @@ void SphericalHarmonics<T>::compute_internal(
+     T* /*sph*/,
+     T* /*dsph*/,
+     T* /*ddsph*/,
+-    void* /*cuda_stream*/
++    void* /*cuda_stream*/,
++    bool /*synchronize*/
+ ) {
+     throw std::runtime_error("sphericart was not compiled with CUDA support");
+ }
+@@ -36,6 +37,15 @@ void SphericalHarmonics<T>::compute_with_gradients(
+     throw std::runtime_error("sphericart was not compiled with CUDA support");
+ }
+
++template <typename T>
++void SphericalHarmonics<T>::compute_with_gradients_async(
++    const T* /*xyz*/, const size_t /*n_samples*/, T* /*sph*/, T* /*dsph*/, void* /*cuda_stream*/
++) {
++    throw std::runtime_error("sphericart was not compiled with CUDA support");
++}
++
++template <typename T> void SphericalHarmonics<T>::release_device_resources() {}
++
+ template <typename T>
+ void SphericalHarmonics<T>::compute_with_hessians(
+     const T* /*xyz*/, const size_t /*n_samples*/, T* /*sph*/, T* /*dsph*/, T* /*ddsph*/, void* /*cuda_stream*/
+diff --git a/sphericart/tests/CMakeLists.txt b/sphericart/tests/CMakeLists.txt
+index 85263de..cc57e7e 100644
+--- a/sphericart/tests/CMakeLists.txt
++++ b/sphericart/tests/CMakeLists.txt
+@@ -13,3 +13,15 @@ target_compile_features(test_derivatives PRIVATE cxx_std_17)
+ add_test(NAME test_hardcoding COMMAND ./test_hardcoding)
+ add_test(NAME test_samples COMMAND ./test_samples)
+ add_test(NAME test_derivatives COMMAND ./test_derivatives)
++
++if(CMAKE_CUDA_COMPILER AND SPHERICART_ENABLE_CUDA)
++    add_executable(test_cuda_async test_cuda_async.cpp)
++    target_link_libraries(test_cuda_async sphericart CUDA::cudart)
++    target_compile_features(test_cuda_async PRIVATE cxx_std_17)
++    add_test(NAME test_cuda_async COMMAND ./test_cuda_async)
++else()
++    add_executable(test_cuda_stub_api test_cuda_stub_api.cpp)
++    target_link_libraries(test_cuda_stub_api sphericart)
++    target_compile_features(test_cuda_stub_api PRIVATE cxx_std_17)
++    add_test(NAME test_cuda_stub_api COMMAND ./test_cuda_stub_api)
++endif()
+diff --git a/sphericart/tests/test_cuda_async.cpp b/sphericart/tests/test_cuda_async.cpp
+new file mode 100644
+index 0000000..ecd97df
+--- /dev/null
++++ b/sphericart/tests/test_cuda_async.cpp
+@@ -0,0 +1,235 @@
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <iostream>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#include <cuda_runtime_api.h>
++
++#include "sphericart_cuda.hpp"
++
++#define CUDA_CHECK(call)                                                                          \
++    do {                                                                                          \
++        const cudaError_t status = (call);                                                        \
++        if (status != cudaSuccess) {                                                              \
++            std::cerr << #call << " failed: " << cudaGetErrorString(status) << std::endl;         \
++            return 1;                                                                             \
++        }                                                                                         \
++    } while (0)
++
++int main() {
++    using Calculator = sphericart::cuda::SphericalHarmonics<double>;
++    static_assert(
++        !noexcept(std::declval<Calculator&>().release_device_resources()),
++        "release_device_resources must report CUDA runtime failures"
++    );
++
++    int device_count = 0;
++    const cudaError_t count_status = cudaGetDeviceCount(&device_count);
++    if (count_status != cudaSuccess || device_count == 0) {
++        std::cout << "No CUDA device; skipping async CUDA API test" << std::endl;
++        return 0;
++    }
++
++    constexpr size_t l_max = 3;
++    constexpr size_t n_samples = 256;
++    constexpr size_t n_spherical = (l_max + 1) * (l_max + 1);
++    const size_t xyz_size = 3 * n_samples;
++    const size_t sph_size = n_samples * n_spherical;
++    const size_t dsph_size = 3 * sph_size;
++
++    std::vector<double> xyz(xyz_size);
++    for (size_t sample = 0; sample < n_samples; ++sample) {
++        xyz[3 * sample] = 0.25 + 0.001 * static_cast<double>(sample);
++        xyz[3 * sample + 1] = -0.5 + 0.002 * static_cast<double>(sample);
++        xyz[3 * sample + 2] = 0.75 - 0.0015 * static_cast<double>(sample);
++    }
++    std::vector<double> async_sph(sph_size);
++    std::vector<double> async_dsph(dsph_size);
++    std::vector<double> sync_sph(sph_size);
++    std::vector<double> sync_dsph(dsph_size);
++    std::vector<double> blocked_sph(sph_size);
++    std::vector<double> blocked_dsph(dsph_size);
++    std::vector<double> recreated_sph(sph_size);
++    std::vector<double> recreated_dsph(dsph_size);
++
++    double* device_xyz = nullptr;
++    double* device_sph = nullptr;
++    double* device_dsph = nullptr;
++    cudaStream_t stream = nullptr;
++    cudaStream_t gate_stream = nullptr;
++    cudaStream_t probe_stream = nullptr;
++    cudaEvent_t gate = nullptr;
++    CUDA_CHECK(cudaSetDevice(0));
++    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++    CUDA_CHECK(cudaStreamCreateWithFlags(&gate_stream, cudaStreamNonBlocking));
++    CUDA_CHECK(cudaStreamCreateWithFlags(&probe_stream, cudaStreamNonBlocking));
++    CUDA_CHECK(cudaEventCreateWithFlags(&gate, cudaEventDisableTiming));
++    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_xyz), xyz_size * sizeof(double)));
++    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_sph), sph_size * sizeof(double)));
++    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_dsph), dsph_size * sizeof(double)));
++    CUDA_CHECK(cudaMemcpyAsync(
++        device_xyz, xyz.data(), xyz_size * sizeof(double), cudaMemcpyHostToDevice, stream
++    ));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++
++    Calculator calculator(l_max);
++    calculator.release_device_resources();
++    calculator.release_device_resources();
++    calculator.compute_with_gradients(
++        device_xyz,
++        n_samples,
++        device_sph,
++        device_dsph,
++        reinterpret_cast<void*>(stream)
++    );
++    CUDA_CHECK(cudaMemcpy(
++        sync_sph.data(), device_sph, sph_size * sizeof(double), cudaMemcpyDeviceToHost
++    ));
++    CUDA_CHECK(cudaMemcpy(
++        sync_dsph.data(), device_dsph, dsph_size * sizeof(double), cudaMemcpyDeviceToHost
++    ));
++
++    CUDA_CHECK(cudaMemsetAsync(device_sph, 0, sph_size * sizeof(double), probe_stream));
++    CUDA_CHECK(cudaMemsetAsync(device_dsph, 0, dsph_size * sizeof(double), probe_stream));
++    CUDA_CHECK(cudaStreamSynchronize(probe_stream));
++    CUDA_CHECK(cudaLaunchHostFunc(
++        gate_stream,
++        [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); },
++        nullptr
++    ));
++    CUDA_CHECK(cudaEventRecord(gate, gate_stream));
++    CUDA_CHECK(cudaStreamWaitEvent(stream, gate, 0));
++
++    const auto async_start = std::chrono::steady_clock::now();
++    calculator.compute_with_gradients_async(
++        device_xyz,
++        n_samples,
++        device_sph,
++        device_dsph,
++        reinterpret_cast<void*>(stream)
++    );
++    const auto async_elapsed = std::chrono::steady_clock::now() - async_start;
++    if (async_elapsed >= std::chrono::milliseconds(250)) {
++        std::cerr << "Asynchronous CUDA call waited for blocked stream work" << std::endl;
++        return 1;
++    }
++    if (cudaEventQuery(gate) != cudaErrorNotReady) {
++        std::cerr << "CUDA stream gate completed before the async call returned" << std::endl;
++        return 1;
++    }
++
++    std::this_thread::sleep_for(std::chrono::milliseconds(50));
++    CUDA_CHECK(cudaMemcpyAsync(
++        blocked_sph.data(), device_sph, sph_size * sizeof(double),
++        cudaMemcpyDeviceToHost, probe_stream
++    ));
++    CUDA_CHECK(cudaMemcpyAsync(
++        blocked_dsph.data(), device_dsph, dsph_size * sizeof(double),
++        cudaMemcpyDeviceToHost, probe_stream
++    ));
++    CUDA_CHECK(cudaStreamSynchronize(probe_stream));
++    if (std::any_of(blocked_sph.begin(), blocked_sph.end(), [](double value) {
++            return value != 0.0;
++        }) || std::any_of(blocked_dsph.begin(), blocked_dsph.end(), [](double value) {
++            return value != 0.0;
++        })) {
++        std::cerr << "Asynchronous CUDA kernel did not honor the supplied stream" << std::endl;
++        return 1;
++    }
++
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaMemcpy(
++        async_sph.data(), device_sph, sph_size * sizeof(double), cudaMemcpyDeviceToHost
++    ));
++    CUDA_CHECK(cudaMemcpy(
++        async_dsph.data(), device_dsph, dsph_size * sizeof(double), cudaMemcpyDeviceToHost
++    ));
++
++    if (async_sph != sync_sph || async_dsph != sync_dsph) {
++        std::cerr << "Asynchronous and synchronous CUDA results differ" << std::endl;
++        return 1;
++    }
++
++    if (device_count > 1) {
++        CUDA_CHECK(cudaSetDevice(1));
++        calculator.release_device_resources();
++        calculator.release_device_resources();
++
++        int restored_device = -1;
++        CUDA_CHECK(cudaGetDevice(&restored_device));
++        if (restored_device != 1) {
++            std::cerr << "Resource release did not restore the caller's CUDA device" << std::endl;
++            return 1;
++        }
++
++        double* other_xyz = nullptr;
++        double* other_sph = nullptr;
++        double* other_dsph = nullptr;
++        cudaStream_t other_stream = nullptr;
++        CUDA_CHECK(cudaStreamCreateWithFlags(&other_stream, cudaStreamNonBlocking));
++        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&other_xyz), xyz_size * sizeof(double)));
++        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&other_sph), sph_size * sizeof(double)));
++        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&other_dsph), dsph_size * sizeof(double)));
++
++        bool migration_rejected = false;
++        try {
++            calculator.compute_with_gradients_async(
++                other_xyz,
++                n_samples,
++                other_sph,
++                other_dsph,
++                reinterpret_cast<void*>(other_stream)
++            );
++        } catch (const std::runtime_error& error) {
++            migration_rejected =
++                std::string(error.what()).find("device migration is unsupported") != std::string::npos;
++        }
++        if (!migration_rejected) {
++            std::cerr << "Calculator accepted migration to another CUDA device" << std::endl;
++            return 1;
++        }
++
++        CUDA_CHECK(cudaFree(other_dsph));
++        CUDA_CHECK(cudaFree(other_sph));
++        CUDA_CHECK(cudaFree(other_xyz));
++        CUDA_CHECK(cudaStreamDestroy(other_stream));
++        CUDA_CHECK(cudaSetDevice(0));
++    } else {
++        calculator.release_device_resources();
++        calculator.release_device_resources();
++    }
++    calculator.compute_with_gradients_async(
++        device_xyz,
++        n_samples,
++        device_sph,
++        device_dsph,
++        reinterpret_cast<void*>(stream)
++    );
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaMemcpy(
++        recreated_sph.data(), device_sph, sph_size * sizeof(double), cudaMemcpyDeviceToHost
++    ));
++    CUDA_CHECK(cudaMemcpy(
++        recreated_dsph.data(), device_dsph, dsph_size * sizeof(double), cudaMemcpyDeviceToHost
++    ));
++    if (recreated_sph != sync_sph || recreated_dsph != sync_dsph) {
++        std::cerr << "CUDA results differ after resource recreation" << std::endl;
++        return 1;
++    }
++    calculator.release_device_resources();
++    calculator.release_device_resources();
++
++    CUDA_CHECK(cudaFree(device_dsph));
++    CUDA_CHECK(cudaFree(device_sph));
++    CUDA_CHECK(cudaFree(device_xyz));
++    CUDA_CHECK(cudaEventDestroy(gate));
++    CUDA_CHECK(cudaStreamDestroy(probe_stream));
++    CUDA_CHECK(cudaStreamDestroy(gate_stream));
++    CUDA_CHECK(cudaStreamDestroy(stream));
++    return 0;
++}
+diff --git a/sphericart/include/sphericart_impl.cuh b/sphericart/include/sphericart_impl.cuh
+--- a/sphericart/include/sphericart_impl.cuh
++++ b/sphericart/include/sphericart_impl.cuh
+@@ -36,7 +36,7 @@ __device__ inline void clear_buffers(
+ */
+ template <typename scalar_t>
+ __device__ inline void write_buffers(
+-    int edge_idx,
++    unsigned long long edge_idx,
+     int nedges,
+     scalar_t x,
+     scalar_t y,
+diff --git a/sphericart/src/sphericart_impl.cu b/sphericart/src/sphericart_impl.cu
+index e8ca608..6e82356 100644
+--- a/sphericart/src/sphericart_impl.cu
++++ b/sphericart/src/sphericart_impl.cu
+@@ -67,7 +67,7 @@ __device__ inline void clear_buffers(
+ */
+ template <typename scalar_t>
+ __device__ inline void write_buffers(
+-    int edge_idx,
++    unsigned long long edge_idx,
+     int nedges,
+     scalar_t x,
+     scalar_t y,
+@@ -101,9 +101,13 @@ __device__ inline void write_buffers(
+     bool normalize
+ ) {
+     if (edge_idx < nedges) {
++        const unsigned long long sample_offset =
++            static_cast<unsigned long long>(edge_idx) * n_total;
++        const unsigned long long gradient_offset = 3 * sample_offset;
++        const unsigned long long hessian_offset = 9 * sample_offset;
+         for (int i = threadIdx.x; i < n_elements; i += blockDim.x) {
+
+-            sph[edge_idx * n_total + offset + i] = buffer_sph[get_index(i)];
++            sph[sample_offset + offset + i] = buffer_sph[get_index(i)];
+
+             if (requires_hessian) {
+                 auto tmp_dx = buffer_dsph_x[get_index(i)];
+@@ -152,25 +156,25 @@ __device__ inline void write_buffers(
+                                           (ir * ir);
+                 }
+
+-                ddsph[edge_idx * 9 * n_total + 0 * 3 * n_total + 0 * n_total + offset + i] =
++                ddsph[hessian_offset + 0 * 3 * n_total + 0 * n_total + offset + i] =
+                     tmp_dxdx;
+-                ddsph[edge_idx * 9 * n_total + 0 * 3 * n_total + 1 * n_total + offset + i] =
++                ddsph[hessian_offset + 0 * 3 * n_total + 1 * n_total + offset + i] =
+                     tmp_dxdy;
+-                ddsph[edge_idx * 9 * n_total + 0 * 3 * n_total + 2 * n_total + offset + i] =
++                ddsph[hessian_offset + 0 * 3 * n_total + 2 * n_total + offset + i] =
+                     tmp_dxdz;
+
+-                ddsph[edge_idx * 9 * n_total + 1 * 3 * n_total + 0 * n_total + offset + i] =
++                ddsph[hessian_offset + 1 * 3 * n_total + 0 * n_total + offset + i] =
+                     tmp_dydx;
+-                ddsph[edge_idx * 9 * n_total + 1 * 3 * n_total + 1 * n_total + offset + i] =
++                ddsph[hessian_offset + 1 * 3 * n_total + 1 * n_total + offset + i] =
+                     tmp_dydy;
+-                ddsph[edge_idx * 9 * n_total + 1 * 3 * n_total + 2 * n_total + offset + i] =
++                ddsph[hessian_offset + 1 * 3 * n_total + 2 * n_total + offset + i] =
+                     tmp_dydz;
+
+-                ddsph[edge_idx * 9 * n_total + 2 * 3 * n_total + 0 * n_total + offset + i] =
++                ddsph[hessian_offset + 2 * 3 * n_total + 0 * n_total + offset + i] =
+                     tmp_dzdx;
+-                ddsph[edge_idx * 9 * n_total + 2 * 3 * n_total + 1 * n_total + offset + i] =
++                ddsph[hessian_offset + 2 * 3 * n_total + 1 * n_total + offset + i] =
+                     tmp_dzdy;
+-                ddsph[edge_idx * 9 * n_total + 2 * 3 * n_total + 2 * n_total + offset + i] =
++                ddsph[hessian_offset + 2 * 3 * n_total + 2 * n_total + offset + i] =
+                     tmp_dzdz;
+             }
+
+@@ -188,9 +192,9 @@ __device__ inline void write_buffers(
+                     tmp_dz = (tmp_dz - z * tmp) * ir;
+                 }
+
+-                dsph[edge_idx * 3 * n_total + 0 * n_total + offset + i] = tmp_dx;
+-                dsph[edge_idx * 3 * n_total + 1 * n_total + offset + i] = tmp_dy;
+-                dsph[edge_idx * 3 * n_total + 2 * n_total + offset + i] = tmp_dz;
++                dsph[gradient_offset + 0 * n_total + offset + i] = tmp_dx;
++                dsph[gradient_offset + 1 * n_total + offset + i] = tmp_dy;
++                dsph[gradient_offset + 2 * n_total + offset + i] = tmp_dz;
+             }
+         }
+     }
+@@ -280,7 +284,8 @@ __global__ void spherical_harmonics_kernel(
+         offset += blockDim.y * nl * sizeof(scalar_t);
+     }
+
+-    int edge_idx = blockIdx.x * blockDim.y + threadIdx.y;
++    const unsigned long long edge_idx =
++        static_cast<unsigned long long>(blockIdx.x) * blockDim.y + threadIdx.y;
+
+     scalar_t x = 0.0;
+     scalar_t y = 0.0;
+@@ -298,9 +303,11 @@ __global__ void spherical_harmonics_kernel(
+     __syncthreads();
+
+     if (edge_idx < nedges) {
+-        x = xyz[edge_idx * 3 + 0];
+-        y = xyz[edge_idx * 3 + 1];
+-        z = xyz[edge_idx * 3 + 2];
++        const unsigned long long coordinate_offset =
++            static_cast<unsigned long long>(edge_idx) * 3;
++        x = xyz[coordinate_offset + 0];
++        y = xyz[coordinate_offset + 1];
++        z = xyz[coordinate_offset + 2];
+
+         x2 = x * x;
+         y2 = y * y;
+@@ -648,7 +655,8 @@ __global__ void backward_kernel(
+     scalar_t* dsph, scalar_t* sph_grad, int nedges, int n_total, scalar_t* xyz_grad
+ ) {
+
+-    int edge_idx = blockIdx.x * blockDim.y + threadIdx.y;
++    const unsigned long long edge_idx =
++        static_cast<unsigned long long>(blockIdx.x) * blockDim.y + threadIdx.y;
+
+     int spatial = blockIdx.y;
+
+@@ -655,12 +663,15 @@ __global__ void backward_kernel(
+     scalar_t sum = 0.0;
+
+     if (edge_idx < nedges) {
++        const unsigned long long sample_offset =
++            static_cast<unsigned long long>(edge_idx) * n_total;
++        const unsigned long long gradient_offset = 3 * sample_offset;
+         // for (int j = threadIdx.x; j < sph_grad.size(1); j += blockDim.x) {
+         for (int j = threadIdx.x; j < n_total; j += blockDim.x) {
+
+             // sum += dsph[edge_idx][spatial][j] * sph_grad[edge_idx][j];
+-            sum += dsph[edge_idx * 3 * n_total + spatial * n_total + j] *
+-                   sph_grad[edge_idx * n_total + j];
++            sum += dsph[gradient_offset + spatial * n_total + j] *
++                   sph_grad[sample_offset + j];
+         }
+     }
+
+@@ -674,7 +685,9 @@ __global__ void backward_kernel(
+     if (edge_idx < nedges) {
+         if (threadIdx.x == 0) {
+             // xyz_grad[sample_idx][spatial] = sum;
+-            xyz_grad[edge_idx * 3 + spatial] = sum;
++            const unsigned long long coordinate_offset =
++                static_cast<unsigned long long>(edge_idx) * 3;
++            xyz_grad[coordinate_offset + spatial] = sum;
+         }
+     }
+ }
+diff --git a/sphericart/tests/test_cuda_stub_api.cpp b/sphericart/tests/test_cuda_stub_api.cpp
+new file mode 100644
+index 0000000..dd8784d
+--- /dev/null
++++ b/sphericart/tests/test_cuda_stub_api.cpp
+@@ -0,0 +1,30 @@
++#include <iostream>
++#include <stdexcept>
++#include <utility>
++
++#include "sphericart_cuda.hpp"
++
++int main() {
++    using Calculator = sphericart::cuda::SphericalHarmonics<double>;
++    static_assert(
++        !noexcept(std::declval<Calculator&>().release_device_resources()),
++        "release_device_resources must report CUDA runtime failures"
++    );
++
++    Calculator calculator(1);
++    calculator.release_device_resources();
++    calculator.release_device_resources();
++
++    bool unavailable = false;
++    try {
++        calculator.compute_with_gradients_async(nullptr, 1, nullptr, nullptr);
++    } catch (const std::runtime_error&) {
++        unavailable = true;
++    }
++
++    if (!unavailable) {
++        std::cerr << "CUDA stub async API did not report unavailable CUDA support" << std::endl;
++        return 1;
++    }
++    return 0;
++}

@@ -1,51 +1,291 @@
-# `symmetrix`
+# Symmetrix-XL
 
-To build the `symmetrix` Python package:
+Symmetrix-XL provides native CPU and GPU inference for MACE and
+MACEField models. The published distribution is named `symmetrix-xl`; the
+Python import namespace and command-line interface remain `symmetrix`.
 
-```
-git clone --recursive https://github.com/wcwitt/symmetrix
-cd symmetrix/symmetrix
-pip install .
-```
+This package is a fork of the original
+[`symmetrix`](https://github.com/wcwitt/symmetrix) project. Symmetrix-XL adds
+two execution strategies:
 
-If CUDA is not detected, the defaults will build a CPU-only version, and the `use_kokkos`
-flag to the ASE calculator will switch between non-Kokkos-serial and Kokkkos-OpenMP
-CPU implementations.
+1. **Edge streaming.** Edge messages are consumed immediately instead of being
+   fully materialized in DRAM.
+2. **Specialized code generation.** Source for critical operations is generated
+   from the model architecture and parameters, enabling compiler specialization
+   and vectorization.
 
-If CUDA is available at build time, the defaults should produce a Kokkos-CUDA GPU version
-of the package. The `use_kokkos` flag to the ASE calculator
-will then switch between non-Kokkos CPU and Kokkos-CUDA GPU implementations.
+The base distribution contains the Python frontend and an x86-64-v3
+CPU/OpenMP backend, which requires AVX2, FMA, and the other x86-64-v3 features.
+CUDA and HIP backends are installed as separate, architecture-qualified
+packages so that they can coexist without overwriting the frontend or CPU
+extension.
 
-For other build types, `CMake` settings need to be specified explicitly, and
-they can be passed as arguments to the `pip install` command, e.g.
-```
-pip install --verbose . \
-    --config-settings=cmake.define.CMAKE_BUILD_TYPE=Release \
-    --config-settings=cmake.define.CMAKE_CXX_FLAGS="-march=native -ffast-math" \
-    --config-settings=cmake.define.CMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF \
-    --config-settings=cmake.define.Kokkos_ENABLE_SERIAL=ON  \
-    --config-settings=cmake.define.Kokkos_ENABLE_CUDA=ON  \
-    --config-settings=cmake.define.Kokkos_ARCH_NATIVE=ON  \
-    --config-settings=cmake.define.Kokkos_ENABLE_AGGRESSIVE_VECTORIZATION=ON  \
-    --config-settings=cmake.define.SYMMETRIX_KOKKOS=ON  \
-    --config-settings=cmake.define.SYMMETRIX_SPHERICART_CUDA=ON
+## Installation
+
+Symmetrix-XL supports CPython 3.10 through 3.14 on Linux x86-64.
+
+```bash
+python -m pip install symmetrix-xl
 ```
 
-### Generating Symmetrix `.json` model files
+Install a GPU package whose architecture exactly matches the target device.
+For example:
 
-Once the Python package is installed, use
+```bash
+python -m pip install symmetrix-xl-cuda12-sm80
+python -m pip install symmetrix-xl-cuda13-sm120
 ```
-symmetrix_extract_mace my-mace.model --atomic-numbers 1 8
-```
-from the command line to extract a `.json` file from a Torch-based model.
-The result will be `my-mace-1-8.json`, and this model is only suitable
-for simulations involving H and O.
 
-### ASE Calculator
+GPU packages depend on the matching version of `symmetrix-xl`, so installing a
+GPU backend also installs the frontend and CPU fallback. CUDA runtime, cuBLAS,
+and NVRTC libraries are supplied by declared NVIDIA Python packages. A
+compatible NVIDIA driver remains a host requirement.
 
-One can import the ASE calculator with
+Inspect the installed backends and verify the selected runtime in a fresh
+process:
+
+```bash
+symmetrix backend list
+symmetrix backend show
+symmetrix doctor
 ```
+
+The frontend loads exactly one native backend per process. Without an explicit
+selection, it chooses an installed accelerator backend only when its
+architecture exactly matches a visible device; otherwise it uses CPU. Select a
+backend before importing a calculator when more than one usable backend is
+installed:
+
+```bash
+SYMMETRIX_BACKEND=cuda13-sm120 python calculation.py
+```
+
+An extension compiled for one GPU architecture must not be used on another
+architecture. NVRTC specializes model kernels at runtime, but Kokkos and
+SpheriCart device code is compiled ahead of time into the backend extension.
+
+## Source installation
+
+Clone the repository with its submodules, create an environment, and use the
+build frontend from the repository root:
+
+```bash
+git clone --recursive https://github.com/bonan-group/symmetrix-xl.git
+cd symmetrix-xl
+uv venv
+source .venv/bin/activate
+python tools/symmetrix_build.py install --backend cpu --cpu-target native
+```
+
+Use `--cpu-target x86-64-v3` for a portable x86-64-v3 CPU build. A native build
+is optimized for the build host and should not be copied to heterogeneous
+machines.
+
+Build an exact CUDA backend with a matching development toolkit:
+
+```bash
+python tools/symmetrix_build.py install \
+    --backend cuda --arch sm120 --cuda-root /usr/local/cuda-13.3
+```
+
+Build HIP in a separate environment and build directory:
+
+```bash
+python tools/symmetrix_build.py install \
+    --backend hip --arch gfx1151 --rocm-root /opt/rocm
+```
+
+Source builds require Python 3.10 or newer, CMake 3.27 or newer, a C++20
+compiler, and a recursive checkout. CPU builds additionally require a Fortran
+compiler and optimized BLAS. CUDA builds require `nvcc`; HIP builds require
+`hipcc`. Do not reuse a build directory across CPU, CUDA, and HIP backends.
+
+The maintained build and cluster instructions are in the
+[installation guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/installation.md)
+and
+[developer build guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/developer/build_and_test.md).
+
+## Model conversion
+
+Compact Symmetrix JSON is the preferred deployment format. JSON evaluation does
+not require PyTorch or `mace-torch`; those packages are needed only when
+loading or converting an upstream checkpoint.
+
+Install the optional converter dependencies and export a checkpoint:
+
+```bash
+python -m pip install "symmetrix-xl[mace]"
+symmetrix_extract_mace \
+    --model mace-omat-0-medium.model \
+    --chemical-symbols Sr Ti O \
+    --output srtio3-mace.json
+```
+
+The converter retains all compatible prediction heads. Use `--head` to select
+the default head without discarding the others:
+
+```bash
+symmetrix_extract_mace \
+    --model MACEField-MH-0-omat-dielectric.model \
+    --chemical-symbols Sr Ti O \
+    --head mp-dielectric \
+    --output srtio3-macefield.json
+```
+
+MACEField checkpoints must be converted before use. Passing an original
+MACEField checkpoint directly to the calculator is rejected rather than
+silently delegating evaluation to PyTorch.
+
+See the
+[model guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/models.md)
+for supported model families, multi-head models, precision, and conversion
+options.
+
+## ASE calculator
+
+Use the compact model with the normal ASE calculator interface:
+
+```python
+from ase.spacegroup import crystal
 from symmetrix import Symmetrix
+
+a = 3.905
+atoms = crystal(
+    symbols=["Sr", "Ti", "O"],
+    basis=[(0, 0, 0), (0.5, 0.5, 0.5), (0.5, 0.5, 0)],
+    spacegroup=221,
+    cellpar=[a, a, a, 90, 90, 90],
+)
+atoms.calc = Symmetrix("srtio3-mace.json")
+
+energy = atoms.get_potential_energy()
+forces = atoms.get_forces()
+stress = atoms.get_stress()
 ```
-See [the source code](source/symmetrix/symmetrix_calc.py) and [this test](test/test_symmetrix_calc.py)
-for additional details.
+
+Model evaluation defaults to FP32. Request FP64 explicitly when needed:
+
+```python
+atoms.calc = Symmetrix("srtio3-mace.json", dtype="float64")
+```
+
+Direct model-specialized execution is the default for supported compact
+models. It compiles or reuses a precision- and backend-specific artifact and
+fails clearly when the required artifact cannot be produced or loaded. Use
+`streamed_edges="non-compiled"` only as a compiler-free compatibility or
+diagnostic mode.
+
+A cold CPU specialization requires a C++20 compiler at runtime. CUDA
+specialization uses NVRTC from the backend package's declared NVIDIA
+dependencies and still requires a compatible host driver.
+
+Runtime artifacts are stored in a private per-user cache. Set
+`SYMMETRIX_JIT_CACHE` before starting Python to choose an explicit location:
+
+```bash
+export SYMMETRIX_JIT_CACHE=/path/to/private/symmetrix-jit-cache
+symmetrix_prepare_jit_host_artifact \
+    --model srtio3-mace.json --precision float32
+```
+
+The cache contains executable code and must not be writable by other users.
+Generated artifacts are specific to the model contract, precision, backend,
+compiler/runtime identity, and host or GPU target.
+
+## MACEField
+
+MACEField models expose energy, forces, stress, polarization, Born effective
+charges, and polarizability. Set the electric field on the calculator or in the
+ASE structure:
+
+```python
+import numpy as np
+from symmetrix import Symmetrix
+
+atoms.info["electric_field"] = np.array([0.01, -0.02, 0.03])
+atoms.calc = Symmetrix("srtio3-macefield.json", dtype="float64")
+
+energy = atoms.get_potential_energy()
+forces = atoms.get_forces()
+polarization = atoms.calc.get_property("polarization", atoms)
+becs = atoms.calc.get_property("becs", atoms)
+polarizability = atoms.calc.get_property("polarizability", atoms)
+```
+
+Response properties are computed only when requested. Calculator instances are
+stateful and should not be called concurrently from multiple host threads.
+
+## Model ensembles
+
+`SymmetrixEnsemble` evaluates compatible models sequentially in one process and
+returns the member mean through ordinary ASE properties. Member values use the
+`_comm` suffix and population variances use `_var`:
+
+```python
+from symmetrix import SymmetrixEnsemble
+
+atoms.calc = SymmetrixEnsemble(["model-1.json", "model-2.json"])
+mean_energy = atoms.get_potential_energy()
+member_forces = atoms.calc.get_property("forces_comm", atoms)
+force_variance = atoms.calc.get_property("forces_var", atoms)
+```
+
+Ensemble members must agree on model type, species, cutoff, precision, backend,
+and execution mode.
+
+## LAMMPS
+
+LAMMPS integration is provided by `pair_symmetrix`. It does not embed Python or
+compile model-specific code at runtime, so required host or device artifacts
+must be prepared before launch. See the
+[LAMMPS guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/lammps.md)
+for installation, artifact preparation, precision, and MPI requirements.
+
+## Troubleshooting
+
+Always diagnose the exact environment used for evaluation:
+
+```bash
+symmetrix backend list
+symmetrix backend show --probe
+symmetrix doctor --json
+```
+
+For CPU deployments, `doctor` checks OpenMP runtime identity and worker
+participation. For CUDA and HIP, it checks device compatibility and launches a
+sentinel kernel. Set `SYMMETRIX_OPENMP_RUNTIME_CHECK=strict` for production CPU
+qualification.
+
+When reporting a failure, include the backend selector, model hash, precision,
+compiler or toolkit version, and the JSON output from `symmetrix doctor`.
+Detailed diagnostic guidance is available in the
+[troubleshooting guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/troubleshooting.md).
+
+## Documentation
+
+- [User guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/index.md)
+- [Python API](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/reference/python_api.md)
+- [Backend and diagnostics guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/backends.md)
+- [Execution modes and artifacts](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/execution.md)
+- [Developer guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/developer/index.md)
+
+## Development
+
+From a recursive source checkout:
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -e "./symmetrix[test]"
+pytest symmetrix/test
+uvx pre-commit run --all-files
+```
+
+Keep CPU, CUDA, HIP, and LAMMPS builds in separate environments and build
+directories.
+
+## License
+
+Symmetrix-XL is distributed under the
+[MIT License](https://github.com/bonan-group/symmetrix-xl/blob/main/LICENSE).
+`pair_symmetrix` is GPLv2 to remain compatible with LAMMPS.

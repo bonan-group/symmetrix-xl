@@ -62,14 +62,6 @@ double sphericart_real_sph_harm(int l, int m, double x, double y, double z) {
     return sph[l*(l+1)+m];
 }
 
-std::vector<double> sphericart_real(int l_max, std::vector<double> xyz)
-{
-    sphericart::SphericalHarmonics<double> sphericart(l_max);
-    auto sh = std::vector<double>((l_max+1)*(l_max+1));
-    sphericart.compute(xyz, sh);
-    return sh;
-}
-
 std::vector<std::complex<double>> sphericart_complex(
     int l_max,
     std::vector<double> xyz)

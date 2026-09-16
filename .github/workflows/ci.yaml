@@ -3,37 +3,41 @@ name: CI
 on: [pull_request, workflow_dispatch]
 
 jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Clone repo
+      uses: actions/checkout@v6
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v8.3.2
+    - name: Run pre-commit
+      run: uvx pre-commit run --all-files
 
   symmetrix:
     runs-on: ubuntu-latest
     steps:
     - name: Clone repo
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
     - name: Install dependencies
       run: |
-        sudo apt-get install -y build-essential cmake git libblas-dev liblapack-dev
-    - name: Set up python
-      uses: actions/setup-python@v5
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake git libblas-dev liblapack-dev ninja-build
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v8.3.2
       with:
         python-version: '3.12'
-    - name: Create python venv
+        enable-cache: true
+    - name: Create python venv and install
       run: |
-        python -m venv venv
-        source venv/bin/activate
-        pip install ase cmake-build-extension[all] numpy pytest setuptools scipy wheel cmake-build-extension[all]
-        deactivate
-    - name: Build and package symmetrix
-      run: |
-        source venv/bin/activate
-        cd symmetrix
-        pip install .
-        cd ..
+        uv venv --clear
+        source .venv/bin/activate
+        uv pip install ./symmetrix[test]
         deactivate
     - name: Run tests
       run: |
-        source venv/bin/activate
+        source .venv/bin/activate
         python -c "import symmetrix; print(symmetrix.__version__)"
         cd symmetrix/test
         pytest
@@ -44,30 +48,49 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Clone repo
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
     - name: Install dependencies
       run: |
-        sudo apt-get install -y build-essential cmake git libfftw3-dev libopenmpi-dev mpi-default-bin mpi-default-dev libblas-dev liblapack-dev
-    - name: Set up python
-      uses: actions/setup-python@v5
+        sudo apt-get update
+        sudo apt-get install -y build-essential ccache cmake git libfftw3-dev libopenmpi-dev mpi-default-bin mpi-default-dev libblas-dev liblapack-dev
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v8.3.2
       with:
         python-version: '3.12'
-    - name: Create python venv
+        enable-cache: true
+    - name: Create python venv and install
       run: |
-        python -m venv venv
-        source venv/bin/activate
-        pip install numpy pytest
+        uv venv --clear
+        source .venv/bin/activate
+        uv pip install pip pytest "./symmetrix" \
+          "mace-torch @ git+https://github.com/mdi-group/mace-field.git@1.0.2"
         deactivate
-    - name: Clone and build LAMMPS
+    - name: Cache test models
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/symmetrix/test-models
+        key: symmetrix-test-models-macefield-1.0.2
+    - name: Clone LAMMPS and install pair style
       run: |
-        source venv/bin/activate
+        source .venv/bin/activate
         git clone -b release --depth 1 https://github.com/lammps/lammps.git
         cd pair_symmetrix
         chmod +x install.sh
         ./install.sh ../lammps
-        cd ../lammps
+        deactivate
+    - name: Cache C++ compiler results
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/ccache
+        key: ccache-${{ runner.os }}-${{ hashFiles('pair_symmetrix/**') }}
+        restore-keys: |
+          ccache-${{ runner.os }}-
+    - name: Build LAMMPS
+      run: |
+        source .venv/bin/activate
+        cd lammps
         cmake \
             -B build \
             -D CMAKE_BUILD_TYPE=Release \
@@ -81,14 +104,15 @@ jobs:
             -D Kokkos_ARCH_NATIVE=ON \
             -D Kokkos_ENABLE_AGGRESSIVE_VECTORIZATION=ON \
             -D SYMMETRIX_KOKKOS=ON \
+            -D CMAKE_CXX_COMPILER_LAUNCHER=ccache \
             cmake
-        cmake --build build -j 2
+        cmake --build build -j 4
         cd build
         make install-python
-        cd ../../..
+        deactivate
     - name: Run tests
       run: |
-        source venv/bin/activate
+        source .venv/bin/activate
         cd pair_symmetrix/test/
         python -m pytest
 
@@ -97,42 +121,163 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mace-torch: ["mace-torch==0.3.10", "mace-torch"]
+        include:
+        - mace-torch: "mace-torch==0.3.10"
+          torch: "torch==2.5.*"
+          mace_field_compatible: false
+        - mace-torch: "mace-torch==0.3.16"
+          torch: "torch==2.5.*"
+          mace_field_compatible: false
+        - mace-torch: "mace-torch @ git+https://github.com/mdi-group/mace-field.git@1.0.2"
+          torch: "torch==2.5.*"
+          mace_field_compatible: true
     steps:
     - name: Clone repo
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
     - name: Install dependencies
       run: |
-        sudo apt-get install -y build-essential cmake git libblas-dev liblapack-dev
-    - name: Set up python
-      uses: actions/setup-python@v5
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake git libblas-dev liblapack-dev ninja-build
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v8.3.2
       with:
         python-version: '3.12'
-    - name: Create python venv
+        enable-cache: true
+    - name: Cache Symmetrix native build
+      uses: actions/cache@v4
+      with:
+        path: symmetrix/build
+        key: symmetrix-native-build-${{ runner.os }}-x86-64-v3-${{ hashFiles('symmetrix/CMakeLists.txt', 'symmetrix/pyproject.toml', 'symmetrix/source/**', 'libsymmetrix/source/**', 'libsymmetrix/CMakeLists.txt', 'libsymmetrix/include/**', 'libsymmetrix/external/**') }}
+    - name: Create python venv and install
       run: |
-        python -m venv venv
-        source venv/bin/activate
-        pip install ${{ matrix.mace-torch }}
+        uv venv --clear
+        source .venv/bin/activate
+        uv pip install --index-url https://download.pytorch.org/whl/cpu "${{ matrix.torch }}"
+        uv pip install "${{ matrix.mace-torch }}" pytest \
+          --config-settings=cmake.define.SYMMETRIX_HOST_ARCH=x86-64-v3 \
+          "./symmetrix[mace]"
         deactivate
-    - name: Build and package symmetrix
+    - name: Cache test models
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/symmetrix/test-models
+        key: symmetrix-test-models-macefield-1.0.2
+    - name: Test MACEField model download
       run: |
-        source venv/bin/activate
-        cd symmetrix
-        pip install .
-        cd ..
+        source .venv/bin/activate
+        PYTHONPATH=symmetrix/test python -c "from model_downloads import macefield_model_path; print(macefield_model_path())"
         deactivate
+    - name: Test compact MACEField conversion and ASE integration
+      if: matrix.mace_field_compatible
+      run: |
+        source .venv/bin/activate
+        cd symmetrix/test
+        pytest -q \
+          test_extract_mace_data.py \
+          test_symmetrix_calc.py::test_compact_macefield_calculator_replaces_active_composition_cache \
+          test_symmetrix_calc.py::test_macefield_native_json_ase_response_properties_match_pytorch \
+          test_symmetrix_calc.py::test_macefield_json_kokkos_response_properties_match_native \
+          test_mace_streamed_edges.py::test_legacy_pair_spline_models_warn_and_default_to_legacy
+        deactivate
+    - name: Cache MACE-MH-1 checkpoint
+      if: matrix.mace_field_compatible
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/symmetrix/test-models/mace-mh-1.model
+        key: mace-mh-1-a522eb7f59c7879963d41586528f4980baf33e086c94aa92e3eafdeccad3be47
+    - name: Download and verify MACE-MH-1 checkpoint
+      if: matrix.mace_field_compatible
+      run: |
+        mkdir -p ~/.cache/symmetrix/test-models
+        if [ ! -f ~/.cache/symmetrix/test-models/mace-mh-1.model ]; then
+          curl --fail --location --retry 3 \
+            https://github.com/ACEsuit/mace-foundations/releases/download/mace_mh_1/mace-mh-1.model \
+            --output ~/.cache/symmetrix/test-models/mace-mh-1.model
+        fi
+        echo "a522eb7f59c7879963d41586528f4980baf33e086c94aa92e3eafdeccad3be47  $HOME/.cache/symmetrix/test-models/mace-mh-1.model" \
+          | sha256sum --check --strict
+    - name: Test standard MACE-MH-1 checkpoint integration
+      if: matrix.mace_field_compatible
+      env:
+        TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: "1"
+      run: |
+        source .venv/bin/activate
+        if ! sudo swapon --show | grep -q '^/swapfile-ci'; then
+          sudo fallocate -l 6G /swapfile-ci \
+            || echo "::warning::fallocate /swapfile-ci failed"
+          sudo chmod 600 /swapfile-ci
+          sudo mkswap /swapfile-ci
+          sudo swapon /swapfile-ci \
+            || echo "::warning::swapon /swapfile-ci failed"
+        fi
+        swapon --show || true
+        free -h
+        df -h /
+        cd symmetrix/test
+        mkdir -p /tmp/mh1-logs
+        set -o pipefail
+        status=0
+        SYMMETRIX_MH1_MODEL="$HOME/.cache/symmetrix/test-models/mace-mh-1.model" \
+          pytest -q test_mh1.py \
+          -k "not universal_extraction and not raw_checkpoint and not json_dispatch and not extracts_and_evaluates_each_head" \
+          2>&1 | tee /tmp/mh1-logs/chunk-core.log \
+          || status=1
+        SYMMETRIX_MH1_MODEL="$HOME/.cache/symmetrix/test-models/mace-mh-1.model" \
+          pytest -q test_mh1.py -k "extracts_and_evaluates_each_head" \
+          2>&1 | tee /tmp/mh1-logs/chunk-heads.log \
+          || status=1
+        SYMMETRIX_MH1_MODEL="$HOME/.cache/symmetrix/test-models/mace-mh-1.model" \
+          pytest -q test_mh1.py \
+          -k "universal_extraction or raw_checkpoint or json_dispatch" \
+          2>&1 | tee /tmp/mh1-logs/chunk-heavy.log \
+          || status=1
+        test "$status" -eq 0
+        deactivate
+    - name: Upload MH-1 test logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: mh1-test-logs
+        path: /tmp/mh1-logs/
+        if-no-files-found: ignore
     - name: Test model extraction
       run: |
-        source venv/bin/activate
-        pip install mace-torch
-        # check for valid symmetrix json from atomic numbers and default filename
-        wget https://github.com/ACEsuit/mace-off/raw/refs/heads/main/mace_off23/MACE-OFF23_small.model 
-        symmetrix_extract_mace --model MACE-OFF23_small.model --atomic-numbers 1 8
-        python3 -c "from symmetrix import Symmetrix; calc = Symmetrix('MACE-OFF23_small-1-8.json', species=[1, 8])"
-        # check for valid symmetrix json from checmical symbols and specified filename
-        wget https://github.com/ACEsuit/mace-off/raw/refs/heads/main/mace_off23/MACE-OFF23_medium.model 
-        symmetrix_extract_mace --model MACE-OFF23_medium.model --chemical-symbols H O -o extract_test.json
-        python3 -c "from symmetrix import Symmetrix; calc = Symmetrix('extract_test.json', species=[1, 8])"
+        source .venv/bin/activate
+        # check compact universal conversion and its default filename
+        wget https://github.com/ACEsuit/mace-off/raw/refs/heads/main/mace_off23/MACE-OFF23_small.model
+        symmetrix_extract_mace --model MACE-OFF23_small.model
+        python3 -c "from symmetrix import Symmetrix; calc = Symmetrix('MACE-OFF23_small-universal.json')"
+        # compare legacy pair splines from chemical symbols with compact output
+        symmetrix_extract_mace --model MACE-OFF23_small.model --chemical-symbols H O --radial-format pair-splines -o extract_test.json
+        python3 - <<'PY'
+        import numpy as np
+        from ase import Atoms
+        from symmetrix import Symmetrix
+
+        atoms = Atoms("OH", positions=[[0, 0, 0], [0, 0, 1]], cell=[10, 10, 10])
+        for dtype, energy_tolerance, force_tolerance in (
+            ("float64", 1e-10, 1e-9),
+            ("float32", 1e-4, 1e-4),
+        ):
+            compact_atoms = atoms.copy()
+            legacy_atoms = atoms.copy()
+            compact_atoms.calc = Symmetrix(
+                "MACE-OFF23_small-universal.json", use_kokkos=True, dtype=dtype,
+            )
+            legacy_atoms.calc = Symmetrix(
+                "extract_test.json", use_kokkos=True, dtype=dtype,
+            )
+            assert np.allclose(
+                compact_atoms.get_potential_energy(),
+                legacy_atoms.get_potential_energy(),
+                atol=energy_tolerance,
+            )
+            assert np.allclose(
+                compact_atoms.get_forces(),
+                legacy_atoms.get_forces(),
+                atol=force_tolerance,
+            )
+        PY
         deactivate

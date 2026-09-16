@@ -1,17 +1,107 @@
 [build-system]
-requires = ["scikit-build-core", "pybind11", "cmake>=3.27"]
+requires = ["scikit-build-core", "pybind11"]
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
 cmake.version = ">=3.27"
 build-dir = "build"
-wheel.exclude = ["lib/", "include/"]
+wheel.exclude = ["lib/", "lib64/", "include/", "bin/"]
 wheel.packages = ["source/symmetrix"]
 
+[tool.scikit-build.sdist.force-include]
+"libsymmetrix" = "libsymmetrix"
+
+[tool.scikit-build.cmake.define]
+SYMMETRIX_DEVICE_BACKEND = "NONE"
+Kokkos_ENABLE_CUDA = "OFF"
+Kokkos_ENABLE_HIP = "OFF"
+Kokkos_ENABLE_OPENMP = "ON"
+Kokkos_ENABLE_SERIAL = "OFF"
+SYMMETRIX_SPHERICART_CUDA = "OFF"
+SPHERICART_ENABLE_CUDA = "OFF"
+
 [project]
-name = "symmetrix"
-version = "0.0.1"
+name = "symmetrix-xl"
+version = "0.1.0"
 description = "Symmetrix — a package for functions equivariant under: translation, rotation, inversion, and exchange of particles."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "William C. Witt" },
+]
+maintainers = [
+    { name = "William C. Witt" },
+]
+keywords = ["symmetry", "equivariance", "machine-learning", "interatomic-potentials", "molecular-dynamics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "ase",
+]
+
+[project.urls]
+Homepage = "https://github.com/bonan-group/symmetrix-xl"
+Repository = "https://github.com/bonan-group/symmetrix-xl"
+Issues = "https://github.com/bonan-group/symmetrix-xl/issues"
+
+[project.optional-dependencies]
+mace = [
+    "torch>=2.5",
+    "mace-torch",
+]
+dispersion = [
+    "torch-dftd",
+]
+test = [
+    "pytest",
+    "torch>=2.5",
+    "mace-torch",
+]
+docs = [
+    "furo>=2024.8.6",
+    "myst-parser>=4.0",
+    "sphinx>=8.0",
+]
 
 [project.scripts]
+symmetrix = "symmetrix.cli.main:main"
 symmetrix_extract_mace = "symmetrix.cli.extract_mace:main"
+symmetrix_calibrate_kernel_launch = "symmetrix.cli.calibrate_kernel_launch:main"
+symmetrix_prepare_jit_device_artifact = "symmetrix.cli.prepare_jit_device_artifact:main"
+symmetrix_prepare_jit_host_artifact = "symmetrix.cli.prepare_jit_host_artifact:main"
+
+[tool.ruff]
+lint.ignore = ["E741"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F403", "E402"]
+"test_*.py" = ["F811"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: launches on a real accelerator",
+    "cuda: requires the CUDA backend",
+    "hip: requires the HIP backend",
+    "device_compile: compiles accelerator code without claiming a launch",
+    "jit: exercises runtime specialization or its cache",
+    "lammps: requires a compatible LAMMPS build",
+    "slow: long-running correctness coverage",
+    "sanitizer: runs under a declared diagnostic tool",
+    "performance: produces qualified timing data",
+]

@@ -1,20 +1,17 @@
 import numpy as np
-import os
 from pytest import approx
 from scipy.interpolate import CubicSpline
-import sys
 
 import symmetrix
 
 
 def test_evaluate():
-
     # generate data
     r_cut = 5
     r, h = np.linspace(0, r_cut, 20, retstep=True)
-    f1 = np.sin(r) * r**2 * (r_cut-r)**2
-    f2 = np.cos(r) * r**2 * (r_cut-r)**2
-    f3 = np.sin(r)*np.cos(r) * r**2 * (r_cut-r)**2
+    f1 = np.sin(r) * r**2 * (r_cut - r) ** 2
+    f2 = np.cos(r) * r**2 * (r_cut - r) ** 2
+    f3 = np.sin(r) * np.cos(r) * r**2 * (r_cut - r) ** 2
     # create splines
     spl1 = CubicSpline(r, f1)
     spl2 = CubicSpline(r, f2)
@@ -22,26 +19,26 @@ def test_evaluate():
     d1 = spl1.derivative()(r)
     d2 = spl2.derivative()(r)
     d3 = spl3.derivative()(r)
-    spl_set = symmetrix.CubicSplineSet(h, [f1,f2,f3], [d1,d2,d3])
+    spl_set = symmetrix.CubicSplineSet(h, [f1, f2, f3], [d1, d2, d3])
     # test equivalence
     r = np.linspace(0, r_cut, 1000, endpoint=False)
-    f1,f2,f3 = (np.zeros(len(r)), np.zeros(len(r)), np.zeros(len(r)))
+    f1, f2, f3 = (np.zeros(len(r)), np.zeros(len(r)), np.zeros(len(r)))
     values = np.zeros(3)
     for i, ri in enumerate(r):
         spl_set.evaluate(ri, values)
-        f1[i],f2[i],f3[i] = values
+        f1[i], f2[i], f3[i] = values
     assert f1 == approx(spl1(r))
     assert f2 == approx(spl2(r))
     assert f3 == approx(spl3(r))
 
-def test_evaluate_derivs():
 
+def test_evaluate_derivs():
     # generate data
     r_cut = 5
     r, h = np.linspace(0, r_cut, 20, retstep=True)
-    f1 = np.sin(r) * r**2 * (r_cut-r)**2
-    f2 = np.cos(r) * r**2 * (r_cut-r)**2
-    f3 = np.sin(r)*np.cos(r) * r**2 * (r_cut-r)**2
+    f1 = np.sin(r) * r**2 * (r_cut - r) ** 2
+    f2 = np.cos(r) * r**2 * (r_cut - r) ** 2
+    f3 = np.sin(r) * np.cos(r) * r**2 * (r_cut - r) ** 2
     # create splines
     spl1 = CubicSpline(r, f1)
     spl2 = CubicSpline(r, f2)
@@ -49,20 +46,39 @@ def test_evaluate_derivs():
     d1 = spl1.derivative()(r)
     d2 = spl2.derivative()(r)
     d3 = spl3.derivative()(r)
-    spl_set = symmetrix.CubicSplineSet(h, [f1,f2,f3], [d1,d2,d3])
+    spl_set = symmetrix.CubicSplineSet(h, [f1, f2, f3], [d1, d2, d3])
     # test equivalence
     r = np.linspace(0, r_cut, 1000, endpoint=False)
-    f1,f2,f3 = (np.zeros(len(r)), np.zeros(len(r)), np.zeros(len(r)))
-    d1,d2,d3 = (np.zeros(len(r)), np.zeros(len(r)), np.zeros(len(r)))
+    f1, f2, f3 = (np.zeros(len(r)), np.zeros(len(r)), np.zeros(len(r)))
+    d1, d2, d3 = (np.zeros(len(r)), np.zeros(len(r)), np.zeros(len(r)))
     values = np.zeros(3)
     derivs = np.zeros(3)
     for i, ri in enumerate(r):
         spl_set.evaluate_derivs(ri, values, derivs)
-        f1[i],f2[i],f3[i] = values
-        d1[i],d2[i],d3[i] = derivs
+        f1[i], f2[i], f3[i] = values
+        d1[i], d2[i], d3[i] = derivs
     assert f1 == approx(spl1(r))
     assert d1 == approx(spl1.derivative()(r))
     assert f2 == approx(spl2(r))
     assert d2 == approx(spl2.derivative()(r))
     assert f3 == approx(spl3(r))
     assert d3 == approx(spl3.derivative()(r))
+
+
+def test_scalar_evaluation_matches_bulk_at_clamped_boundaries():
+    grid, h = np.linspace(0.25, 3.25, 9, retstep=True)
+    values = np.vstack((np.sin(grid), np.cos(grid)))
+    derivatives = np.vstack((np.cos(grid), -np.sin(grid)))
+    splines = symmetrix.CubicSplineSet(h, values, derivatives, grid[0])
+
+    bulk_values = np.zeros(2)
+    bulk_derivatives = np.zeros(2)
+    for radius in (grid[0] - 1.0, grid[0], grid[3], grid[-1], grid[-1] + 1.0):
+        splines.evaluate_derivs(radius, bulk_values, bulk_derivatives)
+        for function in range(2):
+            value, derivative = splines.evaluate_function_derivs(radius, function)
+            assert value == approx(bulk_values[function], abs=1e-14)
+            assert derivative == approx(bulk_derivatives[function], abs=1e-14)
+            assert splines.evaluate_function(radius, function) == approx(
+                value, abs=1e-14
+            )

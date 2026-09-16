@@ -1,0 +1,59 @@
+{
+  "schema": "symmetrix.foundation-model-registry",
+  "version": 1,
+  "models": [
+    {
+      "id": "mace-omat-0-small",
+      "provenance": "MACE-OMAT-0 small foundation checkpoint",
+      "head": "default",
+      "contract": "jit_r1_mace_omat0_small_contract.json",
+      "alias_group": "standard-l0",
+      "verified_aliases": [],
+      "runtime_specialization": "r1_exact_jit",
+      "expected_aot_artifact_ids": []
+    },
+    {
+      "id": "mace-mpa-0-medium",
+      "provenance": "MACE-MPA-0 medium foundation checkpoint",
+      "head": "default",
+      "contract": "jit_r1_mace_mpa0_medium_contract.json",
+      "alias_group": "standard-l1",
+      "verified_aliases": [
+        "mace-omat-0-medium",
+        "mace-mp-0b3-medium"
+      ],
+      "runtime_specialization": "r1_exact_jit",
+      "expected_aot_artifact_ids": []
+    },
+    {
+      "id": "mace-mp-0b2-large",
+      "provenance": "MACE-MP-0b2 large foundation checkpoint",
+      "head": "default",
+      "contract": "jit_r1_mace_mp0b2_large_contract.json",
+      "alias_group": "standard-l2",
+      "verified_aliases": [],
+      "runtime_specialization": "r1_exact_jit",
+      "expected_aot_artifact_ids": []
+    },
+    {
+      "id": "mace-off23-small",
+      "provenance": "MACE-OFF23 small foundation checkpoint",
+      "head": "default",
+      "contract": "jit_r1_mace_off23_small_contract.json",
+      "alias_group": "off23-l0",
+      "verified_aliases": [],
+      "runtime_specialization": "r1_exact_jit",
+      "expected_aot_artifact_ids": []
+    },
+    {
+      "id": "mace-off23-large",
+      "provenance": "MACE-OFF23 large foundation checkpoint",
+      "head": "default",
+      "contract": "jit_r1_mace_off23_large_contract.json",
+      "alias_group": "off23-l2",
+      "verified_aliases": [],
+      "runtime_specialization": "r1_exact_jit",
+      "expected_aot_artifact_ids": []
+    }
+  ]
+}

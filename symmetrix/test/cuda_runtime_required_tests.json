@@ -1,0 +1,11 @@
+{
+  "schema": "symmetrix.cuda-runtime-required-tests",
+  "version": 1,
+  "required_capabilities": [
+    "cuda_environment"
+  ],
+  "required_nodes": [
+    "test/test_cuda_runtime.py::test_cuda_r1_nvrtc_module_matches_generic",
+    "test/test_mh1.py::test_mh1_generated_cuda_handles_nondivisible_second_subgroup_iteration"
+  ]
+}

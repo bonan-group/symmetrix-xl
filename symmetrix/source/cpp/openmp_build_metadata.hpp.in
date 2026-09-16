@@ -1,0 +1,16 @@
+#pragma once
+
+namespace symmetrix::build {
+
+inline constexpr bool openmp_enabled = @SYMMETRIX_BUILD_OPENMP_ENABLED@;
+inline constexpr const char* openmp_version = "@SYMMETRIX_BUILD_OPENMP_VERSION@";
+inline constexpr const char* cxx_compiler_id = "@CMAKE_CXX_COMPILER_ID@";
+inline constexpr const char* cxx_compiler_version = "@CMAKE_CXX_COMPILER_VERSION@";
+inline constexpr const char* cxx_compiler_path = "@SYMMETRIX_BUILD_CXX_COMPILER_PATH@";
+inline constexpr const char* host_arch = "@SYMMETRIX_HOST_ARCH@";
+inline constexpr const char* expected_openmp_runtime_path =
+    "@SYMMETRIX_BUILD_OPENMP_RUNTIME_PATH@";
+inline constexpr const char* expected_openmp_runtime_sha256 =
+    "@SYMMETRIX_BUILD_OPENMP_RUNTIME_SHA256@";
+
+} // namespace symmetrix::build

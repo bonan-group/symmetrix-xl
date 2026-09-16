@@ -14,6 +14,7 @@
 // Contributing author: Chuck Witt
 
 #include "pair_symmetrix_mace.h"
+#include "model_metadata.hpp"
 
 #include "atom.h"
 #include "comm.h"
@@ -39,9 +40,9 @@ PairSymmetrixMACE::PairSymmetrixMACE(LAMMPS *lmp)
   one_coeff = 1;
   manybody_flag = 1;
   no_virial_fdotr_compute = 1;
-  // WARNING: for mace, these variables are model-dependent, so i 
+  // WARNING: for mace, these variables are model-dependent, so i
   //          reset them after the model is loaded (in coeff).
-  //          however, i can't make them zero here, because that 
+  //          however, i can't make them zero here, because that
   //          confusingly yields seg faults with hybrid/overlay.
   //          so, i set them to a fairly big number here and hope.
   //          not a great solution.
@@ -97,14 +98,20 @@ void PairSymmetrixMACE::allocate()
 
 void PairSymmetrixMACE::settings(int narg, char **arg)
 {
-  if (narg == 0) {
-    mode = (comm->nprocs == 1) ? "no_domain_decomposition" : "mpi_message_passing";
-  } else if (narg == 1) {
-    mode = std::string(arg[0]);
-    if (mode != "no_domain_decomposition" and mode != "mpi_message_passing" and mode != "no_mpi_message_passing")
-        error->all(FLERR, "The command \'pair_style symmetrix/mace {}\' is invalid", mode);
-  } else {
-    error->all(FLERR, "Too many pair_style arguments for symmetrix/mace");
+  mode = (comm->nprocs == 1) ? "no_domain_decomposition" : "mpi_message_passing";
+  prediction_head.clear();
+  for (int i = 0; i < narg; ++i) {
+    const std::string token(arg[i]);
+    if (token == "no_domain_decomposition" || token == "mpi_message_passing"
+        || token == "no_mpi_message_passing") {
+      mode = token;
+    } else if (token == "head") {
+      if (i + 1 >= narg)
+        error->all(FLERR, "pair_style symmetrix/mace head requires a name");
+      prediction_head = arg[++i];
+    } else {
+      error->all(FLERR, "The command \'pair_style symmetrix/mace {}\' is invalid", token);
+    }
   }
 
   if (mode == "no_domain_decomposition" and comm->nprocs != 1)
@@ -120,10 +127,20 @@ void PairSymmetrixMACE::settings(int narg, char **arg)
 void PairSymmetrixMACE::coeff(int narg, char **arg)
 {
   if (!allocated) allocate();
+  if (narg != atom->ntypes + 3)
+    error->all(FLERR, "Incorrect args for pair coefficients");
+
+  if (symmetrix_is_nonlinear_mace_model(arg[2]))
+    error->all(FLERR, "MACE_Nonlinear models are not supported by pair_style symmetrix/mace in this release");
 
   utils::logmesg(lmp, "Loading MACE model from \'{}\' ... ", arg[2]);
-  mace = std::make_unique<MACE>(arg[2]);
+  mace = std::make_unique<MACE>(arg[2], prediction_head);
   utils::logmesg(lmp, "success\n");
+  if (!mace->supports_streamed_edges() && comm->me == 0)
+    error->warning(
+      FLERR,
+      "Loaded legacy Symmetrix format-v1 pair-spline model; using streamed_edges='materialized'. "
+      "Re-export with radial_format='compact' to enable streamed_edges='generic' execution.");
 
   // extract atomic numbers from pair_coeff
   mace_types = std::vector<int>();
@@ -142,6 +159,7 @@ void PairSymmetrixMACE::coeff(int narg, char **arg)
                    i-2, arg[i], mace_index);
     mace_types.push_back(mace_index);
   }
+  mace->prepare_active_types(mace_types);
 
   // set message size
   if (mode == "mpi_message_passing") {
@@ -459,8 +477,12 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
 
   mace->compute_Y(xyz);
 
-  mace->compute_R0(num_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_A0(num_nodes, node_types, num_neigh, neigh_types);
+  if (mace->streamed_edges == MACEStreamedEdgesMode::generic)
+    mace->compute_A0_streamed(num_nodes, node_types, num_neigh, neigh_types, r);
+  else {
+    mace->compute_R0(num_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_A0(num_nodes, node_types, num_neigh, neigh_types);
+  }
   mace->compute_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
   mace->compute_M0(num_nodes, node_types);
   mace->compute_H1(num_nodes);
@@ -476,8 +498,13 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
   comm->forward_comm(this);
   mace->H1 = H1;
 
-  mace->compute_R1(num_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_Phi1(num_nodes, num_neigh, neigh_j);
+  if (mace->streamed_edges == MACEStreamedEdgesMode::materialized) {
+    mace->compute_R1(num_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_Phi1(num_nodes, num_neigh, neigh_j);
+  } else {
+    mace->compute_Phi1_streamed(
+      num_nodes, node_types, num_neigh, neigh_j, neigh_types, r);
+  }
   mace->compute_A1(num_nodes);
   mace->compute_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
   mace->compute_M1(num_nodes, node_types);
@@ -489,7 +516,12 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
   mace->reverse_M1(num_nodes, node_types);
   mace->reverse_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r, false);
   mace->reverse_A1(num_nodes);
-  mace->reverse_Phi1(num_nodes, num_neigh, neigh_j, xyz, r, false, false);
+  if (mace->streamed_edges == MACEStreamedEdgesMode::materialized)
+    mace->reverse_Phi1(num_nodes, num_neigh, neigh_j, xyz, r, false, false);
+  else
+    mace->reverse_Phi1_streamed(
+      num_nodes, node_types, num_neigh, neigh_j, neigh_types,
+      xyz, r, false, false);
 
   H1_adj = mace->H1_adj;
   comm->reverse_comm(this);
@@ -498,7 +530,11 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
   mace->reverse_H1(num_nodes);
   mace->reverse_M0(num_nodes, node_types);
   mace->reverse_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
-  mace->reverse_A0(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
+  if (mace->streamed_edges == MACEStreamedEdgesMode::generic)
+    mace->reverse_A0_streamed(
+      num_nodes, node_types, num_neigh, neigh_types, xyz, r);
+  else
+    mace->reverse_A0(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
 
   // ----- end mace evaluation -----
 
@@ -677,31 +713,56 @@ void PairSymmetrixMACE::compute_no_mpi_message_passing(int eflag, int vflag)
 
   mace->compute_Y(xyz);
 
-  mace->compute_R0(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_A0(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types);
+  if (mace->streamed_edges == MACEStreamedEdgesMode::generic)
+    mace->compute_A0_streamed(
+      num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
+  else {
+    mace->compute_R0(
+      num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_A0(
+      num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types);
+  }
   mace->compute_A0_scaled(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
   mace->compute_M0(num_local_nodes+num_ghost_nodes, node_types);
   mace->compute_H1(num_local_nodes+num_ghost_nodes);
 
-  mace->compute_R1(num_local_nodes, node_types, num_neigh, neigh_types, r);
-  mace->compute_Phi1(num_local_nodes, num_neigh, neigh_indices);
+  if (mace->streamed_edges == MACEStreamedEdgesMode::materialized) {
+    mace->compute_R1(num_local_nodes, node_types, num_neigh, neigh_types, r);
+    mace->compute_Phi1(num_local_nodes, num_neigh, neigh_indices);
+  } else {
+    mace->compute_Phi1_streamed(
+      num_local_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
+  }
   mace->compute_A1(num_local_nodes);
   mace->compute_A1_scaled(num_local_nodes, node_types, num_neigh, neigh_types, r);
   mace->compute_M1(num_local_nodes, node_types);
   mace->compute_H2(num_local_nodes, node_types);
 
   mace->compute_readouts(num_local_nodes, node_types);
-  
+
   mace->reverse_H2(num_local_nodes, node_types, false);
   mace->reverse_M1(num_local_nodes, node_types);
   mace->reverse_A1_scaled(num_local_nodes, node_types, num_neigh, neigh_types, xyz, r, false);
   mace->reverse_A1(num_local_nodes);
-  mace->reverse_Phi1(num_local_nodes, num_neigh, neigh_indices, xyz, r, false, false);
+  if (mace->streamed_edges == MACEStreamedEdgesMode::materialized)
+    mace->reverse_Phi1(
+      num_local_nodes, num_neigh, neigh_indices, xyz, r, false, false);
+  else
+    mace->reverse_Phi1_streamed(
+      num_local_nodes, node_types, num_neigh, neigh_indices, neigh_types,
+      xyz, r, false, false);
 
   mace->reverse_H1(num_local_nodes+num_ghost_nodes);
   mace->reverse_M0(num_local_nodes+num_ghost_nodes, node_types);
   mace->reverse_A0_scaled(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, xyz, r);
-  mace->reverse_A0(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, xyz, r);
+  if (mace->streamed_edges == MACEStreamedEdgesMode::generic)
+    mace->reverse_A0_streamed(
+      num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types,
+      xyz, r);
+  else
+    mace->reverse_A0(
+      num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types,
+      xyz, r);
 
   // ----- end mace evaluation -----
 

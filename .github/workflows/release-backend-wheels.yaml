@@ -1,0 +1,192 @@
+# Symmetrix-XL CPU AVX-512 add-on wheel release pipeline.
+#
+# Builds the x86-64-v4 CPU add-on wheels only:
+#   * symmetrix-xl-cpu-avx512       x86-64-v4 CPU add-on, manylinux_2_28
+#
+# GPU backend wheels (cuda12/cuda13 x sm80..sm120, rocm) are NOT built in CI:
+# build them on a qualified local development machine with
+# tools/build_gpu_wheels.sh, then publish with twine. The publish job below
+# covers only the CI-built CPU add-on.
+#
+# Release runbook order: publish the base `symmetrix-xl` wheels first
+# (release-cpu-wheels.yaml), then this workflow, then locally built GPU wheels.
+#
+# Required repository settings:
+#   * PyPI project "symmetrix-xl-cpu-avx512" configured with a Trusted
+#     Publisher pointing at this repository/workflow ("publish" job
+#     environment: pypi).
+#   * Actions permissions: read-only; the publish job needs id-token: write.
+
+name: Release backend wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_pypi:
+        description: Publish qualified artifacts to PyPI
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_VERSION: "4.4.3"
+  CMAKE_SHA256: "d6c83076c575bc00b823522ac974bda66d0af05d6ddc30e739c12385cf32c6cc"
+  OPENBLAS_VERSION: "0.3.29"
+  OPENBLAS_SHA256: "38240eee1b29e2bde47ebb5d61160207dc68668a54cac62c076bb5032013b1eb"
+
+jobs:
+  build-cpu-v4:
+    name: Build cpu avx512 ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["cp310-cp310", "cp311-cp311", "cp312-cp312", "cp313-cp313", "cp314-cp314"]
+    steps:
+      - name: Clone repo
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install system build dependencies
+        run: |
+          dnf install -y gcc-gfortran git patchelf make binutils
+
+      - name: Install a real CMake binary
+        run: |
+          curl -sSL -o /tmp/cmake.tar.gz "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz"
+          echo "${CMAKE_SHA256}  /tmp/cmake.tar.gz" | sha256sum -c -
+          tar xz -C /opt -f /tmp/cmake.tar.gz
+          ln -sf "/opt/cmake-${CMAKE_VERSION}-linux-x86_64/bin/cmake" /usr/local/bin/cmake
+          cmake --version | head -1
+
+      - name: Build pinned OpenBLAS (DYNAMIC_ARCH, OpenMP)
+        run: |
+          curl -sSL -o /tmp/openblas.tar.gz "https://github.com/OpenMathLib/OpenBLAS/releases/download/v${OPENBLAS_VERSION}/OpenBLAS-${OPENBLAS_VERSION}.tar.gz"
+          echo "${OPENBLAS_SHA256}  /tmp/openblas.tar.gz" | sha256sum -c -
+          tar xz -C /tmp -f /tmp/openblas.tar.gz
+          cd "/tmp/OpenBLAS-${OPENBLAS_VERSION}"
+          make -j"$(nproc)" DYNAMIC_ARCH=1 USE_OPENMP=1 NUM_THREADS=64 NO_SHARED=0
+          make PREFIX=/usr/local/openblas install
+          ls /usr/local/openblas/lib
+
+      - name: Build the x86-64-v4 add-on wheel
+        run: |
+          export PATH="/opt/python/${{ matrix.python }}/bin:/usr/local/bin:$PATH"
+          export CMAKE_PREFIX_PATH=/usr/local/openblas
+          python tools/symmetrix_build.py wheel-matrix \
+            --target cpu:avx512 \
+            --wheel-dir dist
+
+      - name: Repair the wheel to manylinux
+        run: |
+          /opt/python/${{ matrix.python }}/bin/python -m pip install auditwheel
+          auditwheel show dist/*.whl
+          auditwheel repair dist/*.whl -w dist-repaired --plat manylinux_2_28_x86_64
+          ls -lh dist-repaired
+
+      - name: Layout sentinels
+        run: |
+          set -e
+          python - <<'PY'
+          import glob, json, re, zipfile
+          wheel = glob.glob("dist-repaired/*.whl")[0]
+          assert re.search(r"-manylinux_2_28_x86_64\.whl$", wheel), wheel
+          with zipfile.ZipFile(wheel) as archive:
+              names = archive.namelist()
+              expected = "symmetrix_backend_cpu_avx512"
+              assert any(n == f"{expected}/backend.json" for n in names), names[:8]
+              assert any(
+                  n == f"{expected}/_native_cpu_avx512.so" for n in names
+              ), names[:8]
+              descriptor = json.loads(
+                  archive.read(f"{expected}/backend.json")
+              )
+              assert descriptor["selector"] == "cpu-avx512", descriptor
+              assert descriptor["architecture"] == "x86-64-v4", descriptor
+              assert not any(n.startswith("symmetrix/") for n in names), names[:8]
+          print("wheel layout OK:", wheel)
+          PY
+
+      - name: Install wheel and prove AVX-512 codegen
+        run: |
+          set -euo pipefail
+          export PATH="/opt/python/${{ matrix.python }}/bin:/usr/local/bin:$PATH"
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/pip install --no-deps dist-repaired/*.whl
+          /tmp/wheelcheck/bin/python - <<'PY'
+          import importlib.metadata as md
+
+          dist = md.distribution("symmetrix-xl-cpu-avx512")
+          requires = dist.requires or []
+          assert any(
+              requirement.split(";")[0].strip().startswith("symmetrix-xl==")
+              for requirement in requires
+          ), requires
+          points = [
+              point for point in dist.entry_points
+              if point.group == "symmetrix.backends"
+          ]
+          assert len(points) == 1, points
+          assert points[0].name == "cpu-avx512", points
+          assert points[0].value == "symmetrix_backend_cpu_avx512", points
+          files = {str(item) for item in dist.files or []}
+          assert "symmetrix_backend_cpu_avx512/__init__.py" in files, sorted(files)[:8]
+          print("installed wheel metadata OK")
+          PY
+          so="$(find /tmp/wheelcheck -type f -name '_native_cpu_avx512*.so' | head -n 1)"
+          test -n "$so"
+          objdump -d "$so" | grep -qm1 'zmm' || {
+            echo "no AVX-512 vector code found in $so"; exit 1;
+          }
+          echo "AVX-512 codegen sentinel OK: $so"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-avx512-${{ matrix.python }}
+          path: dist-repaired/*.whl
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    if: inputs.publish_pypi
+    needs: build-cpu-v4
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-repaired
+          merge-multiple: true
+
+      - name: Collision gate (one artifact per target)
+        run: |
+          ls dist-repaired/*.whl
+          test "$(ls dist-repaired/*.whl | wc -l)" -eq "$(ls dist-repaired/*.whl | xargs -n1 basename | sort -u | wc -l)"
+
+      - name: Compute release manifest
+        run: |
+          mkdir release-manifest
+          sha256sum dist-repaired/*.whl > release-manifest/SHA256SUMS
+          cat release-manifest/SHA256SUMS
+
+      - name: Upload release manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest-backends
+          path: release-manifest/SHA256SUMS
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-repaired
+          attestations: true

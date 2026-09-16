@@ -15,8 +15,6 @@ std::complex<double> sphericart_sph_harm(int l, int m, double x, double y, doubl
 
 double sphericart_real_sph_harm(int l, int m, double x, double y, double z);
 
-std::vector<double> sphericart_real(int l_max, std::vector<double> xyz);
-
 std::vector<std::complex<double>> sphericart_complex(
     int l_max,
     std::vector<double> xyz);

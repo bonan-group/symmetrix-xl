@@ -1,0 +1,123 @@
+name: CUDA qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: MACE-MH-1 CUDA test scope
+        required: true
+        default: focused
+        type: choice
+        options:
+          - focused
+          - full
+
+concurrency:
+  group: cuda-qualification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mace-mh1-cuda:
+    runs-on: [self-hosted, linux, x64, cuda]
+    timeout-minutes: 120
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      KOKKOS_NUM_THREADS: 1
+      TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: "1"
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify CUDA device and compiler
+        run: |
+          nvidia-smi
+          nvcc --version
+          cuda_compiler_path="$(command -v nvcc)"
+          cuda_toolkit_root="$(dirname "$(dirname "$cuda_compiler_path")")"
+          echo "CUDA_ROOT=$cuda_toolkit_root" >> "$GITHUB_ENV"
+          echo "CXX=$GITHUB_WORKSPACE/libsymmetrix/external/kokkos/bin/nvcc_wrapper" >> "$GITHUB_ENV"
+
+      - name: Build CUDA extension
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install mace-torch numpy pytest
+          python -m pip install --verbose ./symmetrix \
+            --config-settings=cmake.define.CMAKE_BUILD_TYPE=Release \
+            --config-settings=cmake.define.Kokkos_ENABLE_SERIAL=ON \
+            --config-settings=cmake.define.Kokkos_ENABLE_CUDA=ON \
+            --config-settings=cmake.define.Kokkos_ARCH_NATIVE=ON \
+            --config-settings=cmake.define.Kokkos_ENABLE_AGGRESSIVE_VECTORIZATION=ON \
+            --config-settings=cmake.define.SYMMETRIX_KOKKOS=ON \
+            --config-settings=cmake.define.SYMMETRIX_SPHERICART_CUDA=ON
+
+      - name: Compile ordinary R1 with required NVRTC
+        env:
+          SYMMETRIX_REQUIRED_TEST_MANIFEST: cuda_compiler_required_tests.json
+        run: |
+          cd symmetrix/test
+          pytest -q \
+            'test_jit_compiler_qualification.py::test_cuda_forced_compiler_produces_expected_artifact[nvrtc]'
+
+      - name: Exercise deprecated NVCC runtime compatibility
+        continue-on-error: true
+        env:
+          SYMMETRIX_JIT_NVCC: ${{ env.CUDA_ROOT }}/bin/nvcc
+        run: |
+          cd symmetrix/test
+          pytest -q \
+            'test_jit_compiler_qualification.py::test_cuda_forced_compiler_produces_expected_artifact[nvcc]'
+
+      - name: Require NVRTC ordinary R1 and MH1 module launches
+        env:
+          SYMMETRIX_JIT_CUDA_JIT_BACKEND: nvrtc
+          SYMMETRIX_REQUIRED_TEST_MANIFEST: cuda_runtime_required_tests.json
+        run: |
+          cd symmetrix/test
+          pytest -q \
+            'test_cuda_runtime.py::test_cuda_r1_nvrtc_module_matches_generic' \
+            'test_mh1.py::test_mh1_generated_cuda_handles_nondivisible_second_subgroup_iteration'
+
+      - name: Download and verify MACE-MH-1 checkpoint
+        run: |
+          mkdir -p "$HOME/.cache/symmetrix/test-models"
+          curl --fail --location --retry 3 \
+            https://github.com/ACEsuit/mace-foundations/releases/download/mace_mh_1/mace-mh-1.model \
+            --output "$HOME/.cache/symmetrix/test-models/mace-mh-1.model"
+          echo "a522eb7f59c7879963d41586528f4980baf33e086c94aa92e3eafdeccad3be47  $HOME/.cache/symmetrix/test-models/mace-mh-1.model" \
+            | sha256sum --check --strict
+
+      - name: Run focused CUDA qualification
+        if: inputs.suite == 'focused'
+        env:
+          SYMMETRIX_MH1_MODEL: ${{ runner.temp }}/mace-mh-1.model
+          SYMMETRIX_JIT_CUDA_JIT_BACKEND: nvrtc
+        run: |
+          cp "$HOME/.cache/symmetrix/test-models/mace-mh-1.model" "$SYMMETRIX_MH1_MODEL"
+          cd symmetrix/test
+          pytest -q test_mh1.py \
+            -k "cuda_streamed_fast_path or float32_streamed_modes or \
+                mode_switch_fences_pending or exposes_synchronized_linear_controls or \
+                cuda_packed_linear or cuda_fused_reverse_matches_control or \
+                cuda_tensor_reverse_direct_nodes or \
+                cuda_tensor_team_size_tracks_edge_multiplicity or \
+                mh1_256_node_64_edge or \
+                generalized_mh1_matches_upstream_and_streamed_modes or \
+                generalized_mh1_kokkos_float32_matches_float64 or \
+                repeated_calculations or reuses_workspaces"
+
+      - name: Run full CUDA qualification
+        if: inputs.suite == 'full'
+        env:
+          SYMMETRIX_MH1_MODEL: ${{ runner.temp }}/mace-mh-1.model
+          SYMMETRIX_JIT_CUDA_JIT_BACKEND: nvrtc
+        run: |
+          cp "$HOME/.cache/symmetrix/test-models/mace-mh-1.model" "$SYMMETRIX_MH1_MODEL"
+          cd symmetrix/test
+          pytest -q test_mh1.py

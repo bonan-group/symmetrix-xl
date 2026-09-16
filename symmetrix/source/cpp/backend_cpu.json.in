@@ -1,0 +1,15 @@
+{
+  "architecture": "@SYMMETRIX_BACKEND_ARCHITECTURE@",
+  "backend": "cpu",
+  "compiler": "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@",
+  "distribution": "symmetrix-xl",
+  "frontend_version": "@SYMMETRIX_FRONTEND_VERSION@",
+  "module": "@SYMMETRIX_PYTHON_MODULE_NAME@",
+  "native_abi": 1,
+  "package": "symmetrix",
+  "schema_version": 1,
+  "selector": "cpu",
+  "source_commit": "@SYMMETRIX_BUILD_SOURCE_COMMIT@",
+  "source_dirty": @SYMMETRIX_BUILD_SOURCE_DIRTY@,
+  "toolkit": ""
+}

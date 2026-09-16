@@ -1,0 +1,814 @@
+{
+  "accumulator": {
+    "fallback": [
+      "float32",
+      "float64"
+    ],
+    "mode": "runtime_precision",
+    "native_generated": [
+      "float32"
+    ]
+  },
+  "channels": 128,
+  "derivatives": [
+    "forward",
+    "state_adjoint",
+    "source_adjoint",
+    "coordinate"
+  ],
+  "edge_harmonics": {
+    "l_max": 3,
+    "layout": "lm=l*l+l+m"
+  },
+  "fingerprint": "sha256:5a074e75b142c103b031a1909b736f366f3e103e4e6f58d4a4364170548bd6dd",
+  "generation_fingerprint": "sha256:6fdf3e63624a0e4502d15539b0e3fa27788e540e0f81deb978ff6f955c878c42",
+  "groups": [
+    {
+      "components": 1,
+      "l": 0,
+      "path_indices": [
+        0,
+        1
+      ]
+    },
+    {
+      "components": 3,
+      "l": 1,
+      "path_indices": [
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "components": 5,
+      "l": 2,
+      "path_indices": [
+        5,
+        6,
+        7
+      ]
+    },
+    {
+      "components": 7,
+      "l": 3,
+      "path_indices": [
+        8,
+        9
+      ]
+    }
+  ],
+  "interaction": "R1",
+  "irreps": {
+    "edge": "1x0e+1x1o+1x2e+1x3o",
+    "output": "128x0e+128x0e+128x1o+128x1o+128x1o+128x2e+128x2e+128x2e+128x3o+128x3o",
+    "source": "128x0e+128x1o"
+  },
+  "layouts": {
+    "aggregate": "receiver,radial_embedding,path_component_channel",
+    "message": "receiver_component,path_channel",
+    "output": "receiver,lm,channel",
+    "source_adjoint": "source,lm,channel"
+  },
+  "paths": [
+    {
+      "connection_mode": "uvu",
+      "edge_l": 0,
+      "has_weight": true,
+      "index": 0,
+      "output_l": 0,
+      "path_shape": [
+        128,
+        1
+      ],
+      "source_l": 0
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 1,
+      "has_weight": true,
+      "index": 1,
+      "output_l": 0,
+      "path_shape": [
+        128,
+        1
+      ],
+      "source_l": 1
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 1,
+      "has_weight": true,
+      "index": 2,
+      "output_l": 1,
+      "path_shape": [
+        128,
+        1
+      ],
+      "source_l": 0
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 0,
+      "has_weight": true,
+      "index": 3,
+      "output_l": 1,
+      "path_shape": [
+        128,
+        1
+      ],
+      "source_l": 1
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 2,
+      "has_weight": true,
+      "index": 4,
+      "output_l": 1,
+      "path_shape": [
+        128,
+        1
+      ],
+      "source_l": 1
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 2,
+      "has_weight": true,
+      "index": 5,
+      "output_l": 2,
+      "path_shape": [
+        128,
+        1
+      ],
+      "source_l": 0
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 1,
+      "has_weight": true,
+      "index": 6,
+      "output_l": 2,
+      "path_shape": [
+        128,
+        1
+      ],
+      "source_l": 1
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 3,
+      "has_weight": true,
+      "index": 7,
+      "output_l": 2,
+      "path_shape": [
+        128,
+        1
+      ],
+      "source_l": 1
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 3,
+      "has_weight": true,
+      "index": 8,
+      "output_l": 3,
+      "path_shape": [
+        128,
+        1
+      ],
+      "source_l": 0
+    },
+    {
+      "connection_mode": "uvu",
+      "edge_l": 2,
+      "has_weight": true,
+      "index": 9,
+      "output_l": 3,
+      "path_shape": [
+        128,
+        1
+      ],
+      "source_l": 1
+    }
+  ],
+  "radial_embedding": 64,
+  "schema": "symmetrix.execution.tensor_product",
+  "source_harmonics": {
+    "l_max": 1,
+    "layout": "lm=l*l+l+m"
+  },
+  "sparse_coupling": {
+    "coefficients_fingerprint": "sha256:e0095bd0d3cbb3f6cb8f7bbf779be0844a97f55159ccc61f6dc27b8cf51b9fc4",
+    "lme_fingerprint": "sha256:c3484c98424673c5aae0bcc2a4895482000b7b4f2faaba7bbd58fa41bab24e4e",
+    "ordering": "edge_lm,source_lm,path,output_m",
+    "rows_fingerprint": "sha256:96b9c2033bdd895c563fbb1328c0c92387263f393320cbd9194e90628083207c",
+    "term_count": 86,
+    "terms": [
+      {
+        "coefficient": 1.0,
+        "lm1": 0,
+        "lm2": 0,
+        "lme": 0,
+        "row": 0
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 0,
+        "lm2": 1,
+        "lme": 3,
+        "row": 13
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 0,
+        "lm2": 2,
+        "lme": 6,
+        "row": 14
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 0,
+        "lm2": 3,
+        "lme": 9,
+        "row": 15
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 1,
+        "lm2": 0,
+        "lme": 2,
+        "row": 10
+      },
+      {
+        "coefficient": 0.5773502691896258,
+        "lm1": 1,
+        "lm2": 1,
+        "lme": 1,
+        "row": 1
+      },
+      {
+        "coefficient": -0.4082482904638627,
+        "lm1": 1,
+        "lm2": 1,
+        "lme": 18,
+        "row": 36
+      },
+      {
+        "coefficient": -0.7071067811865481,
+        "lm1": 1,
+        "lm2": 1,
+        "lme": 24,
+        "row": 36
+      },
+      {
+        "coefficient": 0.7071067811865474,
+        "lm1": 1,
+        "lm2": 2,
+        "lme": 15,
+        "row": 37
+      },
+      {
+        "coefficient": 0.7071067811865481,
+        "lm1": 1,
+        "lm2": 3,
+        "lme": 12,
+        "row": 38
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 2,
+        "lm2": 0,
+        "lme": 5,
+        "row": 11
+      },
+      {
+        "coefficient": 0.7071067811865472,
+        "lm1": 2,
+        "lm2": 1,
+        "lme": 15,
+        "row": 39
+      },
+      {
+        "coefficient": 0.5773502691896258,
+        "lm1": 2,
+        "lm2": 2,
+        "lme": 1,
+        "row": 5
+      },
+      {
+        "coefficient": 0.8164965809277259,
+        "lm1": 2,
+        "lm2": 2,
+        "lme": 18,
+        "row": 40
+      },
+      {
+        "coefficient": 0.7071067811865471,
+        "lm1": 2,
+        "lm2": 3,
+        "lme": 21,
+        "row": 41
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 3,
+        "lm2": 0,
+        "lme": 8,
+        "row": 12
+      },
+      {
+        "coefficient": 0.7071067811865482,
+        "lm1": 3,
+        "lm2": 1,
+        "lme": 12,
+        "row": 42
+      },
+      {
+        "coefficient": 0.7071067811865487,
+        "lm1": 3,
+        "lm2": 2,
+        "lme": 21,
+        "row": 43
+      },
+      {
+        "coefficient": 0.5773502691896258,
+        "lm1": 3,
+        "lm2": 3,
+        "lme": 1,
+        "row": 9
+      },
+      {
+        "coefficient": -0.40824829046386313,
+        "lm1": 3,
+        "lm2": 3,
+        "lme": 18,
+        "row": 44
+      },
+      {
+        "coefficient": 0.7071067811865481,
+        "lm1": 3,
+        "lm2": 3,
+        "lme": 24,
+        "row": 44
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 4,
+        "lm2": 0,
+        "lme": 11,
+        "row": 31
+      },
+      {
+        "coefficient": 0.5477225575051666,
+        "lm1": 4,
+        "lm2": 1,
+        "lme": 10,
+        "row": 16
+      },
+      {
+        "coefficient": -0.18257418583505527,
+        "lm1": 4,
+        "lm2": 1,
+        "lme": 35,
+        "row": 73
+      },
+      {
+        "coefficient": -0.707106781186548,
+        "lm1": 4,
+        "lm2": 1,
+        "lme": 39,
+        "row": 73
+      },
+      {
+        "coefficient": 0.5773502691896258,
+        "lm1": 4,
+        "lm2": 2,
+        "lme": 29,
+        "row": 74
+      },
+      {
+        "coefficient": 0.5477225575051665,
+        "lm1": 4,
+        "lm2": 3,
+        "lme": 4,
+        "row": 18
+      },
+      {
+        "coefficient": 0.7071067811865486,
+        "lm1": 4,
+        "lm2": 3,
+        "lme": 27,
+        "row": 75
+      },
+      {
+        "coefficient": -0.1825741858350553,
+        "lm1": 4,
+        "lm2": 3,
+        "lme": 31,
+        "row": 75
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 5,
+        "lm2": 0,
+        "lme": 14,
+        "row": 32
+      },
+      {
+        "coefficient": 0.5477225575051659,
+        "lm1": 5,
+        "lm2": 1,
+        "lme": 7,
+        "row": 19
+      },
+      {
+        "coefficient": -0.44721359549995754,
+        "lm1": 5,
+        "lm2": 1,
+        "lme": 33,
+        "row": 76
+      },
+      {
+        "coefficient": -0.5773502691896261,
+        "lm1": 5,
+        "lm2": 1,
+        "lme": 37,
+        "row": 76
+      },
+      {
+        "coefficient": 0.5477225575051659,
+        "lm1": 5,
+        "lm2": 2,
+        "lme": 4,
+        "row": 20
+      },
+      {
+        "coefficient": 0.7302967433402214,
+        "lm1": 5,
+        "lm2": 2,
+        "lme": 31,
+        "row": 77
+      },
+      {
+        "coefficient": 0.5773502691896262,
+        "lm1": 5,
+        "lm2": 3,
+        "lme": 29,
+        "row": 78
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 6,
+        "lm2": 0,
+        "lme": 17,
+        "row": 33
+      },
+      {
+        "coefficient": -0.31622776601683766,
+        "lm1": 6,
+        "lm2": 1,
+        "lme": 4,
+        "row": 22
+      },
+      {
+        "coefficient": 0.6324555320336762,
+        "lm1": 6,
+        "lm2": 1,
+        "lme": 31,
+        "row": 79
+      },
+      {
+        "coefficient": 0.6324555320336757,
+        "lm1": 6,
+        "lm2": 2,
+        "lme": 7,
+        "row": 23
+      },
+      {
+        "coefficient": 0.7745966692414833,
+        "lm1": 6,
+        "lm2": 2,
+        "lme": 33,
+        "row": 80
+      },
+      {
+        "coefficient": -0.316227766016838,
+        "lm1": 6,
+        "lm2": 3,
+        "lme": 10,
+        "row": 24
+      },
+      {
+        "coefficient": 0.6324555320336762,
+        "lm1": 6,
+        "lm2": 3,
+        "lme": 35,
+        "row": 81
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 7,
+        "lm2": 0,
+        "lme": 20,
+        "row": 34
+      },
+      {
+        "coefficient": 0.5773502691896258,
+        "lm1": 7,
+        "lm2": 1,
+        "lme": 29,
+        "row": 82
+      },
+      {
+        "coefficient": 0.547722557505167,
+        "lm1": 7,
+        "lm2": 2,
+        "lme": 10,
+        "row": 26
+      },
+      {
+        "coefficient": 0.7302967433402212,
+        "lm1": 7,
+        "lm2": 2,
+        "lme": 35,
+        "row": 83
+      },
+      {
+        "coefficient": 0.5477225575051657,
+        "lm1": 7,
+        "lm2": 3,
+        "lme": 7,
+        "row": 27
+      },
+      {
+        "coefficient": -0.44721359549995787,
+        "lm1": 7,
+        "lm2": 3,
+        "lme": 33,
+        "row": 84
+      },
+      {
+        "coefficient": 0.5773502691896265,
+        "lm1": 7,
+        "lm2": 3,
+        "lme": 37,
+        "row": 84
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 8,
+        "lm2": 0,
+        "lme": 23,
+        "row": 35
+      },
+      {
+        "coefficient": -0.5477225575051665,
+        "lm1": 8,
+        "lm2": 1,
+        "lme": 4,
+        "row": 28
+      },
+      {
+        "coefficient": 0.7071067811865479,
+        "lm1": 8,
+        "lm2": 1,
+        "lme": 27,
+        "row": 85
+      },
+      {
+        "coefficient": 0.18257418583505508,
+        "lm1": 8,
+        "lm2": 1,
+        "lme": 31,
+        "row": 85
+      },
+      {
+        "coefficient": 0.577350269189626,
+        "lm1": 8,
+        "lm2": 2,
+        "lme": 37,
+        "row": 86
+      },
+      {
+        "coefficient": 0.5477225575051665,
+        "lm1": 8,
+        "lm2": 3,
+        "lme": 10,
+        "row": 30
+      },
+      {
+        "coefficient": -0.1825741858350553,
+        "lm1": 8,
+        "lm2": 3,
+        "lme": 35,
+        "row": 87
+      },
+      {
+        "coefficient": 0.7071067811865488,
+        "lm1": 8,
+        "lm2": 3,
+        "lme": 39,
+        "row": 87
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 9,
+        "lm2": 0,
+        "lme": 26,
+        "row": 66
+      },
+      {
+        "coefficient": 0.5976143046671971,
+        "lm1": 9,
+        "lm2": 1,
+        "lme": 25,
+        "row": 45
+      },
+      {
+        "coefficient": 0.5976143046671978,
+        "lm1": 9,
+        "lm2": 3,
+        "lme": 13,
+        "row": 47
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 10,
+        "lm2": 0,
+        "lme": 28,
+        "row": 67
+      },
+      {
+        "coefficient": 0.4879500364742667,
+        "lm1": 10,
+        "lm2": 1,
+        "lme": 22,
+        "row": 48
+      },
+      {
+        "coefficient": 0.4879500364742667,
+        "lm1": 10,
+        "lm2": 2,
+        "lme": 13,
+        "row": 49
+      },
+      {
+        "coefficient": 0.48795003647426693,
+        "lm1": 10,
+        "lm2": 3,
+        "lme": 16,
+        "row": 50
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 11,
+        "lm2": 0,
+        "lme": 30,
+        "row": 68
+      },
+      {
+        "coefficient": 0.534522483824849,
+        "lm1": 11,
+        "lm2": 1,
+        "lme": 19,
+        "row": 51
+      },
+      {
+        "coefficient": 0.15430334996209166,
+        "lm1": 11,
+        "lm2": 1,
+        "lme": 25,
+        "row": 51
+      },
+      {
+        "coefficient": 0.6172133998483675,
+        "lm1": 11,
+        "lm2": 2,
+        "lme": 16,
+        "row": 52
+      },
+      {
+        "coefficient": -0.15430334996209186,
+        "lm1": 11,
+        "lm2": 3,
+        "lme": 13,
+        "row": 53
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 12,
+        "lm2": 0,
+        "lme": 32,
+        "row": 69
+      },
+      {
+        "coefficient": -0.3779644730092269,
+        "lm1": 12,
+        "lm2": 1,
+        "lme": 16,
+        "row": 54
+      },
+      {
+        "coefficient": 0.6546536707079771,
+        "lm1": 12,
+        "lm2": 2,
+        "lme": 19,
+        "row": 55
+      },
+      {
+        "coefficient": -0.37796447300922714,
+        "lm1": 12,
+        "lm2": 3,
+        "lme": 22,
+        "row": 56
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 13,
+        "lm2": 0,
+        "lme": 34,
+        "row": 70
+      },
+      {
+        "coefficient": -0.15430334996209183,
+        "lm1": 13,
+        "lm2": 1,
+        "lme": 13,
+        "row": 57
+      },
+      {
+        "coefficient": 0.6172133998483674,
+        "lm1": 13,
+        "lm2": 2,
+        "lme": 22,
+        "row": 58
+      },
+      {
+        "coefficient": 0.534522483824849,
+        "lm1": 13,
+        "lm2": 3,
+        "lme": 19,
+        "row": 59
+      },
+      {
+        "coefficient": -0.15430334996209186,
+        "lm1": 13,
+        "lm2": 3,
+        "lme": 25,
+        "row": 59
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 14,
+        "lm2": 0,
+        "lme": 36,
+        "row": 71
+      },
+      {
+        "coefficient": -0.4879500364742669,
+        "lm1": 14,
+        "lm2": 1,
+        "lme": 16,
+        "row": 60
+      },
+      {
+        "coefficient": 0.48795003647426677,
+        "lm1": 14,
+        "lm2": 2,
+        "lme": 25,
+        "row": 61
+      },
+      {
+        "coefficient": 0.4879500364742672,
+        "lm1": 14,
+        "lm2": 3,
+        "lme": 22,
+        "row": 62
+      },
+      {
+        "coefficient": 1.0,
+        "lm1": 15,
+        "lm2": 0,
+        "lme": 38,
+        "row": 72
+      },
+      {
+        "coefficient": -0.5976143046671972,
+        "lm1": 15,
+        "lm2": 1,
+        "lme": 13,
+        "row": 63
+      },
+      {
+        "coefficient": 0.5976143046671979,
+        "lm1": 15,
+        "lm2": 3,
+        "lme": 25,
+        "row": 65
+      }
+    ]
+  },
+  "structure_fingerprint": "sha256:db0d13eac2be2f5fad0e6e987c06eb17bbc36f7a3922db460eecd1de8f506f77",
+  "version": 1
+}

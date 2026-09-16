@@ -1,0 +1,268 @@
+# Symmetrix-XL portable CPU wheel release pipeline
+#
+# Produces PyPI-ready manylinux_2_28_x86_64 wheels of `symmetrix-xl`
+# (frontend + CPU/OpenMP backend, x86-64-v3 baseline) for CPython 3.10-3.14,
+# then installs and tests each repaired wheel on stock Ubuntu runners.
+#
+# Required repository settings:
+#   * PyPI project "symmetrix-xl" configured with a Trusted Publisher
+#     pointing at this repository/workflow ("publish" job environment: pypi).
+#   * Actions permissions: read-only; the publish job needs id-token: write.
+#
+# Design notes (verified against tools/symmetrix_build.py as of 2026-09):
+#   * The build tool records the CMake it detects and later FAILS the build
+#     if pip build isolation used a different CMake (provenance gate).
+#     Therefore CMake must be a REAL binary on PATH, not the pip `cmake`
+#     package shim (the shim cannot run inside build isolation).
+#   * The tool requires: git, gfortran, a C++20 compiler, and an optimized
+#     BLAS discoverable as `openblas` for the `auto` BLAS policy.
+#   * Generator stays the tool default (Unix Makefiles).
+#   * auditwheel vendors libgomp + libopenblas into the wheel and retags it.
+
+name: Release CPU wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_pypi:
+        description: Publish qualified artifacts to PyPI
+        required: true
+        default: false
+        type: boolean
+      publish_testpypi:
+        description: Publish qualified wheels to TestPyPI
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build-sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build and inspect source distribution
+        run: |
+          python -m pip install build twine
+          python tools/symmetrix_build.py sdist --output-dir dist
+          python -m twine check dist/*.tar.gz
+          tar tzf dist/*.tar.gz | grep -q '/libsymmetrix/source/'
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build:
+    name: Build wheel ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["cp310-cp310", "cp311-cp311", "cp312-cp312", "cp313-cp313", "cp314-cp314"]
+    steps:
+      - name: Clone repo
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Build, repair, and inspect the CPU wheel
+        env:
+          PYTHON_ABIS: ${{ matrix.python }}
+          CPU_TARGET: x86-64-v3
+          WHEEL_DIR: wheelhouse/cpu
+          JOBS: "4"
+        run: tools/build_cpu_manylinux_wheels.sh
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.python }}
+          path: wheelhouse/cpu/${{ matrix.python }}/*.whl
+          if-no-files-found: error
+
+  test:
+    name: Test wheel on ${{ matrix.os }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    env:
+      SYMMETRIX_OPENMP_RUNTIME_CHECK: strict
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python: "3.10"
+            abi: cp310-cp310
+          - os: ubuntu-22.04
+            python: "3.12"
+            abi: cp312-cp312
+          - os: ubuntu-22.04
+            python: "3.14"
+            abi: cp314-cp314
+          - os: ubuntu-24.04
+            python: "3.10"
+            abi: cp310-cp310
+          - os: ubuntu-24.04
+            python: "3.12"
+            abi: cp312-cp312
+          - os: ubuntu-24.04
+            python: "3.14"
+            abi: cp314-cp314
+    steps:
+      - name: Clone repo (tests only)
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Download matching wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.abi }}
+          path: dist-repaired
+
+      - name: Install wheel and run runtime gates
+        run: |
+          set -e
+          pip install dist-repaired/*.whl
+          python -c "import symmetrix; print('symmetrix', symmetrix.__version__)"
+          symmetrix backend list
+          symmetrix doctor --json | tee doctor.json
+          python - <<'PY'
+          import json, sys
+          record = json.load(open("doctor.json"))
+          assert record.get("ok") is True, (
+              "symmetrix doctor reported failures:\n"
+              + json.dumps(record.get("checks", []), indent=2)
+          )
+          runtime = record.get("runtime") or {}
+          host_blas = runtime.get("host_blas") or {}
+          assert host_blas.get("openblas_openmp_enabled") is True, \
+              "vendored OpenBLAS is not the OpenMP build"
+          assert host_blas.get("openblas_openmp_runtime_compatible") is True, \
+              "vendored OpenBLAS is not OpenMP-runtime compatible"
+          print("doctor gates OK")
+          PY
+
+      - name: Pure-native test subset (no torch required)
+        run: |
+          pip install pytest
+          cd symmetrix/test
+          pytest -q -x \
+            test_backend_loader.py \
+            test_cubic_spline.py test_cubic_spline_kokkos.py \
+            test_cubic_spline_set.py test_cubic_spline_set_kokkos.py \
+            test_zbl.py test_zbl_kokkos.py \
+            test_multilayer_perceptron.py test_multilayer_perceptron_kokkos.py \
+            test_multivariate_polynomial.py \
+            test_standard_modules.py
+
+  qualify-full:
+    name: Run full CPU wheel suite
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Clone repository tests
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download CPython 3.12 wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-cp312-cp312
+          path: wheelhouse
+
+      - name: Install wheel and full test dependencies
+        run: pip install wheelhouse/*.whl pytest torch mace-torch
+
+      - name: Run full applicable test suite
+        env:
+          SYMMETRIX_BACKEND: cpu
+          SYMMETRIX_OPENMP_RUNTIME_CHECK: strict
+        run: pytest -q symmetrix/test
+
+  publish:
+    name: Publish to PyPI
+    if: inputs.publish_pypi
+    needs: [build-sdist, test, qualify-full]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/symmetrix-xl
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-release
+          merge-multiple: true
+
+      - name: Collision gate (one artifact per target)
+        run: |
+          ls dist-release/*.whl dist-release/*.tar.gz
+          test "$(ls dist-release/*.whl | wc -l)" -eq "$(ls dist-release/*.whl | xargs -n1 basename | sort -u | wc -l)"
+
+      - name: Compute release manifest
+        run: |
+          mkdir release-manifest
+          sha256sum dist-release/*.whl dist-release/*.tar.gz > release-manifest/SHA256SUMS
+          cat release-manifest/SHA256SUMS
+
+      - name: Upload release manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: release-manifest/SHA256SUMS
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-release
+          attestations: true
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_testpypi
+    needs: [build-sdist, test, qualify-full]
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/symmetrix-xl
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all repaired wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-repaired
+          merge-multiple: true
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-repaired
+          repository-url: https://test.pypi.org/legacy/
+          attestations: true

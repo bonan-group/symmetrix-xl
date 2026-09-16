@@ -3,25 +3,26 @@
 #include <span>
 #include <vector>
 
-class ZBL {
+template <typename Precision>
+class ZBLT {
 
 public:
 
-ZBL();
+ZBLT();
 
-ZBL(double a_exp,
-    double a_prefactor,
-    std::vector<double> c,
-    std::vector<double> covalent_radii,
+ZBLT(Precision a_exp,
+    Precision a_prefactor,
+    std::vector<Precision> c,
+    std::vector<Precision> covalent_radii,
     int p);
 
-double compute(const int Z_u, const int Z_v, const double r);
+Precision compute(const int Z_u, const int Z_v, const Precision r);
 
-double compute_gradient(const int Z_u, const int Z_v, const double r);
+Precision compute_gradient(const int Z_u, const int Z_v, const Precision r);
 
-double compute_envelope(const double r, const double r_max, const int p);
+Precision compute_envelope(const Precision r, const Precision r_max, const int p);
 
-double compute_envelope_gradient(const double r, const double r_max, const int p);
+Precision compute_envelope_gradient(const Precision r, const Precision r_max, const int p);
 
 void compute_ZBL(const int num_nodes,
                  std::span<const int> node_types,
@@ -30,23 +31,28 @@ void compute_ZBL(const int num_nodes,
                  std::span<const int> atomic_numbers,
                  std::span<const double> r,
                  std::span<const double> xyz,
-                 std::span<double> node_energies,
-                 std::span<double> node_forces);
+                 std::span<Precision> node_energies,
+                 std::span<Precision> node_forces);
 
 private:
 
 // values set in constructor
-double a_exp;
-double a_prefactor;
-std::vector<double> c;
-std::vector<double> covalent_radii;
+Precision a_exp;
+Precision a_prefactor;
+std::vector<Precision> c;
+std::vector<Precision> covalent_radii;
 int p;
-    
+
 // values taken from mace/modules/radial.py
-static constexpr double c_exps_0 = -3.2;
-static constexpr double c_exps_1 = -0.9423;
-static constexpr double c_exps_2 = -0.4028;
-static constexpr double c_exps_3 = -0.2016;
-static constexpr double v_prefactor = 14.3996;
+static constexpr Precision c_exps_0 = -3.2;
+static constexpr Precision c_exps_1 = -0.9423;
+static constexpr Precision c_exps_2 = -0.4028;
+static constexpr Precision c_exps_3 = -0.2016;
+static constexpr Precision v_prefactor = 14.3996;
 
 };
+
+using ZBL = ZBLT<double>;
+
+extern template class ZBLT<float>;
+extern template class ZBLT<double>;

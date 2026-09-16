@@ -50,6 +50,7 @@ class PairSymmetrixMACE : public Pair {
 
  protected:
   std::string mode;
+  std::string prediction_head;
 
   std::vector<double> H1, H1_adj;
 

@@ -1,0 +1,48 @@
+{
+  "schema": "symmetrix.foundation-model-support-matrix",
+  "version": 1,
+  "models": [
+    {"id":"mace-omat-0-small","downloader_key":"small-omat-0","filename":"mace-omat-0-small.model","url":"https://github.com/ACEsuit/mace-foundations/releases/download/mace_omat_0/mace-omat-0-small.model","sha256":"0abfde07862cf1e93b8b4d03cb702f29ce9c344ff2fc4de2ec0d7166d6c113a5","head":null,"contract_group":"standard-l0","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-omat-0-medium","downloader_key":"medium-omat-0","filename":"mace-omat-0-medium.model","url":"https://github.com/ACEsuit/mace-foundations/releases/download/mace_omat_0/mace-omat-0-medium.model","sha256":"d4b14be9afa294eebdbe31a0280b26a0fa29715771e978cbfd3ca24e0d90307a","head":null,"contract_group":"standard-l1","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-mpa-0-medium","downloader_key":"medium-mpa-0","filename":"mace-mpa-0-medium.model","url":"https://github.com/ACEsuit/mace-mp/releases/download/mace_mpa_0/mace-mpa-0-medium.model","sha256":"75428afe3a1d7d8062e19bcaabd5c433623cabf308242ec9fb493e38604fb638","head":null,"contract_group":"standard-l1","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-mp-0b-small","downloader_key":"small-0b","filename":"mace_agnesi_small.model","url":"https://github.com/ACEsuit/mace-mp/releases/download/mace_mp_0b/mace_agnesi_small.model","sha256":"7e3a0abcaf41e03a80e69f778e1b11b29de1cca704783dc25917a736392f8cf0","head":null,"contract_group":"standard-l0-candidate","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-mp-0b-medium","downloader_key":"medium-0b","filename":"mace_agnesi_medium.model","url":"https://github.com/ACEsuit/mace-mp/releases/download/mace_mp_0b/mace_agnesi_medium.model","sha256":"ab8baff639a8f295f3eccad3d3ccf574efb6fb63220bd52cd88664211569e521","head":null,"contract_group":"standard-l1-candidate","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-mp-0b2-small","downloader_key":"small-0b2","filename":"mace-small-density-agnesi-stress.model","url":"https://github.com/ACEsuit/mace-mp/releases/download/mace_mp_0b2/mace-small-density-agnesi-stress.model","sha256":"d5773bf9440e96d6eb8c598f84bd0e6369fcfa432f626a87f890e07da3c651c9","head":null,"contract_group":"standard-l0-candidate","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-mp-0b2-medium","downloader_key":"medium-0b2","filename":"mace-medium-density-agnesi-stress.model","url":"https://github.com/ACEsuit/mace-mp/releases/download/mace_mp_0b2/mace-medium-density-agnesi-stress.model","sha256":"a90be07c8aa6623c390fcc4653d3e319c4a356f8b4a53d323f96b2012d375caf","head":null,"contract_group":"standard-l1-candidate","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-mp-0b2-large","downloader_key":"large-0b2","filename":"mace-large-density-agnesi-stress.model","url":"https://github.com/ACEsuit/mace-mp/releases/download/mace_mp_0b2/mace-large-density-agnesi-stress.model","sha256":"348390e758e1c90011c7675e864850f8e9c5b3e7c217f79a2b4bad1baaa657ad","head":null,"contract_group":"standard-l2","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-mp-0b3-medium","downloader_key":"medium-0b3","filename":"mace-mp-0b3-medium.model","url":"https://github.com/ACEsuit/mace-mp/releases/download/mace_mp_0b3/mace-mp-0b3-medium.model","sha256":"2f2be696351ac9e94fbe01cdfb6f017679acdbd2db7645209ef55fec9826b012","head":null,"contract_group":"standard-l1","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-matpes-pbe-0","downloader_key":"mace-matpes-pbe-0","filename":"MACE-matpes-pbe-omat-ft.model","url":"https://github.com/ACEsuit/mace-foundations/releases/download/mace_matpes_0/MACE-matpes-pbe-omat-ft.model","sha256":"e618ad582b84239905b9c3b77ce6e9ce111b0ecd1533223a1a6aac7a696b8aa0","head":null,"contract_group":"standard-l1-candidate","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-matpes-r2scan-0","downloader_key":"mace-matpes-r2scan-0","filename":"MACE-matpes-r2scan-omat-ft.model","url":"https://github.com/ACEsuit/mace-foundations/releases/download/mace_matpes_0/MACE-matpes-r2scan-omat-ft.model","sha256":"8f147ecffa1d06a696e5648b13b81abda9c96fda9d0fb3faba3cd3fb27d9bba9","head":null,"contract_group":"standard-l1-candidate","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-mh-0","downloader_key":"mh-0","filename":"mace-mh-0.model","url":"https://github.com/ACEsuit/mace-foundations/releases/download/mace_mh_1/mace-mh-0.model","sha256":"d62ff8f293664e6556cfa49364b28ee72a70cf1e6150f3c111a578397fed609d","head":"omat_pbe","contract_group":"mh0-standard-l1","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-mh-1","downloader_key":"mh-1","filename":"mace-mh-1.model","url":"https://github.com/ACEsuit/mace-foundations/releases/download/mace_mh_1/mace-mh-1.model","sha256":"a522eb7f59c7879963d41586528f4980baf33e086c94aa92e3eafdeccad3be47","head":"omat_pbe","contract_group":"mh1-nonlinear","chemistry":{"C64":true,"STO40":true}},
+    {"id":"mace-off23-small","downloader_key":null,"filename":"MACE-OFF23_small.model","url":"https://github.com/ACEsuit/mace-off/raw/main/mace_off23/MACE-OFF23_small.model","sha256":"165cce4cfec5a34b9c64d4ebf95de15d71106bb584b7291c8470f0749977c46f","head":null,"contract_group":"off23-l0","chemistry":{"C64":true,"H2O":true}},
+    {"id":"mace-off23-medium","downloader_key":null,"filename":"MACE-OFF23_medium.model","url":"https://github.com/ACEsuit/mace-off/raw/main/mace_off23/MACE-OFF23_medium.model","sha256":"4842c52ad210d6e1f84d6cf1ffa70fae25a7e0d755ed55cf223f43913f587db7","head":null,"contract_group":"off23-l1-candidate","chemistry":{"C64":true,"H2O":true}},
+    {"id":"mace-off23-large","downloader_key":null,"filename":"MACE-OFF23_large.model","url":"https://github.com/ACEsuit/mace-off/raw/main/mace_off23/MACE-OFF23_large.model","sha256":"a29e397dbf3e7a24ac50a9b0dfc919bd5a62efa346f5895a6237b0950c1d76f4","head":null,"contract_group":"off23-l2","chemistry":{"C64":true,"H2O":true}}
+  ],
+  "structures": {
+    "C64": {"symbols":["C"],"description":"shaken 2x2x2 conventional diamond carbon cell","atoms":64,"seed":20260903,"displacement_sigma_A":0.03},
+    "STO40": {"symbols":["Sr","Ti","O"],"description":"shaken 2x2x2 cubic SrTiO3 cell","atoms":40,"seed":20260903,"displacement_sigma_A":0.03},
+    "H2O": {"symbols":["H","O"],"description":"shaken isolated water molecule in a finite box","atoms":3,"seed":20260903,"displacement_sigma_A":0.03}
+  },
+  "capacity_probes": [
+    {"model":"mace-omat-0-small","structure":"STO40","dtype":"float32","backend":"cuda"},
+    {"model":"mace-mpa-0-medium","structure":"STO40","dtype":"float64","backend":"cuda","expected_m1_tile_channels":16},
+    {"model":"mace-off23-large","structure":"C64","dtype":"float32","backend":"cpu"},
+    {"model":"mace-off23-large","structure":"C64","dtype":"float64","backend":"cpu"},
+    {"model":"mace-off23-large","structure":"C64","dtype":"float32","backend":"cuda"},
+    {"model":"mace-off23-large","structure":"C64","dtype":"float64","backend":"cuda"},
+    {"model":"mace-omat-0-small","structure":"STO40","dtype":"float32","backend":"hip"},
+    {"model":"mace-mpa-0-medium","structure":"STO40","dtype":"float64","backend":"hip","expected_m1_tile_channels":16},
+    {"model":"mace-off23-large","structure":"C64","dtype":"float32","backend":"hip"},
+    {"model":"mace-off23-large","structure":"C64","dtype":"float64","backend":"hip"}
+  ],
+  "cross_precision_tolerances": {
+    "energy_abs_eV_per_atom":0.0005,
+    "forces_max_abs_eV_per_A":0.005,
+    "stress_max_abs_eV_per_A3":0.008
+  },
+  "tolerances": {
+    "float32":{"energy_abs_eV_per_atom":0.0005,"forces_max_abs_eV_per_A":0.005,"stress_max_abs_eV_per_A3":0.008},
+    "float64":{"energy_abs_eV_per_atom":1e-9,"forces_max_abs_eV_per_A":1e-8,"stress_max_abs_eV_per_A3":1e-9}
+  }
+}

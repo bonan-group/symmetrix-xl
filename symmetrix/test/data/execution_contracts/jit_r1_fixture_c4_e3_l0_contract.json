@@ -1,0 +1,74 @@
+{
+  "schema": "symmetrix.execution.tensor_product",
+  "version": 1,
+  "interaction": "R1",
+  "channels": 4,
+  "radial_embedding": 3,
+  "edge_harmonics": {
+    "l_max": 0,
+    "layout": "lm=l*l+l+m"
+  },
+  "source_harmonics": {
+    "l_max": 0,
+    "layout": "lm=l*l+l+m"
+  },
+  "irreps": {
+    "source": "4x0e",
+    "edge": "1x0e",
+    "output": "4x0e"
+  },
+  "groups": [
+    {
+      "l": 0,
+      "components": 1,
+      "path_indices": [0]
+    }
+  ],
+  "paths": [
+    {
+      "index": 0,
+      "output_l": 0,
+      "edge_l": 0,
+      "source_l": 0,
+      "connection_mode": "uvu",
+      "has_weight": true,
+      "path_shape": [4, 1]
+    }
+  ],
+  "sparse_coupling": {
+    "term_count": 1,
+    "lme_fingerprint": "sha256:d0bca111f8628137adc4c16f123496dcdd1d590d06cb5d9acd68b39fe656fb97",
+    "coefficients_fingerprint": "sha256:c2272c0a862f11de35da66ec8be34349001ddebae43b85ab1dafb188f8ad7b30",
+    "rows_fingerprint": "sha256:d0bca111f8628137adc4c16f123496dcdd1d590d06cb5d9acd68b39fe656fb97",
+    "ordering": "edge_lm,source_lm,path,output_m",
+    "terms": [
+      {
+        "lme": 0,
+        "lm1": 0,
+        "lm2": 0,
+        "row": 0,
+        "coefficient": 1.0
+      }
+    ]
+  },
+  "layouts": {
+    "aggregate": "receiver,radial_embedding,path_component_channel",
+    "message": "receiver_component,path_channel",
+    "output": "receiver,lm,channel",
+    "source_adjoint": "source,lm,channel"
+  },
+  "derivatives": [
+    "forward",
+    "state_adjoint",
+    "source_adjoint",
+    "coordinate"
+  ],
+  "accumulator": {
+    "mode": "runtime_precision",
+    "native_generated": ["float32"],
+    "fallback": ["float32", "float64"]
+  },
+  "generation_fingerprint": "sha256:8a3237154ab8be767376992f2a471804c9e22cb519da8650eb32e01ea8e61efe",
+  "fingerprint": "sha256:fb4c0e328ecb222010d5524ae37d95bf825bc4bd42b80ec607552608b88d4afe",
+  "structure_fingerprint": "sha256:d140009ac8dba7b454c8f9c582724410e20618a2a6de552266721671dafc1b6b"
+}

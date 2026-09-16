@@ -1,0 +1,57 @@
+{
+  "accumulator": {"fallback": ["float32", "float64"], "mode": "runtime_precision", "native_generated": ["float32"]},
+  "channels": 128,
+  "derivatives": ["forward", "coordinate"],
+  "edge_harmonics": {"l_max": 3, "layout": "lm=l*l+l+m"},
+  "fingerprint": "sha256:f1a668c426a77ca991dfdc3b03463274b06c1572dfc97d05294d938b53a22acd",
+  "generation_fingerprint": "sha256:8b964667fd8ce8bbc9f2f66bb875b44b1b60b26e6943189119809a1c1664f6c9",
+  "groups": [
+    {"components": 1, "l": 0, "path_indices": [0]},
+    {"components": 3, "l": 1, "path_indices": [1]},
+    {"components": 5, "l": 2, "path_indices": [2]},
+    {"components": 7, "l": 3, "path_indices": [3]}
+  ],
+  "interaction": "R0",
+  "irreps": {
+    "edge": "1x0e+1x1o+1x2e+1x3o",
+    "output": "128x0e+128x1o+128x2e+128x3o",
+    "source": "128x0e"
+  },
+  "layouts": {"aggregate": "receiver,lm,channel", "output": "receiver,lm,channel"},
+  "paths": [
+    {"connection_mode": "uvu", "edge_l": 0, "has_weight": true, "index": 0, "output_l": 0, "path_shape": [128, 1], "source_l": 0},
+    {"connection_mode": "uvu", "edge_l": 1, "has_weight": true, "index": 1, "output_l": 1, "path_shape": [128, 1], "source_l": 0},
+    {"connection_mode": "uvu", "edge_l": 2, "has_weight": true, "index": 2, "output_l": 2, "path_shape": [128, 1], "source_l": 0},
+    {"connection_mode": "uvu", "edge_l": 3, "has_weight": true, "index": 3, "output_l": 3, "path_shape": [128, 1], "source_l": 0}
+  ],
+  "radial_embedding": 64,
+  "schema": "symmetrix.execution.tensor_product",
+  "source_harmonics": {"l_max": 0, "layout": "lm=l*l+l+m"},
+  "sparse_coupling": {
+    "coefficients_fingerprint": "sha256:f8b519c907394980463982727954db849e5f8cd41037fa4b68c52c2da11f1804",
+    "lme_fingerprint": "sha256:4939a292c2f5164ddcf27a07ddc7ef96928baa3e8967453a7294a9ecebf0a5c3",
+    "ordering": "edge_lm,source_lm,path,output_m",
+    "rows_fingerprint": "sha256:4939a292c2f5164ddcf27a07ddc7ef96928baa3e8967453a7294a9ecebf0a5c3",
+    "term_count": 16,
+    "terms": [
+      {"coefficient": 1.0, "lm1": 0, "lm2": 0, "lme": 0, "row": 0},
+      {"coefficient": 1.0, "lm1": 1, "lm2": 0, "lme": 1, "row": 1},
+      {"coefficient": 1.0, "lm1": 2, "lm2": 0, "lme": 2, "row": 2},
+      {"coefficient": 1.0, "lm1": 3, "lm2": 0, "lme": 3, "row": 3},
+      {"coefficient": 1.0, "lm1": 4, "lm2": 0, "lme": 4, "row": 4},
+      {"coefficient": 1.0, "lm1": 5, "lm2": 0, "lme": 5, "row": 5},
+      {"coefficient": 1.0, "lm1": 6, "lm2": 0, "lme": 6, "row": 6},
+      {"coefficient": 1.0, "lm1": 7, "lm2": 0, "lme": 7, "row": 7},
+      {"coefficient": 1.0, "lm1": 8, "lm2": 0, "lme": 8, "row": 8},
+      {"coefficient": 1.0, "lm1": 9, "lm2": 0, "lme": 9, "row": 9},
+      {"coefficient": 1.0, "lm1": 10, "lm2": 0, "lme": 10, "row": 10},
+      {"coefficient": 1.0, "lm1": 11, "lm2": 0, "lme": 11, "row": 11},
+      {"coefficient": 1.0, "lm1": 12, "lm2": 0, "lme": 12, "row": 12},
+      {"coefficient": 1.0, "lm1": 13, "lm2": 0, "lme": 13, "row": 13},
+      {"coefficient": 1.0, "lm1": 14, "lm2": 0, "lme": 14, "row": 14},
+      {"coefficient": 1.0, "lm1": 15, "lm2": 0, "lme": 15, "row": 15}
+    ]
+  },
+  "version": 1,
+  "structure_fingerprint": "sha256:87d40a97a59259e75e7d3f51451a9b4b635349e610415f0aadd7199db238364d"
+}

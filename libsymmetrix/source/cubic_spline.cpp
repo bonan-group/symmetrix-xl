@@ -1,66 +1,108 @@
+#include <cmath>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "cubic_spline.hpp"
 
-CubicSpline::CubicSpline(
-    double h,
-    std::vector<double> nodal_values,
-    std::vector<double> nodal_derivs)
+template <typename Precision>
+CubicSplineT<Precision>::CubicSplineT(
+    Precision h,
+    std::vector<Precision> nodal_values,
+    std::vector<Precision> nodal_derivs,
+    Precision x0)
     : h(h),
+      x0(x0),
       c(generate_coefficients(h, nodal_values, nodal_derivs))
 {
 }
 
-double CubicSpline::evaluate(double r)
+template <typename Precision>
+Precision CubicSplineT<Precision>::evaluate(Precision r)
 {
-    const int i = static_cast<int>(r / h);
-    // TODO: something better with this bounds checking
-    if (i<0 or i>=c.size()/4)
-        throw std::invalid_argument("Out of bounds in CubicSpline::evaluate.");
-    const double x = r - h*i;
-    const double xx = x*x;
-    const double xxx = xx*x;
+    const int num_intervals = c.size()/4;
+    const Precision upper_bound = x0+h*num_intervals;
+    if (std::isnan(r) || (x0 == 0.0 && (r < x0 || r > upper_bound)))
+        throw std::invalid_argument(
+            "Out of bounds in CubicSpline::evaluate. r=" + std::to_string(r));
+    int i = static_cast<int>(std::floor((r-x0)/h));
+    Precision x = r-x0-h*i;
+    if (i < 0) {
+        i = 0;
+        x = 0.0;
+    } else if (i >= num_intervals) {
+        i = num_intervals-1;
+        x = h;
+    }
+    const Precision xx = x*x;
+    const Precision xxx = xx*x;
     const int i4 = 4*i;
-    const double c0 = c[i4], c1 = c[i4+1], c2=c[i4+2], c3=c[i4+3];
+    const Precision c0 = c[i4], c1 = c[i4+1], c2=c[i4+2], c3=c[i4+3];
     return c0 + c1*x + c2*xx + c3*xxx;
 }
 
-std::tuple<double,double> CubicSpline::evaluate_deriv(double r)
+template <typename Precision>
+std::tuple<Precision,Precision> CubicSplineT<Precision>::evaluate_deriv(Precision r)
 {
-    const int i = static_cast<int>(r / h);
-    // TODO: something better with this bounds checking
-    if (i<0 or i>=c.size()/4)
-        throw std::invalid_argument("Out of bounds in CubicSpline::evaluate_deriv.");
-    const double x = r - h*i;
-    const double xx = x*x;
-    const double xxx = xx*x;
+    const int num_intervals = c.size()/4;
+    const Precision upper_bound = x0+h*num_intervals;
+    if (std::isnan(r) || (x0 == 0.0 && (r < x0 || r > upper_bound)))
+        throw std::invalid_argument(
+            "Out of bounds in CubicSpline::evaluate_deriv. r=" + std::to_string(r));
+    int i = static_cast<int>(std::floor((r-x0)/h));
+    Precision x = r-x0-h*i;
+    if (i < 0) {
+        i = 0;
+        x = 0.0;
+    } else if (i >= num_intervals) {
+        i = num_intervals-1;
+        x = h;
+    }
+    const Precision xx = x*x;
+    const Precision xxx = xx*x;
     const int i4 = 4*i;
-    const double c0 = c[i4], c1 = c[i4+1], c2=c[i4+2], c3=c[i4+3];
+    const Precision c0 = c[i4], c1 = c[i4+1], c2=c[i4+2], c3=c[i4+3];
     return {c0 + c1*x + c2*xx + c3*xxx, c1 + 2*c2*x + 3*c3*xx};
 }
 
-std::tuple<double,double> CubicSpline::evaluate_deriv_divided(double r)
+template <typename Precision>
+std::tuple<Precision,Precision> CubicSplineT<Precision>::evaluate_deriv_divided(Precision r)
 {
-    const int i = static_cast<int>(r / h);
-    // TODO: something better with this bounds checking
-    if (i<0 or i>=c.size()/4)
-        throw std::invalid_argument("Out of bounds in CubicSpline::evaluate_deriv.");
-    const double x = r - h*i;
-    const double xx = x*x;
-    const double xxx = xx*x;
+    const int num_intervals = c.size()/4;
+    const Precision upper_bound = x0+h*num_intervals;
+    if (std::isnan(r) || r <= 0.0 || (x0 == 0.0 && r > upper_bound))
+        throw std::invalid_argument(
+            "Out of bounds in CubicSpline::evaluate_deriv_divided. r=" + std::to_string(r));
+    int i = static_cast<int>(std::floor((r-x0)/h));
+    Precision x = r-x0-h*i;
+    if (i < 0) {
+        i = 0;
+        x = 0.0;
+    } else if (i >= num_intervals) {
+        i = num_intervals-1;
+        x = h;
+    }
+    const Precision xx = x*x;
+    const Precision xxx = xx*x;
     const int i4 = 4*i;
-    const double c0 = c[i4], c1 = c[i4+1], c2=c[i4+2], c3=c[i4+3];
+    const Precision c0 = c[i4], c1 = c[i4+1], c2=c[i4+2], c3=c[i4+3];
     return {c0 + c1*x + c2*xx + c3*xxx, (c1 + 2*c2*x + 3*c3*xx) / r};
 }
 
-auto CubicSpline::generate_coefficients(
-    double h,
-    std::vector<double> nodal_values,
-    std::vector<double> nodal_derivs)
-    -> std::vector<double>
+template <typename Precision>
+auto CubicSplineT<Precision>::generate_coefficients(
+    Precision h,
+    std::vector<Precision> nodal_values,
+    std::vector<Precision> nodal_derivs)
+    -> std::vector<Precision>
 {
-    auto c = std::vector<double>(4*(nodal_values.size()-1), 0.0);
+    if (h <= 0 || !std::isfinite(h))
+        throw std::invalid_argument("CubicSpline requires positive finite spacing.");
+    if (nodal_values.size() < 2 || nodal_values.size() != nodal_derivs.size())
+        throw std::invalid_argument(
+            "CubicSpline requires at least two values and matching derivatives.");
+
+    auto c = std::vector<Precision>(4*(nodal_values.size()-1), 0.0);
     for (int i=0; i<nodal_values.size()-1; ++i) {
         c[4*i] = nodal_values[i];
         c[4*i+1] = nodal_derivs[i];
@@ -69,3 +111,6 @@ auto CubicSpline::generate_coefficients(
     }
     return c;
 }
+
+template class CubicSplineT<float>;
+template class CubicSplineT<double>;
