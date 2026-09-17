@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,7 @@ class LammpsInvocation:
     provenance: dict[str, Any]
     qualification_path: Path
     reusable_qualification: bool
+    requested_packages: tuple[str, ...]
 
 
 def parse_lammps_version(header: str) -> tuple[str, int]:
@@ -117,6 +119,64 @@ def _mpi_configuration(
     return True, wrapper, identity or "version unavailable"
 
 
+def probe_mpi_gpu_awareness(
+    backend: str,
+    mpi_cxx: str,
+    repo_root: Path,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    """Compile and run the provider query used by LAMMPS's Kokkos package."""
+    accelerator = {"cuda": "cuda", "hip": "rocm"}.get(backend)
+    if accelerator is None:
+        raise BuildError("GPU-aware MPI can only be required for CUDA or HIP builds")
+    source = repo_root / "tools/mpi_gpu_aware_probe.cpp"
+    if not source.is_file():
+        raise BuildError(f"MPI GPU-awareness probe source is missing: {source}")
+
+    method = f"MPIX_Query_{accelerator}_support"
+    with tempfile.TemporaryDirectory(prefix="symmetrix-mpi-probe-") as temporary:
+        executable = Path(temporary) / "mpi_gpu_aware_probe"
+        compile_result = runner.run(
+            (mpi_cxx, "-std=c++20", str(source), "-o", str(executable))
+        )
+        if compile_result.returncode != 0:
+            detail = compile_result.output.strip() or "no compiler diagnostic"
+            raise BuildError(
+                f"cannot prove {accelerator.upper()}-aware MPI support with "
+                f"{mpi_cxx}; the {method} probe did not compile:\n{detail}"
+            )
+        result = runner.run((str(executable), accelerator))
+
+    match = re.search(
+        r"method=(\S+)\s+compile_time=([01])\s+runtime=([01])", result.output
+    )
+    if match is None:
+        detail = result.output.strip() or "no probe output"
+        raise BuildError(
+            f"cannot interpret the {accelerator.upper()}-aware MPI probe: {detail}"
+        )
+    supported = (
+        result.returncode == 0 and match.group(1) == method and match.group(3) == "1"
+    )
+    evidence = {
+        "required": True,
+        "accelerator": accelerator,
+        "method": match.group(1),
+        "compile_time_support": match.group(2) == "1",
+        "runtime_support": match.group(3) == "1",
+        "status": "supported" if supported else "unsupported",
+    }
+    if evidence["status"] != "supported":
+        raise BuildError(
+            f"{mpi_cxx} does not provide {accelerator.upper()}-aware MPI: "
+            f"{evidence['method']} reported compile_time="
+            f"{int(evidence['compile_time_support'])}, runtime="
+            f"{int(evidence['runtime_support'])}. Load a GPU-aware MPI module "
+            "or omit --require-gpu-aware-mpi to build the host-staged path."
+        )
+    return evidence
+
+
 def lammps_cmake_definitions(
     manifest: TargetManifest,
     *,
@@ -124,6 +184,8 @@ def lammps_cmake_definitions(
     mpi_enabled: bool,
     mpi_cxx: str,
     lammps_source: Path,
+    packages: tuple[str, ...] = (),
+    extra_definitions: dict[str, str] | None = None,
 ) -> dict[str, str]:
     definitions = {
         "CMAKE_BUILD_TYPE": "Release",
@@ -205,6 +267,51 @@ def lammps_cmake_definitions(
         )
     else:
         raise BuildError(f"unsupported manifest backend: {manifest.backend}")
+    for package in packages:
+        definitions[f"PKG_{package}"] = "ON"
+    managed_prefixes = ("PKG_", "Kokkos_", "SYMMETRIX_")
+    for name, value in (extra_definitions or {}).items():
+        if name in definitions or name.startswith(managed_prefixes):
+            raise BuildError(
+                f"LAMMPS CMake definition {name} is managed by the build frontend"
+            )
+        definitions[name] = value
+    return definitions
+
+
+def normalize_lammps_packages(
+    packages: tuple[str, ...], lammps_source: Path
+) -> tuple[str, ...]:
+    normalized: set[str] = set()
+    for requested in packages:
+        package = requested.strip().upper()
+        if package.startswith("PKG_"):
+            package = package[4:]
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9+-]*", package):
+            raise BuildError(f"invalid LAMMPS package name: {requested}")
+        if package == "KOKKOS":
+            raise BuildError("LAMMPS package KOKKOS is always enabled by this frontend")
+        if not (lammps_source / "src" / package).is_dir():
+            raise BuildError(
+                f"LAMMPS package {package} is not present in {lammps_source / 'src'}"
+            )
+        normalized.add(package)
+    return tuple(sorted(normalized))
+
+
+def parse_lammps_cmake_definitions(values: tuple[str, ...]) -> dict[str, str]:
+    definitions: dict[str, str] = {}
+    for requested in values:
+        name, separator, value = requested.partition("=")
+        if not separator or not name or not value:
+            raise BuildError(
+                f"invalid LAMMPS CMake definition {requested!r}; expected NAME=VALUE"
+            )
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.+-]*", name):
+            raise BuildError(f"invalid LAMMPS CMake variable name: {name}")
+        if name in definitions:
+            raise BuildError(f"duplicate LAMMPS CMake definition: {name}")
+        definitions[name] = value
     return definitions
 
 
@@ -235,6 +342,7 @@ def symmetrix_source_fingerprint(repo_root: Path) -> str:
         repo_root / "symmetrix/CMakeLists.txt",
         repo_root / "symmetrix/pyproject.toml",
         repo_root / "pair_symmetrix/install.sh",
+        repo_root / "tools/mpi_gpu_aware_probe.cpp",
         *sorted((repo_root / "pair_symmetrix").glob("*.h")),
         *sorted((repo_root / "pair_symmetrix").glob("*.cpp")),
     ]
@@ -310,7 +418,7 @@ def lammps_source_provenance(
         "src/KOKKOS/pair_symmetrix_mace_kokkos.h",
         "src/KOKKOS/pair_symmetrix_mace_kokkos.cpp",
     }
-    for source_root in (source / "src", source / "cmake", source / "lib/kokkos"):
+    for source_root in (source / "src", source / "cmake", source / "lib"):
         if not source_root.is_dir():
             continue
         for path in sorted(source_root.rglob("*")):
@@ -367,6 +475,10 @@ def lammps_build_invocation(
     runner: CommandRunner,
     build_root: str | Path | None = None,
     force_new: bool = False,
+    require_gpu_aware_mpi: bool = False,
+    lammps_packages: tuple[str, ...] = (),
+    extra_cmake_definitions: tuple[str, ...] = (),
+    materialize: bool = True,
 ) -> LammpsInvocation:
     if jobs < 1:
         raise BuildError("--jobs must be positive")
@@ -374,17 +486,42 @@ def lammps_build_invocation(
     lammps_source, version = validate_lammps_source(
         source, require_nvcc_wrapper=manifest.backend == "cuda"
     )
+    packages = normalize_lammps_packages(lammps_packages, lammps_source)
+    extra_definitions = parse_lammps_cmake_definitions(extra_cmake_definitions)
     install_prefix = Path(prefix).expanduser().resolve()
-    mpi_enabled, selected_mpi, mpi_identity = _mpi_configuration(mpi, mpi_cxx, runner)
+    if require_gpu_aware_mpi and manifest.backend not in {"cuda", "hip"}:
+        raise BuildError("GPU-aware MPI can only be required for CUDA or HIP builds")
+    if require_gpu_aware_mpi and mpi == "off":
+        raise BuildError("--require-gpu-aware-mpi contradicts --mpi off")
+    mpi_policy = "on" if require_gpu_aware_mpi else mpi
+    mpi_enabled, selected_mpi, mpi_identity = _mpi_configuration(
+        mpi_policy, mpi_cxx, runner
+    )
+    gpu_aware_mpi = (
+        probe_mpi_gpu_awareness(manifest.backend, selected_mpi, root, runner)
+        if require_gpu_aware_mpi
+        else {"required": False, "status": "not_checked"}
+    )
+    definitions = lammps_cmake_definitions(
+        manifest,
+        prefix=install_prefix,
+        mpi_enabled=mpi_enabled,
+        mpi_cxx=selected_mpi,
+        lammps_source=lammps_source,
+        packages=packages,
+        extra_definitions=extra_definitions,
+    )
     provenance = {
         "target_fingerprint": manifest.fingerprint,
         "symmetrix": symmetrix_source_provenance(root, runner),
         "lammps": lammps_source_provenance(lammps_source, version, runner),
         "install_prefix": str(install_prefix),
+        "cmake_definitions": definitions,
         "mpi": {
             "enabled": mpi_enabled,
             "cxx": selected_mpi,
             "identity": mpi_identity,
+            "gpu_aware": gpu_aware_mpi,
         },
     }
     fingerprint = _lammps_build_fingerprint(provenance)
@@ -395,18 +532,13 @@ def lammps_build_invocation(
     build_directory, reusable_qualification = _select_build_directory(
         base_directory, force_new
     )
-    manifest_path = prepare_build_directory(build_directory, manifest)
+    manifest_path = build_directory / "symmetrix-target.json"
+    if materialize:
+        manifest_path = prepare_build_directory(build_directory, manifest)
 
     installer = root / "pair_symmetrix/install.sh"
     if not installer.is_file():
         raise BuildError(f"pair_symmetrix installer is missing: {installer}")
-    definitions = lammps_cmake_definitions(
-        manifest,
-        prefix=install_prefix,
-        mpi_enabled=mpi_enabled,
-        mpi_cxx=selected_mpi,
-        lammps_source=lammps_source,
-    )
     configure = [
         manifest.toolchain.cmake,
         "-S",
@@ -438,9 +570,10 @@ def lammps_build_invocation(
         "provenance": provenance,
         "commands": commands,
     }
-    (build_directory / "lammps-invocation.json").write_text(
-        json.dumps(record, indent=2, sort_keys=True) + "\n"
-    )
+    if materialize:
+        (build_directory / "lammps-invocation.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n"
+        )
     return LammpsInvocation(
         commands,
         environment,
@@ -452,6 +585,7 @@ def lammps_build_invocation(
         provenance,
         build_directory / "qualification.json",
         reusable_qualification,
+        packages,
     )
 
 
@@ -495,6 +629,13 @@ def verify_lammps(
     for style in ("symmetrix/mace", "symmetrix/mace/kk"):
         if style not in result.output:
             raise BuildError(f"installed LAMMPS does not report pair style {style}")
+    installed_packages = _installed_lammps_packages(result.output)
+    missing_packages = sorted(set(invocation.requested_packages) - installed_packages)
+    if missing_packages:
+        raise BuildError(
+            "installed LAMMPS does not report requested package(s): "
+            + ", ".join(missing_packages)
+        )
     sha256 = hashlib.sha256(invocation.executable.read_bytes()).hexdigest()
     installed = TargetManifest.read(invocation.installed_manifest_path)
     return {
@@ -504,7 +645,30 @@ def verify_lammps(
         "provenance": invocation.provenance,
         "target_manifest": str(invocation.installed_manifest_path),
         "target_fingerprint": installed.fingerprint,
+        "lammps_packages": sorted(installed_packages),
     }
+
+
+def _installed_lammps_packages(help_output: str) -> set[str]:
+    lines = help_output.splitlines()
+    try:
+        start = next(
+            index
+            for index, line in enumerate(lines)
+            if line.strip() == "Installed packages:"
+        )
+    except StopIteration:
+        return set()
+    packages: set[str] = set()
+    started = False
+    for line in lines[start + 1 :]:
+        if not line.strip():
+            if started:
+                break
+            continue
+        started = True
+        packages.update(line.split())
+    return packages
 
 
 def reuse_lammps_qualification(
