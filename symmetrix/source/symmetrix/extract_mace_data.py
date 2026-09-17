@@ -289,8 +289,8 @@ def _extract_single_head_data(
     model: str / Path
         path to pytorch model file
     species: list(int / str), default None
-        list of atomic numbers or chemical symbols to extract for legacy
-        standard-MACE models. MACE_Nonlinear models reject nonempty subsets;
+        list of atomic numbers or chemical symbols to extract for standard-MACE
+        models. MACE_Nonlinear models reject nonempty subsets;
         if omitted, retain every element supported by the checkpoint.
     head: str, default None
         head to keep, if multihead model, default same as mace.tools.scripts_utils.remove_pt_head
@@ -298,7 +298,8 @@ def _extract_single_head_data(
         number of spline points to approximate various functions
     radial_format: str, default "compact"
         compact stores the shared radial model and materializes splines for
-        active compositions at runtime. pair-splines stores legacy pair tables.
+        active compositions at runtime. pair-splines stores the original
+        Symmetrix format (named v1 here) with pair tables.
 
     Returns
     -------
@@ -319,7 +320,8 @@ def _extract_single_head_data(
         raise ValueError("Compact radial output requires at least 4 spline points.")
     if radial_format == "pair-splines":
         logging.warning(
-            "Generating legacy Symmetrix format-v1 pair-spline data. "
+            "Generating the original Symmetrix pair-spline format "
+            "(named v1 here). "
             "Use radial_format='compact' for the optimized format-v2 runtime."
         )
 
@@ -360,7 +362,7 @@ def _extract_single_head_data(
         if radial_format != "compact":
             raise ValueError(
                 "MACE_Nonlinear models require the format-version-3 compact schema; "
-                "pair-splines is only available for legacy MACE interactions."
+                "pair-splines is only available for standard MACE interactions."
             )
         from .extract_mace_nonlinear import extract_mace_nonlinear_data
 
@@ -369,7 +371,7 @@ def _extract_single_head_data(
     if species is None:
         species = []
 
-    # Legacy standard-MACE extraction retains its existing species-selection
+    # Standard-MACE extraction retains its existing species-selection
     # behavior. The nonlinear branch above has already enforced its full domain.
     atomic_numbers = []
     for sp in species:
@@ -1711,7 +1713,7 @@ def extract_mace_data(
 ):
     """Extract a checkpoint while retaining every compatible prediction head.
 
-    A single-head checkpoint keeps the legacy flat JSON layout. For a
+    A single-head checkpoint keeps the original flat JSON layout. For a
     multi-head checkpoint, ``head`` chooses the declared default; all heads are
     stored in ``prediction_heads`` and the default payload is also retained at
     top level for compatibility with older Symmetrix loaders.

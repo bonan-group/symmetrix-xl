@@ -409,7 +409,7 @@ def test_macefield_extractor_retains_legacy_pair_splines(
     assert len(data["radial_spline_values_1"]) == 3
     assert len(data["A0_spline_values"]) == 3
     assert len(data["A1_spline_values"]) == 3
-    assert "Generating legacy Symmetrix format-v1" in caplog.text
+    assert "original Symmetrix pair-spline format (named v1 here)" in caplog.text
 
 
 @pytest.mark.skipif(

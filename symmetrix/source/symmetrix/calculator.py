@@ -559,7 +559,8 @@ class Symmetrix(Calculator):
         execution without an R1 stage, although capacity planning may still
         specialize those operators.
         ``non-compiled`` is an explicit compiler-free fallback with no
-        performance guarantee. ``materialized`` is a frozen legacy mode.
+        performance guarantee. ``materialized`` is the original Symmetrix
+        execution mode used by the original format (named v1 here).
         The old ``generic`` and ``all_interactions`` spellings remain accepted
         as deprecated aliases. ``factorized`` and ``direct_streamed`` alias
         ``direct`` and preserve the former throughput behavior by changing an
@@ -1026,7 +1027,7 @@ class Symmetrix(Calculator):
         ):
             warnings.warn(
                 f"streamed_edges='{canonical_streamed_edges}' is unavailable "
-                "for legacy format-v1 pair-spline models; using "
+                "for the original Symmetrix pair-spline format (named v1 here); using "
                 "streamed_edges='materialized'. Re-export with "
                 "radial_format='compact' to enable streamed execution.",
                 RuntimeWarning,
@@ -1034,7 +1035,7 @@ class Symmetrix(Calculator):
             )
             canonical_streamed_edges = "materialized"
             self.streamed_edges_resolution_reason = (
-                "legacy format-v1 model selected materialized execution"
+                "original Symmetrix format selected materialized execution"
             )
             self.low_memory_request = False
 
@@ -1100,7 +1101,7 @@ class Symmetrix(Calculator):
                 else:
                     canonical_streamed_edges = "materialized"
                     self.streamed_edges_resolution_reason = (
-                        "auto selected materialized for a legacy model"
+                        "auto selected materialized for an original Symmetrix model"
                     )
             self.evaluator.set_streamed_edges(canonical_streamed_edges)
             selected_streamed_edges = self.evaluator.streamed_edges_mode

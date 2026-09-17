@@ -16,7 +16,8 @@ inline nlohmann::json select_prediction_head(
         if (!requested_head.empty() && requested_head != legacy_head) {
             if (legacy_head.empty())
                 throw std::invalid_argument(
-                    "This legacy Symmetrix JSON does not identify a prediction head.");
+                    "This JSON in the original Symmetrix format (named v1 here) does "
+                    "not identify a prediction head.");
             throw std::invalid_argument(
                 "Requested prediction head '" + requested_head
                 + "' is unavailable; the JSON contains '" + legacy_head + "'.");

@@ -30,7 +30,9 @@ The benchmark uses direct execution and the capacity profile, defaults to
 FP32, and reports median `us/atom` and atoms per second. `--model` accepts a
 local checkpoint or extracted JSON path, as well as a name recognized by
 MACE's `mace_mp` downloader. Symmetrix-XL caches a compact extraction restricted
-to the benchmark species and reuses it on subsequent runs. When the original
+to the benchmark species and reuses it on subsequent runs. This workload-local
+benchmark cache is not the recommended deployment export; retain the full
+checkpoint species domain as described in {doc}`models`. When the original
 checkpoint and MACE-Torch are available, an untimed reference evaluation also
 validates energy, forces, and stress; JSON-only inputs report an explicit skip.
 Adjust `--dtype`, `--threads`, `--warmups`, and `--repeats` for a qualification run.

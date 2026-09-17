@@ -1,6 +1,7 @@
 """Serialization for MACE nonlinear-residual interaction models.
 
-The legacy Symmetrix JSON schema stores a heavily fused two-layer MACE graph.
+The original Symmetrix JSON schema (named v1 here) stores a heavily fused
+two-layer MACE graph.
 `RealAgnosticResidualNonLinearInteractionBlock` has a different differentiable
 graph, so this module records its e3nn metadata and learned tensors directly.
 """

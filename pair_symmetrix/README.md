@@ -27,7 +27,7 @@ the first-class Kokkos direct path requires the matching prepared host or
 device R1 artifact described below. Single-layer models do not require R1
 artifacts.
 
-Without `head NAME`, the JSON's declared default head is used. Legacy
+Without `head NAME`, the JSON's declared default head is used. Original
 single-head JSON files use their existing behavior.
 
 The final `Sr Ti O` assumes that Sr, Ti, and O correspond to LAMMPS
@@ -36,10 +36,10 @@ different input with another element mapping; active radial tables are built
 once during `pair_coeff` for that mapping.
 
 Compact universal files use Symmetrix-XL format version 2 and require an updated
-pair style. Existing unversioned version 1 JSON remains supported. When an
-artifact must also work with an older Symmetrix-XL/LAMMPS installation, generate
-it with `symmetrix_extract_mace --radial-format pair-splines` and an explicit
-element subset.
+pair style. The original Symmetrix format (named v1 here), which was
+unversioned, remains supported. When an artifact must also work with an older
+Symmetrix-XL/LAMMPS installation, generate it with `symmetrix_extract_mace
+--radial-format pair-splines` and an explicit element subset.
 
 Format-version-3 `MACE_Nonlinear` models, including MACE-MH-1, are currently
 supported by the Python ASE calculator and native library only. Both LAMMPS
@@ -65,10 +65,10 @@ temporary compatibility alias, along with `all_interactions -> generic`,
 `factorized -> direct`, and `direct_streamed -> direct`.
 The default `auto` mode selects `direct` only when a `jit_host_artifact` or
 `jit_device_artifact` is provided; otherwise it selects `generic` for compact
-format-version-2 models and retains `materialized` for version-1 pair-spline
-models. Loading version 1 prints a migration warning; explicit mode selections
-override `auto`. The serial pair style applies the same format-aware default
-automatically.
+format-version-2 models and retains `materialized` for original Symmetrix
+pair-spline models (named v1 here). Loading this format prints a migration
+notice; explicit mode selections override `auto`. The serial pair style applies
+the same format-aware default automatically.
 
 `direct` supports both `no_domain_decomposition` and the default
 `mpi_message_passing` domain-decomposition mode. The MPI path computes the
@@ -196,10 +196,17 @@ be performed together on the target GPU:
 
 ```bash
 symmetrix_extract_mace --model mace-omat-0-medium.model \
-    --chemical-symbols Sr Ti O \
     --output srtio3-mace.json \
     --prepare-jit-device-artifact
 ```
+
+This produces the preferred universal format-v2 JSON. Its compact radial model
+is shared across the checkpoint's element domain rather than expanded into
+pair-specific spline tables, so the same file can be mapped to different LAMMPS
+type compositions without quadratic pair-table growth. The file still contains
+the checkpoint's element-indexed learned parameters. Use an explicit element
+subset only for a deliberately restricted deployment or an export in the
+original Symmetrix pair-spline format (named v1 here).
 
 This prepares both FP32 and FP64 artifact sets in one Kokkos runtime session.
 Its JSON array labels each result with `precision`, the R1 `artifact_path`, and

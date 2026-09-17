@@ -586,7 +586,9 @@ def test_legacy_pair_spline_models_warn_and_default_to_legacy(
     use_kokkos,
     dtype,
 ):
-    with pytest.warns(UserWarning, match="format-v1.*streamed_edges='materialized'"):
+    with pytest.warns(
+        UserWarning, match="named v1 here.*streamed_edges='materialized'"
+    ):
         calculator = Symmetrix(
             legacy_standard_model_path,
             use_kokkos=use_kokkos,
@@ -610,7 +612,7 @@ def test_legacy_pair_spline_float32_matches_float64(
     for dtype in ("float64", "float32"):
         atoms = _small_structure()
         with pytest.warns(
-            UserWarning, match="format-v1.*streamed_edges='materialized'"
+            UserWarning, match="named v1 here.*streamed_edges='materialized'"
         ):
             atoms.calc = Symmetrix(
                 legacy_standard_model_path,

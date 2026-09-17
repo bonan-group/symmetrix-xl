@@ -19,9 +19,22 @@ converter dependency:
 uv pip install mace-torch
 symmetrix_extract_mace \
     --model mace-omat-0-medium.model \
-    --chemical-symbols Sr Ti O \
     --output srtio3-mace.json
 ```
+
+Omitting `--chemical-symbols` and `--atomic-numbers` produces the preferred
+universal export and retains the checkpoint's complete element domain. Compact
+format v2 stores the shared radial model once with element-indexed parameters,
+and format v3 uses the same full-domain principle for nonlinear MACE models.
+Unlike the original Symmetrix pair-spline format (named v1 here), these formats
+do not add a separate radial spline table for every element pair, avoiding
+quadratic pair-table growth. A
+universal file still contains the checkpoint's element-indexed learned
+parameters and can therefore be larger than a deliberately restricted v2
+subset, but it can be reused across compositions. Use an explicit element
+subset only for an intentionally restricted format-v2 deployment or when
+producing the original Symmetrix format with `--radial-format pair-splines`;
+format-v3 models reject subsets.
 
 The command retains all compatible prediction heads. It does not download a
 model; obtain a checkpoint from its model provider, then use the resulting JSON

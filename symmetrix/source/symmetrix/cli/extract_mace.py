@@ -15,14 +15,20 @@ def main(argv=None):
         "-Z",
         "-z",
         nargs="+",
-        help="Atomic numbers to extract.",
+        help=(
+            "Optional restricted format-v2 or original Symmetrix pair-spline "
+            "element subset; omit for the preferred universal compact export."
+        ),
         default=[],
     )
     group.add_argument(
         "--chemical-symbols",
         "-s",
         nargs="+",
-        help="Chemical symbols to extract.",
+        help=(
+            "Optional restricted format-v2 or original Symmetrix pair-spline "
+            "element subset; omit for the preferred universal compact export."
+        ),
         default=[],
     )
     parser.add_argument(
@@ -35,7 +41,10 @@ def main(argv=None):
         "--radial-format",
         choices=("compact", "pair-splines"),
         default="compact",
-        help="Radial representation. Compact supports universal artifacts; pair-splines is legacy.",
+        help=(
+            "Radial representation. Compact supports universal artifacts; "
+            "pair-splines writes the original Symmetrix format (named v1 here)."
+        ),
     )
     parser.add_argument(
         "--num-spline-points",

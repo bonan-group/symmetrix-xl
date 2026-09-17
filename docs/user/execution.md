@@ -60,8 +60,9 @@ print(calc.execution_plan)  # MH-0 graph-time report
 `capacity` and `speed`. `generic` is a deprecated alias for `non-compiled`;
 `factorized` and `direct_streamed` alias `direct` and change an
 otherwise-`capacity` request to the old `speed` behavior. Use literal `direct`
-for capacity behavior. `materialized` is the frozen legacy path. The public
-mode and backend matrix is in
+for capacity behavior. `materialized` is the original Symmetrix execution path
+used by the original Symmetrix model format (named v1 here). The public mode and
+backend matrix is in
 {doc}`/reference/execution_support_matrix`; implementation architecture is
 described in {doc}`/streamed_edge_execution`.
 

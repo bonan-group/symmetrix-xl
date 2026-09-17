@@ -1,6 +1,6 @@
 # Symmetrix-XL
 
-[![CI](https://github.com/bonan-group/symmetrix-xl/actions/workflows/ci.yaml/badge.svg)](https://github.com/bonan-group/symmetrix-xl/actions/workflows/ci.yaml?branch=main)
+[![CI](https://github.com/bonan-group/symmetrix-xl/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/bonan-group/symmetrix-xl/actions/workflows/ci.yaml?query=branch%3Amain)
 [![Documentation](https://github.com/bonan-group/symmetrix-xl/actions/workflows/docs-pages.yaml/badge.svg)](https://bonan-group.github.io/symmetrix-xl/)
 
 In Symmetrix-XL, **XL** stands for **eXtreme scale, Low latency**.
@@ -108,8 +108,16 @@ symmetrix_extract_mace \
     --model mace-omat-0-medium.model \
     --output mace-omat-0-medium.json
 ```
-Use `--chemical-symbols Sr Ti O` to retain only selected elements. This creates
-a smaller JSON file but cannot evaluate systems containing other elements.
+
+The default is the preferred universal compact export, retaining every element
+supported by the checkpoint. Compact format v2 stores the shared radial model
+once instead of generating pair-specific spline tables, while format v3 also
+retains the complete checkpoint domain. Universal compact files therefore
+avoid quadratic pair-table growth and can be reused across compositions; they
+still include the checkpoint's element-indexed learned parameters. Element
+selectors are intended only for deliberately restricted format-v2 deployments
+or exports in the original Symmetrix pair-spline format (named v1 here);
+format-v3 models reject subsets.
 
 Run an energy, force, or stress calculation with ASE:
 

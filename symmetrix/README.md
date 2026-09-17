@@ -149,9 +149,17 @@ Install the optional converter dependencies and export a checkpoint:
 python -m pip install "symmetrix-xl[mace]"
 symmetrix_extract_mace \
     --model mace-omat-0-medium.model \
-    --chemical-symbols Sr Ti O \
     --output srtio3-mace.json
 ```
+
+Universal compact exports are preferred. By omitting `--chemical-symbols` and
+`--atomic-numbers`, format v2 retains the checkpoint's complete element domain
+without generating the per-element-pair spline tables used by the original
+Symmetrix format (named v1 here). Format-v3 nonlinear MACE exports likewise
+retain the complete domain and do not support element subsets. Universal files
+still contain the checkpoint's element-indexed learned parameters. Use a subset
+only for an intentionally restricted format-v2 deployment or an original-format
+`--radial-format pair-splines` file.
 
 The converter retains all compatible prediction heads. Use `--head` to select
 the default head without discarding the others:
@@ -159,7 +167,6 @@ the default head without discarding the others:
 ```bash
 symmetrix_extract_mace \
     --model MACEField-MH-0-omat-dielectric.model \
-    --chemical-symbols Sr Ti O \
     --head mp-dielectric \
     --output srtio3-macefield.json
 ```

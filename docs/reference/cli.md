@@ -18,7 +18,11 @@ Artifact preparation commands are exposed as `symmetrix_prepare_jit_host_artifac
 and `symmetrix_prepare_jit_device_artifact`. The converter is
 `symmetrix_extract_mace --model MODEL [--output PATH]`; it accepts species,
 head, compact/pair-spline format, and device-artifact preparation options and
-requires the optional `symmetrix-xl[mace]` dependencies.
+requires the optional `symmetrix-xl[mace]` dependencies. Omitting the species
+options creates the preferred universal compact export. Explicit species
+selection is limited to restricted format-v2 exports or the original Symmetrix
+pair-spline format (named v1 here); format-v3 nonlinear models always retain
+the complete checkpoint domain.
 `symmetrix_calibrate_kernel_launch` explicitly calibrates bounded GPU launch
 profiles for a model and structure; normal `kernel_launch_policy="automatic"`
 execution consumes a compatible calibration record but does not benchmark.

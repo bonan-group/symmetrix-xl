@@ -392,7 +392,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
   if (!mace->supports_streamed_edges() && comm->me == 0)
     error->warning(
       FLERR,
-      "Loaded legacy Symmetrix format-v1 pair-spline model; using streamed_edges='materialized'. "
+      "Loaded the original Symmetrix pair-spline format (named v1 here); using streamed_edges='materialized'. "
       "Re-export with radial_format='compact' to enable streamed_edges='generic' execution.");
   if (comm->me == 0)
     utils::logmesg(

@@ -7,7 +7,7 @@ storage policies, and historical selector names are not separate public modes.
 |---|---|---|---|---|
 | `direct` | Compact standard MACE and MACEField with admitted contracts; compatible compact MACE-MH-1 | Serial, OpenMP, CUDA, HIP | Standard two-interaction MACE/MACEField requires an R1 artifact; single-layer standard MACE runs without R1 specialization, but capacity may specialize M0/R0; MACE-MH-1 requires its generated program | Standard MACE and MACEField; R1 artifact required for two-interaction models, but not single-layer models; MACE-MH-1 is not supported |
 | `non-compiled` | Compact standard MACE and MACEField; compatible compact MACE-MH-1 | Serial, OpenMP, CUDA, HIP | None | Standard MACE and MACEField |
-| `materialized` | Legacy format-v1 models and retained numerical controls | Serial, OpenMP, CUDA, HIP | None | Legacy and supported standard MACE/MACEField controls |
+| `materialized` | Models in the original Symmetrix format (named v1 here) and retained numerical controls | Serial, OpenMP, CUDA, HIP | None | Original Symmetrix and supported standard MACE/MACEField controls |
 | `auto` | Compatibility request resolved from model format and evaluator capability | As resolved above | As resolved above | Format-aware compatibility default |
 
 The non-Kokkos evaluator selected by `use_kokkos=False` does not provide

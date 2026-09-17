@@ -42,7 +42,7 @@ The supported public spellings are:
 |---|---|
 | `direct` | Default prepared execution; two-interaction models require a matching R1 specialization, while admitted single-layer models use prepared R0/M0 execution without an R1 specialization. Capacity may still specialize their M0/R0 operators. |
 | `non-compiled` | Compiler-free compatibility and diagnostic path; no performance guarantee. |
-| `materialized` | Frozen legacy path, principally for legacy model formats and numerical controls. |
+| `materialized` | Original Symmetrix execution path, principally for the original Symmetrix model format (named v1 here) and retained numerical controls. |
 | `auto` | Temporary compatibility request resolved from model and evaluator capability. |
 
 `generic` and `all_interactions` are deprecated aliases for `non-compiled`.
