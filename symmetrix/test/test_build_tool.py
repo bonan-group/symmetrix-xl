@@ -39,6 +39,7 @@ lammps_cmake_definitions = build_lammps.lammps_cmake_definitions
 lammps_build_invocation = build_lammps.lammps_build_invocation
 lammps_source_provenance = build_lammps.lammps_source_provenance
 parse_lammps_version = build_lammps.parse_lammps_version
+probe_mpi_gpu_awareness = build_lammps.probe_mpi_gpu_awareness
 reuse_lammps_qualification = build_lammps.reuse_lammps_qualification
 run_lammps_build = build_lammps.run_lammps_build
 symmetrix_source_fingerprint = build_lammps.symmetrix_source_fingerprint
@@ -127,11 +128,13 @@ def _manifest(backend="cpu", target="native"):
     )
 
 
-def _lammps_source(root, *, with_wrapper=False, version="10 Dec 2025"):
+def _lammps_source(root, *, with_wrapper=False, version="10 Dec 2025", packages=()):
     (root / "src/KOKKOS").mkdir(parents=True)
     (root / "cmake").mkdir()
     (root / "src/version.h").write_text(f'#define LAMMPS_VERSION "{version}"\n')
     (root / "cmake/CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.27)\n")
+    for package in packages:
+        (root / "src" / package).mkdir()
     if with_wrapper:
         wrapper = root / "lib/kokkos/bin/nvcc_wrapper"
         wrapper.parent.mkdir(parents=True)
@@ -877,6 +880,186 @@ def test_mpi_wrapper_validation_preserves_basename_sensitive_symlink(tmp_path):
     assert identity == "Open MPI 4.1.7"
 
 
+class MpiProbeRunner:
+    def __init__(self, output, returncode=0):
+        self.output = output
+        self.returncode = returncode
+
+    def which(self, _command):
+        return None
+
+    def run(self, args, **_kwargs):
+        normalized = tuple(os.fspath(value) for value in args)
+        if normalized[-1] in {"--showme:version", "--version"}:
+            return CommandResult(normalized, 0, "Open MPI test provider\n", "")
+        if "-o" in normalized:
+            Path(normalized[-1]).write_text("probe executable\n")
+            return CommandResult(normalized, 0, "", "")
+        return CommandResult(normalized, self.returncode, self.output, "")
+
+
+@pytest.mark.parametrize(
+    ("backend", "accelerator", "method"),
+    (
+        ("cuda", "cuda", "MPIX_Query_cuda_support"),
+        ("hip", "rocm", "MPIX_Query_rocm_support"),
+    ),
+)
+def test_gpu_aware_mpi_probe_records_positive_provider_query(
+    backend, accelerator, method
+):
+    runner = MpiProbeRunner(f"method={method} compile_time=1 runtime=1\n")
+
+    evidence = probe_mpi_gpu_awareness(
+        backend, "/opt/mpi/bin/mpicxx", REPOSITORY_ROOT, runner
+    )
+
+    assert evidence == {
+        "required": True,
+        "accelerator": accelerator,
+        "method": method,
+        "compile_time_support": True,
+        "runtime_support": True,
+        "status": "supported",
+    }
+
+
+def test_gpu_aware_mpi_probe_matches_lammps_runtime_query():
+    runner = MpiProbeRunner("method=MPIX_Query_cuda_support compile_time=0 runtime=1\n")
+
+    evidence = probe_mpi_gpu_awareness(
+        "cuda", "/opt/mpi/bin/mpicxx", REPOSITORY_ROOT, runner
+    )
+
+    assert evidence["compile_time_support"] is False
+    assert evidence["runtime_support"] is True
+    assert evidence["status"] == "supported"
+
+
+def test_gpu_aware_mpi_requirement_implies_mpi_and_records_evidence(tmp_path):
+    wrapper = _executable(tmp_path / "mpicxx")
+    runner = MpiProbeRunner("method=MPIX_Query_cuda_support compile_time=1 runtime=1\n")
+
+    invocation = lammps_build_invocation(
+        _manifest("cuda", "sm120"),
+        repo_root=REPOSITORY_ROOT,
+        source=_lammps_source(tmp_path / "lammps", with_wrapper=True),
+        prefix=tmp_path / "prefix",
+        mpi="auto",
+        mpi_cxx=wrapper,
+        require_gpu_aware_mpi=True,
+        jobs=1,
+        runner=runner,
+        build_root=tmp_path / "build",
+    )
+
+    mpi = invocation.provenance["mpi"]
+    assert mpi["enabled"] is True
+    assert mpi["cxx"] == wrapper
+    assert mpi["identity"] == "Open MPI test provider"
+    assert mpi["gpu_aware"]["status"] == "supported"
+    configure = invocation.commands[1]
+    assert "-DBUILD_MPI=ON" in configure
+    assert f"-DMPI_CXX_COMPILER={wrapper}" in configure
+
+
+def test_gpu_aware_mpi_probe_rejects_host_only_provider():
+    runner = MpiProbeRunner(
+        "method=MPIX_Query_cuda_support compile_time=0 runtime=0\n",
+        returncode=3,
+    )
+
+    with pytest.raises(BuildError, match="does not provide CUDA-aware MPI"):
+        probe_mpi_gpu_awareness("cuda", "/opt/mpi/bin/mpicxx", REPOSITORY_ROOT, runner)
+
+
+def test_gpu_aware_mpi_probe_rejects_wrong_provider_query():
+    runner = MpiProbeRunner("method=MPIX_Query_rocm_support compile_time=1 runtime=1\n")
+
+    with pytest.raises(BuildError, match="does not provide CUDA-aware MPI"):
+        probe_mpi_gpu_awareness("cuda", "/opt/mpi/bin/mpicxx", REPOSITORY_ROOT, runner)
+
+
+def test_gpu_aware_mpi_requirement_rejects_cpu_build(tmp_path):
+    with pytest.raises(BuildError, match="only be required for CUDA or HIP"):
+        lammps_build_invocation(
+            _manifest(),
+            repo_root=REPOSITORY_ROOT,
+            source=_lammps_source(tmp_path / "lammps"),
+            prefix=tmp_path / "prefix",
+            mpi="auto",
+            mpi_cxx=_executable(tmp_path / "mpicxx"),
+            require_gpu_aware_mpi=True,
+            jobs=1,
+            runner=FakeRunner({}, {}),
+            build_root=tmp_path / "build",
+        )
+
+
+def test_lammps_packages_and_extra_definitions_are_normalized_and_fingerprinted(
+    tmp_path,
+):
+    source = _lammps_source(tmp_path / "lammps", packages=("KSPACE", "EXTRA-PAIR"))
+    arguments = {
+        "repo_root": REPOSITORY_ROOT,
+        "source": source,
+        "prefix": tmp_path / "prefix",
+        "mpi": "off",
+        "mpi_cxx": "",
+        "jobs": 1,
+        "runner": FakeRunner({}, {}),
+        "build_root": tmp_path / "build",
+    }
+
+    invocation = lammps_build_invocation(
+        _manifest(),
+        **arguments,
+        lammps_packages=("kspace", "PKG_EXTRA-PAIR", "KSPACE"),
+        extra_cmake_definitions=("FFT=KISS", "BUILD_SHARED_LIBS=ON"),
+    )
+    baseline = lammps_build_invocation(_manifest(), **arguments)
+
+    assert invocation.requested_packages == ("EXTRA-PAIR", "KSPACE")
+    definitions = invocation.provenance["cmake_definitions"]
+    assert definitions["PKG_EXTRA-PAIR"] == "ON"
+    assert definitions["PKG_KSPACE"] == "ON"
+    assert definitions["FFT"] == "KISS"
+    assert definitions["BUILD_SHARED_LIBS"] == "ON"
+    assert invocation.build_fingerprint != baseline.build_fingerprint
+
+
+@pytest.mark.parametrize(
+    ("packages", "definitions", "message"),
+    (
+        (("MISSING",), (), "package MISSING is not present"),
+        ((), ("PKG_KSPACE=ON",), "PKG_KSPACE is managed"),
+        ((), ("CMAKE_BUILD_TYPE=Debug",), "CMAKE_BUILD_TYPE is managed"),
+        ((), ("Kokkos_ARCH_AMPERE80=ON",), "Kokkos_ARCH_AMPERE80 is managed"),
+        ((), ("Kokkos_ENABLE_OPENMP=ON",), "Kokkos_ENABLE_OPENMP is managed"),
+        ((), ("Kokkos_IMPL_AMDGPU_FLAGS=bad",), "Kokkos_IMPL_AMDGPU_FLAGS is managed"),
+        ((), ("SYMMETRIX_HOST_ARCH=native",), "SYMMETRIX_HOST_ARCH is managed"),
+        ((), ("FFT",), "expected NAME=VALUE"),
+    ),
+)
+def test_lammps_rejects_invalid_package_configuration(
+    tmp_path, packages, definitions, message
+):
+    with pytest.raises(BuildError, match=message):
+        lammps_build_invocation(
+            _manifest(),
+            repo_root=REPOSITORY_ROOT,
+            source=_lammps_source(tmp_path / "lammps"),
+            prefix=tmp_path / "prefix",
+            mpi="off",
+            mpi_cxx="",
+            jobs=1,
+            runner=FakeRunner({}, {}),
+            build_root=tmp_path / "build",
+            lammps_packages=packages,
+            extra_cmake_definitions=definitions,
+        )
+
+
 def test_lammps_source_identity_ignores_installer_block(tmp_path):
     source = _lammps_source(tmp_path / "lammps")
     runner = FakeRunner({}, {})
@@ -891,6 +1074,63 @@ def test_lammps_source_identity_ignores_installer_block(tmp_path):
     after = lammps_source_provenance(source, "10 Dec 2025", runner)
 
     assert after == before
+
+
+def test_lammps_source_identity_includes_bundled_package_libraries(tmp_path):
+    source = _lammps_source(tmp_path / "lammps")
+    library = source / "lib/pace/ace.cpp"
+    library.parent.mkdir(parents=True)
+    library.write_text("int pace_version = 1;\n")
+    runner = FakeRunner({}, {})
+    before = lammps_source_provenance(source, "10 Dec 2025", runner)
+
+    library.write_text("int pace_version = 2;\n")
+
+    assert lammps_source_provenance(source, "10 Dec 2025", runner) != before
+
+
+def test_lammps_dry_run_invocation_does_not_materialize_build_directory(tmp_path):
+    build_root = tmp_path / "build"
+    arguments = {
+        "repo_root": REPOSITORY_ROOT,
+        "source": _lammps_source(tmp_path / "lammps"),
+        "prefix": tmp_path / "prefix",
+        "mpi": "off",
+        "mpi_cxx": "",
+        "jobs": 1,
+        "runner": FakeRunner({}, {}),
+        "build_root": build_root,
+        "materialize": False,
+    }
+
+    first = lammps_build_invocation(_manifest(), **arguments)
+    second = lammps_build_invocation(_manifest(), **arguments)
+
+    assert first.build_directory == second.build_directory
+    assert not build_root.exists()
+
+
+def test_lammps_dry_run_output_is_one_json_document(tmp_path, capsys):
+    invocation = lammps_build_invocation(
+        _manifest(),
+        repo_root=REPOSITORY_ROOT,
+        source=_lammps_source(tmp_path / "lammps"),
+        prefix=tmp_path / "prefix",
+        mpi="off",
+        mpi_cxx="",
+        jobs=1,
+        runner=FakeRunner({}, {}),
+        build_root=tmp_path / "build",
+        materialize=False,
+    )
+
+    build_cli._print_lammps_invocation(invocation)
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["build_directory"] == str(invocation.build_directory)
+    assert output["build_fingerprint"] == invocation.build_fingerprint
+    assert len(output["commands"]) == 4
+    assert output["provenance"] == invocation.provenance
 
 
 def test_symmetrix_source_identity_changes_with_build_source(tmp_path):
@@ -942,6 +1182,41 @@ def test_lammps_qualification_is_verified_and_reused(tmp_path):
     assert reused is not None
     assert reused["reused"] is True
     assert reused["build_fingerprint"] == invocation.build_fingerprint
+
+
+def test_lammps_verification_reports_requested_packages(tmp_path):
+    source = _lammps_source(tmp_path / "lammps", packages=("KSPACE", "EXTRA-PAIR"))
+    runner = FakeRunner(
+        {},
+        {
+            ("lmp", "-help"): (
+                0,
+                "Pair styles: symmetrix/mace symmetrix/mace/kk\n"
+                "Installed packages:\n\n"
+                "EXTRA-PAIR KOKKOS KSPACE\n\n",
+                "",
+            )
+        },
+    )
+    invocation = lammps_build_invocation(
+        _manifest(),
+        repo_root=REPOSITORY_ROOT,
+        source=source,
+        prefix=tmp_path / "prefix",
+        mpi="off",
+        mpi_cxx="",
+        jobs=1,
+        runner=runner,
+        build_root=tmp_path / "build",
+        lammps_packages=("KSPACE", "EXTRA-PAIR"),
+    )
+    invocation.executable.parent.mkdir(parents=True)
+    _executable(invocation.executable)
+    _manifest().write(invocation.installed_manifest_path)
+
+    record = build_lammps.verify_lammps(invocation, runner)
+
+    assert record["lammps_packages"] == ["EXTRA-PAIR", "KOKKOS", "KSPACE"]
 
 
 def test_lammps_stale_qualification_is_invalidated(tmp_path):

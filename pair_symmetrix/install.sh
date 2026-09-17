@@ -55,6 +55,10 @@ ln -sfn -- "$script_dir/pair_symmetrix_mace.h" \
     "$lammps_dir/src/pair_symmetrix_mace.h"
 ln -sfn -- "$script_dir/pair_symmetrix_mace.cpp" \
     "$lammps_dir/src/pair_symmetrix_mace.cpp"
+ln -sfn -- "$script_dir/compute_symmetrix_timing.h" \
+    "$lammps_dir/src/compute_symmetrix_timing.h"
+ln -sfn -- "$script_dir/compute_symmetrix_timing.cpp" \
+    "$lammps_dir/src/compute_symmetrix_timing.cpp"
 ln -sfn -- "$script_dir/pair_symmetrix_mace_kokkos.h" \
     "$lammps_dir/src/KOKKOS/pair_symmetrix_mace_kokkos.h"
 ln -sfn -- "$script_dir/pair_symmetrix_mace_kokkos.cpp" \

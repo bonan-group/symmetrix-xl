@@ -165,6 +165,51 @@ API. They remain zero when LAMMPS uses direct device-buffer pair communication,
 but zero alone is not a positive transport diagnostic because it also occurs
 when no pair communication callback runs.
 
+### Hidden-state communication timing
+
+Hidden-state forward and reverse communication runs inside the pair style, so
+LAMMPS includes it in `Pair` rather than `Comm`. The pair styles maintain
+rank-local cumulative timers for the complete blocking path: packing,
+host/device staging, MPI wait, unpacking, and completion at the existing Kokkos
+fences. They are exposed as
+`symmetrix_mpi_hidden_state_forward_seconds`,
+`symmetrix_mpi_hidden_state_reverse_seconds`,
+`symmetrix_mpi_hidden_state_seconds`, and corresponding `_calls` counters. The
+matching complete pair-style wall time is `symmetrix_pair_seconds`.
+The communication timers add no Kokkos fence. Defining
+`compute symmetrix/timing` enables bounding fences around the complete Kokkos
+pair call so that its device-work denominator is valid; those measurement-only
+fences are absent otherwise, and `symmetrix_pair_seconds` is then not populated.
+
+Executable users can request a rank-correlated summary:
+
+```text
+compute sxt all symmetrix/timing
+timer full
+thermo 1000
+thermo_style custom step atoms c_sxt c_sxt[1] c_sxt[2] c_sxt[3] c_sxt[10]
+thermo_modify colname auto
+run 1000
+```
+
+The scalar `c_sxt` is `SxH1CommPct`, the hidden-state communication percentage on
+the rank with the largest Symmetrix pair time. The first three vector elements
+are `SxPair`, `SxNonComm`, and `SxH1Comm` in
+`us/atom/pair-evaluation`; element 10 is the max/mean rank imbalance. At or above
+50%, hidden-state communication dominates Symmetrix pair evaluation on the
+critical rank. The normalization assumes a fixed atom count during the measured
+run. This is not a percentage of the complete LAMMPS timestep and is not pure
+network latency. See the
+[LAMMPS integration guide](../docs/user/lammps.md#see-whether-communication-dominates)
+for the complete vector schema and interpretation.
+
+The compute requires exactly one Symmetrix pair instance, including under a
+hybrid style. It snapshots counters after the unmeasured setup force evaluation
+and reduces only when queried. Do not put it in per-timestep thermo output for a
+performance measurement; use one query at the end of a warmed measurement
+block. A `run ... every ...` command remains one measurement window. A full new
+run setup starts a new window.
+
 LAMMPS does not run the JIT compiler. Prepare a host artifact in the same
 Symmetrix-XL CPU environment before launching CPU LAMMPS:
 
@@ -293,8 +338,10 @@ same detected backend and architecture policy to LAMMPS:
 ```bash
 python tools/symmetrix_build.py lammps \
     --source /path/to/lammps \
-    --backend auto \
-    --mpi on \
+    --backend cuda --arch sm120 --cuda-root /usr/local/cuda-13.3 \
+    --lammps-package KSPACE --lammps-package EXTRA-PAIR \
+    --lammps-cmake-define FFT=FFTW3 \
+    --require-gpu-aware-mpi \
     --prefix /path/to/install
 ```
 
@@ -310,15 +357,44 @@ provider. A matching qualified executable is verified and reused without
 reconfiguring its CMake cache. Failed or stale attempts retain their logs and
 retry in a fresh directory.
 
-`--mpi on` fails immediately if no MPI C++ wrapper is available. Pass
-`--mpi-cxx /path/to/mpicxx` for a site-specific wrapper. Use `--mpi auto` only
-when falling back to a non-MPI executable is intentional. CPU builds require a
-Fortran compiler and a supported optimized BLAS implementation because the
-KokkosKernels BLAS check uses the Fortran ABI. CUDA and HIP builds use Kokkos
-Serial for host execution and disable Kokkos OpenMP; this is the qualified
-Symmetrix-XL configuration, not a general Kokkos limitation.
+The frontend does not download LAMMPS. `--source` accepts an existing local
+LAMMPS source checkout, not a binary-only installation; build and install
+outputs remain separate under the fingerprinted build directory and `--prefix`.
+Repeat `--lammps-package` to compose Symmetrix with other LAMMPS functionality.
+For example, `KSPACE` enables long-range electrostatics and `EXTRA-PAIR`
+contains `pair_style dispersion/d3`. Repeat `--lammps-cmake-define NAME=VALUE`
+for unmanaged package settings such as `FFT=FFTW3`. Package selections and
+extra definitions are validated and fingerprinted, and the installed executable
+must report every requested package. The frontend retains control of its
+compiler, MPI, Kokkos, architecture, `SYMMETRIX_*`, and `PKG_*` definitions. The
+[LAMMPS integration guide](../docs/user/lammps.md) shows how to compose the
+installed Symmetrix, long-range electrostatics, and D3 styles at runtime.
+
+`--require-gpu-aware-mpi` implies `--mpi on` and fails before CMake unless a
+program compiled by the selected MPI wrapper reports support through
+`MPIX_Query_cuda_support()` or `MPIX_Query_rocm_support()`, matching the query
+used by LAMMPS. Pass `--mpi-cxx /path/to/mpicxx` for a site-specific wrapper.
+The qualification and invocation JSON files record the wrapper, provider, and
+positive query. Use ordinary `--mpi on` when host-staged MPI is intentional;
+use `--mpi auto` only when falling back to a non-MPI executable is acceptable.
+
+The provider query is build-time evidence, not a cross-node transport test. Run
+the installed executable with one MPI rank per GPU in the production module and
+scheduler environment. Keep LAMMPS auto-detection enabled and require the log to
+contain no `Turning off GPU-aware MPI since it is not detected` warning. Do not
+force `-pk kokkos gpu/aware on` as a substitute for that check. See the
+[LAMMPS integration guide](../docs/user/lammps.md) for the qualification command
+and per-rank GPU visibility rules.
+
+CPU builds require a Fortran compiler and a supported optimized BLAS
+implementation because the KokkosKernels BLAS check uses the Fortran ABI. CUDA
+and HIP builds use Kokkos Serial for host execution and disable Kokkos OpenMP;
+this is the qualified Symmetrix-XL configuration, not a general Kokkos
+limitation.
 
 For site module environments and cross-compilation, pass explicit compiler,
 toolkit, MPI-wrapper, generator, and architecture options to the build frontend
 instead of maintaining separate raw CMake recipes. Use `--dry-run` to inspect
-the resolved invocation before starting a build.
+the resolved invocation before starting a build. A dry run performs preflight
+checks without creating a build directory and emits one JSON document with the
+commands, environment, fingerprint, and provenance.

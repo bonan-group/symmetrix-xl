@@ -24,8 +24,10 @@
 #include "memory.h"
 #include "neigh_list.h"
 #include "neighbor.h"
+#include "platform.h"
 
 #include <algorithm>
+#include <cstring>
 #include <numeric>
 
 using namespace LAMMPS_NS;
@@ -65,6 +67,9 @@ PairSymmetrixMACE::~PairSymmetrixMACE()
 
 void PairSymmetrixMACE::compute(int eflag, int vflag)
 {
+  const bool time_pair = execution_timing_enabled != 0.0;
+  const double pair_start = time_pair ? platform::walltime() : 0.0;
+  execution_pair_evaluation_count += 1.0;
   if (mode == "no_domain_decomposition") {
     compute_no_domain_decomposition(eflag, vflag);
   } else if (mode == "mpi_message_passing") {
@@ -72,6 +77,31 @@ void PairSymmetrixMACE::compute(int eflag, int vflag)
   } else if (mode == "no_mpi_message_passing") {
     compute_no_mpi_message_passing(eflag, vflag);
   }
+  if (time_pair) execution_pair_seconds += platform::walltime() - pair_start;
+}
+
+/* ---------------------------------------------------------------------- */
+
+void *PairSymmetrixMACE::extract(const char *name, int &dim)
+{
+  dim = 0;
+  if (std::strcmp(name,"symmetrix_pair_seconds") == 0)
+    return static_cast<void *>(&execution_pair_seconds);
+  if (std::strcmp(name,"symmetrix_pair_evaluation_count") == 0)
+    return static_cast<void *>(&execution_pair_evaluation_count);
+  if (std::strcmp(name,"symmetrix_timing_enabled") == 0)
+    return static_cast<void *>(&execution_timing_enabled);
+  if (std::strcmp(name,"symmetrix_mpi_hidden_state_forward_seconds") == 0)
+    return static_cast<void *>(&execution_mpi_hidden_state_forward_seconds);
+  if (std::strcmp(name,"symmetrix_mpi_hidden_state_reverse_seconds") == 0)
+    return static_cast<void *>(&execution_mpi_hidden_state_reverse_seconds);
+  if (std::strcmp(name,"symmetrix_mpi_hidden_state_seconds") == 0)
+    return static_cast<void *>(&execution_mpi_hidden_state_seconds);
+  if (std::strcmp(name,"symmetrix_mpi_hidden_state_forward_calls") == 0)
+    return static_cast<void *>(&execution_mpi_hidden_state_forward_calls);
+  if (std::strcmp(name,"symmetrix_mpi_hidden_state_reverse_calls") == 0)
+    return static_cast<void *>(&execution_mpi_hidden_state_reverse_calls);
+  return nullptr;
 }
 
 /* ----------------------------------------------------------------------
@@ -136,6 +166,13 @@ void PairSymmetrixMACE::coeff(int narg, char **arg)
   utils::logmesg(lmp, "Loading MACE model from \'{}\' ... ", arg[2]);
   mace = std::make_unique<MACE>(arg[2], prediction_head);
   utils::logmesg(lmp, "success\n");
+  execution_pair_seconds = 0.0;
+  execution_pair_evaluation_count = 0.0;
+  execution_mpi_hidden_state_forward_seconds = 0.0;
+  execution_mpi_hidden_state_reverse_seconds = 0.0;
+  execution_mpi_hidden_state_seconds = 0.0;
+  execution_mpi_hidden_state_forward_calls = 0.0;
+  execution_mpi_hidden_state_reverse_calls = 0.0;
   if (!mace->supports_streamed_edges() && comm->me == 0)
     error->warning(
       FLERR,
@@ -193,6 +230,9 @@ double PairSymmetrixMACE::init_one(int i, int j)
 
 void PairSymmetrixMACE::init_style()
 {
+  // Compute initialization follows pair initialization, so rebuild the number
+  // of active symmetrix/timing computes for every full LAMMPS initialization.
+  execution_timing_enabled = 0.0;
   if (atom->map_user == atom->MAP_NONE) error->all(FLERR, "symmetrix/mace requires \'atom_modify map [yes|array|hash]\'");
   if (force->newton_pair == 0) error->all(FLERR, "symmetrix/mace requires newton pair on");
 
@@ -495,7 +535,12 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
       H1[i*mace->num_LM*mace->num_channels+k] = mace->H1[ii*mace->num_LM*mace->num_channels+k];
     }
   }
+  const double forward_start = platform::walltime();
   comm->forward_comm(this);
+  const double forward_seconds = platform::walltime() - forward_start;
+  execution_mpi_hidden_state_forward_seconds += forward_seconds;
+  execution_mpi_hidden_state_seconds += forward_seconds;
+  execution_mpi_hidden_state_forward_calls += 1.0;
   mace->H1 = H1;
 
   if (mace->streamed_edges == MACEStreamedEdgesMode::materialized) {
@@ -524,7 +569,12 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
       xyz, r, false, false);
 
   H1_adj = mace->H1_adj;
+  const double reverse_start = platform::walltime();
   comm->reverse_comm(this);
+  const double reverse_seconds = platform::walltime() - reverse_start;
+  execution_mpi_hidden_state_reverse_seconds += reverse_seconds;
+  execution_mpi_hidden_state_seconds += reverse_seconds;
+  execution_mpi_hidden_state_reverse_calls += 1.0;
   mace->H1_adj = H1_adj;
 
   mace->reverse_H1(num_nodes);

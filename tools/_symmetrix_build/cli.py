@@ -218,6 +218,33 @@ def _print_invocation(command: tuple[str, ...], environment: dict[str, str]) -> 
     )
 
 
+def _print_lammps_invocation(invocation: build_lammps.LammpsInvocation) -> None:
+    selected_environment = {
+        name: invocation.environment[name]
+        for name in (
+            "CXX",
+            "CMAKE_BUILD_PARALLEL_LEVEL",
+            "CMAKE_GENERATOR",
+            "CMAKE_PREFIX_PATH",
+            "NVCC_WRAPPER_DEFAULT_COMPILER",
+        )
+        if name in invocation.environment
+    }
+    print(
+        json.dumps(
+            {
+                "build_directory": str(invocation.build_directory),
+                "build_fingerprint": invocation.build_fingerprint,
+                "commands": invocation.commands,
+                "environment": selected_environment,
+                "provenance": invocation.provenance,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
 def _write_qualification(build_directory: Path, value: dict[str, object]) -> None:
     (build_directory / "qualification.json").write_text(
         json.dumps(value, indent=2, sort_keys=True) + "\n"
@@ -338,6 +365,28 @@ def _parser() -> argparse.ArgumentParser:
     lammps.add_argument("--prefix", type=Path, required=True)
     lammps.add_argument("--mpi", choices=("auto", "on", "off"), default="auto")
     lammps.add_argument("--mpi-cxx", type=Path)
+    lammps.add_argument(
+        "--lammps-package",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Enable a LAMMPS package such as KSPACE or EXTRA-PAIR; repeatable.",
+    )
+    lammps.add_argument(
+        "--lammps-cmake-define",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Add an unmanaged LAMMPS CMake definition; repeatable.",
+    )
+    lammps.add_argument(
+        "--require-gpu-aware-mpi",
+        action="store_true",
+        help=(
+            "Require the selected MPI to pass the CUDA/ROCm capability query; "
+            "implies --mpi on."
+        ),
+    )
     return parser
 
 
@@ -455,14 +504,18 @@ def main(argv: list[str] | None = None) -> int:
                 "prefix": args.prefix,
                 "mpi": args.mpi,
                 "mpi_cxx": os.fspath(args.mpi_cxx) if args.mpi_cxx else "",
+                "require_gpu_aware_mpi": args.require_gpu_aware_mpi,
+                "lammps_packages": tuple(args.lammps_package),
+                "extra_cmake_definitions": tuple(args.lammps_cmake_define),
                 "jobs": args.jobs if args.jobs is not None else (os.cpu_count() or 1),
                 "runner": runner,
                 "build_root": args.build_root,
             }
-            invocation = lammps_build_invocation(manifest, **invocation_arguments)
+            invocation = lammps_build_invocation(
+                manifest, **invocation_arguments, materialize=not args.dry_run
+            )
             if args.dry_run:
-                for command in invocation.commands:
-                    _print_invocation(command, invocation.environment)
+                _print_lammps_invocation(invocation)
                 return 0
             record = build_lammps.reuse_lammps_qualification(invocation, runner)
             if record is not None:

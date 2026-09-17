@@ -29,6 +29,7 @@
 #include "neigh_list.h"
 #include "neighbor.h"
 #include "neighbor_kokkos.h"
+#include "platform.h"
 #include "neigh_list_kokkos.h"
 #include "neigh_request.h"
 
@@ -92,6 +93,9 @@ PairSymmetrixMACEKokkos<DeviceType, Precision>::~PairSymmetrixMACEKokkos()
 template<class DeviceType, typename Precision>
 void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute(int eflag, int vflag)
 {
+  const bool time_pair = execution_timing_enabled != 0.0;
+  if (time_pair) Kokkos::fence("Symmetrix timing pair begin");
+  const double pair_start = time_pair ? platform::walltime() : 0.0;
   execution_pair_evaluation_count += 1.0;
   if (mode == "no_domain_decomposition") {
     compute_no_domain_decomposition(eflag, vflag);
@@ -102,6 +106,10 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute(int eflag, int vfla
   }
   if (eflag || vflag) atomKK->modified(execution_space,datamask_modify);
   else atomKK->modified(execution_space,F_MASK);
+  if (time_pair) {
+    Kokkos::fence("Symmetrix timing pair end");
+    execution_pair_seconds += platform::walltime() - pair_start;
+  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -112,6 +120,20 @@ void *PairSymmetrixMACEKokkos<DeviceType, Precision>::extract(const char *name, 
   dim = 0;
   if (std::strcmp(name,"symmetrix_pair_evaluation_count") == 0)
     return static_cast<void *>(&execution_pair_evaluation_count);
+  if (std::strcmp(name,"symmetrix_pair_seconds") == 0)
+    return static_cast<void *>(&execution_pair_seconds);
+  if (std::strcmp(name,"symmetrix_timing_enabled") == 0)
+    return static_cast<void *>(&execution_timing_enabled);
+  if (std::strcmp(name,"symmetrix_mpi_hidden_state_forward_seconds") == 0)
+    return static_cast<void *>(&execution_mpi_hidden_state_forward_seconds);
+  if (std::strcmp(name,"symmetrix_mpi_hidden_state_reverse_seconds") == 0)
+    return static_cast<void *>(&execution_mpi_hidden_state_reverse_seconds);
+  if (std::strcmp(name,"symmetrix_mpi_hidden_state_seconds") == 0)
+    return static_cast<void *>(&execution_mpi_hidden_state_seconds);
+  if (std::strcmp(name,"symmetrix_mpi_hidden_state_forward_calls") == 0)
+    return static_cast<void *>(&execution_mpi_hidden_state_forward_calls);
+  if (std::strcmp(name,"symmetrix_mpi_hidden_state_reverse_calls") == 0)
+    return static_cast<void *>(&execution_mpi_hidden_state_reverse_calls);
   if (std::strcmp(name,"symmetrix_graph_rebuild_count") == 0)
     return static_cast<void *>(&execution_graph_rebuild_count);
   if (std::strcmp(name,"symmetrix_geometry_refresh_count") == 0)
@@ -517,6 +539,12 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
   execution_num_edges = 0;
   execution_topology_fingerprint = 0;
   execution_pair_evaluation_count = 0.0;
+  execution_pair_seconds = 0.0;
+  execution_mpi_hidden_state_forward_seconds = 0.0;
+  execution_mpi_hidden_state_reverse_seconds = 0.0;
+  execution_mpi_hidden_state_seconds = 0.0;
+  execution_mpi_hidden_state_forward_calls = 0.0;
+  execution_mpi_hidden_state_reverse_calls = 0.0;
   execution_graph_rebuild_count = 0.0;
   execution_geometry_refresh_count = 0.0;
   execution_geometry_only_update_count = 0.0;
@@ -593,6 +621,9 @@ double PairSymmetrixMACEKokkos<DeviceType, Precision>::init_one(int i, int j)
 template<class DeviceType, typename Precision>
 void PairSymmetrixMACEKokkos<DeviceType, Precision>::init_style()
 {
+  // Compute initialization follows pair initialization, so rebuild the number
+  // of active symmetrix/timing computes for every full LAMMPS initialization.
+  execution_timing_enabled = 0.0;
   if (atom->map_user == atom->MAP_NONE) error->all(FLERR, "symmetrix/mace/kk requires \'atom_modify map [yes|array|hash]\'");
   if (force->newton_pair == 0) error->all(FLERR, "symmetrix/mace/kk requires newton pair on");
 
@@ -1539,8 +1570,13 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
           communicated_H1(node_indices(ii),LM,k) = mace_H1(ii,LM,k);
         });
       Kokkos::fence();
+      const double forward_start = platform::walltime();
       comm->forward_comm(this);
       Kokkos::fence();
+      const double forward_seconds = platform::walltime() - forward_start;
+      execution_mpi_hidden_state_forward_seconds += forward_seconds;
+      execution_mpi_hidden_state_seconds += forward_seconds;
+      execution_mpi_hidden_state_forward_calls += 1.0;
       mace->continue_factorized_distributed_evaluation(
         H1,
         mace->has_field_coupling
@@ -1548,8 +1584,13 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
           : Kokkos::View<const double*>());
       H1_adj = mace->H1_adj;
       Kokkos::fence();
+      const double reverse_start = platform::walltime();
       comm->reverse_comm(this);
       Kokkos::fence();
+      const double reverse_seconds = platform::walltime() - reverse_start;
+      execution_mpi_hidden_state_reverse_seconds += reverse_seconds;
+      execution_mpi_hidden_state_seconds += reverse_seconds;
+      execution_mpi_hidden_state_reverse_calls += 1.0;
       H1_adj = {};
       mace->finish_factorized_distributed_evaluation();
     }
@@ -1596,8 +1637,13 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
       H1(i,LM,k) = mace_H1(ii,LM,k);
     });
   Kokkos::fence();
+  const double forward_start = platform::walltime();
   comm->forward_comm(this);
   Kokkos::fence();
+  const double forward_seconds = platform::walltime() - forward_start;
+  execution_mpi_hidden_state_forward_seconds += forward_seconds;
+  execution_mpi_hidden_state_seconds += forward_seconds;
+  execution_mpi_hidden_state_forward_calls += 1.0;
   mace->H1 = H1;
   if (mace->has_field_coupling) {
     mace->compute_field_H1(num_h1_nodes, electric_field);
@@ -1636,8 +1682,13 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
   }
   H1_adj = mace->H1_adj;
   Kokkos::fence();
+  const double reverse_start = platform::walltime();
   comm->reverse_comm(this);
   Kokkos::fence();
+  const double reverse_seconds = platform::walltime() - reverse_start;
+  execution_mpi_hidden_state_reverse_seconds += reverse_seconds;
+  execution_mpi_hidden_state_seconds += reverse_seconds;
+  execution_mpi_hidden_state_reverse_calls += 1.0;
   H1_adj = {};
 
   if (mace->has_field_coupling)

@@ -3,6 +3,8 @@ from pathlib import Path
 
 INSTALLER = Path(__file__).resolve().parents[1] / "install.sh"
 PAIR_SOURCES = (
+    "compute_symmetrix_timing.h",
+    "compute_symmetrix_timing.cpp",
     "pair_symmetrix_mace.h",
     "pair_symmetrix_mace.cpp",
     "pair_symmetrix_mace_kokkos.h",

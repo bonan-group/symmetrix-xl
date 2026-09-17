@@ -92,6 +92,13 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   int execution_num_edges = 0;
   std::uint64_t execution_topology_fingerprint = 0;
   double execution_pair_evaluation_count = 0.0;
+  double execution_pair_seconds = 0.0;
+  double execution_timing_enabled = 0.0;
+  double execution_mpi_hidden_state_forward_seconds = 0.0;
+  double execution_mpi_hidden_state_reverse_seconds = 0.0;
+  double execution_mpi_hidden_state_seconds = 0.0;
+  double execution_mpi_hidden_state_forward_calls = 0.0;
+  double execution_mpi_hidden_state_reverse_calls = 0.0;
   double execution_graph_rebuild_count = 0.0;
   double execution_geometry_refresh_count = 0.0;
   double execution_geometry_only_update_count = 0.0;

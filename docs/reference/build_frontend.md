@@ -16,6 +16,21 @@ for the target environment.
 | `sdist` | Stage a self-contained source distribution at the pinned submodule commits. |
 | `lammps` | Integrate `pair_symmetrix` with a specified LAMMPS source and install prefix. |
 
+For accelerator LAMMPS builds, `--require-gpu-aware-mpi` implies `--mpi on` and
+requires the selected wrapper to pass the CUDA or ROCm `MPIX` provider query
+before configuration. The evidence becomes part of the fingerprinted build
+provenance. See {doc}`/user/lammps` for the complete build and runtime
+qualification workflow.
+
+The `lammps` command accepts repeatable `--lammps-package NAME` arguments and
+repeatable `--lammps-cmake-define NAME=VALUE` arguments. Package selections are
+validated against the supplied source tree and installed executable. Both forms
+are recorded in the build provenance and therefore select a distinct build
+directory. The frontend rejects extra definitions in its managed `PKG_*`,
+`Kokkos_*`, and `SYMMETRIX_*` namespaces. `lammps --dry-run` performs preflight
+without creating the selected build directory and emits one JSON document with
+the resolved invocation and provenance.
+
 The command help is the authoritative option reference:
 
 ```bash
