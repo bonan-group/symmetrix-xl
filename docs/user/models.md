@@ -1,9 +1,9 @@
 # Models and Properties
 
-- **MACE** supports energy, per-atom energies, forces, and stress.
-- **MACEField** additionally supports polarization and qualified analytical
-  response properties.
-- **MACE-MH-0** uses the ordinary direct execution planner.
+- **Standard MACE**, including MACE-MH-0, supports energy, free energy,
+  per-atom energies, forces, and stress through the ordinary direct execution
+  planner.
+- **MACEField** adds polarization and qualified analytical response properties.
 - **MACE-MH-1** supports generated direct execution for admitted nonlinear
   contracts. Its matching graph-time execution-plan resolver is still pending.
 
