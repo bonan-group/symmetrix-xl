@@ -57,12 +57,8 @@ evaluations. Every run has the same graph hash and directed-edge count. Energy,
 forces, and stress are finite in every run; total energy is identical across
 fresh processes at `-646502.3501055818` eV.
 
-The prior full-evaluator result in `receiver_factorized_rtc_mh0_cpu.md` was
-230.820 us/atom. The new value is 6.04% lower, but this is not a controlled
-code-only speedup: that result used an AMD Ryzen AI MAX+ 395 and model export
-SHA-256 `c202e5bc...eb22`. The historical temporary JSON is no longer present,
-and regenerating from the local checkpoint with the current extractor produces
-the export recorded above. Use 216.869 us/atom as the current-machine baseline.
+Use 216.869 us/atom as the current-machine baseline. Comparisons with results
+from other hosts or model exports are not controlled code-only speedups.
 
 ## Raw samples
 

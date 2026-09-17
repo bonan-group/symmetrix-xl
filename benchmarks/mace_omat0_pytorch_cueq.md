@@ -69,9 +69,9 @@ as rebuilding and transferring the changing neighbor graph through the ASE
 calculator boundary. The prepared diagnostic is not substituted for the
 primary MD metric.
 
-The follow-up [MD workload profile](mace_omat0_md_profile.md) attributes the
-gap to neighbor/input construction, order-sensitive direct execution schedule rebuilding,
-and host-side result reduction rather than a generated CUDA kernel regression.
+A follow-up workload profile attributed the gap to neighbor/input construction,
+order-sensitive direct execution schedule rebuilding, and host-side result
+reduction rather than a generated CUDA kernel regression.
 
 ### Optimized MD result
 

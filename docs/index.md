@@ -25,10 +25,3 @@ developer/index
 
 reference/index
 ```
-
-```{toctree}
-:maxdepth: 2
-:caption: Records
-
-records/index
-```

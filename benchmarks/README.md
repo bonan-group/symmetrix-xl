@@ -1,15 +1,14 @@
 # Benchmarks
 
-This directory contains reproducible performance drivers and concise records of
-benchmark decisions. It does not serve as permanent storage for raw profiler
-captures, generated kernels, model files, or machine-specific run output.
+This directory contains reproducible performance drivers and current
+qualification evidence. It does not serve as permanent storage for raw
+profiler captures, generated kernels, model files, machine-specific run output,
+or superseded reports.
 
 ## Maintained drivers
 
 Current Python files directly under this directory are the maintained entry
-points unless their corresponding report is marked superseded. Scripts kept
-only to explain a historical record are not current public-API examples. Names
-identify the workload or comparison they run. In particular:
+points. Names identify the workload or comparison they run. In particular:
 
 - `factorized_operator_benchmark.py` compares the extracted factorized R1
   operator across Symmetrix and the upstream implementation.
@@ -30,15 +29,14 @@ the exact environment and invocation.
 
 ## Reports
 
-Tracked Markdown files preserve compact methodology, summarized
-results, decisions, and reproducibility context. Historical reports are
-records, not current API documentation.
-
-When a report's selector names, defaults, recommendations, or source map have
-been superseded, add a prominent status note near the title and link the current
-authority. Do not rewrite measured results to match later behavior. References
-to untracked local plans or artifacts must say that they are unavailable rather
-than presenting them as checkout-relative reproduction inputs.
+Tracked Markdown files preserve compact methodology, summarized results,
+decisions, and reproducibility context for current qualification evidence. When
+a report's selector names, defaults, recommendations, or source map have been
+superseded, move any still-relevant conclusion into the current authority and
+remove the stale report. Do not rewrite old measurements as though they were
+produced by later behavior. References to untracked local plans or artifacts
+must say that they are unavailable rather than presenting them as
+checkout-relative reproduction inputs.
 
 Every new performance record must include the atom count and exact model cutoff.
 When graph expansion is active, also record the neighbor-list skin, effective
