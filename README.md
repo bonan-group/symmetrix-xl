@@ -25,30 +25,17 @@ implementation contract.
 
 ### Demonstrated scale
 
-Capacity depends on the model, precision, requested properties, graph density,
-and hardware. Two exact FP32 qualification results illustrate the current
-range:
+An FP32 NVIDIA A100-SXM4-80GB qualification evaluated energy, forces, and
+stress for the standard two-layer MACE-OMAT-0 model on cubic SrTiO3:
 
-- A standard two-layer OMAT-0-medium MACE model evaluated 1,372,000 atoms and
-  149,548,000 directed edges on one NVIDIA A100-SXM4-80GB. Two fresh-process
-  trials took 6.931 and 6.983 us/atom and reached 80,411 MiB sampled peak
-  device memory; the adjacent 1,431,644-atom case failed twice with CUDA OOM.
-  The workload requested energy, forces, and stress with a 6.0 A model cutoff
-  and 0.5 A neighbor-list skin, giving an effective cutoff of 6.5 A. See the
-  [A100 qualification record](benchmarks/extreme_scale_indexing_20260829.md#superseding-a100-capacity-result-2026-09-15).
-- A purpose-built, nonstandard single-layer qualification model
-  (`single-v2`) evaluated 11,943,936 atoms and 1,301,889,024 directed edges on
-  one NVIDIA RTX 5090 with 32,607 MiB at 1.830 us/atom and 22,414 MiB peak
-  device memory. This result used
-  the separately enabled fixed-workspace plan and requested energy, per-atom
-  energies, forces, and stress with the same 6.0 A model cutoff, 0.5 A skin,
-  and an effective cutoff of 6.5 A. It was the largest host-feasible ASE
-  construction tested, not a general GPU capacity limit. See the
-  [fixed-workspace qualification record](benchmarks/single_layer_fixed_workspace_cuda_20260910.md#capacity-result).
+| Execution | Maximum atoms | Directed edges | Speed (us/atom) | Sampled peak VRAM (MiB) |
+|---|---:|---:|---:|---:|
+| Standard | 1,373,125 | 141,157,250 | 6.330 | 79,313 |
+| Fixed workspace | 13,140,360 | 1,350,829,008 | 6.868 | 80,639 |
 
-These results are workload-specific demonstrations, not capacity guarantees
-for other models, properties, precisions, cutoffs, neighbor densities, or
-devices.
+Both used a 6.0 A model cutoff and 0.5 A neighbor-list skin, giving a 6.5 A
+effective cutoff, and completed with zero fallbacks. These are workload-specific
+demonstrations, not capacity guarantees.
 
 ### Demonstrated speed
 
