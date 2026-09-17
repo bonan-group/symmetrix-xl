@@ -1,6 +1,7 @@
 # Symmetrix-XL
 
 [![CI](https://github.com/bonan-group/symmetrix-xl/actions/workflows/ci.yaml/badge.svg)](https://github.com/bonan-group/symmetrix-xl/actions/workflows/ci.yaml?branch=main)
+[![Documentation](https://github.com/bonan-group/symmetrix-xl/actions/workflows/docs-pages.yaml/badge.svg)](https://bonan-group.github.io/symmetrix-xl/)
 
 In Symmetrix-XL, **XL** stands for **eXtreme scale, Low latency**.
 
@@ -19,7 +20,8 @@ operations are scheduled, stored, and compiled. Its two main contributions are:
    each admitted MACE contraction structure into generated CPU, CUDA, or HIP
    kernels and caches the resulting artifact.
 
-See the [user guide](docs/user/index.md) for supported workflows.
+See the [documentation](https://bonan-group.github.io/symmetrix-xl/) for
+installation, supported workflows, and developer references.
 
 ### Demonstrated scale
 
@@ -33,11 +35,11 @@ stress for the standard two-layer MACE-OMAT-0 model on cubic SrTiO3:
 
 Both used a 6.0 A model cutoff and 0.5 A neighbor-list skin, giving a 6.5 A
 effective cutoff, and completed with zero fallbacks. These are workload-specific
-demonstrations, not capacity guarantees. 
+demonstrations, not capacity guarantees.
 
 The extended mode uses a fixed workspace for processing atoms and has a slight perofrmance penalty (10\%-15\%).
 We recommend using the standard execution mode (default) and parallelize over multiple cards with LAMMPS for large
-system. 
+system.
 
 ### Demonstrated speed
 

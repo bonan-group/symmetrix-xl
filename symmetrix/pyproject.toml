@@ -57,6 +57,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/bonan-group/symmetrix-xl"
+Documentation = "https://bonan-group.github.io/symmetrix-xl/"
 Repository = "https://github.com/bonan-group/symmetrix-xl"
 Issues = "https://github.com/bonan-group/symmetrix-xl/issues"
 

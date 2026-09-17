@@ -16,4 +16,10 @@ myst_heading_anchors = 3
 
 html_theme = "furo"
 html_title = "Symmetrix-XL"
+html_baseurl = "https://bonan-group.github.io/symmetrix-xl/"
 html_static_path = []
+html_theme_options = {
+    "source_repository": "https://github.com/bonan-group/symmetrix-xl/",
+    "source_branch": "main",
+    "source_directory": "docs/",
+}
