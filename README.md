@@ -19,9 +19,7 @@ operations are scheduled, stored, and compiled. Its two main contributions are:
    each admitted MACE contraction structure into generated CPU, CUDA, or HIP
    kernels and caches the resulting artifact.
 
-See the [user guide](docs/user/index.md) for supported workflows and the
-[streamed-edge execution guide](docs/streamed_edge_execution.md) for the
-implementation contract.
+See the [user guide](docs/user/index.md) for supported workflows.
 
 ### Demonstrated scale
 
