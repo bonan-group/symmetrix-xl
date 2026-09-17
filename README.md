@@ -4,7 +4,7 @@
 
 In Symmetrix-XL, **XL** stands for **eXtreme scale, Low latency**.
 
-Symmetrix-XL builds on `symmetrix`, a cross-platform evaluator for MACE models,
+Symmetrix-XL builds on [symmetrix](https://github.com/wcwitt/symmetrix) , a cross-platform evaluator for MACE models,
 and extends it with scalable, low-latency native execution paths for CPUs and
 GPUs. The Python distribution is named `symmetrix-xl`; the import namespace and
 command-line interface remain `symmetrix`.
@@ -29,11 +29,15 @@ stress for the standard two-layer MACE-OMAT-0 model on cubic SrTiO3:
 | Execution | Maximum atoms | Directed edges | Speed (us/atom) | Sampled peak VRAM (MiB) |
 |---|---:|---:|---:|---:|
 | Standard | 1,373,125 | 141,157,250 | 6.330 | 79,313 |
-| Fixed workspace | 13,140,360 | 1,350,829,008 | 6.868 | 80,639 |
+| Extended | 13,140,360 | 1,350,829,008 | 6.868 | 80,639 |
 
 Both used a 6.0 A model cutoff and 0.5 A neighbor-list skin, giving a 6.5 A
 effective cutoff, and completed with zero fallbacks. These are workload-specific
-demonstrations, not capacity guarantees.
+demonstrations, not capacity guarantees. 
+
+The extended mode uses a fixed workspace for processing atoms and has a slight perofrmance penalty (10\%-15\%).
+We recommend using the standard execution mode (default) and parallelize over multiple cards with LAMMPS for large
+system. 
 
 ### Demonstrated speed
 
@@ -99,9 +103,10 @@ converter is optional; JSON-only evaluation does not require `mace-torch`.
 uv pip install mace-torch
 symmetrix_extract_mace \
     --model mace-omat-0-medium.model \
-    --chemical-symbols Sr Ti O \
-    --output srtio3-mace.json
+    --output mace-omat-0-medium.json
 ```
+It is possible to select only individual elements with `--chemical-symbols Sr Ti O`.
+This result in a smaller JSON file, but loses the ability to run simulation with other elements.
 
 Run an energy, force, or stress calculation with ASE:
 
@@ -116,7 +121,7 @@ atoms = crystal(
     spacegroup=221,
     cellpar=[a, a, a, 90, 90, 90],
 )
-atoms.calc = Symmetrix("srtio3-mace.json")
+atoms.calc = Symmetrix("mace-omat-0-medium.json")
 print(atoms.get_potential_energy())
 print(atoms.get_forces())
 print(atoms.get_stress())
@@ -144,7 +149,7 @@ uv pip install -e "./symmetrix[test]"
 
 Run Python formatting and lint checks with `uvx pre-commit run --all-files`.
 
-### Citing Symmetrix-XL
+### Citing Symmetrix
 
 The earliest `symmetrix` results are reported in:
 * D. P. Kovács, J. H. Moore, N. J. Browning, I. Batatia, J. T. Horton, Y. Pu, V. Kapil, W. C. Witt, I.-B. Magdău, D. J. Cole, G. Csányi, "MACE-OFF: Short-Range Transferable Machine Learning Force Fields for Organic Molecules", _Journal of the American Chemical Society_ **147**, 17598 (2025). [[arxiv]](https://arxiv.org/abs/2312.15211) [[journal]](https://doi.org/10.1021/jacs.4c07099)
