@@ -165,6 +165,51 @@ API. They remain zero when LAMMPS uses direct device-buffer pair communication,
 but zero alone is not a positive transport diagnostic because it also occurs
 when no pair communication callback runs.
 
+### Hidden-state communication timing
+
+Hidden-state forward and reverse communication runs inside the pair style, so
+LAMMPS includes it in `Pair` rather than `Comm`. The pair styles maintain
+rank-local cumulative timers for the complete blocking path: packing,
+host/device staging, MPI wait, unpacking, and completion at the existing Kokkos
+fences. They are exposed as
+`symmetrix_mpi_hidden_state_forward_seconds`,
+`symmetrix_mpi_hidden_state_reverse_seconds`,
+`symmetrix_mpi_hidden_state_seconds`, and corresponding `_calls` counters. The
+matching complete pair-style wall time is `symmetrix_pair_seconds`.
+The communication timers add no Kokkos fence. Defining
+`compute symmetrix/timing` enables bounding fences around the complete Kokkos
+pair call so that its device-work denominator is valid; those measurement-only
+fences are absent otherwise, and `symmetrix_pair_seconds` is then not populated.
+
+Executable users can request a rank-correlated summary:
+
+```text
+compute sxt all symmetrix/timing
+timer full
+thermo 1000
+thermo_style custom step atoms c_sxt c_sxt[1] c_sxt[2] c_sxt[3] c_sxt[10]
+thermo_modify colname auto
+run 1000
+```
+
+The scalar `c_sxt` is `SxH1CommPct`, the hidden-state communication percentage on
+the rank with the largest Symmetrix pair time. The first three vector elements
+are `SxPair`, `SxNonComm`, and `SxH1Comm` in
+`us/atom/pair-evaluation`; element 10 is the max/mean rank imbalance. At or above
+50%, hidden-state communication dominates Symmetrix pair evaluation on the
+critical rank. The normalization assumes a fixed atom count during the measured
+run. This is not a percentage of the complete LAMMPS timestep and is not pure
+network latency. See the
+[LAMMPS integration guide](../docs/user/lammps.md#see-whether-communication-dominates)
+for the complete vector schema and interpretation.
+
+The compute requires exactly one Symmetrix pair instance, including under a
+hybrid style. It snapshots counters after the unmeasured setup force evaluation
+and reduces only when queried. Do not put it in per-timestep thermo output for a
+performance measurement; use one query at the end of a warmed measurement
+block. A `run ... every ...` command remains one measurement window. A full new
+run setup starts a new window.
+
 LAMMPS does not run the JIT compiler. Prepare a host artifact in the same
 Symmetrix-XL CPU environment before launching CPU LAMMPS:
 

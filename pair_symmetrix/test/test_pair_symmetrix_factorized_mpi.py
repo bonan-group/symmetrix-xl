@@ -114,6 +114,41 @@ def _read_capacity_records(log_text):
     return records
 
 
+_TIMING_FIELDS = (
+    "critical_pair_us_per_atom_eval",
+    "critical_noncommunication_us_per_atom_eval",
+    "critical_comm_us_per_atom_eval",
+    "critical_comm_percent",
+    "critical_forward_us_per_atom_eval",
+    "critical_reverse_us_per_atom_eval",
+    "rank_comm_percent_min",
+    "rank_comm_percent_average",
+    "rank_comm_percent_max",
+    "comm_imbalance_max_over_mean",
+    "forward_calls_per_eval_min",
+    "forward_calls_per_eval_max",
+    "reverse_calls_per_eval_min",
+    "reverse_calls_per_eval_max",
+)
+
+
+def _read_timing_record(log_text):
+    lines = [
+        line.strip()
+        for line in log_text.splitlines()
+        if line.startswith("SYMMETRIX_TIMING ")
+    ]
+    assert len(lines) == 1
+    fields = lines[0].split()[1:]
+    values = {}
+    for field in fields:
+        name, separator, value = field.partition("=")
+        assert separator
+        values[name] = float(value)
+    assert tuple(values) == ("scalar", *_TIMING_FIELDS)
+    return values
+
+
 _WURTZITE_BASIS = (
     (1, (0.0, 0.0, 0.0)),
     (2, (0.0, 1.0 / 3.0, 0.1199379857679)),
@@ -451,6 +486,143 @@ print           "MIGRATED mode={mode} pe=$(pe:%.16g) pxx=$(pxx:%.16g) pyy=$(pyy:
     return result
 
 
+def _run_timing_case(tmp_path, executable, model, pair_backend, ranks, domain_mode):
+    label = f"timing-{pair_backend}-{ranks}-{domain_mode}"
+    data_path = tmp_path / f"{label}.data"
+    input_path = tmp_path / f"in.{label}"
+    log_path = tmp_path / f"{label}.log"
+    data_path.write_text(_physical_aln_fixture(False))
+
+    if pair_backend == "kokkos":
+        atom_style = "atomic/kk"
+        package_command = "package kokkos neigh half newton on"
+        pair_style = "symmetrix/mace/kk"
+        pair_options = " streamed_edges generic"
+        kokkos_arguments = ["-k", "on", "t", "1"]
+        kokkos_gpus = os.environ.get("SYMMETRIX_LAMMPS_KOKKOS_GPUS")
+        if kokkos_gpus:
+            kokkos_arguments.extend(("g", kokkos_gpus))
+        kokkos_arguments.extend(("-sf", "kk"))
+    elif pair_backend == "cpu":
+        atom_style = "atomic"
+        package_command = ""
+        pair_style = "symmetrix/mace"
+        pair_options = ""
+        kokkos_arguments = []
+    else:
+        raise ValueError(f"Unsupported pair backend: {pair_backend}")
+
+    timing_thermo = " ".join(
+        (
+            "c_symmetrix_timing",
+            "c_symmetrix_timing[1]",
+            "c_symmetrix_timing[2]",
+            "c_symmetrix_timing[3]",
+            "c_symmetrix_timing[10]",
+        )
+    )
+    timing_record = " ".join(
+        ["scalar=$(c_symmetrix_timing:%.17g)"]
+        + [
+            f"{name}=$(c_symmetrix_timing[{index}]:%.17g)"
+            for index, name in enumerate(_TIMING_FIELDS, start=1)
+        ]
+    )
+    input_path.write_text(
+        f"""
+units           metal
+atom_style      {atom_style}
+atom_modify     map yes sort 1 0.0
+boundary        p p p
+{package_command}
+newton          on
+processors      {_PROCESSOR_GRIDS[ranks]}
+read_data       {data_path}
+pair_style      {pair_style} {domain_mode}{pair_options}
+pair_coeff      * * {model} Al N
+neighbor        1.0 bin
+neigh_modify    every 1 delay 0 check yes
+compute         symmetrix_timing all symmetrix/timing
+thermo          2
+thermo_style    custom step atoms {timing_thermo}
+thermo_modify   colname auto line one format float %.17g
+run             2 post no
+print           "SYMMETRIX_TIMING {timing_record}"
+"""
+    )
+
+    mpiexec = os.environ.get("MPIEXEC_EXECUTABLE") or shutil.which("mpiexec")
+    if not mpiexec:
+        pytest.skip("mpiexec is unavailable")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "SYMMETRIX_JIT_POLICY": "none",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_PROC_BIND": "false",
+        }
+    )
+    subprocess.run(
+        [
+            mpiexec,
+            "-n",
+            str(ranks),
+            str(executable),
+            "-screen",
+            "none",
+            "-log",
+            str(log_path),
+            *kokkos_arguments,
+            "-in",
+            str(input_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=environment,
+    )
+    log_text = log_path.read_text()
+    assert re.search(
+        r"Step\s+Atoms\s+SxH1CommPct\s+SxPair\s+SxNonComm\s+SxH1Comm\s+SxH1Imbal",
+        log_text,
+    )
+    return _read_timing_record(log_text)
+
+
+def _assert_timing_common(record, ranks):
+    assert all(np.isfinite(value) for value in record.values())
+    assert record["scalar"] == pytest.approx(record["critical_comm_percent"])
+    assert record["critical_pair_us_per_atom_eval"] == pytest.approx(
+        record["critical_noncommunication_us_per_atom_eval"]
+        + record["critical_comm_us_per_atom_eval"],
+        rel=1.0e-12,
+        abs=1.0e-15,
+    )
+    assert record["critical_comm_us_per_atom_eval"] == pytest.approx(
+        record["critical_forward_us_per_atom_eval"]
+        + record["critical_reverse_us_per_atom_eval"],
+        rel=1.0e-12,
+        abs=1.0e-15,
+    )
+    assert (
+        record["rank_comm_percent_min"]
+        <= record["rank_comm_percent_average"]
+        <= record["rank_comm_percent_max"]
+    )
+    assert (
+        record["rank_comm_percent_min"]
+        <= record["critical_comm_percent"]
+        <= record["rank_comm_percent_max"]
+    )
+    assert 0.0 <= record["comm_imbalance_max_over_mean"] <= ranks
+    for direction in ("forward", "reverse"):
+        minimum = record[f"{direction}_calls_per_eval_min"]
+        maximum = record[f"{direction}_calls_per_eval_max"]
+        assert 0.0 <= minimum <= maximum
+
+
 def _run_direct_dynamics_case(
     tmp_path,
     executable,
@@ -777,6 +949,190 @@ def test_capacity_event_parser(tmp_path):
             "h1_allocations": 1,
         }
     ]
+
+
+def test_timing_record_parser_preserves_public_schema():
+    values = [12.0, 10.0, 2.0, 16.6666666666667, 1.25, 0.75]
+    values.extend([10.0, 15.0, 20.0, 1.5, 1.0, 1.0, 1.0, 1.0])
+    fields = " ".join(
+        f"{name}={value:.17g}" for name, value in zip(_TIMING_FIELDS, values)
+    )
+    record = _read_timing_record(
+        f"unrelated output\nSYMMETRIX_TIMING scalar={values[3]:.17g} {fields}\n"
+    )
+
+    assert record["scalar"] == pytest.approx(100.0 / 6.0)
+    assert record["critical_pair_us_per_atom_eval"] == 12.0
+    assert record["critical_noncommunication_us_per_atom_eval"] == 10.0
+    assert record["critical_comm_us_per_atom_eval"] == 2.0
+    assert record["critical_forward_us_per_atom_eval"] == 1.25
+    assert record["critical_reverse_us_per_atom_eval"] == 0.75
+    assert record["rank_comm_percent_min"] == 10.0
+    assert record["rank_comm_percent_average"] == 15.0
+    assert record["rank_comm_percent_max"] == 20.0
+    assert record["comm_imbalance_max_over_mean"] == 1.5
+    assert record["forward_calls_per_eval_min"] == 1.0
+    assert record["forward_calls_per_eval_max"] == 1.0
+    assert record["reverse_calls_per_eval_min"] == 1.0
+    assert record["reverse_calls_per_eval_max"] == 1.0
+
+
+def test_timing_collective_is_deferred_to_compute_query():
+    source_root = Path(__file__).resolve().parents[1]
+    compute_source = (source_root / "compute_symmetrix_timing.cpp").read_text()
+    assert compute_source.count("MPI_Allgather(") == 1
+    assert "if (last_reduced_step == update->ntimestep) return;" in compute_source
+    for name in ("pair_symmetrix_mace.cpp", "pair_symmetrix_mace_kokkos.cpp"):
+        assert "MPI_Allgather(" not in (source_root / name).read_text()
+
+
+def test_timing_compute_reference_counts_pair_timing_opt_in():
+    source_root = Path(__file__).resolve().parents[1]
+    compute_source = (source_root / "compute_symmetrix_timing.cpp").read_text()
+    assert "*timing_enabled += 1.0;" in compute_source
+    assert "*timing_enabled -= 1.0;" in compute_source
+    assert "if (force && timing_enabled)" in compute_source
+    for name in ("pair_symmetrix_mace.cpp", "pair_symmetrix_mace_kokkos.cpp"):
+        pair_source = (source_root / name).read_text()
+        assert pair_source.count("execution_timing_enabled = 0.0;") == 1
+
+
+def test_symmetrix_timing_survives_partial_uncompute_and_pair_replacement(tmp_path):
+    executable = _required_path(
+        "SYMMETRIX_LAMMPS_EXECUTABLE", "an MPI-enabled LAMMPS executable"
+    )
+    model = _required_path(
+        "SYMMETRIX_LAMMPS_COMPACT_MODEL", "a compact standard-MACE model"
+    )
+    data_path = tmp_path / "timing-uncompute.data"
+    input_path = tmp_path / "in.timing-uncompute"
+    log_path = tmp_path / "timing-uncompute.log"
+    data_path.write_text(_physical_aln_fixture(False))
+    input_path.write_text(
+        f"""
+units           metal
+atom_style      atomic
+atom_modify     map yes sort 1 0.0
+boundary        p p p
+read_data       {data_path}
+pair_style      symmetrix/mace no_domain_decomposition
+pair_coeff      * * {model} Al N
+compute         timing_a all symmetrix/timing
+compute         timing_b all symmetrix/timing
+thermo          1
+thermo_style    custom step c_timing_b
+thermo_modify   colname auto line one
+run             1 post no
+uncompute       timing_a
+run             1 pre no post no
+pair_style      symmetrix/mace no_domain_decomposition
+pair_coeff      * * {model} Al N
+run             1 post no
+"""
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "SYMMETRIX_JIT_POLICY": "none",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+        }
+    )
+    subprocess.run(
+        [
+            executable,
+            "-screen",
+            "none",
+            "-log",
+            log_path,
+            "-in",
+            input_path,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=environment,
+    )
+    assert log_path.read_text().count("SxH1CommPct") == 3
+
+
+@pytest.mark.parametrize("pair_backend", ["cpu", "kokkos"])
+def test_symmetrix_timing_reports_reduced_mpi_communication(tmp_path, pair_backend):
+    executable = _required_path(
+        "SYMMETRIX_LAMMPS_EXECUTABLE",
+        "a Kokkos and MPI-enabled LAMMPS executable",
+    )
+    model = _required_path(
+        "SYMMETRIX_LAMMPS_COMPACT_MODEL", "a compact standard-MACE model"
+    )
+    record = _run_timing_case(
+        tmp_path,
+        executable,
+        model,
+        pair_backend,
+        ranks=2,
+        domain_mode="mpi_message_passing",
+    )
+
+    _assert_timing_common(record, ranks=2)
+    assert record["critical_pair_us_per_atom_eval"] > 0.0
+    assert record["critical_noncommunication_us_per_atom_eval"] > 0.0
+    assert record["critical_comm_us_per_atom_eval"] > 0.0
+    assert record["critical_forward_us_per_atom_eval"] > 0.0
+    assert record["critical_reverse_us_per_atom_eval"] > 0.0
+    assert record["scalar"] > 0.0
+    assert record["rank_comm_percent_max"] > 0.0
+    assert 1.0 <= record["comm_imbalance_max_over_mean"] <= 2.0
+    for direction in ("forward", "reverse"):
+        assert record[f"{direction}_calls_per_eval_min"] == pytest.approx(1.0)
+        assert record[f"{direction}_calls_per_eval_max"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("ranks", "domain_mode"),
+    (
+        pytest.param(1, "no_domain_decomposition", id="single-rank"),
+        pytest.param(2, "no_mpi_message_passing", id="two-rank-no-pair-comm"),
+    ),
+)
+def test_symmetrix_timing_zero_communication_controls(tmp_path, ranks, domain_mode):
+    executable = _required_path(
+        "SYMMETRIX_LAMMPS_EXECUTABLE", "an MPI-enabled LAMMPS executable"
+    )
+    model = _required_path(
+        "SYMMETRIX_LAMMPS_COMPACT_MODEL", "a compact standard-MACE model"
+    )
+    record = _run_timing_case(
+        tmp_path,
+        executable,
+        model,
+        "cpu",
+        ranks=ranks,
+        domain_mode=domain_mode,
+    )
+
+    _assert_timing_common(record, ranks=ranks)
+    assert record["critical_pair_us_per_atom_eval"] > 0.0
+    assert record["critical_noncommunication_us_per_atom_eval"] == pytest.approx(
+        record["critical_pair_us_per_atom_eval"]
+    )
+    for field in (
+        "scalar",
+        "critical_comm_us_per_atom_eval",
+        "critical_comm_percent",
+        "critical_forward_us_per_atom_eval",
+        "critical_reverse_us_per_atom_eval",
+        "rank_comm_percent_min",
+        "rank_comm_percent_average",
+        "rank_comm_percent_max",
+        "comm_imbalance_max_over_mean",
+        "forward_calls_per_eval_min",
+        "forward_calls_per_eval_max",
+        "reverse_calls_per_eval_min",
+        "reverse_calls_per_eval_max",
+    ):
+        assert record[field] == 0.0
 
 
 @pytest.mark.parametrize(

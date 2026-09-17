@@ -39,6 +39,7 @@ class PairSymmetrixMACE : public Pair {
   void coeff(int, char **) override;
   double init_one(int, int) override;
   void init_style() override;
+  void *extract(const char *, int &) override;
   int pack_forward_comm(int, int *, double *, int, int *) override;
   void unpack_forward_comm(int, int, double *) override;
   int pack_reverse_comm(int, int, double *) override;
@@ -53,6 +54,15 @@ class PairSymmetrixMACE : public Pair {
   std::string prediction_head;
 
   std::vector<double> H1, H1_adj;
+
+  double execution_pair_seconds = 0.0;
+  double execution_pair_evaluation_count = 0.0;
+  double execution_timing_enabled = 0.0;
+  double execution_mpi_hidden_state_forward_seconds = 0.0;
+  double execution_mpi_hidden_state_reverse_seconds = 0.0;
+  double execution_mpi_hidden_state_seconds = 0.0;
+  double execution_mpi_hidden_state_forward_calls = 0.0;
+  double execution_mpi_hidden_state_reverse_calls = 0.0;
 
   // symmetrix evaluator and inputs
   std::unique_ptr<MACE> mace;

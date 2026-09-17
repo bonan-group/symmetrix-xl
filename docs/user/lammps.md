@@ -117,6 +117,75 @@ capability query, and absence of the fallback warning are the required evidence.
 Cross-node GPUDirect qualification remains specific to the site's MPI provider,
 network, and scheduler configuration.
 
+## See whether communication dominates
+
+LAMMPS accounts the Symmetrix hidden-state exchange inside its `Pair` category,
+because the exchange occurs during pair evaluation. Add the Symmetrix timing
+compute to separate that work and display its share directly:
+
+```text
+compute sxt all symmetrix/timing
+timer full
+thermo 1000
+thermo_style custom step atoms c_sxt c_sxt[1] c_sxt[2] c_sxt[3] c_sxt[10]
+thermo_modify colname auto
+run 1000
+```
+
+The headings are supplied by the compute, so the final row is self-describing:
+
+```text
+Step  Atoms  SxH1CommPct  SxPair  SxNonComm  SxH1Comm  SxH1Imbal
+1000  32768          58.3    4.82       2.01      2.81       1.07
+```
+
+`SxPair`, `SxNonComm`, and `SxH1Comm` are run-to-date averages in
+`us/atom/pair-evaluation` from the rank with the largest measured Symmetrix pair
+time. The normalization assumes the atom count remains fixed during the measured
+run. They are also `us/atom/step` when the pair is evaluated once per timestep.
+`SxPair = SxNonComm + SxH1Comm`, and `SxH1CommPct` is the matching,
+rank-correlated hidden-state communication share. A value of 50% or more means
+hidden-state communication dominates Symmetrix pair evaluation on the critical
+rank. It does not mean that communication occupies the same fraction of the
+complete LAMMPS timestep; inspect LAMMPS's `timer full` breakdown for that
+broader question. `SxH1Imbal` is maximum divided by mean hidden-state
+communication time across ranks; values appreciably above one indicate
+imbalance or uneven MPI wait.
+
+The timed communication path includes packing, host/device staging, MPI send and
+wait, unpacking, and completion at the existing Kokkos fences. It is deliberately
+not called network latency: load imbalance can appear as MPI wait. Ordinary
+LAMMPS halo and force communication remains in LAMMPS's `Comm` category.
+Defining `compute symmetrix/timing` also places fences around the complete
+Kokkos pair call so its denominator includes completed device work. Those
+measurement-only fences are absent when the compute is not defined; compare a
+warmed run with and without the compute when quantifying instrumentation
+overhead.
+
+The run-to-date measurement window begins after LAMMPS's setup force evaluation.
+The initial thermo row therefore reports `nan` for the percentage because no
+timed pair evaluation has occurred. Querying the compute performs an MPI
+reduction, so use a thermo interval equal to the measurement block instead of
+printing it every timestep. The remaining vector fields provide forward/reverse
+and rank-spread diagnostics:
+
+| Field | Meaning |
+| --- | --- |
+| `c_sxt[4]` | Same critical-rank percentage as scalar `c_sxt` |
+| `c_sxt[5]`, `c_sxt[6]` | Critical-rank forward and reverse communication in `us/atom/pair-evaluation` |
+| `c_sxt[7:9]` | Minimum, mean, and maximum communication percentage across ranks |
+| `c_sxt[11:12]` | Minimum and maximum forward calls per pair evaluation |
+| `c_sxt[13:14]` | Minimum and maximum reverse calls per pair evaluation |
+
+Dual-layer `mpi_message_passing` normally reports one forward and one reverse
+call per pair evaluation. Single-layer and non-message-passing modes report zero
+communication time and calls. Library clients can also read the cumulative
+rank-local `symmetrix_mpi_hidden_state_seconds`, forward/reverse seconds and call
+counters, and `symmetrix_pair_seconds` through `extract_pair`.
+The complete-pair counter is populated after `compute symmetrix/timing` has
+initialized for the current pair style, because accurate accelerator timing
+requires the bounding fences.
+
 `--dry-run` performs target and MPI preflight checks but does not create or
 modify a build directory. It prints one JSON document containing the resolved
 commands, selected environment, fingerprint, and provenance.
