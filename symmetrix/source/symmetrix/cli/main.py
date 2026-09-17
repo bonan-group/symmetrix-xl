@@ -113,7 +113,7 @@ def main(argv=None):
         help="Load the selected backend and report runtime details.",
     )
     bench = commands.add_parser(
-        "bench", help="Run the standard SrTiO3 MACE-MPA-0 benchmark."
+        "bench", help="Run the standard SrTiO3 MACE-OMAT-0 benchmark."
     )
     bench.set_defaults(_handler="bench")
     args = parser.parse_args(argv)

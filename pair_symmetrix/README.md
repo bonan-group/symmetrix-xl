@@ -95,9 +95,9 @@ M0 or R0 topology does not match a built-in module additionally use
 validated `chunk32` or `table` schedule through `jit_m0_device_schedule`.
 These operator modules are device-only and are loaded after R1 but before
 low-memory admission. Explicit `direct` requires a matching R1 artifact for
-two-interaction models and never falls back. Single-layer models use built-in
-R1 execution. `generic` rejects artifacts because generic execution is
-compiler-free.
+two-interaction models and never falls back. Single-layer models have no R1
+stage and use the built-in direct executor. `generic` rejects artifacts because
+generic execution is compiler-free.
 The removed `receiver_factorized` selector is rejected by all current
 evaluators, including the LAMMPS pair style.
 The pair style loads artifacts but never invokes a compiler.
@@ -306,10 +306,10 @@ retry in a fresh directory.
 `--mpi on` fails immediately if no MPI C++ wrapper is available. Pass
 `--mpi-cxx /path/to/mpicxx` for a site-specific wrapper. Use `--mpi auto` only
 when falling back to a non-MPI executable is intentional. CPU builds require a
-Fortran compiler and optimized OpenBLAS because the KokkosKernels BLAS check
-uses the Fortran ABI. CUDA and HIP builds use Kokkos Serial for host execution
-and disable Kokkos OpenMP; this is the qualified Symmetrix-XL configuration, not a
-general Kokkos limitation.
+Fortran compiler and a supported optimized BLAS implementation because the
+KokkosKernels BLAS check uses the Fortran ABI. CUDA and HIP builds use Kokkos
+Serial for host execution and disable Kokkos OpenMP; this is the qualified
+Symmetrix-XL configuration, not a general Kokkos limitation.
 
 For site module environments and cross-compilation, pass explicit compiler,
 toolkit, MPI-wrapper, generator, and architecture options to the build frontend

@@ -44,11 +44,13 @@ python benchmarks/radial_spline_convergence.py compact-model.json \
   --output spline-convergence.json
 ```
 
-For MACEField, the driver reads the compact model type and supplies the field
-configured by `--electric-field`. Use `--torch-device` to select the PyTorch
-device. The command exits unsuccessfully when no tested spline count passes all
-enabled gates; `--diagnostic-only` suppresses this failure for exploratory
-sweeps.
+For MACEField, the direct radial sweep reads the compact model type and supplies
+the field configured by `--electric-field`. The optional checkpoint comparison
+also requires a reference MACE calculator that accepts MACEField checkpoints;
+the standard `MACECalculator` interface does not provide that model type. Use
+`--torch-device` to select the PyTorch device. The command exits unsuccessfully
+when no tested spline count passes all enabled gates; `--diagnostic-only`
+suppresses this failure for exploratory sweeps.
 
 An initial MH-0 calibration over `0.5-6.0 A` found that 128 points failed the
 default physical-range gate, while 256 and 512 points passed. At 256 points the

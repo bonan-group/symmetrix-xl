@@ -40,7 +40,7 @@ The supported public spellings are:
 
 | Request | Role |
 |---|---|
-| `direct` | Default prepared execution; two-interaction models require a matching R1 specialization, while admitted single-layer models use built-in R1 execution. Capacity may still specialize their M0/R0 operators. |
+| `direct` | Default prepared execution; two-interaction models require a matching R1 specialization, while admitted single-layer models use prepared R0/M0 execution without an R1 specialization. Capacity may still specialize their M0/R0 operators. |
 | `non-compiled` | Compiler-free compatibility and diagnostic path; no performance guarantee. |
 | `materialized` | Frozen legacy path, principally for legacy model formats and numerical controls. |
 | `auto` | Temporary compatibility request resolved from model and evaluator capability. |
@@ -136,8 +136,10 @@ host-worker BLAS policy. Static `ldd` output alone is not sufficient.
 
 Qualified owner-local CBLAS calls are controlled centrally. Runtime-compatible
 OpenMP OpenBLAS, sequential MKL, and compatible GNU-threaded MKL may be admitted;
-pthread, unidentified, runtime-incompatible, duplicate-runtime, or
-nested-enabled configurations use Kokkos contractions instead. See
+pthread OpenBLAS is admitted only with one OpenMP worker. Intel-threaded MKL,
+unidentified, runtime-incompatible, duplicate-runtime, and nested-enabled
+configurations use Kokkos contractions instead, as does pthread OpenBLAS with
+multiple OpenMP workers. See
 {doc}`openmp_simd_coding_standard`.
 
 ## Prepared Graph Lifecycle

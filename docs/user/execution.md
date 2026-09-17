@@ -4,7 +4,7 @@
 for Kokkos evaluation. The model precision defaults to FP32. Two-interaction
 direct execution requires an artifact matching that precision and fails closed
 rather than silently choosing a different algorithm. Admitted single-layer
-models use built-in R1 execution without an R1 artifact. Their capacity plans
+models have no R1 stage and use built-in direct execution. Their capacity plans
 may still compile or load specialized M0/R0 operator modules.
 
 Prepare a direct host artifact before a reproducible CPU deployment:

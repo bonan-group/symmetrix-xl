@@ -20,9 +20,11 @@ and supported analytical field-response properties. Multi-head model files can
 retain every prediction head, and `SymmetrixEnsemble` can evaluate compatible
 models together and report member values, means, and population variances.
 
-The same compact model data can be used from Python/ASE or from the
-`pair_symmetrix` LAMMPS integration. LAMMPS runs consume prepared model and JIT
-artifacts; they do not invoke the runtime compiler during a simulation.
+Compatible format-version-2 MACE and MACEField JSON can be used from Python/ASE
+or from the `pair_symmetrix` LAMMPS integration. Two-interaction direct LAMMPS
+runs consume a prepared JIT artifact; LAMMPS does not invoke the runtime
+compiler during a simulation. Compiler-free and single-layer paths do not
+require an R1 artifact.
 
 ## Demonstrated Scale
 
@@ -52,7 +54,7 @@ MACE-Torch 0.3.15 with cuEquivariance 0.11.0 used the exact 6.0 A graph.
 Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving a
 candidate graph with an effective cutoff of 6.5 A; the graph policies are not
 identical, and Symmetrix-XL processed more directed candidates. See the
-[matched speed qualification](https://github.com/bonan-group/symmetrix-xl/blob/main/benchmarks/streamed_edge_milestone_20260822.md#superseding-cuda-paper-qualification-2026-09-14).
+[matched speed qualification](https://github.com/bonan-group/symmetrix-xl/blob/main/benchmarks/streamed_edge_milestone_20260822.md#user-content-superseding-cuda-paper-qualification-2026-09-14).
 
 ## How Execution Is Chosen
 
@@ -60,9 +62,9 @@ The first-class performance path is streamed-edge `direct` execution. For
 Kokkos evaluation, the default `capacity` profile estimates device memory and
 chooses the fastest qualified plan that fits. A matching runtime-specialized
 R1 artifact is required for two-interaction direct execution. Admitted
-single-layer models use built-in R1 execution; capacity planning may still
-compile or load specialized M0/R0 operator modules. Incompatibilities fail
-clearly rather than silently changing algorithms.
+single-layer models have no R1 stage and use built-in direct execution. Their
+capacity plans may still compile or load specialized M0/R0 operator modules.
+Incompatibilities fail clearly rather than silently changing algorithms.
 
 Model evaluation defaults to FP32. This is the primary performance and
 capacity mode on CPU and GPU backends. Request `dtype="float64"` explicitly

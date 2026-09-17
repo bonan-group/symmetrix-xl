@@ -7,9 +7,11 @@ particular CPU/GPU backend installed.
 ## Frontend and Backend Selection
 
 `symmetrix.available_backends()` returns installed backend descriptors without
-loading their native extensions. `symmetrix.load_backend(request=None)` loads
-the automatic or named backend and permanently selects it for the process.
-`symmetrix.selected_backend()` exposes the resolved descriptor after selection.
+loading their native extensions or probing whether their target devices are
+available. Use `symmetrix backend list` for a usability inventory.
+`symmetrix.load_backend(request=None)` loads the automatic or named backend and
+permanently selects it for the process. `symmetrix.selected_backend()` exposes
+the resolved descriptor after selection.
 
 Select a backend before loading a calculator or native symbol.
 
@@ -20,7 +22,16 @@ Symmetrix(
     model_file, dtype="float32", use_kokkos=True,
     streamed_edges="direct", execution_profile="capacity",
     allow_fixed_workspace=False,
-    low_memory=<compatibility switch>, neighbor_skin=0.5, head=None,
+    low_memory=<compatibility switch>, jit=None,
+    kernel_launch_policy="automatic", m1_polynomial_policy="automatic",
+    execution_mh1_scratch_budget_bytes=None,
+    execution_mh1_node_state_policy="full-retention-v1",
+    execution_mh1_node_arena_policy="throughput-v1",
+    execution_mh0_state_policy="full-retention-v1",
+    edge_geometry_policy="cartesian-f64-v1",
+    neighbor_skin=0.5, head=None,
+    dispersion=False, dispersion_damping="bj", dispersion_xc="pbe",
+    dispersion_cutoff=None, dispersion_device=None,
     **ase_kwargs,
 )
 ```
@@ -43,10 +54,13 @@ for qualified CUDA FP32 direct capacity execution. It defaults to `False` and
 does not force the planner to select such a plan.
 
 `direct` is the first-class performance path. Two-interaction models require a
-matching admitted R1 artifact; admitted single-layer models use built-in R1
-execution, although capacity planning may still compile or load M0/R0 operator
-modules. `non-compiled` is an explicit compiler-free fallback/diagnostic mode
-with no performance guarantee.
+matching admitted R1 artifact; admitted single-layer models run without R1
+specialization, although capacity planning may still compile or load M0/R0
+operator modules. `non-compiled` is an explicit compiler-free
+fallback/diagnostic mode with no performance guarantee. The `jit` argument is
+deprecated and ignored;
+`SYMMETRIX_JIT_POLICY` controls required specialization or the explicit
+diagnostic-disabled policy.
 
 Set `dispersion=True` to add the D3 correction from the optional `torch-dftd`
 package. Symmetrix-XL evaluates the neural model and D3 calculator together and
@@ -97,6 +111,8 @@ values `x_comm`, and population variance `x_var`.
 ## Direct Artifacts
 
 `prepare_jit_host_artifact(...)` and `prepare_jit_device_artifact(...)` are
-the Python APIs behind the corresponding command-line tools. Their artifacts
-are specific to the model contract, precision, ABI, implementation generation,
-and backend target. Use the command-line wrappers for repeatable deployments.
+the Python APIs behind the corresponding command-line tools. They prepare R1
+artifacts for standard MACE and MACEField compact JSON models; MACE-MH-1 uses
+its separate generated program during calculator construction. Artifacts are
+specific to the model contract, precision, ABI, implementation generation, and
+backend target. Use the command-line wrappers for repeatable deployments.

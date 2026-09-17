@@ -9,7 +9,16 @@ same OpenBLAS configuration and threading fields as `symmetrix doctor`.
 `symmetrix doctor [--json] [--advisory]` prints runtime diagnostics; `--json`
 provides the machine-readable variant for deployment checks.
 
+`symmetrix bench` runs the maintained SrTiO3 MACE-OMAT-0 benchmark and reports
+steady-state performance in microseconds per atom. Its options select the
+model, backend, precision, execution profile, system size, neighbor skin,
+thread count, sampling protocol, and optional MACE-Torch correctness check.
+
 Artifact preparation commands are exposed as `symmetrix_prepare_jit_host_artifact`
 and `symmetrix_prepare_jit_device_artifact`. The converter is
 `symmetrix_extract_mace --model MODEL [--output PATH]`; it accepts species,
-head, compact/pair-spline format, and device-artifact preparation options.
+head, compact/pair-spline format, and device-artifact preparation options and
+requires the optional `symmetrix-xl[mace]` dependencies.
+`symmetrix_calibrate_kernel_launch` explicitly calibrates bounded GPU launch
+profiles for a model and structure; normal `kernel_launch_policy="automatic"`
+execution consumes a compatible calibration record but does not benchmark.

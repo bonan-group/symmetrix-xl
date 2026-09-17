@@ -50,7 +50,7 @@ MACE-Torch 0.3.15 with cuEquivariance 0.11.0 used the exact 6.0 A graph.
 Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving a
 candidate graph with an effective cutoff of 6.5 A; the graph policies are not
 identical, and Symmetrix-XL processed more directed candidates. See the
-[matched speed qualification](https://github.com/bonan-group/symmetrix-xl/blob/main/benchmarks/streamed_edge_milestone_20260822.md#superseding-cuda-paper-qualification-2026-09-14).
+[matched speed qualification](https://github.com/bonan-group/symmetrix-xl/blob/main/benchmarks/streamed_edge_milestone_20260822.md#user-content-superseding-cuda-paper-qualification-2026-09-14).
 
 ## Installation
 

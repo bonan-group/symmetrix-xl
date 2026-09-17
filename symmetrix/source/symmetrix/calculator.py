@@ -555,8 +555,9 @@ class Symmetrix(Calculator):
     streamed_edges : {"direct", "non-compiled", "materialized"}, default="direct"
         Evaluation algorithm for compact MACE models. For two-interaction
         models, ``direct`` requires a model-specific RTC artifact and does not
-        fall back. Admitted single-layer models use built-in R1 execution,
-        although capacity planning may still specialize M0/R0 operators.
+        fall back. Admitted single-layer models use built-in direct M0/R0
+        execution without an R1 stage, although capacity planning may still
+        specialize those operators.
         ``non-compiled`` is an explicit compiler-free fallback with no
         performance guarantee. ``materialized`` is a frozen legacy mode.
         The old ``generic`` and ``all_interactions`` spellings remain accepted

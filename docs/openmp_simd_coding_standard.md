@@ -67,10 +67,11 @@ kernels then execute concurrently across the outer Kokkos workers without
 creating nested OpenMP teams.
 
 The host-worker policy in `libsymmetrix/source/host_worker_blas.hpp` permits
-CBLAS for Serial, one-worker OpenMP, runtime-compatible OpenMP OpenBLAS,
-sequential MKL, and runtime-compatible GNU-threaded MKL. Pthread OpenBLAS,
-Intel-threaded MKL, unresolved `libmkl_rt`, unidentified providers, duplicate
-OpenMP runtimes, and nested-enabled configurations select Kokkos. Merely
+CBLAS for Serial, sequential MKL on OpenMP, runtime-compatible OpenMP OpenBLAS,
+runtime-compatible GNU-threaded MKL, and pthread OpenBLAS only for one-worker
+OpenMP. Intel-threaded MKL, unresolved `libmkl_rt`, unidentified providers,
+duplicate OpenMP runtimes, nested-enabled configurations, and pthread OpenBLAS
+with multiple OpenMP workers select Kokkos. Merely
 setting `OPENBLAS_NUM_THREADS=1` or `MKL_NUM_THREADS=1` does not prove that an
 arbitrary BLAS implementation supports concurrent callers.
 `SYMMETRIX_HOST_WORKER_BLAS=off` forces Kokkos, while `unsafe` is reserved for

@@ -2,8 +2,9 @@
 
 Use LAMMPS 10 Dec 2025 or newer, CMake 3.27 or newer, a C++20 compiler, and a
 recursive Symmetrix-XL checkout. CPU builds additionally require a Fortran
-compiler and an optimized OpenBLAS installation. The build helper installs the
-pair style, enables Kokkos, builds LAMMPS, and verifies its pair styles:
+compiler and a supported optimized BLAS installation (OpenBLAS or MKL). The
+build helper installs the pair style, enables Kokkos, builds LAMMPS, and
+verifies its pair styles:
 
 ```bash
 python tools/symmetrix_build.py lammps \

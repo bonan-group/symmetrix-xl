@@ -36,7 +36,7 @@ must be complete in more than one owner:
 |---|---|---|
 | `mace_kokkos_factorized_blas_detail.hpp` | runtime, factorized execution | BLAS context lifetime, stream binding, and CUDA/HIP batched GEMM launch helpers |
 | `mace_kokkos_kernel_launch_detail.hpp` | runtime, factorized lifecycle, factorized execution, model | Backend capability probing and standard-module launch-profile selection |
-| `mace_kokkos_jit_plugin_detail.hpp` | factorized execution, H1/Phi1 | Validated host and device JIT-plugin launch-packet construction |
+| `mace_kokkos_jit_plugin_detail.hpp` | factorized execution, first interaction, H1/Phi1 | Validated host and device JIT-plugin launch-packet construction |
 | `mace_kokkos_spherical_harmonics_detail.hpp` | runtime, first interaction | Complete nested spherical-harmonics state and backend-specific teardown |
 
 Owner-local helpers stay in the unnamed namespace of their source file. Do not

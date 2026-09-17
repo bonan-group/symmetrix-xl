@@ -5,7 +5,7 @@
 
 In Symmetrix-XL, **XL** stands for **eXtreme scale, Low latency**.
 
-Symmetrix-XL builds on [symmetrix](https://github.com/wcwitt/symmetrix) , a cross-platform evaluator for MACE models,
+Symmetrix-XL builds on [Symmetrix](https://github.com/wcwitt/symmetrix), a cross-platform evaluator for MACE models,
 and extends it with scalable, low-latency native execution paths for CPUs and
 GPUs. The Python distribution is named `symmetrix-xl`; the import namespace and
 command-line interface remain `symmetrix`.
@@ -37,9 +37,10 @@ Both used a 6.0 A model cutoff and 0.5 A neighbor-list skin, giving a 6.5 A
 effective cutoff, and completed with zero fallbacks. These are workload-specific
 demonstrations, not capacity guarantees.
 
-The extended mode uses a fixed workspace for processing atoms and has a slight perofrmance penalty (10\%-15\%).
-We recommend using the standard execution mode (default) and parallelize over multiple cards with LAMMPS for large
-system.
+Fixed-workspace execution traded about 8.5% throughput in this qualification
+for the larger demonstrated capacity. Standard execution remains the default;
+large production systems can also be distributed across multiple GPUs with
+LAMMPS.
 
 ### Demonstrated speed
 
@@ -107,8 +108,8 @@ symmetrix_extract_mace \
     --model mace-omat-0-medium.model \
     --output mace-omat-0-medium.json
 ```
-It is possible to select only individual elements with `--chemical-symbols Sr Ti O`.
-This result in a smaller JSON file, but loses the ability to run simulation with other elements.
+Use `--chemical-symbols Sr Ti O` to retain only selected elements. This creates
+a smaller JSON file but cannot evaluate systems containing other elements.
 
 Run an energy, force, or stress calculation with ASE:
 
@@ -170,5 +171,10 @@ is licensed under the [GNU General Public License (GPLv2)](pair_symmetrix/LICENS
 to maintain consistency with LAMMPS.
 
 ### Acknowledgements
+
+Symmetrix-XL is based on [Symmetrix](https://github.com/wcwitt/symmetrix),
+developed by Chuck Witt.
+
+The original Symmetrix project also has the following acknowledgement statement:
 
 An early phase of this project, leading to the Kokkos-based MACE implementation, was supported by the Schmidt Sciences Virtual Institute for Scientific Software (VISS). This engagement involved key contributions from Dave Brownell and Ketan Bhardwaj of the Center for Scientific and Software Engineering at Georgia Tech.
