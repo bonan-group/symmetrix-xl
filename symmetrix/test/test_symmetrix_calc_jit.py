@@ -1811,13 +1811,7 @@ def test_jit_parameter_is_deprecated_and_ignored(jit_harness, legacy_value):
     assert calculator.jit_status == "built"
 
 
-@pytest.mark.parametrize(
-    ("mode", "canonical"),
-    (("factorized", "direct"), ("receiver_factorized", "receiver_factorized")),
-)
-def test_jit_none_policy_rejects_rtc_modes_without_fallback(
-    jit_harness, monkeypatch, mode, canonical
-):
+def test_jit_none_policy_rejects_rtc_modes_without_fallback(jit_harness, monkeypatch):
     monkeypatch.setenv("SYMMETRIX_JIT_POLICY", "none")
     monkeypatch.setattr(
         symmetrix_calc.symmetrix,
@@ -1827,13 +1821,13 @@ def test_jit_none_policy_rejects_rtc_modes_without_fallback(
 
     with pytest.raises(
         symmetrix_calc._JitRequiredError,
-        match=rf"SYMMETRIX_JIT_POLICY=none is incompatible.*{canonical}",
+        match=r"SYMMETRIX_JIT_POLICY=none is incompatible.*direct",
     ):
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
             use_kokkos=True,
-            streamed_edges=mode,
+            streamed_edges="factorized",
         )
     assert jit_harness["prepare_calls"] == []
 
@@ -1897,7 +1891,6 @@ def test_non_factorized_modes_do_not_dispatch_jit(jit_harness, monkeypatch, mode
         ("direct", "direct", None, True),
         ("factorized", "direct", "factorized", True),
         ("direct_streamed", "direct", "direct_streamed", True),
-        ("receiver_factorized", "receiver_factorized", None, True),
     ),
 )
 def test_execution_mode_aliases_canonicalize_before_native_dispatch(
@@ -1918,6 +1911,29 @@ def test_execution_mode_aliases_canonicalize_before_native_dispatch(
     assert ("mode", canonical) in jit_harness["events"]
     assert bool(jit_harness["prepare_calls"]) is uses_jit
     assert calculator.jit_status == ("built" if uses_jit else "not_applicable")
+
+
+@pytest.mark.parametrize("mode", ("factorized", "direct_streamed"))
+def test_direct_compatibility_aliases_preserve_speed_profile(jit_harness, mode):
+    calculator = Symmetrix(
+        jit_harness["model_path"],
+        dtype="float32",
+        use_kokkos=True,
+        streamed_edges=mode,
+    )
+
+    assert calculator.streamed_edges == "direct"
+    assert calculator.execution_profile == "speed"
+
+
+def test_removed_receiver_factorized_selector_is_rejected(jit_harness):
+    with pytest.raises(ValueError, match="streamed_edges must be one of"):
+        Symmetrix(
+            jit_harness["model_path"],
+            dtype="float32",
+            use_kokkos=True,
+            streamed_edges="receiver_factorized",
+        )
 
 
 def test_jit_generation_version_mismatch_fails_before_generation(

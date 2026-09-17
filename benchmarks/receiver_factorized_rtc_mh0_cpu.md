@@ -1,5 +1,10 @@
 # MH-0 CPU Receiver-Factorized RTC Experiment
 
+> **Historical record (superseded).** This experiment predates removal of the
+> public `receiver_factorized` selector. Its decision below is retained as
+> measurement history, not current guidance. See the
+> [execution support matrix](../docs/reference/execution_support_matrix.md).
+
 Date: 2026-08-19
 
 ## Question

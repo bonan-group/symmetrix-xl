@@ -1,5 +1,11 @@
 # MACE-OMAT-0 MD overhead profile and optimization
 
+> **Historical record (superseded).** This report preserves the `all` selector
+> used for its original control measurements. That selector is no longer
+> public; see the
+> [execution support matrix](../docs/reference/execution_support_matrix.md) for
+> current requests and defaults.
+
 ## Conclusion
 
 The original ASE MD path hid the generated direct execution evaluator's advantage behind

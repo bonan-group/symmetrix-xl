@@ -1,5 +1,10 @@
 # Optimizing MACE GPU execution with radial splines and specialized node kernels
 
+Status: retained investigation and optimization methodology. Numerical results
+describe the recorded RTX 5090 campaign; current public execution behavior is
+documented in {doc}`/reference/execution_support_matrix` and
+{doc}`/user/execution`.
+
 This document describes the optimization method used to reduce the CUDA FP32
 time of the MACE-MH-1 path from `33.170419 us/atom` to about `6.67 us/atom` on a
 matched RTX 5090 workload. The method is intended as a reusable playbook for
@@ -507,8 +512,10 @@ This selection happens while generating and loading the RTC module. It is not
 a runtime fallback: zero fallback evaluations only prove that the selected
 artifact ran, not that the policy inherited all compatible optimizations.
 
-For Float32 CUDA MH-1, `low_memory=True` selects `retain-interaction-v1` and
-the bounded `capacity-v1` node arena before RTC compilation. The module then
+For the recorded Float32 CUDA MH-1 implementation, the capacity profile
+(`low_memory=True` in the historical invocation) selected
+`retain-interaction-v1` and the bounded `capacity-v1` node arena before RTC
+compilation. The module then
 uses the retained CUDA schedule, replaying only pre-gate state before Gate
 reverse. On the 864-atom AlN throughput contract, the same hybrid state with
 the 1,024-row throughput arena measured `7.172 us/atom` across two fresh

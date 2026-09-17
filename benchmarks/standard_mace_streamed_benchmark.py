@@ -21,10 +21,8 @@ MODE_ALIASES = {
     "factorized": "direct",
     "direct_streamed": "direct",
 }
-CANONICAL_MODES = frozenset(
-    ("materialized", "generic", "direct", "receiver_factorized")
-)
-PREPARED_MODES = frozenset(("direct", "receiver_factorized"))
+CANONICAL_MODES = frozenset(("materialized", "generic", "direct"))
+PREPARED_MODES = frozenset(("direct",))
 for variable in ("KOKKOS_NUM_THREADS", "OMP_NUM_THREADS"):
     os.environ[variable] = THREAD_COUNT
 for variable in (
@@ -1388,11 +1386,13 @@ def main():
         "--factorized-r1-reverse-cache-policy",
         dest="factorized_reverse_cache_policy",
         choices=("automatic", "recompute", "retain"),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--factorized-r1-planner-budget-bytes",
         dest="factorized_planner_budget_bytes",
         type=int,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--standard-r0-executor",
@@ -1405,7 +1405,7 @@ def main():
     parser.add_argument(
         "--factorized-parameter-gradients",
         action="store_true",
-        help="enable host parameter replay for factorized records only",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--m1-polynomial-policy",
@@ -1477,8 +1477,8 @@ def main():
     modes = [MODE_ALIASES.get(mode, mode) for mode in requested_modes]
     if any(mode not in CANONICAL_MODES for mode in modes):
         parser.error(
-            "--modes must contain only materialized,generic,direct,"
-            "receiver_factorized or a compatibility alias"
+            "--modes must contain only materialized,generic,direct or a "
+            "compatibility alias"
         )
     if len(set(modes)) != len(modes):
         parser.error("--modes contains selectors that resolve to the same algorithm")
@@ -1508,16 +1508,12 @@ def main():
             )
         if args.factorized_planner_budget_bytes < 1:
             parser.error("--factorized-r1-planner-budget-bytes must be positive")
-    if args.standard_r0_executor is not None and not {
-        "direct",
-        "receiver_factorized",
-    }.intersection(modes):
-        parser.error("--standard-r0-executor requires direct or receiver_factorized")
+    if args.standard_r0_executor is not None and "direct" not in modes:
+        parser.error("--standard-r0-executor requires direct")
     if (
         args.standard_m0_executor is not None
         and "generic" not in modes
         and "direct" not in modes
-        and "receiver_factorized" not in modes
     ):
         parser.error("--standard-m0-executor requires a streamed mode")
     if args.factorized_parameter_gradients and "receiver_factorized" not in modes:

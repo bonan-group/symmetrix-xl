@@ -1,5 +1,10 @@
 # Generalized MACE-MH-1 family qualification
 
+> **Historical record (superseded).** This report preserves the former
+> `legacy`, `r1`, and `all` selector names used by its qualification matrix.
+> They are no longer public requests; see the
+> [execution support matrix](../docs/reference/execution_support_matrix.md).
+
 Date: 2026-07-28
 
 This report qualifies the runtime-sized two-interaction MACE-MH-1 family

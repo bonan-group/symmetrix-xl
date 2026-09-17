@@ -59,18 +59,21 @@ identical, and Symmetrix-XL processed more directed candidates. See the
 The first-class performance path is streamed-edge `direct` execution. For
 Kokkos evaluation, the default `capacity` profile estimates device memory and
 chooses the fastest qualified plan that fits. A matching runtime-specialized
-artifact is required for direct execution, and incompatibilities fail clearly
-rather than silently changing algorithms.
+R1 artifact is required for two-interaction direct execution. Admitted
+single-layer models use built-in R1 execution; capacity planning may still
+compile or load specialized M0/R0 operator modules. Incompatibilities fail
+clearly rather than silently changing algorithms.
 
 Model evaluation defaults to FP32. This is the primary performance and
 capacity mode on CPU and GPU backends. Request `dtype="float64"` explicitly
 when a calculation requires higher numerical precision; JIT artifacts are
 precision-specific.
 
-`generic` is an explicit compiler-free compatibility and diagnostic path. It is
-useful when preparing or diagnosing a direct artifact, but it has no performance
-guarantee. Historical `materialized` and other compatibility modes remain
-available only where the current support matrix permits them.
+`non-compiled` is the explicit compiler-free compatibility and diagnostic path.
+It is useful when preparing or diagnosing a direct artifact, but it has no
+performance guarantee. `generic` is its deprecated internal-facing alias.
+Historical `materialized` and other compatibility modes remain available only
+where the current support matrix permits them.
 
 ## What Is Installed
 

@@ -1,5 +1,10 @@
 # JIT-free `all` AOT M0 and M1 recomputation
 
+> **Historical record (superseded).** This report preserves the internal mode
+> names and decisions used for its original measurements. `streamed_edges="all"`
+> is no longer a public request; see the
+> [execution support matrix](../docs/reference/execution_support_matrix.md).
+
 ## Decision
 
 Promote automatic structural AOT M0 admission inside `streamed_edges="all"` for

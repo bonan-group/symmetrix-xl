@@ -201,9 +201,11 @@ Model evaluation defaults to FP32. Request FP64 explicitly when needed:
 atoms.calc = Symmetrix("srtio3-mace.json", dtype="float64")
 ```
 
-Direct model-specialized execution is the default for supported compact
-models. It compiles or reuses a precision- and backend-specific artifact and
-fails clearly when the required artifact cannot be produced or loaded. Use
+Direct execution is the default for supported compact models. Two-interaction
+models compile or reuse a precision- and backend-specific artifact and fail
+clearly when it cannot be produced or loaded. Admitted single-layer models use
+built-in direct execution without an R1 artifact; capacity planning may still
+compile or load specialized M0/R0 operator modules. Use
 `streamed_edges="non-compiled"` only as a compiler-free compatibility or
 diagnostic mode.
 

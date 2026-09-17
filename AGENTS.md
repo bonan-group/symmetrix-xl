@@ -224,6 +224,12 @@ nontrivial speedup, not only requested thread counts.
 
 Add focused pytest coverage beside the affected component. Parametrize backend/precision variants when behavior differs. Test coverage must not be limited to the currently installed extension. When compatible CUDA or HIP hardware and toolchains are available, create isolated temporary virtual environments and fresh backend-specific build directories, build the corresponding Kokkos backend, and run its applicable tests. Do not replace or reconfigure the developer's installed extension to obtain this coverage. Tests requiring unavailable accelerator hardware, toolchains, compilers, LAMMPS, or downloaded model checkpoints should skip clearly with the missing prerequisite in the reason. Run the smallest relevant test file while iterating, then the full applicable suite and pre-commit before submission.
 
+If the worktree has no usable test environment, create the repository-local
+`.venv` with `uv venv`, activate it, and install the editable test package with
+`uv pip install -e "./symmetrix[test]"`. Do not treat a missing `pytest`
+executable as a reason to skip tests when this CPU development environment can
+be built.
+
 Inspect `git status` before running formatters. In a dirty worktree, run
 pre-commit on the exact intended files first; `--all-files` can rewrite
 unrelated tracked files. Never restore a formatter change unless the file was

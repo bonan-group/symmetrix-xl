@@ -12,9 +12,9 @@ command-line interface remain `symmetrix`.
 Symmetrix-XL preserves the learned MACE model while changing how its equivariant
 operations are scheduled, stored, and compiled. Its two main contributions are:
 
-1. **Streamed-edge execution.** Edge intermediates are consumed, aggregated, or
-   recomputed without retaining every materialized tensor, reducing graph-sized
-   workspace.
+1. **Memory-bounded direct execution.** The default executor consumes,
+   aggregates, or recomputes edge intermediates without retaining every
+   materialized tensor, reducing graph-sized workspace.
 2. **Model-specialized execution with runtime compilation.** Symmetrix-XL lowers
    each admitted MACE contraction structure into generated CPU, CUDA, or HIP
    kernels and caches the resulting artifact.

@@ -173,13 +173,13 @@ def test_full_benchmark_help_exposes_nvtx_and_storage_policies(monkeypatch, caps
             "standard",
             SCRIPT,
             "--modes",
-            ("materialized", "generic", "direct", "receiver_factorized"),
+            ("materialized", "generic", "direct"),
         ),
         (
             "macefield",
             MACEFIELD_SCRIPT,
             "--modes",
-            ("materialized", "generic", "direct", "receiver_factorized"),
+            ("materialized", "generic", "direct"),
         ),
         (
             "mh1",

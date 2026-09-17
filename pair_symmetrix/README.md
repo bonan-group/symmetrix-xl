@@ -22,8 +22,10 @@ pair_style    symmetrix/mace head omat_pbe
 pair_coeff    * * srtio3-mace.json Sr Ti O
 ```
 
-This minimal example uses the serial pair style. The first-class Kokkos direct
-path requires the matching prepared host or device artifact described below.
+This minimal example uses the serial pair style. For a two-interaction model,
+the first-class Kokkos direct path requires the matching prepared host or
+device R1 artifact described below. Single-layer models do not require R1
+artifacts.
 
 Without `head NAME`, the JSON's declared default head is used. Legacy
 single-head JSON files use their existing behavior.
@@ -92,10 +94,12 @@ M0 or R0 topology does not match a built-in module additionally use
 `jit_m0_device_artifact` and/or `jit_r0_device_artifact`; M0 also records its
 validated `chunk32` or `table` schedule through `jit_m0_device_schedule`.
 These operator modules are device-only and are loaded after R1 but before
-low-memory admission. Explicit `direct` requires a matching R1 artifact and
-never falls back. `generic` rejects artifacts because generic execution is
-compiler-free. The experimental Python-only
-`receiver_factorized` algorithm is not accepted by the LAMMPS pair style.
+low-memory admission. Explicit `direct` requires a matching R1 artifact for
+two-interaction models and never falls back. Single-layer models use built-in
+R1 execution. `generic` rejects artifacts because generic execution is
+compiler-free.
+The removed `receiver_factorized` selector is rejected by all current
+evaluators, including the LAMMPS pair style.
 The pair style loads artifacts but never invokes a compiler.
 
 `profile capacity` is the default and activates the same qualified M1
@@ -115,10 +119,11 @@ selection when the planner determines that they reduce the graph memory
 requirement. The option permits selection and does not force a tiled plan.
 
 Single-layer direct MPI evaluates owned receivers and local-plus-ghost sources
-without communicating H1 or H1 adjoints. Both retained and fixed-workspace
-single-layer plans are supported. Dual-layer fixed-workspace MPI remains
-unsupported; dual-layer retained and non-tiled capacity plans keep their H1
-communication protocol.
+without communicating H1 or H1 adjoints. Retained single-layer plans are
+backend-independent; fixed-workspace single-layer plans currently require
+CUDA FP32. Dual-layer fixed-workspace likewise requires CUDA FP32 and remains
+unsupported with MPI; dual-layer retained and non-tiled capacity plans keep
+their H1 communication protocol.
 
 Multi-rank direct execution with pre-generated Kokkos OpenMP host artifacts is
 qualified for FP32 and FP64 standard MACE and MACEField in two-rank periodic
@@ -306,155 +311,7 @@ uses the Fortran ABI. CUDA and HIP builds use Kokkos Serial for host execution
 and disable Kokkos OpenMP; this is the qualified Symmetrix-XL configuration, not a
 general Kokkos limitation.
 
-The manual recipes below are retained for site-specific MPI and module
-environments. Their common prerequisites are CMake 3.27 or newer and a C++20
-compiler.
-
-Below are recipes for building LAMMPS with `pair_symmetrix` on various machines:
-* [ARCHER2](#building-lammps-on-archer2);
-* [Harvard's FASRC Cannon](#building-lammps-on-fasrc-cannon).
-
------
-
-#### Building LAMMPS with Kokkos HIP
-
-Use the same hipcc compiler and AMD architecture for LAMMPS, Kokkos, and
-libsymmetrix. The qualification target is FP64 on one `gfx1151` GPU:
-
-```bash
-cmake -S cmake -B build-hip \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc \
-    -DCMAKE_PREFIX_PATH=/opt/rocm \
-    -DCMAKE_CXX_STANDARD=20 \
-    -DBUILD_MPI=ON \
-    -DPKG_KOKKOS=ON \
-    -DKokkos_ENABLE_HIP=ON \
-    -DKokkos_ENABLE_SERIAL=ON \
-    -DKokkos_ENABLE_OPENMP=OFF \
-    -DKokkos_ARCH_NATIVE=OFF \
-    -DKokkos_ARCH_AMD_GFX1100=ON \
-    -DKokkos_IMPL_AMDGPU_FLAGS=--offload-arch=gfx1151 \
-    -DKokkos_IMPL_AMDGPU_LINK=--offload-arch=gfx1151 \
-    -DSYMMETRIX_KOKKOS=ON \
-    -DSYMMETRIX_SPHERICART_CUDA=OFF
-cmake --build build-hip -j 4
-```
-
-Run one MPI rank per active GPU. FP32 and simultaneous multi-GPU execution are
-not currently qualified for the pair style.
-
------
-
-#### Building LAMMPS on ARCHER2
-```
-# download lammps and Symmetrix-XL
-mkdir lammps-symmetrix && cd lammps-symmetrix
-git clone -b release https://github.com/lammps/lammps
-git clone --recursive https://github.com/bonan-group/symmetrix-xl
-# obtain a compute node
-srun --nodes=1 --exclusive --time=00:20:00 --partition=standard --qos=short --account=e89-camm --pty /bin/bash
-module load cmake/3.29.4
-module load PrgEnv-gnu
-export CRAYPE_LINK_TYPE=dynamic
-# patch lammps with pair_symmetrix
-cd symmetrix/pair_symmetrix
-./install.sh ../../lammps
-cd ../..
-# build lammps
-cd lammps
-cmake \
-    -B build \
-    -D CMAKE_BUILD_TYPE=Release \
-    -D CMAKE_C_COMPILER=cc \
-    -D CMAKE_CXX_COMPILER=CC \
-    -D CMAKE_Fortran_COMPILER=ftn \
-    -D CMAKE_CXX_STANDARD=20 \
-    -D CMAKE_CXX_STANDARD_REQUIRED=ON \
-    -D CMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS} -march=native -ffast-math" \
-    -D BUILD_SHARED_LIBS=ON \
-    -D PKG_KOKKOS=ON \
-    -D Kokkos_ENABLE_SERIAL=ON \
-    -D Kokkos_ENABLE_OPENMP=ON \
-    -D BUILD_OMP=ON \
-    -D Kokkos_ARCH_NATIVE=ON \
-    -D Kokkos_ENABLE_AGGRESSIVE_VECTORIZATION=ON \
-    -D SYMMETRIX_KOKKOS=ON \
-    cmake
-cmake --build build -j 128
-cd ../..
-```
-
-#### Building LAMMPS on FASRC Cannon
-
-```
-# download lammps and patch with Symmetrix-XL
-mkdir lammps-symmetrix && cd lammps-symmetrix
-git clone --branch release --depth 1 https://github.com/lammps/lammps
-git clone --recursive https://github.com/bonan-group/symmetrix-xl
-cd symmetrix/pair_symmetrix
-./install.sh ../../lammps
-cd ../..
-
-# example: cpu-only build (uses intel compilers)
-srun --nodes=1 --exclusive --mem=800G --partition=test --time=1:00:00 --pty bash
-module load cmake/3.30.3-fasrc01
-module load intel/25.0.1-fasrc01
-module load intelmpi/2021.14-fasrc01
-module load intel-mkl/25.0.1-fasrc01
-cd lammps
-cmake \
-    -B build-cpu \
-    -D CMAKE_BUILD_TYPE=Release \
-    -D CMAKE_CXX_STANDARD=20 \
-    -D CMAKE_CXX_STANDARD_REQUIRED=ON \
-    -D CMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS} -march=native -fp-model fast" \
-    -D BUILD_SHARED_LIBS=ON \
-    -D BUILD_OMP=ON \
-    -D BUILD_MPI=ON \
-    -D PKG_KOKKOS=ON \
-    -D Kokkos_ENABLE_SERIAL=ON \
-    -D Kokkos_ENABLE_OPENMP=ON \
-    -D Kokkos_ARCH_NATIVE=ON \
-    -D Kokkos_ENABLE_AGGRESSIVE_VECTORIZATION=ON \
-    -D SYMMETRIX_KOKKOS=ON \
-    cmake
-cmake --build build-cpu -j 112
-cd ..
-
-# example: gpu-enabled build (uses gcc and nvcc)
-srun --nodes=1 --exclusive --mem=400G --gres=gpu:1 --partition=gpu_test --time=1:00:00 --pty bash
-module load cmake/3.30.3-fasrc01
-module load gcc/13.2.0-fasrc01
-module load openmpi/5.0.2-fasrc02
-module load cuda/12.4.1-fasrc01
-module load cudnn/9.5.1.17_cuda12-fasrc01
-cd lammps
-cmake \
-    -B build-gpu \
-    -D CMAKE_BUILD_TYPE=Release \
-    -D CMAKE_CXX_STANDARD=20 \
-    -D CMAKE_CXX_STANDARD_REQUIRED=ON \
-    -D CMAKE_CXX_COMPILER=$(pwd)/lib/kokkos/bin/nvcc_wrapper \
-    -D CMAKE_CUDA_HOST_COMPILER=$(command -v g++) \
-    -D BUILD_SHARED_LIBS=ON \
-    -D BUILD_OMP=OFF \
-    -D BUILD_MPI=ON \
-    -D PKG_KOKKOS=ON \
-    -D Kokkos_ENABLE_SERIAL=ON \
-    -D Kokkos_ENABLE_OPENMP=OFF \
-    -D Kokkos_ARCH_NATIVE=OFF \
-    -D Kokkos_ENABLE_CUDA=ON \
-    -D Kokkos_ARCH_AMPERE80=ON \
-    -D SYMMETRIX_KOKKOS=ON \
-    -D SYMMETRIX_SPHERICART_CUDA=ON \
-    cmake
-cmake --build build-gpu -j 64
-cd ../..
-```
-
-When `libsymmetrix` is embedded into a Kokkos CUDA build, CUDA SpheriCart now
-defaults ON. Keep `-D SYMMETRIX_SPHERICART_CUDA=ON` in reproducible build
-recipes and verify the cache after configuration. An explicit OFF is retained
-only as a diagnostic and emits a warning because it copies edge coordinates to
-the host and harmonic values/gradients back to the GPU on every evaluation.
+For site module environments and cross-compilation, pass explicit compiler,
+toolkit, MPI-wrapper, generator, and architecture options to the build frontend
+instead of maintaining separate raw CMake recipes. Use `--dry-run` to inspect
+the resolved invocation before starting a build.

@@ -5,8 +5,10 @@ CUDA and HIP direct artifacts are generated at runtime with NVRTC and hipRTC;
 the ahead-of-time extension still determines Kokkos and SpheriCart support.
 Artifacts must be prepared before LAMMPS production runs.
 
-Cache identity, source validation, target rules, and diagnostic environment
-variables are defined in {doc}`/streamed_edge_execution`.
+The direct-execution architecture and cache invariants are described in
+{doc}`/streamed_edge_execution`. The implementation in
+`symmetrix/source/symmetrix/jit.py` is authoritative for compiler discovery,
+cache identity, publication, and validation.
 
 Use a task-specific cache and require direct specialization when qualifying it:
 

@@ -28,19 +28,25 @@ Symmetrix(
 `Symmetrix` is an ASE calculator. `dtype` defaults to `"float32"` and also
 accepts `"float64"`. Select float64 explicitly for high-precision calculations;
 the non-Kokkos serial `MACE_Nonlinear` evaluator currently requires it.
-`streamed_edges` accepts `direct` (default),
-`non-compiled`, `materialized`, `receiver_factorized`, and temporary compatibility
-`auto`. The legacy aliases are `all_interactions`, `factorized`, and
-`direct_streamed`. `execution_profile` is `capacity` (default) or `speed`;
+`streamed_edges` accepts `direct` (default), `non-compiled`, `materialized`,
+and temporary compatibility request `auto`. `generic` and `all_interactions`
+are deprecated aliases for `non-compiled`. `factorized` and `direct_streamed`
+are compatibility aliases for `direct`; in the Python frontend they preserve
+the former throughput behavior by changing an otherwise-`capacity` request to
+the `speed` profile. Use literal `direct` for capacity behavior. The removed
+`receiver_factorized` selector is rejected.
+`execution_profile` is `capacity` (default) or `speed`;
 the compatibility `low_memory=True` and `low_memory=False` spellings map to
 those profiles.
 `allow_fixed_workspace=True` separately permits bounded tiled workspace plans
-for qualified direct Kokkos capacity execution. It defaults to `False` and
+for qualified CUDA FP32 direct capacity execution. It defaults to `False` and
 does not force the planner to select such a plan.
 
-`direct` is the first-class performance path and requires a matching admitted
-artifact. `non-compiled` is an explicit compiler-free fallback/diagnostic mode with
-no performance guarantee.
+`direct` is the first-class performance path. Two-interaction models require a
+matching admitted R1 artifact; admitted single-layer models use built-in R1
+execution, although capacity planning may still compile or load M0/R0 operator
+modules. `non-compiled` is an explicit compiler-free fallback/diagnostic mode
+with no performance guarantee.
 
 Set `dispersion=True` to add the D3 correction from the optional `torch-dftd`
 package. Symmetrix-XL evaluates the neural model and D3 calculator together and

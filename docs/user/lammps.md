@@ -75,9 +75,10 @@ enables fixed workspace.
 `allow_fixed_workspace` defaults to `no`. Set it to `yes` only with
 `profile capacity` to permit bounded tiled workspace selection; it does not
 force that plan when another qualified capacity plan is preferred.
-Single-layer direct MPI supports retained and fixed-workspace plans without H1
-communication and does not require an R1 artifact. Dual-layer fixed-workspace
-MPI is not supported yet.
+Single-layer direct MPI does not require an R1 artifact. Its retained plan is
+backend-independent; its fixed-workspace plan currently requires CUDA FP32.
+Dual-layer fixed-workspace also requires CUDA FP32 and is not supported with
+MPI.
 
 Artifact preparation uses the Python runtime, not the LAMMPS executable. Install
 the `symmetrix-xl` CPU frontend first and then install the backend matching the

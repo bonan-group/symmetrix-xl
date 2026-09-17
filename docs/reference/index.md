@@ -5,5 +5,6 @@
 
 python_api
 cli
+build_frontend
 execution_support_matrix
 ```

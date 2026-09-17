@@ -1,13 +1,12 @@
 # MH-0 CUDA cubic-coefficient layout experiment
 
-Date: 2026-09-10. The standalone microbenchmark is retained; the production
-prototype was rejected and removed.
+Date: 2026-09-10. The production prototype and standalone microbenchmark source
+were not retained; this file preserves the measured decision record.
 
 ## Decision
 
-Keep the `float4` coefficient-layout experiment in
-[`mh0_radial_point_microbench.cu`](mh0_radial_point_microbench.cu), but keep the
-generation-10 scalar coefficient layout in production. Packing gives a large
+Keep the generation-10 scalar coefficient layout in production. The rejected
+`float4` packing experiment gave a large
 synthetic R1-forward improvement, but matched full-evaluator timing is neutral
 at 4,000 atoms and regresses at 864 atoms. Nsight Systems also shows no R1
 kernel improvement in the actual generated implementation.
@@ -138,22 +137,9 @@ Nsight Compute was attempted earlier on this host, but hardware-counter
 collection fails with `ERR_NVGPUCTRPERM`. No replay time or inferred timeline
 metric is substituted for the unavailable counter data.
 
-## Reproduction and artifacts
+## Historical artifacts
 
-Build and run the retained microbenchmark coefficient suite with:
-
-```bash
-/usr/local/cuda-13.3/bin/nvcc -O3 -std=c++20 -arch=sm_120 -lineinfo \
-  -Xptxas=-v benchmarks/mh0_radial_point_microbench.cu \
-  -o /tmp/symmetrix-mh0-coefficient-layout-20260910/mh0_radial_point_microbench
-
-/tmp/symmetrix-mh0-coefficient-layout-20260910/mh0_radial_point_microbench \
-  --atoms 4000 --edges-per-atom 91 --warmups 10 --repeats 31 \
-  --suite coefficient \
-  --output /tmp/symmetrix-mh0-coefficient-layout-20260910/result-4000.json
-```
-
-Use `--atoms 864` for the small workload. The retained source SHA256 is
+The uncommitted source SHA256 was
 `659933144896527abc575cb07035d045736957998b5a72d770d490c641ddf45a` and
 the measured binary SHA256 is
 `f4847f5a8fa3370d1a832796aff782562132a7003f404bb0198f9ae1c55c7bf9`.

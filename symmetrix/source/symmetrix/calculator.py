@@ -553,11 +553,17 @@ class Symmetrix(Calculator):
         Use the compiled Kokkos evaluator. ``False`` selects the non-Kokkos
         serial CPU evaluator.
     streamed_edges : {"direct", "non-compiled", "materialized"}, default="direct"
-        Evaluation algorithm for compact two-layer MACE models. ``direct``
-        requires a model-specific RTC artifact and does not fall back.
+        Evaluation algorithm for compact MACE models. For two-interaction
+        models, ``direct`` requires a model-specific RTC artifact and does not
+        fall back. Admitted single-layer models use built-in R1 execution,
+        although capacity planning may still specialize M0/R0 operators.
         ``non-compiled`` is an explicit compiler-free fallback with no
         performance guarantee. ``materialized`` is a frozen legacy mode.
-        The old ``generic`` spelling remains accepted as a deprecated alias.
+        The old ``generic`` and ``all_interactions`` spellings remain accepted
+        as deprecated aliases. ``factorized`` and ``direct_streamed`` alias
+        ``direct`` and preserve the former throughput behavior by changing an
+        otherwise-``capacity`` request to the ``speed`` profile. Use literal
+        ``direct`` for capacity behavior.
     execution_profile : {"capacity", "speed"}, default="capacity"
         Resource objective for direct Kokkos execution. ``capacity`` chooses
         the fastest qualified direct policy estimated to fit the device; when
@@ -656,7 +662,7 @@ class Symmetrix(Calculator):
         model cutoff plus this skin and reused until any atom has moved by
         half the skin. With ``streamed_edges="generic"``, current exact-cutoff
         members are compacted from those candidates in native Kokkos code.
-        With ``streamed_edges="direct"`` or ``"receiver_factorized"``, inactive candidates are retained at
+        With ``streamed_edges="direct"``, inactive candidates are retained at
         the exact compact-radial cutoff, where their radial contribution is
         zero, so the prepared schedule remains stable. Set to zero to rebuild
         the exact neighbor list every call.
@@ -667,9 +673,9 @@ class Symmetrix(Calculator):
     Attributes
     ----------
     jit_status : str
-        Specialization outcome: ``"built"``, ``"cached"``, ``"disabled"``,
-        or ``"not_applicable"``. Specialization failures raise during
-        construction.
+        Specialization outcome: ``"unresolved"``, ``"built"``, ``"cached"``,
+        ``"failed"``, or ``"not_applicable"``. Specialization failures raise
+        during construction.
     jit_reason : str or None
         Explanation when specialization is disabled or not applicable.
     jit_artifact_id : str or None
