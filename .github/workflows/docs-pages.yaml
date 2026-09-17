@@ -56,7 +56,7 @@ jobs:
         touch docs/_build/html/.nojekyll
     - name: Upload Pages artifact
       if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-      uses: actions/upload-pages-artifact@v3
+      uses: actions/upload-pages-artifact@v5
       with:
         path: docs/_build/html
 
@@ -74,9 +74,9 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
     - name: Configure Pages
-      uses: actions/configure-pages@v5
+      uses: actions/configure-pages@v6
       with:
         enablement: true
     - name: Deploy Pages artifact
       id: deployment
-      uses: actions/deploy-pages@v4
+      uses: actions/deploy-pages@v5
