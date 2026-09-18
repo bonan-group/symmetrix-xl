@@ -681,10 +681,10 @@ void MACEKokkos<Precision>::compute_single_layer_tiled(
 template <typename Precision>
 void MACEKokkos<Precision>::compute_dual_layer_tiled(
     const int num_receivers,
-    Kokkos::View<const int*> node_types,
-    Kokkos::View<const int*> num_neigh,
     Kokkos::View<const int*>,
-    Kokkos::View<const double*> xyz,
+    Kokkos::View<const int*>,
+    Kokkos::View<const int*>,
+    Kokkos::View<const double*>,
     Kokkos::View<const double*>)
 {
     if (!dual_layer_tiled_plan_active || single_layer_readout)
@@ -692,14 +692,53 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled(
             "Dual-layer tiled execution was entered without an active plan.");
     if (dual_layer_workspace_active_capacity <= 0
         || dual_layer_workspace_arena.data() == nullptr
-        || dual_layer_graph_h1.extent_int(0) < num_receivers
-        || dual_layer_graph_h1_adjoint.extent_int(0) < num_receivers)
+        || dual_layer_graph_h1.extent_int(0) < execution_prepared_num_feature_nodes
+        || dual_layer_graph_h1_adjoint.extent_int(0)
+            < execution_prepared_num_feature_nodes)
         throw std::logic_error(
             "Dual-layer tiled workspace was not prepared with the graph.");
+    Kokkos::deep_copy(
+        factorized_execution_space, dual_layer_graph_h1_adjoint, Precision(0));
+    compute_dual_layer_tiled_phase1(num_receivers);
+    compute_dual_layer_tiled_phase2(num_receivers);
+    compute_dual_layer_tiled_phase3(num_receivers);
+}
 
-    const auto all_node_types = node_types;
-    const auto all_num_neigh = num_neigh;
-    const auto all_node_energies = node_energies;
+template <typename Precision>
+void MACEKokkos<Precision>::compute_dual_layer_tiled_phase1(
+    const int num_receivers)
+{
+    compute_dual_layer_tiled_phase(num_receivers, 1);
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::compute_dual_layer_tiled_phase2(
+    const int num_receivers)
+{
+    compute_dual_layer_tiled_phase(num_receivers, 2);
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::compute_dual_layer_tiled_phase3(
+    const int num_receivers)
+{
+    compute_dual_layer_tiled_phase(num_receivers, 3);
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
+    const int num_receivers, const int phase)
+{
+    if (!dual_layer_tiled_plan_active || single_layer_readout
+        || phase < 1 || phase > 3)
+        throw std::logic_error("Invalid dual-layer tiled evaluation phase.");
+    const auto all_node_types =
+        Kokkos::View<const int*>(execution_prepared_node_types);
+    const auto all_num_neigh =
+        Kokkos::View<const int*>(execution_prepared_num_neigh);
+    const auto all_node_energies = node_energies_storage;
+    const auto receiver_features = execution_prepared_receiver_feature_indices;
+    const bool identity_receiver_features = receiver_features.extent(0) == 0;
     const int capacity = dual_layer_workspace_active_capacity;
     const int num_tiles = num_receivers/capacity
         +(num_receivers%capacity != 0);
@@ -767,126 +806,162 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled(
             batch_neigh_types, batch_r};
     };
 
-    // Phase 1: first interaction forward and the linear readout seed.
     for (int tile=0; tile<num_tiles; ++tile) {
         const auto [receiver_begin, receiver_end, edge_begin, edge_end] =
             tile_bounds(tile);
         const int receiver_count = receiver_end-receiver_begin;
         const int edge_count = edge_end-edge_begin;
-        bind_dual_layer_phase1_workspace(receiver_begin, receiver_count);
+        if (phase == 1)
+            bind_dual_layer_phase1_workspace(receiver_begin, receiver_count);
+        else if (phase == 2)
+            bind_dual_layer_phase2_workspace(receiver_begin, receiver_count);
+        else
+            bind_dual_layer_phase3_workspace(receiver_begin, receiver_count);
         auto [batch_node_types, batch_num_neigh, batch_neigh_indices,
               batch_neigh_types, batch_r] = prepare_tile(
                   receiver_begin, receiver_end, edge_begin, edge_end);
+        const auto batch_xyz = single_layer_workspace_xyz;
         Kokkos::deep_copy(factorized_execution_space, node_forces, 0.0);
-        if (has_zbl) {
-            zbl.compute_ZBL(
-                factorized_execution_space,
+        if (phase == 1) {
+            if (has_zbl)
+                zbl.compute_ZBL(
+                    factorized_execution_space,
+                    receiver_count, batch_node_types, batch_num_neigh,
+                    batch_neigh_types, atomic_numbers, streamed_first_neigh,
+                    batch_r, execution_prepared_unit_direction, node_energies,
+                    node_forces, 0);
+            compute_Y(batch_xyz, batch_r, true, 0, edge_count);
+            compute_A0_streamed(
                 receiver_count, batch_node_types, batch_num_neigh,
-                batch_neigh_types, atomic_numbers, streamed_first_neigh,
-                batch_r, execution_prepared_unit_direction, node_energies,
-                node_forces, 0);
+                batch_neigh_types, batch_r, 0);
+            compute_A0_scaled(
+                receiver_count, batch_node_types, batch_num_neigh,
+                batch_neigh_types, batch_r);
+            if (use_m0_module())
+                compute_M0_module(receiver_count, batch_node_types);
+            else
+                compute_M0(receiver_count, batch_node_types);
+            compute_H1(receiver_count);
+            add_H1_first_residual(receiver_count, batch_node_types, true);
+            compute_readout_1(receiver_count, batch_node_types, true);
+            const auto tile_h1 = H1;
+            const auto tile_h1_adjoint = H1_adj;
+            const auto graph_h1 = dual_layer_graph_h1;
+            const auto graph_h1_adjoint = dual_layer_graph_h1_adjoint;
+            Kokkos::parallel_for(
+                "MACEKokkos::scatter_dual_layer_phase1_state",
+                Kokkos::MDRangePolicy<decltype(factorized_execution_space),
+                    Kokkos::Rank<3>>(
+                    factorized_execution_space, {0,0,0},
+                    {receiver_count,num_LM,num_channels}),
+                KOKKOS_LAMBDA (const int receiver, const int LM, const int k) {
+                    const int global_receiver = receiver_begin+receiver;
+                    const int feature = identity_receiver_features
+                        ? global_receiver : receiver_features(global_receiver);
+                    graph_h1(feature,LM,k) = tile_h1(receiver,LM,k);
+                    graph_h1_adjoint(feature,LM,k) =
+                        tile_h1_adjoint(receiver,LM,k);
+                });
+        } else if (phase == 2) {
+            const auto tile_h1 = H1;
+            const auto tile_h1_adjoint = H1_adj;
+            const auto graph_h1 = dual_layer_graph_h1;
+            const auto graph_h1_adjoint = dual_layer_graph_h1_adjoint;
+            Kokkos::parallel_for(
+                "MACEKokkos::gather_dual_layer_phase2_state",
+                Kokkos::MDRangePolicy<decltype(factorized_execution_space),
+                    Kokkos::Rank<3>>(
+                    factorized_execution_space, {0,0,0},
+                    {receiver_count,num_LM,num_channels}),
+                KOKKOS_LAMBDA (const int receiver, const int LM, const int k) {
+                    const int global_receiver = receiver_begin+receiver;
+                    const int feature = identity_receiver_features
+                        ? global_receiver : receiver_features(global_receiver);
+                    tile_h1(receiver,LM,k) = graph_h1(feature,LM,k);
+                    tile_h1_adjoint(receiver,LM,k) =
+                        graph_h1_adjoint(feature,LM,k);
+                });
+            compute_Y(batch_xyz, batch_r, true, 0, edge_count);
+            H1 = dual_layer_graph_h1;
+            H1_adj = dual_layer_graph_h1_adjoint;
+            compute_Phi1_streamed_jit(
+                receiver_count, batch_node_types, batch_num_neigh,
+                batch_neigh_indices, batch_neigh_types, batch_r);
+            H1 = tile_h1;
+            H1_adj = tile_h1_adjoint;
+            compute_A1_scaled(
+                receiver_count, batch_node_types, batch_num_neigh,
+                batch_neigh_types, batch_r);
+            compute_M1(receiver_count, batch_node_types);
+            compute_H2(receiver_count, batch_node_types);
+            compute_readout_2(receiver_count);
+            reverse_H2(receiver_count, batch_node_types, false);
+            reverse_M1(receiver_count, batch_node_types);
+            reverse_A1_scaled(
+                receiver_count, batch_node_types, batch_num_neigh,
+                batch_neigh_types, batch_xyz, batch_r);
+            Kokkos::parallel_for(
+                "MACEKokkos::scatter_dual_layer_phase2_receiver_adjoint",
+                Kokkos::MDRangePolicy<decltype(factorized_execution_space),
+                    Kokkos::Rank<3>>(
+                    factorized_execution_space, {0,0,0},
+                    {receiver_count,num_LM,num_channels}),
+                KOKKOS_LAMBDA (const int receiver, const int LM, const int k) {
+                    const int global_receiver = receiver_begin+receiver;
+                    const int feature = identity_receiver_features
+                        ? global_receiver : receiver_features(global_receiver);
+                    graph_h1_adjoint(feature,LM,k) =
+                        tile_h1_adjoint(receiver,LM,k);
+                });
+            H1 = dual_layer_graph_h1;
+            H1_adj = dual_layer_graph_h1_adjoint;
+            dual_layer_active_tile = tile;
+            dual_layer_active_segment_begin =
+                dual_layer_tile_segment_offsets_host.at(
+                    static_cast<std::size_t>(tile));
+            dual_layer_active_segment_count =
+                dual_layer_tile_segment_offsets_host.at(
+                    static_cast<std::size_t>(tile+1))
+                -dual_layer_active_segment_begin;
+            reverse_factorized_direct(
+                receiver_count, batch_node_types, batch_neigh_indices,
+                batch_neigh_types, batch_xyz, batch_r);
+        } else {
+            const auto tile_h1_adjoint = H1_adj;
+            const auto graph_h1_adjoint = dual_layer_graph_h1_adjoint;
+            Kokkos::parallel_for(
+                "MACEKokkos::gather_dual_layer_phase3_adjoint",
+                Kokkos::MDRangePolicy<decltype(factorized_execution_space),
+                    Kokkos::Rank<3>>(
+                    factorized_execution_space, {0,0,0},
+                    {receiver_count,num_LM,num_channels}),
+                KOKKOS_LAMBDA (const int receiver, const int LM, const int k) {
+                    const int global_receiver = receiver_begin+receiver;
+                    const int feature = identity_receiver_features
+                        ? global_receiver : receiver_features(global_receiver);
+                    tile_h1_adjoint(receiver,LM,k) =
+                        graph_h1_adjoint(feature,LM,k);
+                });
+            compute_Y(batch_xyz, batch_r, true, 0, edge_count);
+            compute_A0_streamed(
+                receiver_count, batch_node_types, batch_num_neigh,
+                batch_neigh_types, batch_r, 0);
+            compute_A0_scaled(
+                receiver_count, batch_node_types, batch_num_neigh,
+                batch_neigh_types, batch_r);
+            reverse_H1(receiver_count);
+            if (use_m0_module())
+                reverse_M0_module(receiver_count, batch_node_types);
+            else
+                reverse_M0(receiver_count, batch_node_types);
+            reverse_A0_scaled(
+                receiver_count, batch_node_types, batch_num_neigh,
+                batch_neigh_types, batch_xyz, batch_r);
+            reverse_A0_streamed(
+                receiver_count, batch_node_types, batch_num_neigh,
+                batch_neigh_types, batch_xyz, batch_r,
+                receiver_begin, 0, edge_count);
         }
-        compute_Y(xyz, batch_r, true, 0, edge_count);
-        compute_A0_streamed(
-            receiver_count, batch_node_types, batch_num_neigh,
-            batch_neigh_types, batch_r, 0);
-        compute_A0_scaled(
-            receiver_count, batch_node_types, batch_num_neigh,
-            batch_neigh_types, batch_r);
-        if (use_m0_module())
-            compute_M0_module(receiver_count, batch_node_types);
-        else
-            compute_M0(receiver_count, batch_node_types);
-        compute_H1(receiver_count);
-        add_H1_first_residual(receiver_count, batch_node_types, true);
-        compute_readout_1(receiver_count, batch_node_types, true);
-        accumulate_single_layer_tiled_outputs(
-            receiver_begin, receiver_count, edge_begin, edge_count);
-        evaluation_batches += 1;
-    }
-
-    // Phase 2: second interaction forward and reverse, including R1.
-    for (int tile=0; tile<num_tiles; ++tile) {
-        const auto [receiver_begin, receiver_end, edge_begin, edge_end] =
-            tile_bounds(tile);
-        const int receiver_count = receiver_end-receiver_begin;
-        const int edge_count = edge_end-edge_begin;
-        bind_dual_layer_phase2_workspace(receiver_begin, receiver_count);
-        auto [batch_node_types, batch_num_neigh, batch_neigh_indices,
-              batch_neigh_types, batch_r] = prepare_tile(
-                  receiver_begin, receiver_end, edge_begin, edge_end);
-        Kokkos::deep_copy(factorized_execution_space, node_forces, 0.0);
-        compute_Y(xyz, batch_r, true, 0, edge_count);
-        compute_Phi1_streamed_jit(
-            receiver_count, batch_node_types, batch_num_neigh,
-            batch_neigh_indices, batch_neigh_types, batch_r);
-        const auto graph_rows = Kokkos::make_pair(
-            static_cast<std::size_t>(receiver_begin),
-            static_cast<std::size_t>(receiver_end));
-        H1 = Kokkos::subview(
-            dual_layer_graph_h1, graph_rows, Kokkos::ALL, Kokkos::ALL);
-        H1_adj = Kokkos::subview(
-            dual_layer_graph_h1_adjoint,
-            graph_rows, Kokkos::ALL, Kokkos::ALL);
-        compute_A1_scaled(
-            receiver_count, batch_node_types, batch_num_neigh,
-            batch_neigh_types, batch_r);
-        compute_M1(receiver_count, batch_node_types);
-        compute_H2(receiver_count, batch_node_types);
-        compute_readout_2(receiver_count);
-        reverse_H2(receiver_count, batch_node_types, false);
-        reverse_M1(receiver_count, batch_node_types);
-        reverse_A1_scaled(
-            receiver_count, batch_node_types, batch_num_neigh,
-            batch_neigh_types, xyz, batch_r);
-        H1 = dual_layer_graph_h1;
-        H1_adj = dual_layer_graph_h1_adjoint;
-        dual_layer_active_tile = tile;
-        dual_layer_active_segment_begin =
-            dual_layer_tile_segment_offsets_host.at(
-                static_cast<std::size_t>(tile));
-        dual_layer_active_segment_count =
-            dual_layer_tile_segment_offsets_host.at(
-                static_cast<std::size_t>(tile+1))
-            -dual_layer_active_segment_begin;
-        reverse_factorized_direct(
-            receiver_count, batch_node_types, batch_neigh_indices,
-            batch_neigh_types, xyz, batch_r);
-        accumulate_single_layer_tiled_outputs(
-            receiver_begin, receiver_count, edge_begin, edge_count);
-        evaluation_batches += 1;
-    }
-
-    // Phase 3: replay only first-layer inputs, then reverse the first interaction.
-    for (int tile=0; tile<num_tiles; ++tile) {
-        const auto [receiver_begin, receiver_end, edge_begin, edge_end] =
-            tile_bounds(tile);
-        const int receiver_count = receiver_end-receiver_begin;
-        const int edge_count = edge_end-edge_begin;
-        bind_dual_layer_phase3_workspace(receiver_begin, receiver_count);
-        auto [batch_node_types, batch_num_neigh, batch_neigh_indices,
-              batch_neigh_types, batch_r] = prepare_tile(
-                  receiver_begin, receiver_end, edge_begin, edge_end);
-        Kokkos::deep_copy(factorized_execution_space, node_forces, 0.0);
-        compute_Y(xyz, batch_r, true, 0, edge_count);
-        compute_A0_streamed(
-            receiver_count, batch_node_types, batch_num_neigh,
-            batch_neigh_types, batch_r, 0);
-        compute_A0_scaled(
-            receiver_count, batch_node_types, batch_num_neigh,
-            batch_neigh_types, batch_r);
-        reverse_H1(receiver_count);
-        if (use_m0_module())
-            reverse_M0_module(receiver_count, batch_node_types);
-        else
-            reverse_M0(receiver_count, batch_node_types);
-        reverse_A0_scaled(
-            receiver_count, batch_node_types, batch_num_neigh,
-            batch_neigh_types, xyz, batch_r);
-        reverse_A0_streamed(
-            receiver_count, batch_node_types, batch_num_neigh,
-            batch_neigh_types, xyz, batch_r,
-            receiver_begin, 0, edge_count);
         accumulate_single_layer_tiled_outputs(
             receiver_begin, receiver_count, edge_begin, edge_count);
         evaluation_batches += 1;
@@ -897,8 +972,10 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled(
     H1 = dual_layer_graph_h1;
     H1_adj = dual_layer_graph_h1_adjoint;
     dual_layer_workspace_batches += evaluation_batches;
-    dual_layer_tiled_evaluations += 1;
-    single_layer_tiled_outputs_ready = true;
+    if (phase == 3) {
+        dual_layer_tiled_evaluations += 1;
+        single_layer_tiled_outputs_ready = true;
+    }
 }
 
 template <typename Precision>
@@ -1367,6 +1444,51 @@ compute_factorized_single_layer_distributed_positions_evaluation(
 }
 
 template <typename Precision>
+void MACEKokkos<Precision>::begin_factorized_distributed_positions_evaluation(
+    const int num_receivers,
+    const int num_feature_nodes,
+    Kokkos::View<const double*> positions,
+    const std::uint64_t execution_graph_generation)
+{
+    if (!dual_layer_tiled_plan_active || single_layer_readout
+        || has_field_coupling)
+        throw std::invalid_argument(
+            "Distributed position prefix requires a tiled standard "
+            "dual-layer model.");
+    if (positions.extent(0)
+        != std::size_t(3)*static_cast<std::size_t>(num_feature_nodes))
+        throw std::invalid_argument(
+            "Dual-layer distributed position extents are inconsistent.");
+    if (edge_geometry_policy != EdgeGeometryPolicy::unit_f32_radius_f64)
+        throw std::logic_error(
+            "Dual-layer fixed-workspace MPI requires compact edge geometry.");
+    if (execution_prepared_geometry_invalid.extent(0) != 1) {
+        execution_prepared_geometry_invalid = Kokkos::View<int*>(
+            "Execution prepared geometry invalid", 1);
+        factorized_geometry_state_allocation_count += 1;
+    }
+    Kokkos::deep_copy(
+        factorized_execution_space, execution_prepared_geometry_invalid, 0);
+    const auto workspace_r = Kokkos::subview(
+        execution_prepared_r,
+        Kokkos::make_pair(
+            std::size_t(0), static_cast<std::size_t>(
+                dual_layer_workspace_active_edge_capacity)));
+    single_layer_explicit_feature_positions_device = positions;
+    compact_edge_geometry_active = true;
+    try {
+        begin_factorized_distributed_evaluation(
+            num_receivers, num_feature_nodes,
+            Kokkos::View<const double*>(), workspace_r,
+            execution_graph_generation);
+    } catch (...) {
+        compact_edge_geometry_active = false;
+        single_layer_explicit_feature_positions_device = {};
+        throw;
+    }
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::begin_factorized_distributed_evaluation(
     const int num_receivers,
     const int num_feature_nodes,
@@ -1385,13 +1507,18 @@ void MACEKokkos<Precision>::begin_factorized_distributed_evaluation(
         || factorized_schedule_dirty)
         throw std::invalid_argument(
             "Distributed factorized evaluation received a stale graph token.");
+    const bool dual_tiled = dual_layer_tiled_plan_active;
+    const bool invalid_radius_extent = dual_tiled
+        ? r.extent(0) < static_cast<std::size_t>(
+            dual_layer_workspace_active_edge_capacity)
+        : r.extent(0) != execution_prepared_neigh_indices.extent(0);
     if (num_receivers < 0 || num_feature_nodes < num_receivers
         || num_receivers != static_cast<int>(execution_prepared_node_types.extent(0))
         || num_feature_nodes != execution_prepared_num_feature_nodes
         || num_receivers != execution_schedule_num_nodes
         || num_feature_nodes != execution_schedule_num_feature_nodes
-        || r.extent(0) != execution_prepared_neigh_indices.extent(0)
-        || (!use_compact_edge_geometry()
+        || invalid_radius_extent
+        || (!dual_tiled && !use_compact_edge_geometry()
             && xyz.extent(0) < 3*execution_prepared_neigh_indices.extent(0)))
         throw std::invalid_argument(
             "Distributed factorized graph or geometry extents are inconsistent.");
@@ -1403,6 +1530,54 @@ void MACEKokkos<Precision>::begin_factorized_distributed_evaluation(
         static_cast<std::size_t>(num_receivers),
         static_cast<std::size_t>(num_feature_nodes),
         execution_prepared_neigh_indices.extent(0));
+
+    if (dual_tiled) {
+        try {
+            prepare_mh0_state_policy_views();
+            factorized_distributed_start = std::chrono::steady_clock::now();
+            begin_factorized_production_evaluation();
+            factorized_prepared_evaluation_count += 1;
+            factorized_topology_validation_skip_count += 1;
+            ensure_execution_result_capacity(
+                num_receivers, num_feature_nodes, execution_active_edges);
+            Kokkos::deep_copy(
+                factorized_execution_space, node_energies, 0.0);
+            Kokkos::deep_copy(
+                factorized_execution_space, atom_forces, 0.0);
+            Kokkos::deep_copy(
+                factorized_execution_space, dual_layer_workspace_virial, 0.0);
+            Kokkos::deep_copy(
+                factorized_execution_space,
+                dual_layer_graph_h1_adjoint, Precision(0));
+            single_layer_tiled_outputs_ready = false;
+            begin_execution_parameter_gradients();
+            begin_factorized_observation(num_receivers, execution_active_edges);
+            compute_dual_layer_tiled_phase1(num_receivers);
+            factorized_execution_space.fence(
+                "Dual-layer tiled H1 communication boundary");
+            factorized_stage_fence_count += 1;
+            H1 = dual_layer_graph_h1;
+            H1_adj = dual_layer_graph_h1_adjoint;
+            factorized_distributed_num_receivers = num_receivers;
+            factorized_distributed_num_feature_nodes = num_feature_nodes;
+            factorized_distributed_graph_generation = execution_graph_generation;
+            factorized_distributed_xyz = xyz;
+            factorized_distributed_r = r;
+            factorized_distributed_electric_field = {};
+            factorized_distributed_phase =
+                FactorizedDistributedPhase::prefix_complete;
+            return;
+        } catch (...) {
+            factorized_distributed_phase = FactorizedDistributedPhase::idle;
+            factorized_distributed_num_receivers = 0;
+            factorized_distributed_num_feature_nodes = 0;
+            factorized_distributed_graph_generation = 0;
+            factorized_distributed_xyz = {};
+            factorized_distributed_r = {};
+            factorized_distributed_electric_field = {};
+            throw;
+        }
+    }
 
     prepare_mh0_state_policy_views();
     factorized_distributed_start = std::chrono::steady_clock::now();
@@ -1522,6 +1697,44 @@ void MACEKokkos<Precision>::continue_factorized_distributed_evaluation(
             "A field was supplied to a standard MACE evaluation.");
     }
 
+    if (dual_layer_tiled_plan_active) {
+        try {
+            if (communicated_h1.data() != dual_layer_graph_h1.data()) {
+                const auto active_communicated_h1 = Kokkos::subview(
+                    communicated_h1,
+                    Kokkos::make_pair(
+                        std::size_t(0),
+                        static_cast<std::size_t>(num_feature_nodes)),
+                    Kokkos::ALL, Kokkos::ALL);
+                Kokkos::deep_copy(
+                    factorized_execution_space,
+                    dual_layer_graph_h1, active_communicated_h1);
+            }
+            H1 = dual_layer_graph_h1;
+            H1_adj = dual_layer_graph_h1_adjoint;
+            compute_dual_layer_tiled_phase2(num_receivers);
+            factorized_execution_space.fence(
+                "Dual-layer tiled H1 adjoint communication boundary");
+            factorized_stage_fence_count += 1;
+            H1 = dual_layer_graph_h1;
+            H1_adj = dual_layer_graph_h1_adjoint;
+            factorized_distributed_phase =
+                FactorizedDistributedPhase::middle_complete;
+            return;
+        } catch (...) {
+            factorized_distributed_phase = FactorizedDistributedPhase::idle;
+            factorized_distributed_num_receivers = 0;
+            factorized_distributed_num_feature_nodes = 0;
+            factorized_distributed_graph_generation = 0;
+            factorized_distributed_xyz = {};
+            factorized_distributed_r = {};
+            factorized_distributed_electric_field = {};
+            compact_edge_geometry_active = false;
+            single_layer_explicit_feature_positions_device = {};
+            throw;
+        }
+    }
+
     const auto node_types = Kokkos::View<const int*>(execution_prepared_node_types);
     const auto num_neigh = Kokkos::View<const int*>(execution_prepared_num_neigh);
     const auto neigh_indices =
@@ -1617,6 +1830,47 @@ void MACEKokkos<Precision>::finish_factorized_distributed_evaluation()
     const auto neigh_types = Kokkos::View<const int*>(execution_prepared_neigh_types);
     const auto xyz = factorized_distributed_xyz;
     const auto r = factorized_distributed_r;
+
+    if (dual_layer_tiled_plan_active) {
+        try {
+            H1 = dual_layer_graph_h1;
+            H1_adj = dual_layer_graph_h1_adjoint;
+            compute_dual_layer_tiled_phase3(num_receivers);
+            factorized_execution_space.fence(
+                "Dual-layer tiled energy and force evaluation");
+            factorized_evaluation_fence_count += 1;
+            factorized_last_evaluation_ms =
+                std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()
+                    -factorized_distributed_start).count();
+            complete_factorized_prepared_evaluation(
+                factorized_distributed_graph_generation);
+            factorized_distributed_phase = FactorizedDistributedPhase::idle;
+            factorized_distributed_num_receivers = 0;
+            factorized_distributed_num_feature_nodes = 0;
+            factorized_distributed_graph_generation = 0;
+            factorized_distributed_xyz = {};
+            factorized_distributed_r = {};
+            factorized_distributed_electric_field = {};
+            if (compact_edge_geometry_active) {
+                compact_edge_geometry_active = false;
+                single_layer_explicit_feature_positions_device = {};
+                validate_prepared_factorized_positions_geometry();
+            }
+            return;
+        } catch (...) {
+            factorized_distributed_phase = FactorizedDistributedPhase::idle;
+            factorized_distributed_num_receivers = 0;
+            factorized_distributed_num_feature_nodes = 0;
+            factorized_distributed_graph_generation = 0;
+            factorized_distributed_xyz = {};
+            factorized_distributed_r = {};
+            factorized_distributed_electric_field = {};
+            compact_edge_geometry_active = false;
+            single_layer_explicit_feature_positions_device = {};
+            throw;
+        }
+    }
 
     if (has_field_coupling)
         reverse_H1_product(num_receivers);

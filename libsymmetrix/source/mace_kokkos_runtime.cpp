@@ -2697,8 +2697,6 @@ std::string MACEKokkos<Precision>::dual_layer_tiled_admission_reason() const
         return "mh0-dual-layer-tiled-v1 requires direct prepared execution";
     if (has_field_coupling)
         return "mh0-dual-layer-tiled-v1 does not support field coupling";
-    if (factorized_distributed_phase != FactorizedDistributedPhase::idle)
-        return "mh0-dual-layer-tiled-v1 does not support distributed execution";
     if (factorized_observer_enabled)
         return "mh0-dual-layer-tiled-v1 does not support execution observers";
     if (execution_parameter_gradients_enabled)
@@ -2728,13 +2726,14 @@ std::size_t MACEKokkos<Precision>::estimate_dual_layer_tiled_graph_bytes(
     const std::size_t workspace_edges,
     const std::size_t source_segments) const
 {
-    if (num_receivers < 0 || num_feature_nodes != num_receivers
+    if (num_receivers < 0 || num_feature_nodes < num_receivers
         || workspace_receivers < 0 || workspace_receivers > num_receivers
         || workspace_edges > num_edges || source_segments > num_edges)
         throw std::invalid_argument(
-            "Dual-layer tiled estimate requires a monolithic graph and valid "
+            "Dual-layer tiled estimate requires valid distributed graph and "
             "workspace cardinalities.");
     const std::size_t receivers = static_cast<std::size_t>(num_receivers);
+    const std::size_t features = static_cast<std::size_t>(num_feature_nodes);
     const std::size_t workspace = static_cast<std::size_t>(workspace_receivers);
     const std::size_t channels = static_cast<std::size_t>(num_channels);
     const std::size_t harmonics = static_cast<std::size_t>(num_lm);
@@ -2753,10 +2752,14 @@ std::size_t MACEKokkos<Precision>::estimate_dual_layer_tiled_graph_bytes(
          checked_extent_product(
              "dual-layer tiled receiver outputs", {receivers, std::size_t(4)*sizeof(double)}),
          checked_extent_product(
-             "dual-layer tiled feature geometry", {receivers, std::size_t(6)*sizeof(double)})});
+             "dual-layer tiled receiver mapping", {receivers, sizeof(int)}),
+         checked_extent_product(
+             "dual-layer tiled feature types", {features, sizeof(int)}),
+         checked_extent_product(
+             "dual-layer tiled feature geometry", {features, std::size_t(6)*sizeof(double)})});
     const std::size_t learned_state = checked_extent_product(
         "dual-layer tiled H1 state",
-        {std::size_t(2), receivers, outputs, channels, sizeof(Precision)});
+        {std::size_t(2), features, outputs, channels, sizeof(Precision)});
     const std::size_t schedule = checked_extent_sum(
         "dual-layer tiled source schedule",
         {checked_extent_product(
@@ -2773,6 +2776,8 @@ std::size_t MACEKokkos<Precision>::estimate_dual_layer_tiled_graph_bytes(
              "dual-layer tiled A slot", {workspace, harmonics, channels}),
          checked_extent_product(
              "dual-layer tiled equivariant slot", {workspace, outputs, channels}),
+         checked_extent_product(
+             "dual-layer tiled second equivariant slot", {workspace, outputs, channels}),
          checked_extent_product(
              "dual-layer tiled Phi1 slot",
              {workspace, coupled, static_cast<std::size_t>(phi1_channel_tile_size)}),
@@ -2963,6 +2968,8 @@ void MACEKokkos<Precision>::select_low_memory_policy_for_graph(
         speed_policy != LowMemoryPolicy::capacity_y_only;
     const std::string single_layer_tiled_admission =
         single_layer_tiled_admission_reason();
+    const std::string dual_layer_tiled_admission =
+        dual_layer_tiled_admission_reason();
     const std::size_t previous_selected_estimate =
         low_memory_selected_estimate;
     const int previous_planned_receivers = execution_planned_receivers;
@@ -3020,8 +3027,7 @@ void MACEKokkos<Precision>::select_low_memory_policy_for_graph(
         }
     }
     dual_layer_tiled_estimate = 0;
-    if (!single_layer_readout && num_interactions == 2
-        && num_feature_nodes == num_receivers)
+    if (!single_layer_readout && num_interactions == 2)
         dual_layer_tiled_estimate = estimate_dual_layer_tiled_graph_bytes(
             num_receivers, num_feature_nodes, num_edges,
             dual_workspace_receivers, dual_workspace_edges, num_edges);
@@ -3287,18 +3293,30 @@ void MACEKokkos<Precision>::select_low_memory_policy_for_graph(
             "speed selection: estimated speed graph bytes fit available "
             "device memory after reserve";
     } else if (allow_fixed_workspace_
-        && single_layer_tiled_admission.empty()
+        && (single_layer_readout
+            ? single_layer_tiled_admission.empty()
+            : dual_layer_tiled_admission.empty())
         && low_memory_capacity_y_only_estimate > low_memory_available
-        && single_layer_tiled_estimate
+        && (single_layer_readout
+                ? single_layer_tiled_estimate : dual_layer_tiled_estimate)
             < low_memory_capacity_y_only_estimate) {
         capacity_bundle = true;
         retain_harmonic_gradients = false;
-        exact_estimate = single_layer_tiled_estimate;
+        exact_estimate = single_layer_readout
+            ? single_layer_tiled_estimate : dual_layer_tiled_estimate;
         apply_low_memory_policy(LowMemoryPolicy::capacity_y_only);
-        single_layer_tiled_plan_active = true;
-        single_layer_workspace_active_capacity = tiled_workspace_receivers;
-        single_layer_workspace_active_edge_capacity =
-            static_cast<int>(tiled_workspace_edges);
+        if (single_layer_readout) {
+            single_layer_tiled_plan_active = true;
+            single_layer_workspace_active_capacity = tiled_workspace_receivers;
+            single_layer_workspace_active_edge_capacity =
+                static_cast<int>(tiled_workspace_edges);
+        } else {
+            dual_layer_tiled_plan_active = true;
+            set_phi1_policy("channel-tiled-64");
+            dual_layer_workspace_active_capacity = dual_workspace_receivers;
+            dual_layer_workspace_active_edge_capacity =
+                static_cast<int>(dual_workspace_edges);
+        }
         low_memory_selection_reason = exact_estimate <= low_memory_available
             ? "fixed-workspace selection: capacity Y-only exceeds the advisory "
               "device-memory budget"
@@ -3475,6 +3493,12 @@ void MACEKokkos<Precision>::refresh_execution_plan_report()
         || execution_plan_debug_id_ == "mh0-single-layer-tiled-v1";
     const bool dual_layer_tiled_permitted = allow_fixed_workspace_
         || execution_plan_debug_id_ == "mh0-dual-layer-tiled-v1";
+    const bool applicable_tiled_permitted = single_layer_readout
+        ? single_layer_tiled_permitted : dual_layer_tiled_permitted;
+    const auto& applicable_tiled_reason = single_layer_readout
+        ? single_layer_tiled_reason : dual_layer_tiled_reason;
+    const std::size_t applicable_tiled_estimate = single_layer_readout
+        ? single_layer_tiled_estimate : dual_layer_tiled_estimate;
     const std::string fixed_workspace_opt_in_reason =
         "fixed-workspace execution requires explicit opt-in via "
         "allow_fixed_workspace";
@@ -3488,9 +3512,9 @@ void MACEKokkos<Precision>::refresh_execution_plan_report()
         low_memory_speed_estimate > low_memory_available
         && low_memory_capacity_y_only_estimate > low_memory_available
         && low_memory_capacity_retained_estimate > low_memory_available
-        && (!single_layer_tiled_permitted
-            || !single_layer_tiled_reason.empty()
-            || single_layer_tiled_estimate > low_memory_available);
+        && (!applicable_tiled_permitted
+            || !applicable_tiled_reason.empty()
+            || applicable_tiled_estimate > low_memory_available);
     execution_plan_.selected_id = execution_plan_.requested_profile
             == symmetrix::execution::ExecutionProfile::speed
         ? "mh0-direct-speed"

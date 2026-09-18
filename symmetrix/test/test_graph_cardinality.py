@@ -160,3 +160,32 @@ def test_graph_entry_points_validate_before_allocation_or_narrowing():
         )
         assert guard < allocation
         assert guard < entry_point.index("begin_factorized_production_evaluation()")
+
+
+def test_dual_layer_distributed_tiled_lifecycle_uses_feature_mapping():
+    lifecycle = (SOURCE_ROOT / "mace_kokkos_factorized_lifecycle.cpp").read_text()
+    evaluate = (SOURCE_ROOT / "mace_kokkos_evaluate.cpp").read_text()
+    runtime = (SOURCE_ROOT / "mace_kokkos_runtime.cpp").read_text()
+
+    assert "num_feature_nodes < num_receivers" in runtime
+    assert "std::size_t(2), features, outputs, channels" in runtime
+    assert "num_feature_nodes < num_receivers" in lifecycle
+    assert "receiver feature indices must be unique" in lifecycle
+    assert "num_feature_nodes, num_LM, num_channels" in lifecycle
+
+    tiled = _function_source(
+        evaluate,
+        "void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(\n",
+        "void MACEKokkos<Precision>::accumulate_single_layer_tiled_outputs(\n",
+    )
+    assert "identity_receiver_features = receiver_features.extent(0) == 0" in tiled
+    assert tiled.count("receiver_features(global_receiver)") == 4
+    assert "compute_dual_layer_tiled_phase1(num_receivers);" in evaluate
+    assert "compute_dual_layer_tiled_phase2(num_receivers);" in evaluate
+    assert "compute_dual_layer_tiled_phase3(num_receivers);" in evaluate
+    assert evaluate.index("compute_dual_layer_tiled_phase1(num_receivers);") < (
+        evaluate.index("FactorizedDistributedPhase::prefix_complete")
+    )
+    assert evaluate.index("compute_dual_layer_tiled_phase2(num_receivers);") < (
+        evaluate.index("FactorizedDistributedPhase::middle_complete")
+    )

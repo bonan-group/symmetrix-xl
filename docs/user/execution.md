@@ -33,7 +33,10 @@ geometry. FP64 retains Cartesian geometry; CUDA FP64 and HIP retain harmonic
 gradients.
 Bounded fixed-workspace plans require the separate
 `allow_fixed_workspace=True` opt-in, currently require CUDA FP32, and are
-excluded by default.
+excluded by default. In LAMMPS MPI, the ordinary two-layer standard-MACE plan
+uses the existing forward-H1 and reverse-H1-adjoint exchanges between its three
+tiled phases. Its receiver and edge workspace is bounded, while the hidden
+state remains proportional to the local-plus-ghost feature count.
 
 ```python
 from ase.spacegroup import crystal

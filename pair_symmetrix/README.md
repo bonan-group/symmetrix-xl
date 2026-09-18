@@ -121,9 +121,14 @@ requirement. The option permits selection and does not force a tiled plan.
 Single-layer direct MPI evaluates owned receivers and local-plus-ghost sources
 without communicating H1 or H1 adjoints. Retained single-layer plans are
 backend-independent; fixed-workspace single-layer plans currently require
-CUDA FP32. Dual-layer fixed-workspace likewise requires CUDA FP32 and remains
-unsupported with MPI; dual-layer retained and non-tiled capacity plans keep
-their H1 communication protocol.
+CUDA FP32. Dual-layer fixed-workspace MPI is supported for ordinary two-layer
+standard MACE with CUDA FP32, direct prepared execution, and a generated device
+artifact with tiled R1 support. It keeps the existing one-forward/one-reverse
+H1 communication protocol. Receiver- and edge-sized intermediates are bounded,
+while H1 and its adjoint necessarily retain local-plus-ghost feature storage.
+MACEField, FP64, HIP, parameter gradients, and execution observers are not
+admitted to this tiled MPI plan. Dual-layer retained and non-tiled capacity
+plans keep the same H1 packet ABI.
 
 Multi-rank direct execution with pre-generated Kokkos OpenMP host artifacts is
 qualified for FP32 and FP64 standard MACE and MACEField in two-rank periodic
@@ -164,6 +169,13 @@ the cumulative legacy-callback counters `symmetrix_mpi_staged_packet_d2h_bytes`,
 API. They remain zero when LAMMPS uses direct device-buffer pair communication,
 but zero alone is not a positive transport diagnostic because it also occurs
 when no pair communication callback runs.
+
+LAMMPS represents each pair communication count with a signed `int`.
+Symmetrix-XL therefore validates the H1 width against a global upper bound on
+the atoms in any halo message, derived from the largest rank-local ghost count,
+rather than against the complete local-plus-ghost feature tensor. This permits
+large interior atom counts while retaining the ABI guard on every actual pack
+and unpack callback.
 
 ### Hidden-state communication timing
 

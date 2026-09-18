@@ -187,6 +187,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
   allow_fixed_workspace = false;
   debug_execution_plan.clear();
   debug_single_layer_workspace_receivers = 0;
+  debug_dual_layer_workspace_receivers = 0;
   prediction_head.clear();
   jit_host_artifact.clear();
   jit_device_artifact.clear();
@@ -279,6 +280,24 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
         error->all(
           FLERR,
           "pair_style symmetrix/mace/kk _debug_single_layer_workspace_receivers requires a positive integer");
+    } else if (token == "_debug_dual_layer_workspace_receivers") {
+      if (i+1 >= narg)
+        error->all(
+          FLERR,
+          "pair_style symmetrix/mace/kk _debug_dual_layer_workspace_receivers requires a positive integer");
+      const std::string value(arg[++i]);
+      bool invalid_value = false;
+      try {
+        std::size_t consumed = 0;
+        debug_dual_layer_workspace_receivers = std::stoi(value, &consumed);
+        invalid_value = consumed != value.size();
+      } catch (const std::exception&) {
+        invalid_value = true;
+      }
+      if (invalid_value || debug_dual_layer_workspace_receivers <= 0)
+        error->all(
+          FLERR,
+          "pair_style symmetrix/mace/kk _debug_dual_layer_workspace_receivers requires a positive integer");
     } else if (token == "head") {
       if (i+1 >= narg)
         error->all(FLERR, "pair_style symmetrix/mace/kk head requires a name");
@@ -374,6 +393,12 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
       FLERR,
       "pair_style symmetrix/mace/kk _debug_single_layer_workspace_receivers requires "
       "_debug_execution_plan mh0-single-layer-tiled-v1");
+  if (debug_dual_layer_workspace_receivers != 0
+      && debug_execution_plan != "mh0-dual-layer-tiled-v1")
+    error->all(
+      FLERR,
+      "pair_style symmetrix/mace/kk _debug_dual_layer_workspace_receivers requires "
+      "_debug_execution_plan mh0-dual-layer-tiled-v1");
 }
 
 /* ----------------------------------------------------------------------
@@ -396,6 +421,9 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
   if (debug_single_layer_workspace_receivers != 0)
     mace->set_single_layer_workspace_receiver_limit_for_testing(
       debug_single_layer_workspace_receivers);
+  if (debug_dual_layer_workspace_receivers != 0)
+    mace->set_dual_layer_workspace_receiver_limit_for_testing(
+      debug_dual_layer_workspace_receivers);
   utils::logmesg(lmp, "success\n");
   const std::string requested_streamed_edges = streamed_edges;
   if (streamed_edges == "auto") {
@@ -425,11 +453,6 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
     error->all(
       FLERR,
       "pair_style symmetrix/mace/kk allow_fixed_workspace yes requires streamed_edges direct");
-  if (allow_fixed_workspace && mode == "mpi_message_passing"
-      && !mace->single_layer_readout)
-    error->all(
-      FLERR,
-      "pair_style symmetrix/mace/kk dual-layer fixed-workspace MPI is not supported");
   if (mace_uses_prepared_execution(mace->streamed_edges)) {
     if (mode == "no_mpi_message_passing")
       error->all(
@@ -1240,9 +1263,6 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
     error->one(FLERR,
       "pair_style symmetrix/mace/kk local feature-node count exceeds INT_MAX");
   const int num_feature_nodes = static_cast<int>(num_feature_nodes_size);
-  if (!mace->single_layer_readout)
-    checked_comm_value_count(
-      num_feature_nodes_size, "local feature-state");
   if (stable_execution && num_nodes != atom->nlocal)
     error->all(FLERR,
       "Factorized MPI execution requires one receiver for every owned atom");
@@ -1277,6 +1297,18 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
       +0x9e3779b97f4a7c15ULL+(feature_fingerprint<<6)+(feature_fingerprint>>2);
     rebuild_topology = rebuild_topology
       || feature_fingerprint != execution_topology_fingerprint;
+  }
+  if (!mace->single_layer_readout
+      && (execution_graph_generation == 0 || neighbor->ago == 0)) {
+    int max_ghost_atoms = 0;
+    const int local_ghost_atoms = atom->nghost;
+    MPI_Allreduce(
+      &local_ghost_atoms, &max_ghost_atoms, 1, MPI_INT, MPI_MAX, world);
+    // A swap's receive count is bounded by the destination's total ghosts;
+    // its matching send count has the same bound on another rank.
+    checked_comm_value_count(
+      static_cast<std::size_t>(max_ghost_atoms),
+      "per-message ghost upper bound");
   }
   if (node_indices.size() < num_nodes) Kokkos::realloc(node_indices, num_nodes);
   if (node_types.size() < num_nodes) Kokkos::realloc(node_types, num_nodes);
@@ -1391,9 +1423,13 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
   const bool single_layer_tiled = stable_execution
     && mace->single_layer_readout
     && mace->execution_plan_report().selected_id == "mh0-single-layer-tiled-v1";
+  const bool dual_layer_tiled = stable_execution
+    && !mace->single_layer_readout
+    && mace->execution_plan_report().selected_id == "mh0-dual-layer-tiled-v1";
+  const bool fixed_workspace_tiled = single_layer_tiled || dual_layer_tiled;
   Kokkos::View<double*> xyz;
   Kokkos::View<double*> r;
-  if (single_layer_tiled) {
+  if (fixed_workspace_tiled) {
     if (this->xyz.extent(0) != 0 || this->r.extent(0) != 0) {
       Kokkos::fence("Release retained MPI edge geometry");
       this->xyz = {};
@@ -1413,9 +1449,14 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
         active_feature_positions(3*i+1) = x(i,1);
         active_feature_positions(3*i+2) = x(i,2);
       });
-    mace->compute_factorized_single_layer_distributed_positions_evaluation(
-      num_nodes, num_feature_nodes, active_feature_positions,
-      execution_graph_generation);
+    if (single_layer_tiled)
+      mace->compute_factorized_single_layer_distributed_positions_evaluation(
+        num_nodes, num_feature_nodes, active_feature_positions,
+        execution_graph_generation);
+    else
+      mace->begin_factorized_distributed_positions_evaluation(
+        num_nodes, num_feature_nodes, active_feature_positions,
+        execution_graph_generation);
   } else {
     if (feature_positions.extent(0) != 0) {
       Kokkos::fence("Release MPI feature positions");
@@ -1481,19 +1522,23 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
 
     const bool single_layer = mace->single_layer_readout;
     if (!single_layer) {
-      const int h1_capacity = std::max(
-        num_feature_nodes, mace->execution_planned_feature_node_capacity());
-      if (H1.extent(0) < static_cast<std::size_t>(h1_capacity)
-          || H1.extent(1) != static_cast<std::size_t>(mace->num_LM)
-          || H1.extent(2) != static_cast<std::size_t>(mace->num_channels)) {
-        Kokkos::fence("Replace Pair Symmetrix communicated H1 capacity");
-        if (H1_adj.data() == H1.data()) H1_adj = {};
-        H1 = {};
-        H1 = decltype(H1)(
-          Kokkos::view_alloc(
-            "Pair Symmetrix communicated H1", Kokkos::WithoutInitializing),
-          h1_capacity, mace->num_LM, mace->num_channels);
-        execution_h1_allocation_count += 1.0;
+      if (dual_layer_tiled) {
+        H1 = mace->H1;
+      } else {
+        const int h1_capacity = std::max(
+          num_feature_nodes, mace->execution_planned_feature_node_capacity());
+        if (H1.extent(0) < static_cast<std::size_t>(h1_capacity)
+            || H1.extent(1) != static_cast<std::size_t>(mace->num_LM)
+            || H1.extent(2) != static_cast<std::size_t>(mace->num_channels)) {
+          Kokkos::fence("Replace Pair Symmetrix communicated H1 capacity");
+          if (H1_adj.data() == H1.data()) H1_adj = {};
+          H1 = {};
+          H1 = decltype(H1)(
+            Kokkos::view_alloc(
+              "Pair Symmetrix communicated H1", Kokkos::WithoutInitializing),
+            h1_capacity, mace->num_LM, mace->num_channels);
+          execution_h1_allocation_count += 1.0;
+        }
       }
     }
     if (rebuild_topology) {
@@ -1512,10 +1557,18 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
         << "; profile=" << execution_profile
         << "; plan=" << mace->execution_plan_report().selected_id
         << "; fixed workspace=" << (allow_fixed_workspace ? "allowed" : "disabled")
-        << "; workspace receivers=" << mace->single_layer_workspace_active_receivers()
-        << ", edges=" << mace->single_layer_workspace_active_edges()
-        << ", bytes=" << mace->single_layer_workspace_bytes()
-        << ", batches=" << mace->single_layer_workspace_batch_count()
+        << "; workspace receivers="
+        << (dual_layer_tiled ? mace->dual_layer_workspace_active_receivers()
+                             : mace->single_layer_workspace_active_receivers())
+        << ", edges="
+        << (dual_layer_tiled ? mace->dual_layer_workspace_active_edges()
+                             : mace->single_layer_workspace_active_edges())
+        << ", bytes="
+        << (dual_layer_tiled ? mace->dual_layer_workspace_bytes()
+                             : mace->single_layer_workspace_bytes())
+        << ", batches="
+        << (dual_layer_tiled ? mace->dual_layer_workspace_batch_count()
+                             : mace->single_layer_workspace_batch_count())
         << "; pair edge geometry bytes="
         << sizeof(double)*(this->xyz.extent(0)+this->r.extent(0))
         << ", feature position bytes="
@@ -1557,18 +1610,20 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
       }
     }
     if (!single_layer) {
-      Kokkos::deep_copy(H1, Precision(0));
-      const auto num_LM = mace->num_LM;
-      const auto num_channels = mace->num_channels;
-      const auto mace_H1 = mace->H1;
-      const auto communicated_H1 = H1;
-      Kokkos::parallel_for(
-        "PairSymmetrixMACEKokkos::scatter_factorized_H1",
-        Kokkos::MDRangePolicy<Kokkos::Rank<3>>(
-          {0,0,0}, {num_nodes,num_LM,num_channels}),
-        KOKKOS_LAMBDA (const int ii, const int LM, const int k) {
-          communicated_H1(node_indices(ii),LM,k) = mace_H1(ii,LM,k);
-        });
+      if (!dual_layer_tiled) {
+        Kokkos::deep_copy(H1, Precision(0));
+        const auto num_LM = mace->num_LM;
+        const auto num_channels = mace->num_channels;
+        const auto mace_H1 = mace->H1;
+        const auto communicated_H1 = H1;
+        Kokkos::parallel_for(
+          "PairSymmetrixMACEKokkos::scatter_factorized_H1",
+          Kokkos::MDRangePolicy<Kokkos::Rank<3>>(
+            {0,0,0}, {num_nodes,num_LM,num_channels}),
+          KOKKOS_LAMBDA (const int ii, const int LM, const int k) {
+            communicated_H1(node_indices(ii),LM,k) = mace_H1(ii,LM,k);
+          });
+      }
       Kokkos::fence();
       const double forward_start = platform::walltime();
       comm->forward_comm(this);
@@ -1726,10 +1781,10 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
   }
 
   auto mace_node_forces = mace->node_forces;
-  if (single_layer_tiled) {
+  if (fixed_workspace_tiled) {
     const auto reduced_forces = mace->atom_forces;
     Kokkos::parallel_for(
-      "Extract Single-Layer Reduced Forces", num_feature_nodes,
+      "Extract Fixed-Workspace Reduced Forces", num_feature_nodes,
       KOKKOS_LAMBDA (const int i) {
         Kokkos::atomic_add(&f(i,0), reduced_forces(3*i));
         Kokkos::atomic_add(&f(i,1), reduced_forces(3*i+1));
@@ -1763,7 +1818,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
   }
 
   if (vflag_global) {
-    if (single_layer_tiled) {
+    if (fixed_workspace_tiled) {
       mace->reduce_prepared_stress(1.0, execution_graph_generation);
       const auto h_stress = Kokkos::create_mirror_view_and_copy(
         Kokkos::HostSpace(), mace->stress_tensor);

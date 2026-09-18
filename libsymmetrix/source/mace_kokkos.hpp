@@ -496,6 +496,7 @@ std::size_t dual_layer_tiled_evaluations = 0;
 Kokkos::View<std::uint64_t*> dual_layer_workspace_arena;
 Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_a0;
 Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_equivariant_a;
+Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_equivariant_b;
 Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_a1;
 Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_phi1;
 Kokkos::View<Precision**,Kokkos::LayoutRight> dual_layer_workspace_m1;
@@ -513,7 +514,8 @@ Kokkos::View<int*> dual_layer_segment_edge_offsets;
 Kokkos::View<int*> dual_layer_source_edges;
 Kokkos::View<int*> dual_layer_edge_local_receivers;
 std::vector<int> dual_layer_tile_segment_offsets_host;
-void prepare_dual_layer_tiled_workspace(int num_receivers);
+void prepare_dual_layer_tiled_workspace(
+    int num_receivers, int num_feature_nodes);
 void bind_dual_layer_phase1_workspace(int receiver_begin, int receiver_count);
 void bind_dual_layer_phase2_workspace(int receiver_begin, int receiver_count);
 void bind_dual_layer_phase3_workspace(int receiver_begin, int receiver_count);
@@ -530,6 +532,10 @@ void compute_dual_layer_tiled(
     Kokkos::View<const int*> neigh_indices,
     Kokkos::View<const double*> xyz,
     Kokkos::View<const double*> r);
+void compute_dual_layer_tiled_phase1(int num_receivers);
+void compute_dual_layer_tiled_phase2(int num_receivers);
+void compute_dual_layer_tiled_phase3(int num_receivers);
+void compute_dual_layer_tiled_phase(int num_receivers, int phase);
 void compute_readout_1(
     int num_nodes, Kokkos::View<const int*> node_types,
     bool initialize_h1_adjoint);
@@ -604,6 +610,11 @@ void begin_factorized_distributed_evaluation(
     int num_feature_nodes,
     Kokkos::View<const double*> xyz,
     Kokkos::View<const double*> r,
+    std::uint64_t execution_graph_generation);
+void begin_factorized_distributed_positions_evaluation(
+    int num_receivers,
+    int num_feature_nodes,
+    Kokkos::View<const double*> positions,
     std::uint64_t execution_graph_generation);
 void compute_factorized_single_layer_distributed_evaluation(
     int num_receivers,
