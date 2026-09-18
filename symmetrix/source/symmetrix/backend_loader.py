@@ -262,6 +262,17 @@ def _cpu_backend_level(architecture: str, host_level: int) -> int:
     }.get(architecture, 1)
 
 
+def _cpu_backend_priority(
+    descriptor: BackendDescriptor, host_level: int
+) -> tuple[bool, int]:
+    """Prefer a host-native build, then the highest compatible ISA level."""
+
+    return (
+        descriptor.architecture == "native",
+        _cpu_backend_level(descriptor.architecture, host_level),
+    )
+
+
 def _compatible(descriptor: BackendDescriptor, frontend_version: str) -> None:
     if descriptor.frontend_version != frontend_version:
         raise BackendError(
@@ -317,11 +328,11 @@ def _preferred_cpu_backend(
         raise BackendError("no compatible CPU backend is installed")
     host_level = _host_capability_level()
 
-    def level(item: BackendDescriptor) -> int:
-        return _cpu_backend_level(item.architecture, host_level)
+    def priority(item: BackendDescriptor) -> tuple[bool, int]:
+        return _cpu_backend_priority(item, host_level)
 
-    highest = max(level(item) for item in compatible)
-    top = [item for item in compatible if level(item) == highest]
+    highest = max(priority(item) for item in compatible)
+    top = [item for item in compatible if priority(item) == highest]
     base = next((item for item in top if item.selector == "cpu"), None)
     if base is not None:
         return base

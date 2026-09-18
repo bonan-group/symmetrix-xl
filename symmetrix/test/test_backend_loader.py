@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -172,7 +173,20 @@ def _no_gpus():
     return lambda: {"cuda": set(), "hip": set()}
 
 
-def test_cpu_v4_addon_is_preferred_on_avx512_host(tmp_path, monkeypatch):
+def _baseline_cpu_descriptor():
+    return backend_loader.BackendDescriptor(
+        selector="cpu",
+        backend="cpu",
+        architecture="native-or-wheel-baseline",
+        distribution="symmetrix-xl",
+        frontend_version=FRONTEND_VERSION,
+        native_abi=1,
+        package="symmetrix",
+        module="_native_cpu",
+    )
+
+
+def test_cpu_v4_addon_is_preferred_over_baseline_on_avx512_host(tmp_path, monkeypatch):
     monkeypatch.setattr(
         backend_loader, "_entry_points", lambda: (_cpu_v4_entry_point(tmp_path),)
     )
@@ -181,6 +195,9 @@ def test_cpu_v4_addon_is_preferred_on_avx512_host(tmp_path, monkeypatch):
         backend_loader,
         "_host_cpu_flags",
         lambda: backend_loader._V3_CPU_FLAGS | backend_loader._V4_CPU_FLAGS,
+    )
+    monkeypatch.setattr(
+        backend_loader, "_cpu_descriptor", lambda version: _baseline_cpu_descriptor()
     )
 
     assert (
@@ -199,6 +216,20 @@ def _local_native_descriptor():
         package="symmetrix",
         module="_native_cpu",
     )
+
+
+def test_native_cpu_priority_exceeds_matching_v4_level():
+    native = _local_native_descriptor()
+    v4 = replace(
+        native,
+        selector="cpu-avx512",
+        architecture="x86-64-v4",
+        distribution="symmetrix-xl-cpu-avx512",
+    )
+
+    assert backend_loader._cpu_backend_priority(
+        native, 4
+    ) > backend_loader._cpu_backend_priority(v4, 4)
 
 
 def test_local_native_build_wins_over_avx512_addon_on_avx512_host(
@@ -235,7 +266,7 @@ def test_cpu_v4_addon_is_skipped_on_v3_host(tmp_path, monkeypatch):
         backend_loader.select_backend(FRONTEND_VERSION, "cpu-avx512")
 
 
-def test_backend_inventory_marks_preferred_cpu_backend(tmp_path, monkeypatch):
+def test_backend_inventory_marks_v4_preferred_over_baseline(tmp_path, monkeypatch):
     monkeypatch.setattr(
         backend_loader, "_entry_points", lambda: (_cpu_v4_entry_point(tmp_path),)
     )
@@ -244,6 +275,9 @@ def test_backend_inventory_marks_preferred_cpu_backend(tmp_path, monkeypatch):
         backend_loader,
         "_host_cpu_flags",
         lambda: backend_loader._V3_CPU_FLAGS | backend_loader._V4_CPU_FLAGS,
+    )
+    monkeypatch.setattr(
+        backend_loader, "_cpu_descriptor", lambda version: _baseline_cpu_descriptor()
     )
 
     inventory = backend_loader.backend_inventory(FRONTEND_VERSION)
