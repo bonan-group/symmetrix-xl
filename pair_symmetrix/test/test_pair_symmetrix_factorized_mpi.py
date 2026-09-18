@@ -292,7 +292,9 @@ def _run_lammps_case(
     migrated_run_commands="run 0",
     debug_execution_plan=None,
     debug_single_layer_workspace_receivers=None,
+    debug_dual_layer_workspace_receivers=None,
     pair_backend="kokkos",
+    capture_timing=False,
 ):
     label_parts = [mode, precision, "triclinic" if triclinic else "orthogonal"]
     label_parts.append(pair_backend)
@@ -332,6 +334,11 @@ def _run_lammps_case(
         debug_option += (
             "_debug_single_layer_workspace_receivers "
             f"{debug_single_layer_workspace_receivers} "
+        )
+    if debug_dual_layer_workspace_receivers is not None:
+        debug_option += (
+            "_debug_dual_layer_workspace_receivers "
+            f"{debug_dual_layer_workspace_receivers} "
         )
     if jit_host_artifact is not None and jit_device_artifact is not None:
         raise ValueError("Specify only one JIT artifact")
@@ -388,6 +395,22 @@ def _run_lammps_case(
         pair_options = ""
     else:
         raise ValueError(f"Unsupported pair backend: {pair_backend}")
+    timing_compute = (
+        "compute         symmetrix_timing all symmetrix/timing"
+        if capture_timing
+        else ""
+    )
+    timing_print = ""
+    if capture_timing:
+        timing_fields = " ".join(
+            f"{name}=$(c_symmetrix_timing[{index}]:%.17g)"
+            for index, name in enumerate(_TIMING_FIELDS, start=1)
+        )
+        timing_print = (
+            'print           "SYMMETRIX_TIMING '
+            "scalar=$(c_symmetrix_timing:%.17g) "
+            f'{timing_fields}"'
+        )
     input_path.write_text(
         f"""
 units           metal
@@ -403,6 +426,7 @@ pair_coeff      * * {model} Al N
 neighbor        1.0 bin
 neigh_modify    every 1 delay 0 check yes
 compute         atom_energy all pe/atom
+{timing_compute}
 thermo          1
 thermo_style    custom step atoms pe pxx pyy pzz pxy pxz pyz
 thermo_modify   format float %.16g
@@ -417,6 +441,7 @@ reset_timestep  1
 {migrated_run_commands}
 write_dump      all custom {migrated_dump} id type x y z fx fy fz c_atom_energy proc modify sort id format float %.16g
 print           "MIGRATED mode={mode} pe=$(pe:%.16g) pxx=$(pxx:%.16g) pyy=$(pyy:%.16g) pzz=$(pzz:%.16g) pxy=$(pxy:%.16g) pxz=$(pxz:%.16g) pyz=$(pyz:%.16g)"
+{timing_print}
 """
     )
     mpiexec = os.environ.get("MPIEXEC_EXECUTABLE") or shutil.which("mpiexec")
@@ -471,6 +496,7 @@ print           "MIGRATED mode={mode} pe=$(pe:%.16g) pxx=$(pxx:%.16g) pyy=$(pyy:
         "initial_global": _read_result(log_path, "RESULT"),
         "migrated_global": _read_result(log_path, "MIGRATED"),
         "capacity_records": _read_capacity_records(log_text),
+        "timing": _read_timing_record(log_text) if capture_timing else None,
         "log_text": log_text,
     }
     energy_tolerance = 2.0e-5 if precision == "float32" else 1.0e-10
@@ -1319,6 +1345,99 @@ def test_direct_single_layer_fixed_workspace_mpi_matches_retained_after_migratio
         record["feature_position_bytes"] >= 24 * record["active_features"]
         for record in records
     )
+
+    for key in ("initial_atoms", "migrated_atoms"):
+        np.testing.assert_allclose(
+            fixed_workspace[key], retained[key], rtol=2.0e-4, atol=1.0e-4
+        )
+        np.testing.assert_allclose(
+            fixed_workspace[key][:, :9],
+            single_rank[key][:, :9],
+            rtol=2.0e-4,
+            atol=1.0e-4,
+        )
+    for key in ("initial_global", "migrated_global"):
+        np.testing.assert_allclose(
+            fixed_workspace[key], retained[key], rtol=2.0e-4, atol=0.1
+        )
+        np.testing.assert_allclose(
+            fixed_workspace[key], single_rank[key], rtol=2.0e-4, atol=0.1
+        )
+
+
+@pytest.mark.parametrize("triclinic", (False, True), ids=("orthogonal", "triclinic"))
+def test_direct_dual_layer_fixed_workspace_mpi_matches_retained_after_migration(
+    tmp_path, triclinic
+):
+    if not os.environ.get("SYMMETRIX_LAMMPS_KOKKOS_GPUS"):
+        pytest.skip("Set SYMMETRIX_LAMMPS_KOKKOS_GPUS for CUDA MPI qualification.")
+    executable = _required_path(
+        "SYMMETRIX_LAMMPS_EXECUTABLE", "a CUDA and MPI-enabled LAMMPS executable"
+    )
+    model = _required_path(
+        "SYMMETRIX_LAMMPS_COMPACT_MODEL", "a compact standard-MACE model"
+    )
+    device_artifact = _required_path(
+        "SYMMETRIX_LAMMPS_JIT_ARTIFACT",
+        "a float32 Execution device artifact with tiled R1 support",
+    )
+    retained = _run_lammps_case(
+        tmp_path,
+        executable,
+        model,
+        "direct",
+        precision="float32",
+        triclinic=triclinic,
+        profile="capacity",
+        jit_device_artifact=device_artifact,
+    )
+    fixed_workspace = _run_lammps_case(
+        tmp_path,
+        executable,
+        model,
+        "direct",
+        precision="float32",
+        triclinic=triclinic,
+        profile="capacity",
+        allow_fixed_workspace=True,
+        migrated_run_commands="run 1 post no\nrun 1",
+        debug_execution_plan="mh0-dual-layer-tiled-v1",
+        debug_dual_layer_workspace_receivers=4,
+        jit_device_artifact=device_artifact,
+        capture_timing=True,
+    )
+    single_rank = _run_lammps_case(
+        tmp_path,
+        executable,
+        model,
+        "direct",
+        precision="float32",
+        triclinic=triclinic,
+        ranks=1,
+        domain_mode="no_domain_decomposition",
+        profile="capacity",
+        jit_device_artifact=device_artifact,
+    )
+
+    records = fixed_workspace["capacity_records"]
+    assert records
+    assert {record["plan"] for record in records} == {"mh0-dual-layer-tiled-v1"}
+    assert {record["fixed_workspace"] for record in records} == {"allowed"}
+    assert {record["h1_allocations"] for record in records} == {0}
+    assert all(0 < record["workspace_receivers"] <= 4 for record in records)
+    assert all(record["workspace_edges"] > 0 for record in records)
+    assert all(record["workspace_bytes"] > 0 for record in records)
+    assert all(record["workspace_batches"] > 1 for record in records)
+    assert {record["pair_geometry_bytes"] for record in records} == {0}
+    assert all(
+        record["feature_position_bytes"] >= 24 * record["active_features"]
+        for record in records
+    )
+    timing = fixed_workspace["timing"]
+    assert timing["forward_calls_per_eval_min"] == 1.0
+    assert timing["forward_calls_per_eval_max"] == 1.0
+    assert timing["reverse_calls_per_eval_min"] == 1.0
+    assert timing["reverse_calls_per_eval_max"] == 1.0
 
     for key in ("initial_atoms", "migrated_atoms"):
         np.testing.assert_allclose(

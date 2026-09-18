@@ -1007,6 +1007,16 @@ std::uint64_t MACEKokkos<Precision>::prepare_factorized_graph(
             throw std::invalid_argument(
                 "Prepared Execution R1 receiver and feature types disagree.");
     }
+    {
+        std::vector<unsigned char> receiver_features_seen(
+            static_cast<std::size_t>(num_feature_nodes), 0);
+        for (const int feature : prepared_receiver_feature_indices) {
+            if (receiver_features_seen[static_cast<std::size_t>(feature)] != 0)
+                throw std::invalid_argument(
+                    "Prepared Execution R1 receiver feature indices must be unique.");
+            receiver_features_seen[static_cast<std::size_t>(feature)] = 1;
+        }
+    }
     for (const int type : prepared_neigh_types)
         if (type < 0 || type >= static_cast<int>(atomic_numbers_host.size()))
             throw std::out_of_range(
@@ -1038,10 +1048,6 @@ std::uint64_t MACEKokkos<Precision>::prepare_factorized_graph(
         num_receivers, num_feature_nodes, prepared_neigh_indices.size(),
         prepared_num_neigh);
     if (single_layer_tiled_plan_active || dual_layer_tiled_plan_active) {
-        if (dual_layer_tiled_plan_active
-            && num_feature_nodes != num_receivers)
-            throw std::invalid_argument(
-                "Dual-layer fixed-workspace execution requires a monolithic graph.");
         for (std::size_t edge=0; edge<prepared_neigh_indices.size(); ++edge)
             if (prepared_neigh_types[edge]
                 != prepared_feature_types[prepared_neigh_indices[edge]])
@@ -1060,7 +1066,7 @@ std::uint64_t MACEKokkos<Precision>::prepare_factorized_graph(
     if (single_layer_tiled_plan_active)
         prepare_single_layer_tiled_workspace(num_receivers);
     if (dual_layer_tiled_plan_active)
-        prepare_dual_layer_tiled_workspace(num_receivers);
+        prepare_dual_layer_tiled_workspace(num_receivers, num_feature_nodes);
     reserve_execution_geometry_workspace(
         static_cast<int>(prepared_neigh_indices.size()));
     copy_int_prefix(
@@ -1340,7 +1346,7 @@ void MACEKokkos<Precision>::bind_single_layer_tiled_workspace_batch(
 
 template <typename Precision>
 void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
-    const int num_receivers)
+    const int num_receivers, const int num_feature_nodes)
 {
     if (!dual_layer_tiled_plan_active)
         return;
@@ -1384,7 +1390,8 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
         "dual-layer precision slots",
         {checked_workspace_sum(
              "dual-layer precision slots",
-             {a_slot_elements, equivariant_elements, phi_elements, m1_elements}),
+             {a_slot_elements, std::size_t(2)*equivariant_elements,
+              phi_elements, m1_elements}),
          sizeof(Precision)});
     const std::size_t double_offset = checked_workspace_align_up(
         "dual-layer FP64 workspace alignment", precision_bytes, alignof(double));
@@ -1409,7 +1416,7 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
 
     const std::size_t graph_elements = checked_workspace_product(
         "dual-layer graph H1 state",
-        {static_cast<std::size_t>(num_receivers),
+        {static_cast<std::size_t>(num_feature_nodes),
          static_cast<std::size_t>(num_LM), channels});
     const bool graph_state_fits =
         dual_layer_graph_h1.size() >= graph_elements
@@ -1446,6 +1453,7 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
     if (!arena_fits) {
         dual_layer_workspace_a0 = {};
         dual_layer_workspace_equivariant_a = {};
+        dual_layer_workspace_equivariant_b = {};
         dual_layer_workspace_a1 = {};
         dual_layer_workspace_phi1 = {};
         dual_layer_workspace_m1 = {};
@@ -1475,6 +1483,12 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
         offset += a_slot_elements*sizeof(Precision);
         dual_layer_workspace_equivariant_a = make_tracked_workspace_alias<
             decltype(dual_layer_workspace_equivariant_a)>(
+                dual_layer_workspace_arena,
+                reinterpret_cast<Precision*>(raw+offset),
+                capacity, num_LM, num_channels);
+        offset += equivariant_elements*sizeof(Precision);
+        dual_layer_workspace_equivariant_b = make_tracked_workspace_alias<
+            decltype(dual_layer_workspace_equivariant_b)>(
                 dual_layer_workspace_arena,
                 reinterpret_cast<Precision*>(raw+offset),
                 capacity, num_LM, num_channels);
@@ -1523,11 +1537,11 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
         dual_layer_graph_h1 = decltype(dual_layer_graph_h1)(
             Kokkos::view_alloc(
                 "Dual-layer graph H1", Kokkos::WithoutInitializing),
-            num_receivers, num_LM, num_channels);
+            num_feature_nodes, num_LM, num_channels);
         dual_layer_graph_h1_adjoint = decltype(dual_layer_graph_h1_adjoint)(
             Kokkos::view_alloc(
                 "Dual-layer graph H1 adjoint", Kokkos::WithoutInitializing),
-            num_receivers, num_LM, num_channels);
+            num_feature_nodes, num_LM, num_channels);
     }
     if (!edge_receiver_fits) {
         dual_layer_edge_local_receivers = Kokkos::View<int*>(
@@ -1550,18 +1564,15 @@ void MACEKokkos<Precision>::bind_dual_layer_phase1_workspace(
             "Dual-layer phase-1 batch exceeds the prepared capacity.");
     const auto local_rows = Kokkos::make_pair(
         std::size_t(0), static_cast<std::size_t>(receiver_count));
-    const auto graph_rows = Kokkos::make_pair(
-        static_cast<std::size_t>(receiver_begin),
-        static_cast<std::size_t>(receiver_begin+receiver_count));
     A0 = Kokkos::subview(
         dual_layer_workspace_a0, local_rows, Kokkos::ALL, Kokkos::ALL);
     M0 = Kokkos::subview(
         dual_layer_workspace_equivariant_a,
         local_rows, Kokkos::ALL, Kokkos::ALL);
     H1 = Kokkos::subview(
-        dual_layer_graph_h1, graph_rows, Kokkos::ALL, Kokkos::ALL);
-    H1_adj = Kokkos::subview(
-        dual_layer_graph_h1_adjoint, graph_rows, Kokkos::ALL, Kokkos::ALL);
+        dual_layer_workspace_equivariant_b,
+        local_rows, Kokkos::ALL, Kokkos::ALL);
+    H1_adj = M0;
     standard_r0_density_state = Kokkos::subview(
         dual_layer_workspace_density_a0, local_rows);
     streamed_first_neigh = Kokkos::subview(
@@ -1588,8 +1599,13 @@ void MACEKokkos<Precision>::bind_dual_layer_phase2_workspace(
         dual_layer_workspace_m1, local_rows, Kokkos::ALL);
     H2 = Kokkos::subview(
         dual_layer_workspace_h2, local_rows, Kokkos::ALL);
-    H1 = dual_layer_graph_h1;
-    H1_adj = dual_layer_graph_h1_adjoint;
+    H1 = Kokkos::subview(
+        dual_layer_workspace_equivariant_a,
+        local_rows, Kokkos::ALL, Kokkos::ALL);
+    H1_adj = Kokkos::subview(
+        dual_layer_workspace_equivariant_b,
+        local_rows, Kokkos::ALL, Kokkos::ALL);
+    M0 = {};
     streamed_first_neigh = Kokkos::subview(
         dual_layer_workspace_first_neigh, local_rows);
     A1_adj = {};
@@ -1608,6 +1624,7 @@ void MACEKokkos<Precision>::bind_dual_layer_phase3_workspace(
     const int receiver_begin, const int receiver_count)
 {
     bind_dual_layer_phase1_workspace(receiver_begin, receiver_count);
+    H1_adj = H1;
     mh0_a0_scale_adjoint = make_tracked_workspace_alias<
         decltype(mh0_a0_scale_adjoint)>(
             dual_layer_workspace_arena,
@@ -2152,7 +2169,7 @@ MACEKokkos<Precision>::prepare_periodic_factorized_graph(
     if (dual_layer_tiled_plan_active) {
         prepare_dual_layer_tile_source_schedule_device(
             num_nodes, num_nodes, num_edges);
-        prepare_dual_layer_tiled_workspace(num_nodes);
+        prepare_dual_layer_tiled_workspace(num_nodes, num_nodes);
     } else if (single_layer_tiled_plan_active)
         prepare_single_layer_tiled_workspace(num_nodes);
     factorized_coupling_capacity_bytes = 0;
@@ -3230,10 +3247,10 @@ void MACEKokkos<Precision>::prepare_dual_layer_tile_source_schedule_host(
     if (!dual_layer_tiled_plan_active)
         return;
     dual_layer_source_schedule_preparation_explicit_scratch_bytes = 0;
-    if (num_receivers <= 0 || num_feature_nodes != num_receivers
+    if (num_receivers <= 0 || num_feature_nodes < num_receivers
         || num_neigh.size() != static_cast<std::size_t>(num_receivers))
         throw std::invalid_argument(
-            "Dual-layer tile-source schedule requires a nonempty monolithic graph.");
+            "Dual-layer tile-source schedule requires a valid distributed graph.");
     const int capacity = dual_layer_workspace_active_capacity;
     if (capacity <= 0)
         throw std::logic_error(
@@ -3338,12 +3355,12 @@ void MACEKokkos<Precision>::prepare_dual_layer_tile_source_schedule_device(
 {
     if (!dual_layer_tiled_plan_active)
         return;
-    if (num_receivers <= 0 || num_feature_nodes != num_receivers
+    if (num_receivers <= 0 || num_feature_nodes < num_receivers
         || num_edges < 0
         || execution_prepared_num_neigh.extent_int(0) != num_receivers
         || execution_prepared_neigh_indices.extent_int(0) != num_edges)
         throw std::invalid_argument(
-            "Dual-layer device tile-source schedule requires a valid monolithic graph.");
+            "Dual-layer device tile-source schedule requires a valid distributed graph.");
     const int capacity = dual_layer_workspace_active_capacity;
     if (capacity <= 0)
         throw std::logic_error(

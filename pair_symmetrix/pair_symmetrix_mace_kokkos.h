@@ -79,6 +79,7 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   bool allow_fixed_workspace = false;
   std::string debug_execution_plan;
   int debug_single_layer_workspace_receivers = 0;
+  int debug_dual_layer_workspace_receivers = 0;
   std::string jit_host_artifact;
   std::string jit_device_artifact;
   std::string jit_m0_device_artifact;

@@ -234,8 +234,14 @@ enables fixed workspace.
 force that plan when another qualified capacity plan is preferred.
 Single-layer direct MPI does not require an R1 artifact. Its retained plan is
 backend-independent; its fixed-workspace plan currently requires CUDA FP32.
-Dual-layer fixed-workspace also requires CUDA FP32 and is not supported with
-MPI.
+Dual-layer fixed-workspace MPI requires an ordinary two-layer standard-MACE
+model, CUDA FP32, direct prepared execution, and a generated device artifact
+with tiled R1 support. It bounds receiver and edge intermediates but retains
+local-plus-ghost H1 and H1-adjoint state. MACEField, FP64, HIP, parameter
+gradients, and execution observers remain unsupported for this tiled MPI plan.
+LAMMPS communication counts remain signed `int` values, so the H1 width times
+the largest rank-local ghost count must fit that ABI. The bound applies to a
+halo message, not to the full local-plus-ghost feature tensor.
 
 Artifact preparation uses the Python runtime, not the LAMMPS executable. Install
 the `symmetrix-xl` CPU frontend first and then install the backend matching the

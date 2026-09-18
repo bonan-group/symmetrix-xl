@@ -33,5 +33,12 @@ the direct algorithm. `allow_fixed_workspace=True` separately permits bounded
 tiled workspace for qualified CUDA FP32 models. These controls do not create
 additional execution modes.
 
+LAMMPS `mpi_message_passing` supports the dual-layer fixed-workspace plan only
+for ordinary two-interaction standard MACE with CUDA FP32 direct execution and
+a generated tiled R1 device artifact. The receiver- and edge-sized workspace is
+bounded, while H1 and its adjoint remain sized to all local and ghost feature
+nodes. FP64, HIP, field-coupled models, parameter gradients, and execution
+observers are outside this qualification boundary.
+
 See {doc}`/streamed_edge_execution` for the architecture, {doc}`/user/execution`
 for user controls, and {doc}`/user/lammps` for the narrower LAMMPS boundary.

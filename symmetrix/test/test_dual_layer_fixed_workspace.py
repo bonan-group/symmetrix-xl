@@ -308,3 +308,77 @@ def test_normal_two_layer_execution_does_not_select_dual_plan(dual_layer_model, 
     assert calculator.evaluator.dual_layer_tiled_evaluation_count == 0
     assert calculator.evaluator.dual_layer_workspace_bytes == 0
     assert (calculator._neighbor_cache is None) == (skin == 0.0)
+
+
+def test_dual_layer_fixed_workspace_is_selected_automatically_at_memory_boundary(
+    dual_layer_model,
+):
+    _require_cuda_backend()
+    atoms = _atoms(9)
+    capacity = 4
+    device_bytes = 32 * 1024**3
+
+    reference = _calculator(dual_layer_model, REFERENCE_PLAN)
+    expected, expected_h1_adjoint = _evaluate(reference, atoms)
+
+    probe = Symmetrix(
+        dual_layer_model,
+        use_kokkos=True,
+        dtype="float32",
+        streamed_edges="direct",
+        execution_profile="capacity",
+        neighbor_skin=0.5,
+        _debug_execution_plan=REFERENCE_PLAN,
+    )
+    probe.evaluator._set_dual_layer_workspace_receiver_limit_for_testing(capacity)
+    probe_inputs = probe._mace_inputs(atoms)
+    probe.evaluator._set_low_memory_device_memory_info_for_testing(
+        device_bytes, device_bytes
+    )
+    probe.evaluator._prepare_factorized_graph(*probe_inputs[:5])
+    estimates = {
+        candidate["id"]: candidate["estimated_bytes"]
+        for candidate in probe.execution_plan["candidates"]
+    }
+    tiled_estimate = estimates[PLAN]
+    y_only_estimate = estimates[REFERENCE_PLAN]
+    assert tiled_estimate < y_only_estimate
+
+    calculator = Symmetrix(
+        dual_layer_model,
+        use_kokkos=True,
+        dtype="float32",
+        streamed_edges="direct",
+        execution_profile="capacity",
+        allow_fixed_workspace=True,
+        neighbor_skin=0.5,
+    )
+    evaluator = calculator.evaluator
+    evaluator._set_dual_layer_workspace_receiver_limit_for_testing(capacity)
+    inputs = calculator._mace_inputs(atoms)
+    reserve = device_bytes // 20
+    available = (tiled_estimate + y_only_estimate) // 2
+    evaluator._set_low_memory_device_memory_info_for_testing(
+        reserve + available, device_bytes
+    )
+    evaluator._prepare_factorized_graph(*inputs[:5])
+
+    assert calculator.execution_plan["selected_id"] == PLAN
+    assert calculator.execution_plan["boundary_attempt"] is False
+    assert evaluator.low_memory_policy == "capacity-y-only"
+    assert evaluator.low_memory_selected_estimated_bytes <= tiled_estimate
+    assert evaluator.dual_layer_workspace_active_receivers == capacity
+    assert evaluator.low_memory_selection_reason.startswith(
+        "fixed-workspace selection:"
+    )
+
+    actual, actual_h1_adjoint = _evaluate(calculator, atoms)
+    _assert_results(actual, expected)
+    np.testing.assert_allclose(
+        actual_h1_adjoint,
+        expected_h1_adjoint,
+        rtol=2.0e-4,
+        atol=2e-5,
+    )
+    assert evaluator.dual_layer_tiled_evaluation_count == 1
+    assert evaluator.factorized_fallback_evaluation_count == 0
