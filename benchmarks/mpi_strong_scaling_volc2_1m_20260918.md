@@ -70,6 +70,42 @@ and 60.0681 ms in the candidate, consistent with their non-contiguous and
 atomic semantics. Reports and SQLite exports are retained under the candidate
 `profile/` directory.
 
+## Direct-speed retest without fixed workspace
+
+The previous candidate comparison forced `mh0-dual-layer-tiled-v1` to qualify
+the fixed-workspace path. To isolate the communication optimization from that
+policy, the same 1M-atom workload was rerun with
+`profile speed allow_fixed_workspace no _debug_execution_plan mh0-direct-speed`.
+The logs report `fixed workspace=disabled`, `plan=mh0-direct-speed`, and one
+dedicated communicated-H1 allocation. This is the retained direct execution
+plan, not the fixed-workspace plan.
+
+Remote test folder:
+`/vepfs/symmetrix-fixed-workspace-mpi/mh0-direct-speed-optimized-20260919`.
+The baseline used the original `build/lmp` executable (SHA256
+`55d06587fbb9fff64aef1ccf534373f54ac2f0e1570d3bae75c9c93394c09220`); the
+candidate used `optimized-contiguous-copy-20260919/build/lmp` (SHA256
+`6e1b5292e2acc29053b2b584ef57afcfd0ba64ba1fbeaec2bfcd152403f52f9c`). Each
+case used three fresh 5-warmup/20-measured-step repetitions.
+
+| Plan / binary | 1-rank samples | Median 1-rank | 2-rank samples | Median 2-rank | Speedup | Efficiency |
+|---|---|---:|---|---:|---:|---:|
+| `mh0-direct-speed` baseline | 6.088550, 6.090750, 6.101550 | 6.090750 | 3.075625, 3.077915, 3.083340 | 3.077915 | 1.9789x | 98.94% |
+| `mh0-direct-speed` candidate | 6.066000, 6.067900, 6.071150 | 6.067900 | 3.062930, 3.062985, 3.067415 | 3.062985 | **1.9810x** | **99.05%** |
+
+The direct-speed internal timing medians were:
+
+| Binary | Critical pair | Noncommunication | H1 communication | H1 share |
+|---|---:|---:|---:|---:|
+| Baseline, 2 ranks | 3.075471 | 3.022637 | 0.052834 | 1.718% |
+| Candidate, 2 ranks | 3.060699 | 3.029729 | 0.031797 | **1.039%** |
+
+The contiguous-copy optimization reduces direct-speed H1 communication by
+**39.8%** and improves two-rank end-to-end time by **0.49%**. All twelve
+process runs exited successfully with zero dangerous builds. Raw logs and
+command records are retained in the remote test folder under `logs/` and
+`results/`.
+
 ## Workload and environment
 
 - 1,000,000 SrTiO3 atoms from a `100 x 100 x 20` five-site cubic replication
