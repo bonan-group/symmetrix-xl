@@ -99,6 +99,25 @@ symmetrix backend list
 symmetrix doctor
 ```
 
+To download a published backend wheel into the current environment, use the
+CLI. Automatic selection is the default; pass an explicit selector on a
+headless or multi-GPU host:
+
+```bash
+symmetrix backend install
+symmetrix backend install --arch cuda13-sm120
+```
+
+The command uses `uv` when available and otherwise falls back to
+`python -m pip`. It prints the detected GPU architecture, toolkit version and
+source, selected backend selector, package, and Python environment before
+installing. When `nvidia-smi` reports CUDA 13 but the matching CUDA 13 wheel is
+not published, automatic selection probes and falls back to the CUDA 12 wheel
+for the same GPU architecture, which remains driver-compatible.
+On a CPU-only host, the command reports that the bundled CPU backend needs no
+download. If no pre-compiled wheel is available, it prints the corresponding
+source-build command.
+
 Convert a MACE checkpoint to the compact JSON format used by Symmetrix-XL. The
 converter is optional; JSON-only evaluation does not require `mace-torch`.
 
