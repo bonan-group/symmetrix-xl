@@ -62,14 +62,51 @@ identical, and Symmetrix-XL processed more directed candidates. See the
 
 ### Quick Start
 
-Symmetrix-XL supports CPU/OpenMP, CUDA, and HIP through separately built backend
-packages. Install the Python frontend and CPU backend first; the CPU package is
-the required base installation and remains available as a fallback. Additional
-GPU backends can then be installed alongside it without replacing the frontend
-or CPU backend. Each GPU backend must be built for the exact architecture of
-the target device.
+Symmetrix-XL supports CPU/OpenMP, CUDA, and HIP through separately packaged
+backends. For a normal installation, use the published wheels:
 
-Start from a source checkout and install the CPU backend:
+```bash
+python -m pip install symmetrix-xl
+```
+
+The base `symmetrix-xl` package provides the Python frontend and an x86-64-v3
+CPU/OpenMP backend. It is the required fallback package and needs AVX2, FMA,
+and the other x86-64-v3 CPU features. A CPU-only machine needs no additional
+backend package.
+
+GPU packages are architecture-qualified and can be installed alongside the
+base package. The selector contains the CUDA or ROCm major version and the
+device target:
+
+```bash
+python -m pip install symmetrix-xl-cuda12-sm80   # NVIDIA, compute capability 8.0
+python -m pip install symmetrix-xl-cuda13-sm120  # NVIDIA, compute capability 12.0
+python -m pip install symmetrix-xl-rocm6-gfx1151 # AMD, gfx1151 (when published)
+```
+
+Only install a GPU package whose target matches the deployment device. GPU
+packages depend on the matching `symmetrix-xl` frontend and retain the CPU
+fallback; they do not overwrite another installed architecture. NVIDIA
+packages provide the CUDA runtime dependencies through Python packages, but a
+compatible NVIDIA driver is still required. Use `symmetrix backend list` and
+`symmetrix doctor` to inspect and verify the selected backend.
+
+The CLI can resolve and install a published matching GPU wheel automatically:
+
+```bash
+symmetrix backend install --arch auto
+```
+
+Use an explicit selector such as `--arch cuda13-sm120` on a headless or
+multi-GPU host. Automatic selection reports its architecture and toolkit
+resolution, and falls back from a missing CUDA 13 wheel to CUDA 12 when that
+wheel is published. If no published wheel exists, the CLI prints a source-build
+command.
+
+### Source and custom builds
+
+Start from a source checkout to build the CPU backend for the local machine or
+to build a CUDA/HIP target that does not have a published wheel:
 
 ```bash
 git clone --recursive https://github.com/bonan-group/symmetrix-xl.git
@@ -98,25 +135,6 @@ machine:
 symmetrix backend list
 symmetrix doctor
 ```
-
-To download a published backend wheel into the current environment, use the
-CLI. Automatic selection is the default; pass an explicit selector on a
-headless or multi-GPU host:
-
-```bash
-symmetrix backend install
-symmetrix backend install --arch cuda13-sm120
-```
-
-The command uses `uv` when available and otherwise falls back to
-`python -m pip`. It prints the detected GPU architecture, toolkit version and
-source, selected backend selector, package, and Python environment before
-installing. When `nvidia-smi` reports CUDA 13 but the matching CUDA 13 wheel is
-not published, automatic selection probes and falls back to the CUDA 12 wheel
-for the same GPU architecture, which remains driver-compatible.
-On a CPU-only host, the command reports that the bundled CPU backend needs no
-download. If no pre-compiled wheel is available, it prints the corresponding
-source-build command.
 
 Convert a MACE checkpoint to the compact JSON format used by Symmetrix-XL. The
 converter is optional; JSON-only evaluation does not require `mace-torch`.
