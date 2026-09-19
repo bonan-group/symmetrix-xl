@@ -189,3 +189,33 @@ def test_dual_layer_distributed_tiled_lifecycle_uses_feature_mapping():
     assert evaluate.index("compute_dual_layer_tiled_phase2(num_receivers);") < (
         evaluate.index("FactorizedDistributedPhase::middle_complete")
     )
+
+
+def test_fp64_tiled_geometry_remains_workspace_bounded():
+    runtime = (SOURCE_ROOT / "mace_kokkos_runtime.cpp").read_text()
+    lifecycle = (SOURCE_ROOT / "mace_kokkos_factorized_lifecycle.cpp").read_text()
+    evaluate = (SOURCE_ROOT / "mace_kokkos_evaluate.cpp").read_text()
+
+    reserve = _function_source(
+        runtime,
+        "void MACEKokkos<Precision>::reserve_execution_geometry_workspace(",
+        "void MACEKokkos<Precision>::ensure_execution_result_capacity(",
+    )
+    assert "3*geometry_edge_capacity" in reserve
+    assert "? execution_prepared_unit_direction.extent(0)" in reserve
+    assert ": execution_prepared_xyz.extent(0)" in reserve
+
+    geometry = _function_source(
+        lifecycle,
+        "void MACEKokkos<Precision>::prepare_single_layer_tiled_geometry(",
+        "std::uint64_t MACEKokkos<Precision>::prepare_factorized_graph_device(",
+    )
+    assert "const bool compact_geometry = use_compact_edge_geometry();" in geometry
+    assert "explicit_xyz(3*local_edge+component) =" in geometry
+    assert "scale*vector[component]" in geometry
+
+    assert "fixed-workspace MPI requires compact edge geometry" not in evaluate
+    assert (
+        evaluate.count("Kokkos::subview(\n                execution_prepared_xyz") >= 2
+    )
+    assert "const auto coordinates = single_layer_workspace_xyz;" in evaluate

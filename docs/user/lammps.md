@@ -233,12 +233,13 @@ enables fixed workspace.
 `profile capacity` to permit bounded tiled workspace selection; it does not
 force that plan when another qualified capacity plan is preferred.
 Single-layer direct MPI does not require an R1 artifact. Its retained plan is
-backend-independent; its fixed-workspace plan currently requires CUDA FP32.
+backend-independent; its fixed-workspace plan currently requires CUDA.
 Dual-layer fixed-workspace MPI requires an ordinary two-layer standard-MACE
-model, CUDA FP32, direct prepared execution, and a generated device artifact
-with tiled R1 support. It bounds receiver and edge intermediates but retains
-local-plus-ghost H1 and H1-adjoint state. MACEField, FP64, HIP, parameter
-gradients, and execution observers remain unsupported for this tiled MPI plan.
+model, CUDA FP32 or FP64, direct prepared execution, and a precision-matched
+generated device artifact with tiled R1 support. It bounds receiver and edge
+intermediates but retains local-plus-ghost H1 and H1-adjoint state. MACEField,
+HIP, parameter gradients, and execution observers remain unsupported for this
+tiled MPI plan.
 LAMMPS communication counts remain signed `int` values, so the H1 width times
 the largest rank-local ghost count must fit that ABI. The bound applies to a
 halo message, not to the full local-plus-ghost feature tensor.

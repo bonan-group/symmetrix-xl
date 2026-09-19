@@ -121,12 +121,13 @@ requirement. The option permits selection and does not force a tiled plan.
 Single-layer direct MPI evaluates owned receivers and local-plus-ghost sources
 without communicating H1 or H1 adjoints. Retained single-layer plans are
 backend-independent; fixed-workspace single-layer plans currently require
-CUDA FP32. Dual-layer fixed-workspace MPI is supported for ordinary two-layer
-standard MACE with CUDA FP32, direct prepared execution, and a generated device
-artifact with tiled R1 support. It keeps the existing one-forward/one-reverse
+CUDA and support FP32 and FP64. Dual-layer fixed-workspace MPI is supported for
+ordinary two-layer standard MACE with CUDA FP32 or FP64, direct prepared
+execution, and a precision-matched generated device artifact with tiled R1
+support. It keeps the existing one-forward/one-reverse
 H1 communication protocol. Receiver- and edge-sized intermediates are bounded,
 while H1 and its adjoint necessarily retain local-plus-ghost feature storage.
-MACEField, FP64, HIP, parameter gradients, and execution observers are not
+MACEField, HIP, parameter gradients, and execution observers are not
 admitted to this tiled MPI plan. Dual-layer retained and non-tiled capacity
 plans keep the same H1 packet ABI.
 

@@ -471,7 +471,8 @@ def test_pair_symmetrix_mpi_stages_only_boundary_packets():
     assert "checked_comm_value_count(std::size_t, const char *)" in header
     assert "std::numeric_limits<int>::max()" in source
     assert 'checked_comm_value_count(1, "per-atom")' in source
-    assert 'num_feature_nodes_size, "local feature-state"' in source
+    assert "static_cast<std::size_t>(max_ghost_atoms)" in source
+    assert '"per-message ghost upper bound"' in source
     for counter in (
         "symmetrix_mpi_staged_packet_d2h_bytes",
         "symmetrix_mpi_staged_packet_h2d_bytes",

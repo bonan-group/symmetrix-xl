@@ -74,11 +74,11 @@ def _atoms(count):
     return Atoms(symbols, positions=positions, cell=[7.5, 7.5, 7.5], pbc=True)
 
 
-def _calculator(model, plan, capacity=None, skin=0.5):
+def _calculator(model, plan, capacity=None, skin=0.5, dtype="float32"):
     calculator = Symmetrix(
         model,
         use_kokkos=True,
-        dtype="float32",
+        dtype=dtype,
         streamed_edges="direct",
         execution_profile="capacity",
         neighbor_skin=skin,
@@ -253,19 +253,30 @@ def test_dual_layer_reuses_topology_and_grows_workspace(dual_layer_model, monkey
     assert evaluator.factorized_fallback_evaluation_count == 0
 
 
-def test_dual_layer_rejects_float64(dual_layer_model):
+def test_dual_layer_float64_matches_y_only(dual_layer_model):
     _require_cuda_backend()
-    calculator = Symmetrix(
-        dual_layer_model,
-        use_kokkos=True,
-        dtype="float64",
-        streamed_edges="direct",
-        execution_profile="capacity",
-        neighbor_skin=0.5,
-        _debug_execution_plan=PLAN,
+    atoms = _atoms(5)
+    reference = _calculator(dual_layer_model, REFERENCE_PLAN, dtype="float64")
+    tiled = _calculator(dual_layer_model, PLAN, capacity=4, dtype="float64")
+    expected, expected_h1_adjoint = _evaluate(reference, atoms)
+    actual, actual_h1_adjoint = _evaluate(tiled, atoms)
+
+    for name in PROPERTIES:
+        np.testing.assert_allclose(
+            actual[name], expected[name], rtol=1.0e-10, atol=1e-11
+        )
+    np.testing.assert_allclose(
+        actual_h1_adjoint,
+        expected_h1_adjoint,
+        rtol=1.0e-10,
+        atol=1e-11,
     )
-    with pytest.raises(ValueError, match="requires float32 precision"):
-        calculator.calculate(_atoms(3), properties=["energy"])
+    evaluator = tiled.evaluator
+    assert tiled.execution_plan["selected_id"] == PLAN
+    assert evaluator.dual_layer_workspace_active_receivers == 4
+    assert evaluator.dual_layer_workspace_bytes > 0
+    assert evaluator.dual_layer_tiled_evaluation_count == 1
+    assert evaluator.factorized_fallback_evaluation_count == 0
 
 
 def test_dual_layer_rejects_host_backend(dual_layer_model):

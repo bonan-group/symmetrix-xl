@@ -1,28 +1,38 @@
-# Volc2 FP64 LAMMPS MPI usability
+# Volc2 FP64 LAMMPS MPI fixed workspace
 
-Date: 2026-09-19  
-Host: `volc2`  
-Remote evidence: `/vepfs/symmetrix-fixed-workspace-mpi/fp64-mpi-usability-20260919`
+Date: 2026-09-19
+Host: `volc2`
+Remote evidence: `/vepfs/symmetrix-fixed-workspace-mpi/fp64-fixed-workspace-20260919`
 
 ## Outcome
 
-FP64 direct LAMMPS MPI is usable for the one-million-atom SrTiO3 workload on
-two A100-80GB GPUs. With one MPI rank per GPU, `profile capacity` selects
-`mh0-direct-capacity-y-only`, completes sustained NVT execution, and uses a
-sampled peak of 62,173 MiB (60.72 GiB) per GPU.
+FP64 CUDA fixed-workspace execution is implemented for the single- and
+dual-layer tiled plans. The tiled geometry path keeps Cartesian FP64 edge
+vectors in a batch-sized workspace instead of allocating full-graph geometry.
+FP32 continues to use compact FP32 unit directions plus FP64 radii.
 
-FP64 fixed workspace is not implemented. `allow_fixed_workspace yes` is
-accepted, but it does not select a fixed-workspace plan: the run still selects
-`mh0-direct-capacity-y-only`, reports zero workspace bytes and batches, and has
-the same memory and throughput as the no-opt-in run. Explicitly forcing
-`mh0-dual-layer-tiled-v1` fails with the clear message
-`mh0-dual-layer-tiled-v1 requires float32 precision`.
+The one-million-atom SrTiO3 workload now runs on one A100-80GB with automatic
+plan selection. It previously selected a 110.50-GiB non-fixed plan and failed;
+it now selects `mh0-dual-layer-tiled-v1`, peaks at 17,991 MiB, and completes a
+five-step warmup plus 20 measured NVT steps.
 
-This distinction matters at the capacity boundary. The 1M-atom FP64 workload
-does not fit on one A100: both with and without fixed-workspace opt-in it plans
-118,649,035,584 bytes (110.50 GiB) and fails allocating the 38.15-GiB MH0 Phi1
-forward state. The opt-in cannot rescue the workload because no FP64 tiled plan
-is available.
+On two GPUs, fixed workspace reduces sampled memory from 62,173 to 13,125 MiB
+per GPU (78.9%) and costs 12.7% throughput relative to the direct capacity
+plan. Automatic selection still chooses the direct plan when it fits; the
+fixed plan was forced for that comparison.
+
+## Implementation
+
+- Removed the FP32-only admission restriction from both tiled plans.
+- Enabled the generated `channel-tiled-64` Phi1 module for FP64 while keeping
+  the receiver-local implementation FP32-only.
+- Materialized cutoff-clamped FP64 Cartesian geometry per tile in
+  `execution_prepared_xyz`; its extent is the workspace edge capacity, not the
+  full graph edge count.
+- Preserved the FP32 compact unit-direction path and selected the correct ZBL,
+  harmonic, reverse, and virial inputs for each geometry policy.
+- Accounted for either compact directions or Cartesian coordinates in tiled
+  workspace estimates and runtime counters.
 
 ## Workload and identities
 
@@ -30,11 +40,12 @@ is available.
 - OMAT-medium standard MACE, two interactions, 128 channels, FP64
 - 6.0 Angstrom model cutoff, 0.5 Angstrom skin, 6.5 Angstrom effective cutoff
 - Initial 102,800,000 directed edges; 99,817,766 after the measured trajectory
-- Two MPI ranks, one rank per A100-SXM4-80GB, `1x1x2` rank grid
+- One or two MPI ranks, one rank per A100-SXM4-80GB
+- Two-rank grid: `1x1x2`
 - OpenMPI 4.1.6 CUDA-aware transport; no GPU-aware fallback warning
 - Five warmup plus 20 measured NVT steps for sustained cases
 - Candidate LAMMPS SHA256:
-  `6e1b5292e2acc29053b2b584ef57afcfd0ba64ba1fbeaec2bfcd152403f52f9c`
+  `13895b4c85dc7c26f941381b0868f3e0199d467f0cb6013a8d7746fe1bbd0e2e`
 - Model SHA256:
   `3cc5b7641dbd4c9d766d6140661187c4fd484bae53d4aab5293faa5e76224414`
 - FP64 SM80 artifact SHA256:
@@ -42,62 +53,53 @@ is available.
 
 The artifact was prepared on the target GPU with
 `symmetrix_prepare_jit_device_artifact --precision float64` and used with
-`pair_style symmetrix/mace/kk`. The FP32 pair-style name is not valid for this
-artifact.
+`pair_style symmetrix/mace/kk`.
 
-## Sustained two-rank result
+## Sustained results
 
-Primary timing is in us/atom/step. Both inputs use `profile capacity`; only
-`allow_fixed_workspace` differs.
+Primary timing is in us/atom/step.
 
-| FP64 input | Selected plan | Planned bytes/rank | Peak/GPU | us/atom/step | H1 us/atom/eval | H1 share |
-|---|---|---:|---:|---:|---:|---:|
-| Fixed workspace disabled | `mh0-direct-capacity-y-only` | 60,672,722,484 | 62,173 MiB | 6.00990 | 0.034065 | 0.567% |
-| Fixed workspace allowed | `mh0-direct-capacity-y-only` | 60,672,722,484 | 62,173 MiB | 6.00965 | 0.037089 | 0.617% |
+| Ranks | Selection | Plan | Planned bytes/rank | Peak/GPU | us/atom/step | H1 us/atom/eval |
+|---:|---|---|---:|---:|---:|---:|
+| 2 | Fixed disabled | `mh0-direct-capacity-y-only` | 60,672,722,484 | 62,173 MiB | 6.01980 | 0.040002 |
+| 2 | Fixed forced | `mh0-dual-layer-tiled-v1` | 9,275,370,188 | 13,125 MiB | 6.78355 | 0.049076 |
+| 1 | Fixed allowed, automatic | `mh0-dual-layer-tiled-v1` | 14,766,772,000 | 17,991 MiB | 13.44445 | 0.026568 |
 
-The 0.004% throughput difference is noise. Both cases report one forward and
-one reverse H1 exchange per evaluation, one neighbor rebuild, zero dangerous
-builds, graph reuse without replacement growth, and identical final energy to
-printed precision. Ownership changes from 500,000 atoms/rank to a 500,081 / 
-499,919 split during the trajectory.
+All three sustained cases report one neighbor rebuild, zero dangerous builds,
+one forward and one reverse hidden-state exchange per evaluation, and exit
+status zero. The single-rank case uses periodic self-exchanges.
 
-The capacity log says `fixed workspace=allowed` for the opt-in case, but the
-selection evidence is `workspace receivers=0, edges=0, bytes=0, batches=0` and
-one dedicated communicated-H1 allocation. Users must inspect `plan=` and the
-workspace counters; the word `allowed` alone is not evidence that fixed
-workspace is active.
+The two-rank fixed run completed ownership migration from 500,000 atoms/rank
+to a 500,081 / 499,919 split. Rank 0 replaced its exact-size prepared graph
+once when its receiver count first grew; subsequent geometry and neighbor-list
+updates reused the fixed-workspace execution path.
 
-## Boundary and rejection behavior
+Final thermodynamics agree to FP64 precision. At step 25, direct and fixed
+total energies differ by approximately `2e-9 eV` over one million atoms, and
+the one- and two-rank fixed results agree to printed precision.
 
-| Case | Result | Relevant evidence |
-|---|---|---|
-| Two ranks, fixed disabled | Pass | Capacity Y-only, 60.72 GiB sampled/GPU |
-| Two ranks, fixed allowed | Pass | Same non-tiled plan and memory |
-| One rank, fixed disabled | Fail | 110.50-GiB plan; 38.15-GiB allocation failure |
-| One rank, fixed allowed | Fail | Same plan and allocation failure |
-| Two ranks, tiled plan forced | Expected fail | `requires float32 precision` |
+## Small-system parity
 
-The forced-plan rejection occurs at Verlet setup after atom and neighbor-list
-construction, not during `pair_coeff`. The message is actionable, but an
-earlier validation or explicit warning when FP64 ignores fixed-workspace opt-in
-would improve usability and avoid expensive setup before failure.
+A 320-atom, two-rank comparison forced either
+`mh0-direct-capacity-y-only` or `mh0-dual-layer-tiled-v1`. The fixed plan loaded
+the FP64 generated device artifact, reported zero fallback executions, and
+matched energy and pressure to printed precision. Sorted per-atom position and
+force dumps over two frames had a maximum force-component difference of
+`4.88e-14 eV/Angstrom`.
 
-## FP64 communication copy check
+## Selection behavior
+
+`allow_fixed_workspace yes` grants permission; it does not force tiled
+execution. At two ranks the 60.67-GB direct plan fits and automatic capacity
+selection retains it. At one rank the direct estimate is 110.50 GiB, so the
+same option automatically selects the 14.77-GB fixed-workspace plan and makes
+the workload feasible. The authoritative evidence remains `plan=` plus the
+workspace receiver, edge, byte, and batch counters.
+
+## Communication copy check
 
 A matched two-step run with the pre-optimization executable produced identical
 thermodynamics. Its H1 communication time was 0.070004 us/atom/eval, versus
 0.035269 us/atom/eval with the optimized FP64 `Kokkos::deep_copy` path, a
-49.6% reduction. End-to-end short-run time changed from 5.88640 to 5.85135
-us/atom/step. Longer runs are required for a robust end-to-end performance
-claim, but correctness and the intended communication-path change are clear.
-
-## Usability decision
-
-- **Supported:** FP64 CUDA-aware LAMMPS MPI with retained/non-tiled capacity
-  execution, using `symmetrix/mace/kk` and a matching FP64 device artifact.
-- **Not supported:** FP64 single- or dual-layer tiled fixed workspace.
-- **Potentially misleading:** `allow_fixed_workspace yes` is permission, not a
-  guarantee, and currently degrades silently to a non-fixed FP64 plan.
-- **Capacity implication:** the tested 1M workload requires two A100-80GB GPUs;
-  fixed-workspace opt-in does not make the one-GPU case feasible.
-
+49.6% reduction. This optimization is retained in the fixed-workspace
+candidate.
