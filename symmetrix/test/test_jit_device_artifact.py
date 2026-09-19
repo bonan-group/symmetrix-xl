@@ -517,6 +517,34 @@ def test_pair_symmetrix_mpi_stages_only_boundary_packets():
         assert callbacks.count(f'"{operation}"') == 2
 
 
+def test_pair_symmetrix_contiguous_comm_uses_copy_or_scalar_conversion():
+    repository = Path(__file__).resolve().parents[2]
+    source = (repository / "pair_symmetrix/pair_symmetrix_mace_kokkos.cpp").read_text()
+
+    assert "std::is_same_v<Precision, double>" in source
+    assert "Kokkos::deep_copy(target, source);" in source
+    assert "Kokkos::deep_copy(output, input);" in source
+    assert "PairSymmetrixMACEKokkos::unpack_forward_comm_convert" in source
+    assert "PairSymmetrixMACEKokkos::pack_reverse_comm_convert" in source
+
+    forward_unpack = source[
+        source.index(
+            "void PairSymmetrixMACEKokkos<DeviceType, Precision>::unpack_forward_comm_kokkos"
+        ) : source.index(
+            "int PairSymmetrixMACEKokkos<DeviceType, Precision>::pack_reverse_comm"
+        )
+    ]
+    reverse_pack = source[
+        source.index(
+            "int PairSymmetrixMACEKokkos<DeviceType, Precision>::pack_reverse_comm_kokkos"
+        ) : source.index(
+            "void PairSymmetrixMACEKokkos<DeviceType, Precision>::unpack_reverse_comm"
+        )
+    ]
+    assert "MDRangePolicy" not in forward_unpack
+    assert "MDRangePolicy" not in reverse_pack
+
+
 def test_extract_mace_preserves_conversion_without_device_preparation(
     monkeypatch, tmp_path
 ):
