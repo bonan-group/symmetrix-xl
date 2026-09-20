@@ -1174,6 +1174,10 @@ void MACEKokkos<Precision>::prepare_single_layer_tiled_workspace(
     single_layer_workspace_active_capacity = capacity;
     single_layer_workspace_planned_edge_capacity = std::max(
         single_layer_workspace_planned_edge_capacity, edge_capacity);
+    const std::size_t geometry_bytes_per_edge =
+        edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64
+        ? std::size_t(3)*sizeof(Precision)
+        : std::size_t(3)*sizeof(double);
     single_layer_workspace_edge_bytes = checked_workspace_sum(
         "single-layer edge workspace bytes",
         {checked_workspace_product(
@@ -1187,10 +1191,10 @@ void MACEKokkos<Precision>::prepare_single_layer_tiled_workspace(
                   single_layer_workspace_planned_edge_capacity),
               std::size_t(3), sizeof(double)}),
          checked_workspace_product(
-             "single-layer unit-direction workspace bytes",
+             "single-layer geometry workspace bytes",
              {static_cast<std::size_t>(
                   single_layer_workspace_planned_edge_capacity),
-              std::size_t(3), sizeof(Precision)}),
+              geometry_bytes_per_edge}),
          checked_workspace_product(
              "single-layer radius workspace bytes",
              {static_cast<std::size_t>(
@@ -1405,13 +1409,17 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
         "dual-layer workspace",
         {double_offset, h2_bytes, density_bytes, first_neigh_bytes});
     dual_layer_workspace_receiver_bytes = required_bytes/receivers;
+    const std::size_t geometry_bytes_per_edge =
+        edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64
+        ? std::size_t(3)*sizeof(Precision)
+        : std::size_t(3)*sizeof(double);
     dual_layer_workspace_edge_bytes = checked_workspace_product(
         "dual-layer edge workspace",
         {static_cast<std::size_t>(dual_layer_workspace_planned_edge_capacity),
          checked_workspace_sum(
              "dual-layer edge workspace per edge",
              {static_cast<std::size_t>(num_lm)*sizeof(Precision),
-              std::size_t(3)*sizeof(double), std::size_t(3)*sizeof(Precision),
+              std::size_t(3)*sizeof(double), geometry_bytes_per_edge,
               sizeof(double), std::size_t(2)*sizeof(int)})});
 
     const std::size_t graph_elements = checked_workspace_product(
@@ -1638,16 +1646,16 @@ void MACEKokkos<Precision>::prepare_single_layer_tiled_geometry(
     const int edge_begin,
     const int edge_count)
 {
-    if ((!single_layer_tiled_plan_active && !dual_layer_tiled_plan_active)
-        || !use_compact_edge_geometry())
+    if (!single_layer_tiled_plan_active && !dual_layer_tiled_plan_active)
         throw std::logic_error(
-            "Single-layer tiled geometry requires compact tiled execution.");
+            "Single-layer tiled geometry requires tiled execution.");
     if (receiver_begin < 0 || receiver_count <= 0
         || edge_begin < 0 || edge_count < 0)
         throw std::invalid_argument(
             "Single-layer tiled geometry has invalid edge bounds.");
     const std::size_t receiver_end = static_cast<std::size_t>(receiver_begin)
         +static_cast<std::size_t>(receiver_count);
+    const bool compact_geometry = use_compact_edge_geometry();
     const bool explicit_host_geometry =
         single_layer_explicit_xyz_host.extent(0) != 0
         || single_layer_explicit_r_host.extent(0) != 0;
@@ -1690,7 +1698,9 @@ void MACEKokkos<Precision>::prepare_single_layer_tiled_geometry(
             : explicit_feature_positions
                 ? !explicit_feature_positions_fit
                 : !retained_geometry_fits)
-        || execution_prepared_unit_direction.extent(0)
+        || (compact_geometry
+            ? execution_prepared_unit_direction.extent(0)
+            : single_layer_workspace_xyz.extent(0))
             < static_cast<std::size_t>(3)*edge_count
         || execution_prepared_r.extent(0)
             < static_cast<std::size_t>(edge_count)
@@ -1803,15 +1813,30 @@ void MACEKokkos<Precision>::prepare_single_layer_tiled_geometry(
                         }
                         if (!valid) {
                             Kokkos::atomic_add(&invalid(0), 1);
-                            direction(3*local_edge) = Precision(1);
-                            direction(3*local_edge+1) = Precision(0);
-                            direction(3*local_edge+2) = Precision(0);
+                            if (compact_geometry) {
+                                direction(3*local_edge) = Precision(1);
+                                direction(3*local_edge+1) = Precision(0);
+                                direction(3*local_edge+2) = Precision(0);
+                            } else {
+                                explicit_xyz(3*local_edge) = cutoff;
+                                explicit_xyz(3*local_edge+1) = 0.0;
+                                explicit_xyz(3*local_edge+2) = 0.0;
+                            }
                             radius(local_edge) = cutoff;
                             return;
                         }
-                        for (int component=0; component<3; ++component)
-                            direction(3*local_edge+component) =
-                                static_cast<Precision>(vector[component]/distance);
+                        const double scale = distance >= cutoff
+                            ? cutoff/distance : 1.0;
+                        for (int component=0; component<3; ++component) {
+                            if (compact_geometry)
+                                direction(3*local_edge+component) =
+                                    static_cast<Precision>(
+                                        vector[component]/distance);
+                            else
+                                explicit_xyz(3*local_edge+component) =
+                                    scale*vector[component];
+                        }
+                        radius(local_edge) = distance >= cutoff ? cutoff : distance;
                         return;
                     }
                     double squared_distance = 0.0;
@@ -1855,17 +1880,30 @@ void MACEKokkos<Precision>::prepare_single_layer_tiled_geometry(
                     if (!Kokkos::isfinite(squared_distance)
                         || !(squared_distance > 0.0)) {
                         Kokkos::atomic_add(&invalid(0), 1);
-                        direction(3*local_edge) = Precision(1);
-                        direction(3*local_edge+1) = Precision(0);
-                        direction(3*local_edge+2) = Precision(0);
+                        if (compact_geometry) {
+                            direction(3*local_edge) = Precision(1);
+                            direction(3*local_edge+1) = Precision(0);
+                            direction(3*local_edge+2) = Precision(0);
+                        } else {
+                            explicit_xyz(3*local_edge) = cutoff;
+                            explicit_xyz(3*local_edge+1) = 0.0;
+                            explicit_xyz(3*local_edge+2) = 0.0;
+                        }
                         radius(local_edge) = cutoff;
                         return;
                     }
                     const double distance = Kokkos::sqrt(squared_distance);
-                    for (int component=0; component<3; ++component)
-                        direction(3*local_edge+component) =
-                            static_cast<Precision>(
-                                vector[component]/distance);
+                    const double scale = distance >= cutoff
+                        ? cutoff/distance : 1.0;
+                    for (int component=0; component<3; ++component) {
+                        if (compact_geometry)
+                            direction(3*local_edge+component) =
+                                static_cast<Precision>(
+                                    vector[component]/distance);
+                        else
+                            explicit_xyz(3*local_edge+component) =
+                                scale*vector[component];
+                    }
                     radius(local_edge) = distance >= cutoff ? cutoff : distance;
                 });
         });
@@ -2777,7 +2815,8 @@ void MACEKokkos<Precision>::compute_prepared_factorized(
         factorized_prepared_geometry_graph_generation = 0;
         factorized_prepared_geometry_fractional = false;
         factorized_prepared_geometry_uses_shifts = false;
-        compact_edge_geometry_active = true;
+        compact_edge_geometry_active =
+            edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64;
         try {
             compute_node_energies_forces(
                 static_cast<int>(num_nodes),

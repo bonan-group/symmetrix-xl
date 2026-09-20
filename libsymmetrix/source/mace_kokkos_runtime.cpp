@@ -308,11 +308,14 @@ void MACEKokkos<Precision>::reserve_execution_geometry_workspace(
     const std::size_t required_harmonic_edges = tiled_workspace
         ? tiled_edge_capacity
         : static_cast<std::size_t>(num_edges);
+    const bool compact_geometry =
+        edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64;
     if (num_edges <= execution_geometry_capacity_edges
         && Y.extent(0) >= required_harmonic_edges*static_cast<std::size_t>(num_lm)
         && (!tiled_workspace
-            || (execution_prepared_unit_direction.extent(0)
-                    >= 3*tiled_edge_capacity
+            || ((compact_geometry
+                    ? execution_prepared_unit_direction.extent(0)
+                    : execution_prepared_xyz.extent(0)) >= 3*tiled_edge_capacity
                 && execution_prepared_r.extent(0) >= tiled_edge_capacity
                 && (dual_layer_tiled_plan_active
                     ? dual_layer_workspace_neigh_types.extent(0)
@@ -351,7 +354,7 @@ void MACEKokkos<Precision>::reserve_execution_geometry_workspace(
     single_layer_workspace_neigh_types = {};
     dual_layer_workspace_neigh_types = {};
     execution_geometry_capacity_edges = 0;
-    if (edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64) {
+    if (compact_geometry) {
         execution_prepared_unit_direction =
             decltype(execution_prepared_unit_direction)(
                 Kokkos::view_alloc(
@@ -362,7 +365,7 @@ void MACEKokkos<Precision>::reserve_execution_geometry_workspace(
         execution_prepared_xyz = decltype(execution_prepared_xyz)(
             Kokkos::view_alloc(
                 "Execution prepared xyz", Kokkos::WithoutInitializing),
-            3*edge_capacity);
+            3*geometry_edge_capacity);
     }
     execution_prepared_r = decltype(execution_prepared_r)(
             Kokkos::view_alloc(
@@ -2074,7 +2077,6 @@ bool MACEKokkos<Precision>::use_channel_tiled_phi1() const
 {
 #if defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_CUDA)
     return phi1_policy == Phi1Policy::channel_tiled_64
-        && std::is_same_v<Precision,float>
         && !has_field_coupling
         && mace_admits_low_memory(streamed_edges)
         && factorized_source_strategy == FactorizedSourceStrategy::jit_plugin
@@ -2120,9 +2122,10 @@ void MACEKokkos<Precision>::set_phi1_policy(std::string policy)
             "Phi1 policy must be 'retained', 'channel-tiled-64', or "
             "'receiver-local'.");
     if (requested != Phi1Policy::retained) {
-        if constexpr (!std::is_same_v<Precision,float>)
+        if (requested == Phi1Policy::receiver_local
+            && !std::is_same_v<Precision,float>)
             throw std::invalid_argument(
-                "experimental Phi1 policies currently require float32 inference.");
+                "receiver-local Phi1 currently requires float32 inference.");
         if (has_field_coupling)
             throw std::invalid_argument(
                 "experimental Phi1 policies currently support ordinary MACE only.");
@@ -2640,12 +2643,16 @@ std::size_t MACEKokkos<Precision>::estimate_single_layer_tiled_graph_bytes(
          checked_extent_product(
              "single-layer tiled receiver-offset workspace",
              {workspace, sizeof(int)})});
+    const std::size_t geometry_workspace_bytes =
+        edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64
+        ? std::size_t(3)*sizeof(Precision)
+        : std::size_t(3)*sizeof(double);
     const std::size_t edge_workspace_bytes = checked_extent_product(
         "single-layer tiled edge workspace",
         {workspace_edges, checked_extent_sum(
             "single-layer tiled workspace per edge",
             {harmonics*sizeof(Precision), std::size_t(3)*sizeof(double),
-             std::size_t(3)*sizeof(Precision), sizeof(double), sizeof(int)})});
+             geometry_workspace_bytes, sizeof(double), sizeof(int)})});
     return checked_extent_sum(
         "single-layer tiled graph",
         {topology_edge_bytes, topology_node_bytes, edge_bytes,
@@ -2659,8 +2666,6 @@ std::string MACEKokkos<Precision>::single_layer_tiled_admission_reason() const
 #ifndef KOKKOS_ENABLE_CUDA
     return "mh0-single-layer-tiled-v1 currently requires CUDA";
 #else
-    if constexpr (!std::is_same_v<Precision,float>)
-        return "mh0-single-layer-tiled-v1 requires float32 precision";
     if (!single_layer_readout)
         return "mh0-single-layer-tiled-v1 requires single_layer_readout=true";
     if (!mace_uses_prepared_execution(streamed_edges))
@@ -2689,8 +2694,6 @@ std::string MACEKokkos<Precision>::dual_layer_tiled_admission_reason() const
 #ifndef KOKKOS_ENABLE_CUDA
     return "mh0-dual-layer-tiled-v1 currently requires CUDA";
 #else
-    if constexpr (!std::is_same_v<Precision,float>)
-        return "mh0-dual-layer-tiled-v1 requires float32 precision";
     if (single_layer_readout || num_interactions != 2)
         return "mh0-dual-layer-tiled-v1 requires an ordinary two-layer MACE model";
     if (!mace_uses_prepared_execution(streamed_edges))
@@ -2798,12 +2801,16 @@ std::size_t MACEKokkos<Precision>::estimate_dual_layer_tiled_graph_bytes(
              {workspace, std::size_t(2), sizeof(double)}),
          checked_extent_product(
              "dual-layer tiled receiver offsets", {workspace, sizeof(int)})});
+    const std::size_t geometry_workspace_bytes =
+        edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64
+        ? std::size_t(3)*sizeof(Precision)
+        : std::size_t(3)*sizeof(double);
     const std::size_t edge_workspace = checked_extent_product(
         "dual-layer tiled edge workspace",
         {workspace_edges, checked_extent_sum(
             "dual-layer tiled workspace per edge",
             {harmonics*sizeof(Precision), std::size_t(3)*sizeof(double),
-             std::size_t(3)*sizeof(Precision), sizeof(double),
+             geometry_workspace_bytes, sizeof(double),
              std::size_t(2)*sizeof(int)})});
     return checked_extent_sum(
         "dual-layer tiled graph",

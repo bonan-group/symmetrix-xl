@@ -277,12 +277,17 @@ def _single_v2_test_atoms(count):
 
 
 def _single_v2_plan_results(
-    model_json, atoms, plan, receiver_limit=None, neighbor_skin=0.5
+    model_json,
+    atoms,
+    plan,
+    receiver_limit=None,
+    neighbor_skin=0.5,
+    dtype="float32",
 ):
     calculator = Symmetrix(
         model_json,
         use_kokkos=True,
-        dtype="float32",
+        dtype=dtype,
         streamed_edges="direct",
         execution_profile="speed" if plan == "mh0-direct-speed" else "capacity",
         neighbor_skin=neighbor_skin,
@@ -631,19 +636,34 @@ def test_single_v2_fixed_workspace_uses_compact_shifts_without_neighbor_skin(
     )
 
 
-def test_single_v2_fixed_workspace_rejects_float64(single_v2_artifacts):
+def test_single_v2_fixed_workspace_float64_matches_y_only(single_v2_artifacts):
     _require_cuda_backend()
     _, _, model_json = single_v2_artifacts
-    calculator = Symmetrix(
+    atoms = _single_v2_test_atoms(5)
+    _, expected = _single_v2_plan_results(
         model_json,
-        use_kokkos=True,
+        atoms,
+        "mh0-direct-capacity-y-only",
         dtype="float64",
-        streamed_edges="direct",
-        execution_profile="capacity",
-        _debug_execution_plan="mh0-single-layer-tiled-v1",
     )
-    with pytest.raises(ValueError, match="requires float32 precision"):
-        calculator.calculate(_single_v2_test_atoms(3), properties=["energy"])
+    calculator, actual = _single_v2_plan_results(
+        model_json,
+        atoms,
+        "mh0-single-layer-tiled-v1",
+        receiver_limit=4,
+        dtype="float64",
+    )
+
+    for name in ("energy", "energies", "forces", "stress"):
+        np.testing.assert_allclose(
+            actual[name], expected[name], rtol=1.0e-10, atol=1e-11
+        )
+    evaluator = calculator.evaluator
+    assert calculator.execution_plan["selected_id"] == "mh0-single-layer-tiled-v1"
+    assert evaluator.single_layer_workspace_active_receivers == 4
+    assert evaluator.single_layer_workspace_bytes > 0
+    assert evaluator.single_layer_tiled_evaluation_count == 1
+    assert evaluator.factorized_fallback_evaluation_count == 0
 
 
 def test_training_checkpoint_exports_loadable_model(single_layer_artifacts):
