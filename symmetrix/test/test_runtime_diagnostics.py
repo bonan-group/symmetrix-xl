@@ -493,6 +493,170 @@ def test_backend_show_accepts_an_explicit_selector(monkeypatch, capsys):
     assert "cuda13-sm80: cuda sm80" in capsys.readouterr().out
 
 
+def test_backend_install_prefers_uv_and_reports_resolution(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "_automatic_backend_resolution",
+        lambda: (
+            "cuda13-sm120",
+            {
+                "visible": "CUDA architectures: sm120",
+                "toolkit": "CUDA major: 13 (source: nvidia-smi CUDA Version)",
+            },
+        ),
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/uv")
+
+    def fake_run(command, check, **kwargs):
+        calls.append((command, check, kwargs))
+        if kwargs.get("capture_output"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return None
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    assert cli.main(["backend", "install"]) == 0
+    command, check, _ = calls[-1]
+    assert command[:4] == [
+        "/usr/bin/uv",
+        "pip",
+        "install",
+        "--python",
+    ]
+    assert command[4] == cli.sys.executable
+    assert command[-1] == "symmetrix-xl-cuda13-sm120"
+    assert check is True
+    output = capsys.readouterr().out
+    assert "CUDA architectures: sm120" in output
+    assert "CUDA major: 13 (source: nvidia-smi CUDA Version)" in output
+    assert "selected selector: cuda13-sm120" in output
+
+
+def test_backend_install_auto_resolves_visible_cuda(monkeypatch):
+    from symmetrix import backend_loader
+
+    monkeypatch.setattr(
+        backend_loader,
+        "_visible_targets",
+        lambda: {"cuda": {"sm120"}, "hip": set()},
+    )
+    monkeypatch.setattr(cli, "_toolkit_resolution", lambda kind: ("13", "test"))
+
+    assert cli._automatic_backend_selector() == "cuda13-sm120"
+
+
+def test_cuda_toolkit_resolution_prefers_nvidia_smi(monkeypatch):
+    calls = []
+    monkeypatch.delenv("SYMMETRIX_CUDA_MAJOR", raising=False)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/local/cuda/bin/nvcc")
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command == ["nvidia-smi"]:
+            return SimpleNamespace(returncode=0, stdout="CUDA Version: 13.0", stderr="")
+        raise AssertionError(f"unexpected fallback command: {command}")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    assert cli._toolkit_resolution("cuda") == ("13", "nvidia-smi CUDA Version")
+    assert calls == [["nvidia-smi"]]
+
+
+def test_backend_install_falls_back_to_python_pip(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli.shutil, "which", lambda name: None)
+
+    def fake_run(command, check, **kwargs):
+        calls.append((command, check, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    assert cli.main(["backend", "install", "--arch", "cuda12-sm80"]) == 0
+    command, check, _ = calls[-1]
+    assert command[:4] == [
+        cli.sys.executable,
+        "-m",
+        "pip",
+        "install",
+    ]
+    assert "--verbose" not in command
+    assert command[-1] == "symmetrix-xl-cuda12-sm80"
+    assert check is True
+
+
+def test_backend_install_without_visible_gpu_explains_cpu_fallback(monkeypatch, capsys):
+    from symmetrix import backend_loader
+
+    monkeypatch.setattr(
+        backend_loader,
+        "_visible_targets",
+        lambda: {"cuda": set(), "hip": set()},
+    )
+
+    assert cli.main(["backend", "install"]) == 0
+    output = capsys.readouterr().out
+    assert "bundled CPU backend is already available" in output
+    assert "No backend download is required" in output
+    assert "--arch cuda13-sm120" in output
+
+
+def test_backend_install_auto_falls_back_to_cuda12_when_needed(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "_automatic_backend_resolution",
+        lambda: (
+            "cuda13-sm120",
+            {"visible": "CUDA architectures: sm120", "toolkit": "CUDA major: 13"},
+        ),
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/uv")
+
+    def fake_run(command, check, **kwargs):
+        calls.append((command, check, kwargs))
+        if kwargs.get("capture_output"):
+            available = command[-1] == "symmetrix-xl-cuda12-sm120"
+            return SimpleNamespace(returncode=int(not available), stdout="", stderr="")
+        return None
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    assert cli.main(["backend", "install"]) == 0
+    command, _, _ = calls[-1]
+    assert command[-1] == "symmetrix-xl-cuda12-sm120"
+    assert "using published fallback cuda12-sm120" in capsys.readouterr().out
+
+
+def test_backend_install_reports_source_build_when_no_wheel_exists(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli,
+        "_automatic_backend_resolution",
+        lambda: ("cuda13-sm120", {"visible": "CUDA architectures: sm120"}),
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda command, check, **kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="no matching distribution"
+        ),
+    )
+
+    assert cli.main(["backend", "install"]) == 1
+    error = capsys.readouterr().err
+    assert "no pre-compiled backend wheel" in error
+    assert "python tools/symmetrix_build.py install --backend cuda" in error
+
+
+def test_backend_install_rejects_untrusted_selector(monkeypatch, capsys):
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/uv")
+
+    assert cli.main(["backend", "install", "--arch", "cuda13-sm120;echo"]) == 1
+    assert "invalid backend selector" in capsys.readouterr().err
+
+
 def test_backend_show_probe_reports_openblas_runtime(monkeypatch, capsys):
     from symmetrix import backend_loader
 

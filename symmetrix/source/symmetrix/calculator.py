@@ -575,8 +575,10 @@ class Symmetrix(Calculator):
         is available as :attr:`execution_plan` after graph preparation.
     allow_fixed_workspace : bool, default=False
         Permit capacity planning to select bounded tiled workspace execution.
-        This can increase the maximum graph size for qualified direct Kokkos
-        models, but must be enabled explicitly. It does not force a tiled plan.
+        This can increase the maximum graph size for qualified ordinary MH0
+        standard MACE models on CUDA, but must be enabled explicitly. MACEField
+        and MACE-MH-1 do not support fixed-workspace plans. The option does not
+        force a tiled plan.
     dispersion : bool, default=False
         Add a D3 dispersion correction using the optional ``torch-dftd``
         package. The correction is evaluated alongside Symmetrix and added to

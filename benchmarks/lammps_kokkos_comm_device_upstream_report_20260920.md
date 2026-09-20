@@ -8,11 +8,13 @@ is usually `Atom outside of neighbor bin range`, but instrumentation shows that
 neighbor binning is only the first consumer: the receive buffer already holds
 unrelated finite values immediately after `MPI_Wait`.
 
-Keeping superseded `k_buf_send` and `k_buf_recv` DualViews alive prevents the
-device virtual addresses from being recycled and fixes the failure.  The
-number of retained views is bounded by geometrically growing buffer capacity.
-This is a compatibility workaround; the provider should also be investigated
-for stale CUDA registration or IPC cache entries.
+Keeping superseded `k_buf_send` and `k_buf_recv` DualViews alive on the
+multi-rank CUDA-aware device path prevents their virtual addresses from being
+recycled and fixes the failure. Host-staged, CPU, single-rank, and non-CUDA-aware
+paths retain no allocation history. The number of retained views is bounded by
+geometrically growing buffer capacity. This is a compatibility workaround; the
+provider should also be investigated for stale CUDA registration or IPC cache
+entries.
 
 ## Environment
 
@@ -93,11 +95,11 @@ Independent eight-rank, 64 MiB and 256 MiB multi-peer CUDA-buffer MPI probes
 pass, so generic CUDA-aware MPI and CUDA IPC are functional.  The evidence
 specifically implicates address lifetime and registration reuse.
 
-## Proposed patch
+## Candidate compatibility patch
 
 Apply `benchmarks/lammps_cuda_aware_buffer_keepalive.patch` to the LAMMPS root.
-It changes only `CommKokkos` buffer lifetime.  No host staging, transport
-forcing, global fence, or pair-style workaround is introduced.
+It changes only multi-rank CUDA-aware device-buffer lifetime. No host staging,
+transport forcing, global fence, or pair-style workaround is introduced.
 
 With the patch, two-, four-, and eight-rank Symmetrix cases pass; two separate
 eight-rank repetitions complete all 25 steps with ownership migration, one

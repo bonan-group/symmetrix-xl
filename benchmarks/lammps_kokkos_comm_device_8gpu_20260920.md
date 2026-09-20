@@ -47,11 +47,13 @@ UCX selection remained enabled.  A separate provenance run records
 
 ## Fix
 
-The upstream-ready patch is
-`benchmarks/lammps_cuda_aware_buffer_keepalive.patch`.  Before each geometric
-growth, the old send or receive DualView is moved into a keepalive vector.
-Because growth is geometric, the number of retained allocations is bounded.
-They are released with `CommKokkos` at shutdown.
+The candidate compatibility patch is
+`benchmarks/lammps_cuda_aware_buffer_keepalive.patch`. Before each geometric
+growth on the multi-rank CUDA-aware device path, the old send or receive
+DualView is moved into a keepalive vector. Host-staged, CPU, single-rank, and
+non-CUDA-aware paths retain no allocation history. Because growth is geometric,
+the number of retained device allocations is bounded. They are released with
+`CommKokkos` at shutdown.
 
 No Symmetrix source change is required.  Temporary pair-style assertions and
 fences were removed after they established that callback indices, extents,

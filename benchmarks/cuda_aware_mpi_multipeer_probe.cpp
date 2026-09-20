@@ -32,6 +32,19 @@ bool parse_mebibytes(const char *text, std::size_t &bytes)
   return true;
 }
 
+bool any_rank_failed(bool failed, MPI_Comm comm, int rank)
+{
+  const int local_failed = failed ? 1 : 0;
+  int global_failed = 0;
+  const int status = MPI_Allreduce(
+    &local_failed, &global_failed, 1, MPI_INT, MPI_MAX, comm);
+  if (status != MPI_SUCCESS) {
+    std::fprintf(stderr, "rank=%d MPI_Allreduce failed: %d\n", rank, status);
+    return true;
+  }
+  return global_failed != 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
@@ -69,6 +82,8 @@ int main(int argc, char **argv)
   if (!failed)
     failed = !cuda_ok(cudaSetDevice(local_rank), "cudaSetDevice", rank);
 
+  failed = any_rank_failed(failed, MPI_COMM_WORLD, rank);
+
   constexpr int repetitions = 4;
   const std::array<int, 3> distances{1, 2, 4};
   for (int repetition = 0; repetition < repetitions && !failed; ++repetition) {
@@ -76,16 +91,27 @@ int main(int argc, char **argv)
     unsigned char *receive = nullptr;
     failed = !cuda_ok(cudaMalloc(&send, bytes), "cudaMalloc(send)", rank)
       || !cuda_ok(cudaMalloc(&receive, bytes), "cudaMalloc(receive)", rank);
-    if (failed) break;
+    if (any_rank_failed(failed, MPI_COMM_WORLD, rank)) {
+      if (receive != nullptr) cudaFree(receive);
+      if (send != nullptr) cudaFree(send);
+      failed = true;
+      break;
+    }
 
     const auto value = static_cast<unsigned char>(rank + 17 + repetition);
     failed = !cuda_ok(cudaMemset(send, value, bytes), "cudaMemset(send)", rank)
       || !cuda_ok(cudaMemset(receive, 0, bytes), "cudaMemset(receive)", rank)
       || !cuda_ok(
         cudaDeviceSynchronize(), "cudaDeviceSynchronize(pre-MPI)", rank);
+    if (any_rank_failed(failed, MPI_COMM_WORLD, rank)) {
+      cudaFree(receive);
+      cudaFree(send);
+      failed = true;
+      break;
+    }
 
     for (const int distance : distances) {
-      if (distance >= size || failed) continue;
+      if (distance >= size) continue;
       const int destination = (rank + distance) % size;
       const int source = (rank - distance + size) % size;
       const int mpi_status = MPI_Sendrecv(
@@ -95,20 +121,21 @@ int main(int argc, char **argv)
       if (mpi_status != MPI_SUCCESS) {
         std::fprintf(stderr, "rank=%d MPI_Sendrecv failed: %d\n", rank, mpi_status);
         failed = true;
-        break;
       }
 
       std::array<unsigned char, 3> samples{};
-      const std::array<std::size_t, 3> offsets{0, bytes / 2, bytes - 1};
-      for (std::size_t i = 0; i < offsets.size(); ++i)
-        failed = !cuda_ok(
-          cudaMemcpy(
-            &samples[i], receive + offsets[i], 1, cudaMemcpyDeviceToHost),
-          "cudaMemcpy(sample)", rank)
-          || failed;
       const auto expected = static_cast<unsigned char>(source + 17 + repetition);
-      for (const auto sample : samples) failed = failed || sample != expected;
-      if (failed)
+      if (!failed) {
+        const std::array<std::size_t, 3> offsets{0, bytes / 2, bytes - 1};
+        for (std::size_t i = 0; i < offsets.size(); ++i)
+          failed = !cuda_ok(
+            cudaMemcpy(
+              &samples[i], receive + offsets[i], 1, cudaMemcpyDeviceToHost),
+            "cudaMemcpy(sample)", rank)
+            || failed;
+        for (const auto sample : samples) failed = failed || sample != expected;
+      }
+      if (mpi_status == MPI_SUCCESS && failed)
         std::fprintf(
           stderr,
           "rank=%d repetition=%d distance=%d source=%d expected=%u "
@@ -116,10 +143,13 @@ int main(int argc, char **argv)
           rank, repetition, distance, source, static_cast<unsigned>(expected),
           static_cast<unsigned>(samples[0]), static_cast<unsigned>(samples[1]),
           static_cast<unsigned>(samples[2]));
+      failed = any_rank_failed(failed, MPI_COMM_WORLD, rank);
+      if (failed) break;
     }
 
     failed = !cuda_ok(cudaFree(receive), "cudaFree(receive)", rank) || failed;
     failed = !cuda_ok(cudaFree(send), "cudaFree(send)", rank) || failed;
+    failed = any_rank_failed(failed, MPI_COMM_WORLD, rank);
   }
 
   int local_failed = failed ? 1 : 0;

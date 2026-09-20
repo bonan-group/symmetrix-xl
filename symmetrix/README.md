@@ -82,6 +82,22 @@ symmetrix backend show
 symmetrix doctor
 ```
 
+Published accelerator wheels can also be installed from the CLI:
+
+```bash
+symmetrix backend install
+symmetrix backend install --arch cuda13-sm120
+```
+
+The default `--arch auto` detects one visible GPU architecture. The command
+uses `uv` when available and otherwise invokes `python -m pip`; it reports the
+detected architecture, toolkit version and source, selected package, and
+Python environment before installing. If the detected CUDA-major wheel is not
+published, automatic selection probes the lower CUDA 12 wheel for the same
+architecture.
+On CPU-only hosts, the bundled CPU backend needs no download. If no pre-built
+wheel is available, the CLI reports a source-build command.
+
 The frontend loads exactly one native backend per process. Without an explicit
 selection, it chooses an installed accelerator backend only when its
 architecture exactly matches a visible device; otherwise it uses CPU. Select a

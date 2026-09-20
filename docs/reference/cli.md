@@ -6,6 +6,20 @@ usability without loading an extension. `symmetrix backend show [selector]
 incompatible accelerator selector is an error rather than a usability report.
 With `--probe`, the selected extension is loaded and CPU backends report the
 same OpenBLAS configuration and threading fields as `symmetrix doctor`.
+`symmetrix backend install --arch SELECTOR` downloads and installs a published
+backend wheel into the current Python environment. `--arch` defaults to
+`auto`, which requires exactly one visible GPU architecture and infers the
+CUDA or ROCm major version. If `uv` is available it is used; otherwise the
+command invokes `python -m pip`. Use an explicit selector such as
+`cuda13-sm120` on headless or multi-GPU systems. The command prints the
+resolution details, including detected architecture, toolkit version and
+source, selected package, and Python environment.
+When the detected CUDA-major wheel is unavailable, automatic mode probes and
+falls back to the CUDA 12 wheel for the same architecture. Explicit selectors
+remain strict.
+On CPU-only hosts, automatic mode reports that the bundled CPU backend needs no
+download. If no pre-compiled wheel resolves, it reports the attempted selectors
+and a source-build command.
 `symmetrix doctor [--json] [--advisory]` prints runtime diagnostics; `--json`
 provides the machine-readable variant for deployment checks.
 
