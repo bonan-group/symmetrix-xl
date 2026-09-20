@@ -1,0 +1,36 @@
+diff --git a/src/KOKKOS/comm_kokkos.cpp b/src/KOKKOS/comm_kokkos.cpp
+--- a/src/KOKKOS/comm_kokkos.cpp
++++ b/src/KOKKOS/comm_kokkos.cpp
+@@ -1875,3 +1875,5 @@ void CommKokkos::grow_send_kokkos(int n, int flag, ExecutionSpace space)
++  if (k_buf_send.extent(0)) retired_mpi_buffers.push_back(k_buf_send);
++
+   // bufextra, not the bare BUFEXTRA constant: CommBrick::exchange() packs one
+   // atom of up to maxexchange doubles beyond maxsend before it grows the
+   // buffer again, and rounding up keeps the truncating division from handing
+@@ -1916,5 +1918,6 @@ void CommKokkos::grow_send_kokkos(int n, int flag, ExecutionSpace space)
+ void CommKokkos::grow_recv_kokkos(int n, ExecutionSpace /*space*/)
+ {
++  if (k_buf_recv.extent(0)) retired_mpi_buffers.push_back(k_buf_recv);
+   maxrecv = static_cast<int> (BUFFACTOR * n);
+   int maxrecv_border = (maxrecv + Comm::BUFEXTRA + atomKK->avecKK->size_border - 1)/
+     atomKK->avecKK->size_border;
+diff --git a/src/KOKKOS/comm_kokkos.h b/src/KOKKOS/comm_kokkos.h
+--- a/src/KOKKOS/comm_kokkos.h
++++ b/src/KOKKOS/comm_kokkos.h
+@@ -18,4 +18,5 @@
+ #include "comm_brick.h"
+ #include "kokkos_type.h"
+-
++#include <vector>
++
+ namespace LAMMPS_NS {
+@@ -75,6 +77,9 @@ class CommKokkos : public CommBrick {
+   DAT::tdual_int_2d_lr k_sendlist;
+   DAT::tdual_int_scalar k_total_send;
+   DAT::tdual_double_2d_lr k_buf_send,k_buf_recv;
++  // CUDA-aware MPI providers may retain registrations by allocation address.
++  // Keep retired device buffers alive so a later grow cannot recycle one.
++  std::vector<DAT::tdual_double_2d_lr> retired_mpi_buffers;
+   DAT::tdual_int_1d k_exchange_sendlist,k_exchange_copylist,k_indices;
+   DAT::tdual_int_1d k_exchange_sendlist_bonus,k_exchange_copylist_bonus;
+   DAT::tdual_int_1d k_count;
