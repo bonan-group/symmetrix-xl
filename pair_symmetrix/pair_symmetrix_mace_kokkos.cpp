@@ -39,6 +39,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 using namespace LAMMPS_NS;
@@ -819,21 +820,33 @@ template<class DeviceType, typename Precision>
 void PairSymmetrixMACEKokkos<DeviceType, Precision>::unpack_forward_comm_kokkos(int n, int first, DAT::tdual_double_1d &buf)
 {
   auto H1 = this->H1;
-  const auto num_channels = static_cast<std::size_t>(mace->num_channels);
-  const auto num_LM = static_cast<std::size_t>(mace->num_LM);
-  checked_comm_value_count(static_cast<std::size_t>(n), "forward-unpack");
-  //typename ArrayTypes<DeviceType>::t_xfloat_1d_um v_buf = buf.view<DeviceType>();
+  const auto num_values = static_cast<std::size_t>(
+    checked_comm_value_count(static_cast<std::size_t>(n), "forward-unpack"));
   const auto d_buf = buf.view<DeviceType>();
-  Kokkos::parallel_for(
-    "PairSymmetrixMACEKokkos::unpack_forward_comm_kokkos",
-    Kokkos::MDRangePolicy<Kokkos::Rank<3>>(
-      {0,0,0}, {n,mace->num_LM,mace->num_channels}),
-    KOKKOS_LAMBDA (const int i, const int LM, const int k) {
-      const auto offset =
-        (static_cast<std::size_t>(i)*num_LM + static_cast<std::size_t>(LM))*num_channels
-        + static_cast<std::size_t>(k);
-      H1((first+i),LM,k) = d_buf(offset);
-    });
+  const auto destination = H1.data()
+    + static_cast<std::size_t>(first)*H1.stride(0);
+  // LAMMPS packets are double-valued, so FP32 still needs scalar conversion.
+  if constexpr (std::is_same_v<Precision, double>) {
+    using h1_view_type = std::remove_cv_t<decltype(H1)>;
+    using buffer_view_type = std::remove_cv_t<decltype(d_buf)>;
+    using unmanaged_source = Kokkos::View<
+      const double*, typename buffer_view_type::device_type,
+      Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    using unmanaged_destination = Kokkos::View<
+      double*, typename h1_view_type::device_type,
+      Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    const unmanaged_source source(d_buf.data(), num_values);
+    const unmanaged_destination target(destination, num_values);
+    Kokkos::deep_copy(target, source);
+  } else {
+    const auto source = d_buf.data();
+    Kokkos::parallel_for(
+      "PairSymmetrixMACEKokkos::unpack_forward_comm_convert",
+      Kokkos::RangePolicy<Kokkos::IndexType<std::size_t>>(0, num_values),
+      KOKKOS_LAMBDA (const std::size_t index) {
+        destination[index] = static_cast<Precision>(source[index]);
+      });
+  }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -876,20 +889,33 @@ int PairSymmetrixMACEKokkos<DeviceType, Precision>::pack_reverse_comm_kokkos(
 {
   auto d_buf = buf.view<DeviceType>();
   const auto H1_adj = this->H1_adj;
-  const auto num_channels = static_cast<std::size_t>(mace->num_channels);
-  const auto num_LM = static_cast<std::size_t>(mace->num_LM);
   const auto value_count = checked_comm_value_count(
     static_cast<std::size_t>(n), "reverse-pack");
-  Kokkos::parallel_for(
-    "PairSymmetrixMACEKokkos::pack_reverse_comm_kokkos",
-    Kokkos::MDRangePolicy<Kokkos::Rank<3>>(
-      {0,0,0}, {n,mace->num_LM,mace->num_channels}),
-    KOKKOS_LAMBDA (const int i, const int LM, const int k) {
-      const auto offset =
-        (static_cast<std::size_t>(i)*num_LM + static_cast<std::size_t>(LM))*num_channels
-        + static_cast<std::size_t>(k);
-      d_buf(offset) = H1_adj((first+i),LM,k);
-    });
+  const auto num_values = static_cast<std::size_t>(value_count);
+  const auto source = H1_adj.data()
+    + static_cast<std::size_t>(first)*H1_adj.stride(0);
+  // LAMMPS packets are double-valued, so FP32 still needs scalar conversion.
+  if constexpr (std::is_same_v<Precision, double>) {
+    using h1_view_type = std::remove_cv_t<decltype(H1_adj)>;
+    using buffer_view_type = std::remove_cv_t<decltype(d_buf)>;
+    using unmanaged_source = Kokkos::View<
+      const double*, typename h1_view_type::device_type,
+      Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    using unmanaged_destination = Kokkos::View<
+      double*, typename buffer_view_type::device_type,
+      Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    const unmanaged_source input(source, num_values);
+    const unmanaged_destination output(d_buf.data(), num_values);
+    Kokkos::deep_copy(output, input);
+  } else {
+    auto destination = d_buf.data();
+    Kokkos::parallel_for(
+      "PairSymmetrixMACEKokkos::pack_reverse_comm_convert",
+      Kokkos::RangePolicy<Kokkos::IndexType<std::size_t>>(0, num_values),
+      KOKKOS_LAMBDA (const std::size_t index) {
+        destination[index] = static_cast<double>(source[index]);
+      });
+  }
   return value_count;
 }
 

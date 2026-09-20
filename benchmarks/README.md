@@ -22,6 +22,9 @@ points. Names identify the workload or comparison they run. In particular:
   `ase_omat_static_graph_backend_scale.py` measure OMAT backend scaling.
 - The remaining `*_benchmark.py`, profiling, generation, and validation scripts
   support the workload named by each file.
+- `volc_lammps_kokkos_comm_device_reproducer.sh` and
+  `lammps_kokkos_comm_device_migration.in` exercise eight-rank Kokkos
+  ownership migration and generic communication-buffer growth on `volc`.
 
 Drivers may require an existing model checkpoint, compiled extension, GPU, or
 external profiler. Consult the corresponding report and command-line help for

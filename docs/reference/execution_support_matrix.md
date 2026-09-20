@@ -30,15 +30,16 @@ benchmark reports provide the evidence for a specific backend and workload.
 
 `execution_profile="capacity"` and `"speed"` select resource objectives inside
 the direct algorithm. `allow_fixed_workspace=True` separately permits bounded
-tiled workspace for qualified CUDA FP32 models. These controls do not create
-additional execution modes.
+tiled workspace for qualified ordinary MH0 standard MACE models on CUDA in
+FP32 and FP64. MACEField and MACE-MH-1 do not support fixed-workspace plans.
+These controls do not create additional execution modes.
 
-LAMMPS `mpi_message_passing` supports the dual-layer fixed-workspace plan only
-for ordinary two-interaction standard MACE with CUDA FP32 direct execution and
-a generated tiled R1 device artifact. The receiver- and edge-sized workspace is
-bounded, while H1 and its adjoint remain sized to all local and ghost feature
-nodes. FP64, HIP, field-coupled models, parameter gradients, and execution
-observers are outside this qualification boundary.
+LAMMPS `mpi_message_passing` supports the dual-layer fixed-workspace plan for
+ordinary two-interaction standard MACE with CUDA FP32 or FP64 direct execution
+and a precision-matched generated tiled R1 device artifact. The receiver- and
+edge-sized workspace is bounded, while H1 and its adjoint remain sized to all
+local and ghost feature nodes. HIP, field-coupled models, parameter gradients,
+and execution observers are outside this qualification boundary.
 
 See {doc}`/streamed_edge_execution` for the architecture, {doc}`/user/execution`
 for user controls, and {doc}`/user/lammps` for the narrower LAMMPS boundary.

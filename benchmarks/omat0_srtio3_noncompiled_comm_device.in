@@ -1,0 +1,40 @@
+units metal
+atom_style atomic/kk
+atom_modify map yes sort 0 0.0
+boundary p p p
+processors ${px} ${py} ${pz}
+package kokkos neigh half newton on
+newton on
+
+lattice custom 3.905 a1 1 0 0 a2 0 1 0 a3 0 0 1 &
+  basis 0.0 0.0 0.0 &
+  basis 0.5 0.5 0.5 &
+  basis 0.5 0.5 0.0 &
+  basis 0.5 0.0 0.5 &
+  basis 0.0 0.5 0.5
+region simulation block 0 ${nx} 0 ${ny} 0 ${nz} units lattice
+create_box 3 simulation
+create_atoms 1 box basis 1 1 basis 2 2 basis 3 3 basis 4 3 basis 5 3
+mass 1 87.62
+mass 2 47.867
+mass 3 15.999
+
+pair_style symmetrix/mace/float32/kk mpi_message_passing &
+  streamed_edges non-compiled profile capacity
+pair_coeff * * ${model} Sr Ti O
+neighbor 0.5 bin
+neigh_modify every 1 delay 0 check yes
+
+velocity all create 300.0 20260918 mom yes rot no dist gaussian loop geom
+fix dynamics all nvt temp 300.0 300.0 0.1
+timestep 0.001
+
+thermo 20
+thermo_style custom step atoms temp pe ke etotal press
+thermo_modify format float %.16g flush yes lost error
+
+run 5 post no
+print "NONCOMPILED_WARMUP_COMPLETE step=$(step:%.0f) atoms=$(atoms:%.0f)"
+timer full
+run 20
+print "NONCOMPILED_MEASUREMENT_COMPLETE step=$(step:%.0f) atoms=$(atoms:%.0f)"

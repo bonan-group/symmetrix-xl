@@ -1,0 +1,45 @@
+units metal
+atom_style atomic/kk
+atom_modify map yes sort 0 0.0
+boundary p p p
+processors ${px} ${py} ${pz}
+package kokkos neigh half newton on
+newton on
+
+lattice custom 3.905 a1 1 0 0 a2 0 1 0 a3 0 0 1 &
+  basis 0.0 0.0 0.0 &
+  basis 0.5 0.5 0.5 &
+  basis 0.5 0.5 0.0 &
+  basis 0.5 0.0 0.5 &
+  basis 0.0 0.5 0.5
+region simulation block 0 ${nx} 0 ${ny} 0 ${nz} units lattice
+create_box 3 simulation
+create_atoms 1 box basis 1 1 basis 2 2 basis 3 3 basis 4 3 basis 5 3
+mass 1 87.62
+mass 2 47.867
+mass 3 15.999
+
+# Keep the original 6.0 A interaction cutoff so border communication has the
+# same geometric reach as the Symmetrix workload.  The weak LJ interaction is
+# only a standard Kokkos pair-style replacement for isolating generic comm.
+pair_style lj/cut/kk 6.0
+pair_coeff * * ${epsilon} 2.0 6.0
+neighbor 0.5 bin
+neigh_modify every 1 delay 0 check yes
+
+velocity all create 300.0 20260918 mom yes rot no dist gaussian loop geom
+fix dynamics all nve/kk
+timestep ${timestep}
+
+thermo 1
+thermo_style custom step atoms temp pe ke etotal press
+thermo_modify format float %.16g flush yes lost error
+
+run 5 post no
+print "KOKKOS_COMM_WARMUP_COMPLETE step=$(step:%.0f) atoms=$(atoms:%.0f)"
+# Grow the generic border buffers only after their original device addresses
+# have participated in CUDA-aware MPI during warmup.
+comm_modify cutoff ${comm_cutoff}
+timer full
+run 20
+print "KOKKOS_COMM_MEASUREMENT_COMPLETE step=$(step:%.0f) atoms=$(atoms:%.0f)"

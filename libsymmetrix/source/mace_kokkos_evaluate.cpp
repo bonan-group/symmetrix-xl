@@ -274,8 +274,9 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
                 "Execution R1 graph token is stale; prepare the graph again.");
         const std::size_t graph_edges =
             execution_prepared_neigh_indices.extent(0);
-        const bool invalid_radius_extent =
-            (single_layer_tiled_plan_active || dual_layer_tiled_plan_active)
+        const bool tiled_workspace = single_layer_tiled_plan_active
+            || dual_layer_tiled_plan_active;
+        const bool invalid_radius_extent = tiled_workspace
             ? r.extent(0) < static_cast<std::size_t>(
                 dual_layer_tiled_plan_active
                     ? dual_layer_workspace_active_edge_capacity
@@ -283,7 +284,7 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
             : r.extent(0) != graph_edges;
         if (num_nodes != static_cast<int>(execution_prepared_node_types.extent(0))
             || invalid_radius_extent
-            || (!use_compact_edge_geometry()
+            || (!tiled_workspace && !use_compact_edge_geometry()
                 && xyz.extent(0) < 3*graph_edges))
             throw std::invalid_argument(
                 "Execution R1 prepared coordinates do not match the graph extents.");
@@ -604,7 +605,13 @@ void MACEKokkos<Precision>::compute_single_layer_tiled(
             node_forces_storage,
             Kokkos::make_pair(
                 std::size_t(0), static_cast<std::size_t>(3)*edge_count));
-        single_layer_workspace_xyz = node_forces;
+        if (use_compact_edge_geometry())
+            single_layer_workspace_xyz = node_forces;
+        else
+            single_layer_workspace_xyz = Kokkos::subview(
+                execution_prepared_xyz,
+                Kokkos::make_pair(
+                    std::size_t(0), static_cast<std::size_t>(3)*edge_count));
         Kokkos::parallel_scan(
             "MACEKokkos::single_layer_tiled_receiver_offsets",
             Kokkos::RangePolicy<decltype(factorized_execution_space)>(
@@ -787,7 +794,13 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
             node_forces_storage,
             Kokkos::make_pair(
                 std::size_t(0), static_cast<std::size_t>(3)*edge_count));
-        single_layer_workspace_xyz = node_forces;
+        if (use_compact_edge_geometry())
+            single_layer_workspace_xyz = node_forces;
+        else
+            single_layer_workspace_xyz = Kokkos::subview(
+                execution_prepared_xyz,
+                Kokkos::make_pair(
+                    std::size_t(0), static_cast<std::size_t>(3)*edge_count));
         const auto first_neigh = streamed_first_neigh;
         Kokkos::parallel_scan(
             "MACEKokkos::dual_layer_tiled_receiver_offsets",
@@ -823,13 +836,21 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
         const auto batch_xyz = single_layer_workspace_xyz;
         Kokkos::deep_copy(factorized_execution_space, node_forces, 0.0);
         if (phase == 1) {
-            if (has_zbl)
-                zbl.compute_ZBL(
-                    factorized_execution_space,
-                    receiver_count, batch_node_types, batch_num_neigh,
-                    batch_neigh_types, atomic_numbers, streamed_first_neigh,
-                    batch_r, execution_prepared_unit_direction, node_energies,
-                    node_forces, 0);
+            if (has_zbl) {
+                if (use_compact_edge_geometry())
+                    zbl.compute_ZBL(
+                        factorized_execution_space,
+                        receiver_count, batch_node_types, batch_num_neigh,
+                        batch_neigh_types, atomic_numbers, streamed_first_neigh,
+                        batch_r, execution_prepared_unit_direction,
+                        node_energies, node_forces, 0);
+                else
+                    zbl.compute_ZBL(
+                        factorized_execution_space,
+                        receiver_count, batch_node_types, batch_num_neigh,
+                        batch_neigh_types, atomic_numbers, streamed_first_neigh,
+                        batch_r, batch_xyz, node_energies, node_forces, 0);
+            }
             compute_Y(batch_xyz, batch_r, true, 0, edge_count);
             compute_A0_streamed(
                 receiver_count, batch_node_types, batch_num_neigh,
@@ -1040,7 +1061,7 @@ void MACEKokkos<Precision>::accumulate_single_layer_tiled_outputs(
     const bool compact = use_compact_edge_geometry();
     const auto direction = execution_prepared_unit_direction;
     const auto radius = execution_prepared_r;
-    const auto coordinates = execution_prepared_xyz;
+    const auto coordinates = single_layer_workspace_xyz;
     for (int component=0; component<9; ++component) {
         const int force_component = component/3;
         const int vector_component = component%3;
@@ -1352,9 +1373,6 @@ void MACEKokkos<Precision>::compute_factorized_single_layer_distributed_evaluati
             xyz, r, execution_graph_generation);
         return;
     }
-    if (edge_geometry_policy != EdgeGeometryPolicy::unit_f32_radius_f64)
-        throw std::logic_error(
-            "Single-layer fixed-workspace MPI requires compact edge geometry.");
     if (execution_prepared_geometry_invalid.extent(0) != 1) {
         execution_prepared_geometry_invalid = Kokkos::View<int*>(
             "Execution prepared geometry invalid", 1);
@@ -1364,7 +1382,8 @@ void MACEKokkos<Precision>::compute_factorized_single_layer_distributed_evaluati
         factorized_execution_space, execution_prepared_geometry_invalid, 0);
     single_layer_explicit_xyz_device = xyz;
     single_layer_explicit_r_device = r;
-    compact_edge_geometry_active = true;
+    compact_edge_geometry_active =
+        edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64;
     try {
         compute_node_energies_forces(
             num_receivers,
@@ -1409,9 +1428,6 @@ compute_factorized_single_layer_distributed_positions_evaluation(
             != std::size_t(3)*static_cast<std::size_t>(num_feature_nodes))
         throw std::invalid_argument(
             "Single-layer distributed graph or position extents are inconsistent.");
-    if (edge_geometry_policy != EdgeGeometryPolicy::unit_f32_radius_f64)
-        throw std::logic_error(
-            "Single-layer fixed-workspace MPI requires compact edge geometry.");
     if (execution_prepared_geometry_invalid.extent(0) != 1) {
         execution_prepared_geometry_invalid = Kokkos::View<int*>(
             "Execution prepared geometry invalid", 1);
@@ -1425,7 +1441,8 @@ compute_factorized_single_layer_distributed_positions_evaluation(
             std::size_t(0), static_cast<std::size_t>(
                 single_layer_workspace_active_edge_capacity)));
     single_layer_explicit_feature_positions_device = positions;
-    compact_edge_geometry_active = true;
+    compact_edge_geometry_active =
+        edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64;
     try {
         compute_node_energies_forces(
             num_receivers,
@@ -1459,9 +1476,6 @@ void MACEKokkos<Precision>::begin_factorized_distributed_positions_evaluation(
         != std::size_t(3)*static_cast<std::size_t>(num_feature_nodes))
         throw std::invalid_argument(
             "Dual-layer distributed position extents are inconsistent.");
-    if (edge_geometry_policy != EdgeGeometryPolicy::unit_f32_radius_f64)
-        throw std::logic_error(
-            "Dual-layer fixed-workspace MPI requires compact edge geometry.");
     if (execution_prepared_geometry_invalid.extent(0) != 1) {
         execution_prepared_geometry_invalid = Kokkos::View<int*>(
             "Execution prepared geometry invalid", 1);
@@ -1475,7 +1489,8 @@ void MACEKokkos<Precision>::begin_factorized_distributed_positions_evaluation(
             std::size_t(0), static_cast<std::size_t>(
                 dual_layer_workspace_active_edge_capacity)));
     single_layer_explicit_feature_positions_device = positions;
-    compact_edge_geometry_active = true;
+    compact_edge_geometry_active =
+        edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64;
     try {
         begin_factorized_distributed_evaluation(
             num_receivers, num_feature_nodes,
@@ -1852,8 +1867,10 @@ void MACEKokkos<Precision>::finish_factorized_distributed_evaluation()
             factorized_distributed_xyz = {};
             factorized_distributed_r = {};
             factorized_distributed_electric_field = {};
-            if (compact_edge_geometry_active) {
-                compact_edge_geometry_active = false;
+            const bool prepared_positions_active =
+                single_layer_explicit_feature_positions_device.extent(0) != 0;
+            compact_edge_geometry_active = false;
+            if (prepared_positions_active) {
                 single_layer_explicit_feature_positions_device = {};
                 validate_prepared_factorized_positions_geometry();
             }
