@@ -35,7 +35,7 @@ set(SYMMETRIX_PYTHON_INSTALL_PACKAGE "" CACHE STRING
     "Python package receiving the native extension.")
 set(SYMMETRIX_DISTRIBUTION_NAME "symmetrix-xl" CACHE STRING
     "Owning Python distribution recorded in backend metadata.")
-set(SYMMETRIX_FRONTEND_VERSION "0.1.0" CACHE STRING
+set(SYMMETRIX_FRONTEND_VERSION "0.1.1" CACHE STRING
     "Compatible Symmetrix Python frontend version.")
 set(SYMMETRIX_BACKEND_SELECTOR "" CACHE STRING
     "Runtime backend selector recorded in backend metadata.")

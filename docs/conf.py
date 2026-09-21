@@ -5,7 +5,7 @@ from datetime import date
 project = "Symmetrix-XL"
 copyright = f"{date.today().year}, Symmetrix-XL contributors"
 author = "Symmetrix-XL contributors"
-release = "0.1.0"
+release = "0.1.1"
 
 extensions = ["myst_parser"]
 source_suffix = {".rst": "restructuredtext", ".md": "markdown"}

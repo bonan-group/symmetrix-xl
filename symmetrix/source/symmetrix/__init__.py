@@ -10,7 +10,7 @@ from .backend_loader import available_backends as _available_backends
 from .backend_loader import load_backend as _load_backend
 from .backend_loader import selected_backend as selected_backend
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 _FRONTEND_EXPORTS = {
     "Symmetrix": (".calculator", "Symmetrix"),

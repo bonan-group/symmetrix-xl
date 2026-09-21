@@ -670,7 +670,7 @@ def test_gpu_wheel_project_owns_no_frontend_files(tmp_path):
         "Architecture-qualified Symmetrix native backend"
     )
     assert metadata["project"]["dependencies"] == [
-        "symmetrix-xl==0.1.0",
+        "symmetrix-xl==0.1.1",
         "nvidia-cuda-runtime>=13,<14",
         "nvidia-cuda-nvrtc>=13,<14",
         "nvidia-cublas>=13,<14",
@@ -708,7 +708,7 @@ def test_wheel_build_redacts_private_build_paths(tmp_path):
 def test_wheel_content_audit_accepts_release_payload(tmp_path):
     wheel = tmp_path / "safe.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr("symmetrix/__init__.py", '__version__ = "0.1.0"\n')
+        archive.writestr("symmetrix/__init__.py", '__version__ = "0.1.1"\n')
         archive.writestr("symmetrix/_native.so", b"/usr/src/symmetrix-xl/source.cpp")
 
     audit_wheel(wheel)
@@ -752,7 +752,7 @@ def test_cuda12_wheel_declares_split_nvidia_dependencies(tmp_path):
     )
 
     assert metadata["project"]["dependencies"] == [
-        "symmetrix-xl==0.1.0",
+        "symmetrix-xl==0.1.1",
         "nvidia-cuda-runtime-cu12>=12,<13",
         "nvidia-cuda-nvrtc-cu12>=12,<13",
         "nvidia-cublas-cu12>=12,<13",
@@ -1670,7 +1670,7 @@ def test_matrix_toolkit_mismatch_is_rejected():
 def _fake_backend_wheel(tmp_path, manifest, descriptor):
     identity = package_identity(manifest)
     wheel = (
-        tmp_path / f"{identity.distribution.replace('-', '_')}-0.1.0-py3-none-any.whl"
+        tmp_path / f"{identity.distribution.replace('-', '_')}-0.1.1-py3-none-any.whl"
     )
     wheel.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -1689,7 +1689,7 @@ def test_matrix_wheel_descriptor_verification(tmp_path):
         "backend": identity.backend,
         "architecture": identity.architecture,
         "distribution": identity.distribution,
-        "frontend_version": "0.1.0",
+        "frontend_version": "0.1.1",
         "native_abi": 1,
         "package": identity.package,
         "module": identity.module,
@@ -1716,13 +1716,13 @@ def test_matrix_base_wheel_descriptor_verification(tmp_path):
         "backend": "cpu",
         "architecture": "x86-64-v3",
         "distribution": "symmetrix-xl",
-        "frontend_version": "0.1.0",
+        "frontend_version": "0.1.1",
         "native_abi": 1,
         "package": "symmetrix",
         "module": "_native_cpu",
         "toolkit": "",
     }
-    wheel = tmp_path / "symmetrix_xl-0.1.0-cp312-cp312-linux_x86_64.whl"
+    wheel = tmp_path / "symmetrix_xl-0.1.1-cp312-cp312-linux_x86_64.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr(
             "symmetrix/_backend_cpu.json", json.dumps(descriptor, sort_keys=True)
@@ -1855,7 +1855,7 @@ def _write_sdist(path, members):
 
 
 def test_sdist_contents_verification(tmp_path):
-    root = "symmetrix_xl-0.1.0"
+    root = "symmetrix_xl-0.1.1"
     members = [
         *(f"{root}/{member}" for member in build_sdist.REQUIRED_SDIST_MEMBERS),
         f"{root}/VENDORED_DEPS.json",
@@ -1865,7 +1865,7 @@ def test_sdist_contents_verification(tmp_path):
     complete = tmp_path / "complete.tar.gz"
     _write_sdist(complete, members)
 
-    record = build_sdist.verify_sdist_contents(complete, "0.1.0")
+    record = build_sdist.verify_sdist_contents(complete, "0.1.1")
 
     assert record["filename"] == "complete.tar.gz"
     assert record["members"] == len(members)
@@ -1877,14 +1877,14 @@ def test_sdist_contents_verification(tmp_path):
     missing = tmp_path / "missing.tar.gz"
     _write_sdist(missing, incomplete)
     with pytest.raises(BuildError, match="not self-contained"):
-        build_sdist.verify_sdist_contents(missing, "0.1.0")
+        build_sdist.verify_sdist_contents(missing, "0.1.1")
 
     polluted = tmp_path / "polluted.tar.gz"
     _write_sdist(
         polluted, [*members, f"{root}/libsymmetrix/external/kokkos/.git/config"]
     )
     with pytest.raises(BuildError, match="VCS metadata"):
-        build_sdist.verify_sdist_contents(polluted, "0.1.0")
+        build_sdist.verify_sdist_contents(polluted, "0.1.1")
 
 
 def test_sdist_configuration_is_self_contained():
@@ -1967,7 +1967,7 @@ def test_sdist_rejects_dirty_worktree(tmp_path):
 
 
 def test_sdist_smoke_check_rebuilds_from_itself(tmp_path):
-    root = "symmetrix_xl-0.1.0"
+    root = "symmetrix_xl-0.1.1"
     sdist = tmp_path / f"{root}.tar.gz"
     _write_sdist(sdist, [f"{root}/pyproject.toml", f"{root}/LICENSE"])
     rebuild_args = (
@@ -1982,7 +1982,7 @@ def test_sdist_smoke_check_rebuilds_from_itself(tmp_path):
 
     healthy = FakeRunner({}, {rebuild_args: (0, "", "")})
     build_sdist.verify_sdist_rebuilds_from_itself(
-        sdist, sys.executable, healthy, tmp_path, "0.1.0"
+        sdist, sys.executable, healthy, tmp_path, "0.1.1"
     )
     assert (tmp_path / "smoke-extracted" / root / "pyproject.toml").is_file()
 
@@ -1991,6 +1991,6 @@ def test_sdist_smoke_check_rebuilds_from_itself(tmp_path):
     )
     with pytest.raises(BuildError, match="cannot be rebuilt from"):
         build_sdist.verify_sdist_rebuilds_from_itself(
-            sdist, sys.executable, broken, tmp_path, "0.1.0"
+            sdist, sys.executable, broken, tmp_path, "0.1.1"
         )
     assert "License file not found" in (tmp_path / "sdist-smoke.log").read_text()

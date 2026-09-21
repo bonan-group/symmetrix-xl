@@ -22,7 +22,7 @@ SPHERICART_ENABLE_CUDA = "OFF"
 
 [project]
 name = "symmetrix-xl"
-version = "0.1.0"
+version = "0.1.1"
 description = "Symmetrix — a package for functions equivariant under: translation, rotation, inversion, and exchange of particles."
 readme = "README.md"
 requires-python = ">=3.10"

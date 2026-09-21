@@ -2,6 +2,13 @@
 
 All notable changes to Symmetrix-XL are documented in this file.
 
+## 0.1.1 - 2026-09-22
+
+- Added automatic installation of architecture-qualified accelerator backends.
+- Improved LAMMPS MPI execution, including fixed-workspace and FP64 support.
+- Hardened periodic neighbor-graph indexing for large flattened edge arrays.
+- Updated public documentation and qualified performance summaries.
+
 ## 0.1.0 - 2026-09-16
 
 Initial public Symmetrix-XL release.
