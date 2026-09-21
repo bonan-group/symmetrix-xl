@@ -55,8 +55,24 @@ energy/forces/stress calls for the standard OMAT-0-medium checkpoint:
 MACE-Torch 0.3.15 with cuEquivariance 0.11.0 used the exact 6.0 A graph.
 Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving a
 candidate graph with an effective cutoff of 6.5 A; the graph policies are not
-identical, and Symmetrix-XL processed more directed candidates. See the
-[matched speed qualification](benchmarks/streamed_edge_milestone_20260822.md#superseding-cuda-paper-qualification-2026-09-14).
+identical, and Symmetrix-XL processed more directed candidates.
+
+A separate FP32 RTX 5090 qualification measured complete warmed LAMMPS steps
+for 5,000-atom perturbed cubic SrTiO3 using the same MACE-OMAT-0-medium model.
+It compares the standard MACE-Torch/cuEquivariance deployment through the
+LAMMPS ML-IAP package with the Symmetrix-XL LAMMPS pair style:
+
+| Implementation | Time (us/atom/step) | Speedup vs. ML-IAP |
+|---|---:|---:|
+| MACE-Torch + cuEquivariance through LAMMPS ML-IAP | 12.813 | 1.00x |
+| Symmetrix-XL LAMMPS pair style | 2.559 | 5.01x |
+
+Each value is the median of three 20-step runs after warmup. Both deployments
+used a 6.0 A model cutoff and a 0.5 A neighbor-list skin (6.5 A effective
+neighbor cutoff); the shared LAMMPS neighbor list contained 511,932 directed
+candidates. The ML-IAP baseline used MACE-Torch 0.3.16 and cuEquivariance
+0.11.1. This is an end-to-end LAMMPS comparison, so it is reported separately
+from the ASE-call measurements above.
 
 -----
 
