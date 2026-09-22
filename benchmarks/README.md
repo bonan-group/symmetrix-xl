@@ -1,9 +1,8 @@
 # Benchmarks
 
-This directory contains reproducible performance drivers and current
-qualification evidence. It does not serve as permanent storage for raw
-profiler captures, generated kernels, model files, machine-specific run output,
-or superseded reports.
+This directory contains reproducible performance drivers. It does not serve as
+storage for benchmark results, raw profiler captures, generated kernels, model
+files, machine-specific run output, or historical qualification reports.
 
 ## Maintained drivers
 
@@ -27,24 +26,8 @@ points. Names identify the workload or comparison they run. In particular:
   ownership migration and generic communication-buffer growth on `volc`.
 
 Drivers may require an existing model checkpoint, compiled extension, GPU, or
-external profiler. Consult the corresponding report and command-line help for
-the exact environment and invocation.
-
-## Reports
-
-Tracked Markdown files preserve compact methodology, summarized results,
-decisions, and reproducibility context for current qualification evidence. When
-a report's selector names, defaults, recommendations, or source map have been
-superseded, move any still-relevant conclusion into the current authority and
-remove the stale report. Do not rewrite old measurements as though they were
-produced by later behavior. References to untracked local plans or artifacts
-must say that they are unavailable rather than presenting them as
-checkout-relative reproduction inputs.
-
-Every new performance record must include the atom count and exact model cutoff.
-When graph expansion is active, also record the neighbor-list skin, effective
-cutoff, and directed-edge count. Include the model, backend, precision, timing,
-memory, hardware, software revision, and relevant compiler or profiler context.
+external profiler. Use their command-line help and the relevant user or build
+documentation to establish the environment and invocation.
 
 ## Output and retention
 
@@ -54,7 +37,7 @@ sessions, traces, generated source and binaries, downloaded models, and bulk
 per-sample output must not be committed.
 
 Keep raw evidence locally only as long as it is useful for analysis or external
-archival. Promote durable conclusions into a small tracked report, including
-enough aggregate values and provenance to explain the decision. A raw artifact
+archival. User-facing, current performance claims belong in the README or
+documentation and must state the workload and hardware context. A raw artifact
 may be added to version control only when a focused test consumes it as a stable
 fixture; test fixtures belong with that test rather than in `.artifacts`.
