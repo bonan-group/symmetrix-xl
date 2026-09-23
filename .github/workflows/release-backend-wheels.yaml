@@ -3,13 +3,14 @@
 # Builds the x86-64-v4 CPU add-on wheels only:
 #   * symmetrix-xl-cpu-avx512       x86-64-v4 CPU add-on, manylinux_2_28
 #
-# GPU backend wheels (cuda12/cuda13 x sm80..sm120, rocm) are NOT built in CI:
-# build them on a qualified local development machine with
-# tools/build_gpu_wheels.sh, then publish with twine. The publish job below
-# covers only the CI-built CPU add-on.
+# GPU releases start with one local target-hardware build and test. Then
+# release-cuda-wheels.yaml builds the CPython matrix on GitHub-hosted runners
+# and publishes it through Trusted Publishing. The publish job below covers
+# only the CI-built CPU add-on.
 #
 # Release runbook order: publish the base `symmetrix-xl` wheels first
-# (release-cpu-wheels.yaml), then this workflow, then locally built GPU wheels.
+# (release-cpu-wheels.yaml), then this workflow, then dispatch
+# release-cuda-wheels.yaml for locally qualified GPU targets.
 #
 # Required repository settings:
 #   * PyPI project "symmetrix-xl-cpu-avx512" configured with a Trusted

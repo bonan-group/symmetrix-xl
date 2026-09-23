@@ -1,3 +1,9 @@
+# CUDA wheel release pipeline.
+#
+# Build and test one representative wheel locally on matching target hardware
+# before dispatching this workflow. GitHub-hosted jobs then build the CPython
+# wheel matrix and publish it through Trusted Publishing; they do not perform
+# GPU runtime qualification.
 name: Release CUDA wheels
 
 on:
@@ -16,12 +22,12 @@ on:
         type: choice
         options: [sm70, sm80, sm86, sm89, sm90, sm100, sm120]
       publish_testpypi:
-        description: Publish qualified wheels to TestPyPI
+        description: Publish locally qualified wheels to TestPyPI
         required: true
         default: false
         type: boolean
       publish_pypi:
-        description: Publish qualified wheels to PyPI
+        description: Publish locally qualified wheels to PyPI
         required: true
         default: false
         type: boolean
@@ -78,142 +84,10 @@ jobs:
           path: wheelhouse/cuda${{ inputs.cuda_major }}/${{ matrix.python }}/*.whl
           if-no-files-found: error
 
-  frontend:
-    name: Build CPython 3.12 frontend wheel
-    needs: validate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Clone repository
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Build and repair frontend wheel
-        env:
-          PYTHON_ABIS: cp312-cp312
-          CPU_TARGET: x86-64-v3
-          WHEEL_DIR: wheelhouse/cpu
-          JOBS: "4"
-        run: tools/build_cpu_manylinux_wheels.sh
-
-      - name: Upload frontend wheel
-        uses: actions/upload-artifact@v4
-        with:
-          name: cuda-qualification-frontend-cp312-cp312
-          path: wheelhouse/cpu/cp312-cp312/*.whl
-          if-no-files-found: error
-
-  test:
-    name: Qualify CUDA ${{ inputs.cuda_major }} ${{ inputs.target }} wheel
-    needs: [build, frontend]
-    runs-on: [self-hosted, linux, x64, cuda]
-    timeout-minutes: 180
-    steps:
-      - name: Clone repository tests
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Download CPython 3.12 wheel
-        uses: actions/download-artifact@v4
-        with:
-          name: cuda${{ inputs.cuda_major }}-${{ inputs.target }}-cp312-cp312
-          path: backend-wheel
-
-      - name: Download matching frontend wheel
-        uses: actions/download-artifact@v4
-        with:
-          name: cuda-qualification-frontend-cp312-cp312
-          path: frontend-wheel
-
-      - name: Set up uv and Python
-        uses: astral-sh/setup-uv@v8.3.2
-        with:
-          python-version: "3.12"
-
-      - name: Install frontend and backend wheels together
-        run: |
-          set -euo pipefail
-          uv venv --clear --python 3.12 "$RUNNER_TEMP/symmetrix-cuda-wheel"
-          python_path="$RUNNER_TEMP/symmetrix-cuda-wheel/bin/python"
-          uv pip install --python "$python_path" \
-            frontend-wheel/*.whl backend-wheel/*.whl pytest torch mace-torch
-
-      - name: Prove packaged CUDA libraries and device execution
-        env:
-          CUDA_MAJOR: ${{ inputs.cuda_major }}
-          SYMMETRIX_BACKEND: cuda${{ inputs.cuda_major }}-${{ inputs.target }}
-          SYMMETRIX_JIT_CUDA_JIT_BACKEND: nvrtc
-        run: |
-          set -euo pipefail
-          python_path="$RUNNER_TEMP/symmetrix-cuda-wheel/bin/python"
-          env -u LD_LIBRARY_PATH "$python_path" - <<'PY'
-          import os
-          import pathlib
-          import symmetrix
-          from symmetrix.jit import jit_nvrtc_information
-
-          native = symmetrix.load_backend()
-          native._init_kokkos()
-          try:
-              assert native._kokkos_device_sentinel()
-              information = jit_nvrtc_information()
-              assert information.get("available") is True, information
-              maps = pathlib.Path("/proc/self/maps").read_text()
-              major = os.environ["CUDA_MAJOR"]
-              if major == "13":
-                  expected = {
-                      "libcudart.so.13": "cu13",
-                      "libcublas.so.13": "cu13",
-                      "libnvrtc.so.13": "cu13",
-                  }
-              else:
-                  expected = {
-                      "libcudart.so.12": "cuda_runtime",
-                      "libcublas.so.12": "cublas",
-                      "libnvrtc.so.12": "cuda_nvrtc",
-                  }
-              for library, package in expected.items():
-                  paths = {
-                      line.rsplit(None, 1)[-1]
-                      for line in maps.splitlines()
-                      if library in line and "/" in line.rsplit(None, 1)[-1]
-                  }
-                  assert paths, f"{library} is not mapped"
-                  expected_path = f"/site-packages/nvidia/{package}/lib/"
-                  assert all(expected_path in path for path in paths), paths
-          finally:
-              native._finalize_kokkos()
-          print("packaged CUDA libraries and device sentinel passed")
-          PY
-          env -u LD_LIBRARY_PATH "$RUNNER_TEMP/symmetrix-cuda-wheel/bin/symmetrix" \
-            backend show "cuda${{ inputs.cuda_major }}-${{ inputs.target }}" --probe
-          env -u LD_LIBRARY_PATH "$RUNNER_TEMP/symmetrix-cuda-wheel/bin/symmetrix" \
-            doctor --json
-
-      - name: Run mandatory CUDA wheel tests
-        env:
-          SYMMETRIX_BACKEND: cuda${{ inputs.cuda_major }}-${{ inputs.target }}
-          SYMMETRIX_JIT_CUDA_JIT_BACKEND: nvrtc
-          SYMMETRIX_REQUIRED_TEST_MANIFEST: cuda_runtime_required_tests.json
-        run: |
-          cd symmetrix/test
-          env -u LD_LIBRARY_PATH "$RUNNER_TEMP/symmetrix-cuda-wheel/bin/pytest" -q \
-            test_cuda_runtime.py::test_cuda_r1_nvrtc_module_matches_generic \
-            test_mh1.py::test_mh1_generated_cuda_handles_nondivisible_second_subgroup_iteration
-
-      - name: Run full applicable test suite
-        env:
-          SYMMETRIX_BACKEND: cuda${{ inputs.cuda_major }}-${{ inputs.target }}
-          SYMMETRIX_JIT_CUDA_JIT_BACKEND: nvrtc
-        run: |
-          cd symmetrix/test
-          env -u LD_LIBRARY_PATH "$RUNNER_TEMP/symmetrix-cuda-wheel/bin/pytest" -q
-
   publish-testpypi:
     name: Publish to TestPyPI
     if: inputs.publish_testpypi
-    needs: [build, test]
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: testpypi
@@ -238,7 +112,7 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     if: inputs.publish_pypi
-    needs: [build, test]
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: pypi
