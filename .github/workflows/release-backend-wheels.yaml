@@ -66,18 +66,30 @@ jobs:
 
       - name: Build pinned OpenBLAS (DYNAMIC_ARCH, OpenMP)
         run: |
+          set -euo pipefail
           curl -sSL -o /tmp/openblas.tar.gz "https://github.com/OpenMathLib/OpenBLAS/releases/download/v${OPENBLAS_VERSION}/OpenBLAS-${OPENBLAS_VERSION}.tar.gz"
           echo "${OPENBLAS_SHA256}  /tmp/openblas.tar.gz" | sha256sum -c -
           tar xz -C /tmp -f /tmp/openblas.tar.gz
           cd "/tmp/OpenBLAS-${OPENBLAS_VERSION}"
-          make -j"$(nproc)" DYNAMIC_ARCH=1 USE_OPENMP=1 NUM_THREADS=64 NO_SHARED=0
-          make PREFIX=/usr/local/openblas install
-          ls /usr/local/openblas/lib
+          log=/tmp/openblas-build.log
+          if ! make -s -j"$(nproc)" DYNAMIC_ARCH=1 USE_OPENMP=1 NUM_THREADS=64 NO_SHARED=0 >"$log" 2>&1; then
+            tail -n 200 "$log"
+            exit 1
+          fi
+          if ! make -s PREFIX=/usr/local/openblas install >"$log" 2>&1; then
+            tail -n 200 "$log"
+            exit 1
+          fi
+          printf '%s\n' /usr/local/openblas/lib > /etc/ld.so.conf.d/symmetrix-openblas.conf
+          ldconfig
+          ldconfig -p | grep -q 'libopenblas\.so'
 
       - name: Build the x86-64-v4 add-on wheel
         run: |
           export PATH="/opt/python/${{ matrix.python }}/bin:/usr/local/bin:$PATH"
           export CMAKE_PREFIX_PATH=/usr/local/openblas
+          export LIBRARY_PATH=/usr/local/openblas/lib
+          export LD_LIBRARY_PATH=/usr/local/openblas/lib
           python tools/symmetrix_build.py wheel-matrix \
             --target cpu:avx512 \
             --wheel-dir dist

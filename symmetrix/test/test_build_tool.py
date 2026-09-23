@@ -1388,6 +1388,11 @@ def test_python_build_default_jobs(monkeypatch, backend, cpu_count, expected):
 
 def test_python_build_verifies_actual_cmake_against_manifest(tmp_path):
     manifest = _manifest()
+    cmake = _executable(tmp_path / "cmake")
+    manifest = replace(
+        manifest,
+        toolchain=replace(manifest.toolchain, cmake=cmake),
+    )
     invocation = python_build_invocation(
         manifest,
         repo_root=REPOSITORY_ROOT,
