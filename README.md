@@ -20,6 +20,16 @@ operations are scheduled, stored, and compiled. Its two main contributions are:
    each admitted MACE contraction structure into generated CPU, CUDA, or HIP
    kernels and caches the resulting artifact.
 
+![Symmetrix-XL execution overview: (a) streaming edge contributions into receiver sums, (b) compiling and caching model-specialized operators, and (c) reusing a tile workspace for energy, force, and virial evaluation.](docs/figures/symmetrix-xl-overview.jpg)
+
+**How Symmetrix-XL works.** **(a)** Stream edge contributions directly into
+receiver sums without storing a graph-wide edge tensor. **(b)** Generate,
+compile, and cache model-specialized contractions for repeated forward and
+analytic reverse evaluation. **(c)** Optionally reuse a tile-bounded workspace
+across forward and reverse sweeps for two-interaction MACE models, accumulating
+energies, forces, and virials while persistent graph state still scales with
+system size.
+
 See the [documentation](https://bonan-group.github.io/symmetrix-xl/) for
 installation, supported workflows, and developer references.
 
