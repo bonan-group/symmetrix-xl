@@ -11,24 +11,28 @@ GPUs. The Python distribution is named `symmetrix-xl`; the import namespace and
 command-line interface remain `symmetrix`.
 
 Symmetrix-XL preserves the learned MACE model while changing how its equivariant
-operations are scheduled, stored, and compiled. Its two main contributions are:
+operations are scheduled, stored, and compiled. Its execution strategy has
+three main components:
 
-1. **Memory-bounded direct execution.** The default executor consumes,
-   aggregates, or recomputes edge intermediates without retaining every
-   materialized tensor, reducing graph-sized workspace.
-2. **Model-specialized execution with runtime compilation.** Symmetrix-XL lowers
-   each admitted MACE contraction structure into generated CPU, CUDA, or HIP
-   kernels and caches the resulting artifact.
+1. **Memory-bounded direct execution (a).** Streamed-edge execution avoids
+   retaining broad graph-wide radial and tensor-product edge state by generating
+   each contribution near its point of use, accumulating it into the
+   corresponding receiver, and discarding kernel-local products.
 
-![Symmetrix-XL execution overview: (a) streaming edge contributions into receiver sums, (b) compiling and caching model-specialized operators, and (c) reusing a tile workspace for energy, force, and virial evaluation.](docs/figures/symmetrix-xl-overview.jpg)
+2. **Model-specialized execution with runtime compilation (b).** Symmetrix-XL
+   lowers the checkpoint's fixed sparse coupling structure, coefficients, and
+   tensor layouts into generated CPU, CUDA, or HIP kernels and caches the
+   resulting artifact. Learned model parameters and per-system graph and
+   geometry data remain runtime inputs.
 
-**How Symmetrix-XL works.** **(a)** Stream edge contributions directly into
-receiver sums without storing a graph-wide edge tensor. **(b)** Generate,
-compile, and cache model-specialized contractions for repeated forward and
-analytic reverse evaluation. **(c)** Optionally reuse a tile-bounded workspace
-across forward and reverse sweeps for two-interaction MACE models, accumulating
-energies, forces, and virials while persistent graph state still scales with
-system size.
+3. **Tiled execution with workspace reuse (c).** For capacity-limited
+   calculations, optional tiled execution partitions receivers and their
+   incident edges into bounded tiles and reuses a tile-local workspace across
+   three sweeps. Inter-layer state remains graph-wide, while larger temporary
+   intermediates are bounded by the active tile. Persistent outputs and
+   inter-layer updates are committed before the workspace is reused.
+
+![Symmetrix-XL execution overview](docs/figures/symmetrix-xl-overview.png)
 
 See the [documentation](https://bonan-group.github.io/symmetrix-xl/) for
 installation, supported workflows, and developer references.
