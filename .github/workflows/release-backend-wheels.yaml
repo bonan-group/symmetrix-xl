@@ -115,7 +115,12 @@ jobs:
               expected = "symmetrix_backend_cpu_avx512"
               assert any(n == f"{expected}/backend.json" for n in names), names[:8]
               assert any(
-                  n == f"{expected}/_native_cpu_avx512.so" for n in names
+                  n == f"{expected}/_native_cpu_avx512.so"
+                  or (
+                      n.startswith(f"{expected}/_native_cpu_avx512.")
+                      and n.endswith(".so")
+                  )
+                  for n in names
               ), names[:8]
               descriptor = json.loads(
                   archive.read(f"{expected}/backend.json")
