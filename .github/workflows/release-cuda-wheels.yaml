@@ -1,33 +1,21 @@
 # CUDA wheel release pipeline.
 #
-# Build and test one representative wheel locally on matching target hardware
-# before dispatching this workflow. GitHub-hosted jobs then build the CPython
-# wheel matrix and publish it through Trusted Publishing; they do not perform
-# GPU runtime qualification.
+# Qualify intended targets locally on matching hardware before dispatching this
+# workflow. GitHub-hosted jobs build every supported CUDA/CPython combination
+# and publish each architecture-specific project through Trusted Publishing;
+# they do not perform GPU runtime qualification.
 name: Release CUDA wheels
 
 on:
   workflow_dispatch:
     inputs:
-      cuda_major:
-        description: CUDA toolkit major version
-        required: true
-        default: "13"
-        type: choice
-        options: ["12", "13"]
-      target:
-        description: CUDA architecture for the backend wheel
-        required: true
-        default: sm120
-        type: choice
-        options: [sm70, sm80, sm86, sm89, sm90, sm100, sm120]
       publish_testpypi:
-        description: Publish locally qualified wheels to TestPyPI
+        description: Publish all CUDA variants to TestPyPI
         required: true
         default: false
         type: boolean
       publish_pypi:
-        description: Publish locally qualified wheels to PyPI
+        description: Publish all CUDA variants to PyPI
         required: true
         default: false
         type: boolean
@@ -36,32 +24,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-cuda${{ inputs.cuda_major }}-${{ github.ref }}-${{ inputs.target }}
+  group: release-cuda-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  validate:
-    name: Validate CUDA target
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check toolkit compatibility
-        env:
-          CUDA_MAJOR: ${{ inputs.cuda_major }}
-          CUDA_TARGET: ${{ inputs.target }}
-        run: |
-          if [[ "$CUDA_MAJOR" == 13 && "$CUDA_TARGET" == sm70 ]]; then
-            echo "CUDA 13 does not support offline compilation for sm70; select CUDA 12." >&2
-            exit 1
-          fi
-
   build:
-    name: Build CUDA ${{ inputs.cuda_major }} ${{ inputs.target }} ${{ matrix.python }}
-    needs: validate
+    name: Build CUDA ${{ matrix.cuda_major }} ${{ matrix.target }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python: [cp310-cp310, cp311-cp311, cp312-cp312, cp313-cp313, cp314-cp314]
+        cuda_major: ["12", "13"]
+        target: [sm70, sm80, sm86, sm89, sm90, sm100, sm120]
+        exclude:
+          - cuda_major: "13"
+            target: sm70
     steps:
       - name: Clone repository
         uses: actions/checkout@v6
@@ -70,37 +47,55 @@ jobs:
 
       - name: Build and repair in the manylinux CUDA container
         env:
-          CUDA_MAJOR: ${{ inputs.cuda_major }}
-          CUDA_TARGET: ${{ inputs.target }}
-          PYTHON_ABIS: ${{ matrix.python }}
-          WHEEL_DIR: wheelhouse/cuda${{ inputs.cuda_major }}
+          CUDA_MAJOR: ${{ matrix.cuda_major }}
+          CUDA_TARGET: ${{ matrix.target }}
+          PYTHON_ABIS: cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314
+          WHEEL_DIR: wheelhouse/cuda${{ matrix.cuda_major }}-${{ matrix.target }}
           JOBS: "4"
         run: tools/build_cuda_manylinux_wheels.sh
+
+      - name: Collect and verify the CPython wheel matrix
+        env:
+          CUDA_MAJOR: ${{ matrix.cuda_major }}
+          CUDA_TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p wheelhouse/release
+          find "wheelhouse/cuda${CUDA_MAJOR}-${CUDA_TARGET}" \
+            -type f -name '*.whl' -exec cp -t wheelhouse/release {} +
+          ls -lh wheelhouse/release
+          test "$(find wheelhouse/release -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 5
 
       - name: Upload repaired wheel
         uses: actions/upload-artifact@v4
         with:
-          name: cuda${{ inputs.cuda_major }}-${{ inputs.target }}-${{ matrix.python }}
-          path: wheelhouse/cuda${{ inputs.cuda_major }}/${{ matrix.python }}/*.whl
+          name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}
+          path: wheelhouse/release/*.whl
           if-no-files-found: error
 
   publish-testpypi:
-    name: Publish to TestPyPI
+    name: Publish CUDA ${{ matrix.cuda_major }} ${{ matrix.target }} to TestPyPI
     if: inputs.publish_testpypi
     needs: build
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_major: ["12", "13"]
+        target: [sm70, sm80, sm86, sm89, sm90, sm100, sm120]
+        exclude:
+          - cuda_major: "13"
+            target: sm70
     environment:
-      name: testpypi
-      url: https://test.pypi.org/p/symmetrix-xl-cuda${{ inputs.cuda_major }}-${{ inputs.target }}
+      name: testpypi-cuda${{ matrix.cuda_major }}-${{ matrix.target }}
+      url: https://test.pypi.org/p/symmetrix-xl-cuda${{ matrix.cuda_major }}-${{ matrix.target }}
     permissions:
       id-token: write
     steps:
       - name: Download all repaired wheels
         uses: actions/download-artifact@v4
         with:
-          pattern: cuda${{ inputs.cuda_major }}-${{ inputs.target }}-*
+          name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}
           path: wheelhouse
-          merge-multiple: true
 
       - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
@@ -108,24 +103,32 @@ jobs:
           packages-dir: wheelhouse
           repository-url: https://test.pypi.org/legacy/
           attestations: true
+          skip-existing: true
 
   publish-pypi:
-    name: Publish to PyPI
+    name: Publish CUDA ${{ matrix.cuda_major }} ${{ matrix.target }} to PyPI
     if: inputs.publish_pypi
     needs: build
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda_major: ["12", "13"]
+        target: [sm70, sm80, sm86, sm89, sm90, sm100, sm120]
+        exclude:
+          - cuda_major: "13"
+            target: sm70
     environment:
-      name: pypi
-      url: https://pypi.org/p/symmetrix-xl-cuda${{ inputs.cuda_major }}-${{ inputs.target }}
+      name: pypi-cuda${{ matrix.cuda_major }}-${{ matrix.target }}
+      url: https://pypi.org/p/symmetrix-xl-cuda${{ matrix.cuda_major }}-${{ matrix.target }}
     permissions:
       id-token: write
     steps:
       - name: Download all repaired wheels
         uses: actions/download-artifact@v4
         with:
-          pattern: cuda${{ inputs.cuda_major }}-${{ inputs.target }}-*
+          name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}
           path: wheelhouse
-          merge-multiple: true
 
       - name: Compute release manifest
         run: |
@@ -136,7 +139,7 @@ jobs:
       - name: Upload release manifest artifact
         uses: actions/upload-artifact@v4
         with:
-          name: release-manifest-cuda${{ inputs.cuda_major }}-${{ inputs.target }}
+          name: release-manifest-cuda${{ matrix.cuda_major }}-${{ matrix.target }}
           path: release-manifest/SHA256SUMS
 
       - name: Publish to PyPI
@@ -144,3 +147,4 @@ jobs:
         with:
           packages-dir: wheelhouse
           attestations: true
+          skip-existing: true
