@@ -106,7 +106,8 @@ jobs:
             -D Kokkos_ENABLE_SERIAL=ON \
             -D Kokkos_ENABLE_OPENMP=ON \
             -D BUILD_OMP=ON \
-            -D Kokkos_ARCH_NATIVE=ON \
+            -D SYMMETRIX_HOST_ARCH=x86-64-v3 \
+            -D Kokkos_ARCH_NATIVE=OFF \
             -D Kokkos_ENABLE_AGGRESSIVE_VECTORIZATION=ON \
             -D SYMMETRIX_KOKKOS=ON \
             -D CMAKE_CXX_COMPILER_LAUNCHER=ccache \
