@@ -106,9 +106,10 @@ jobs:
         run: |
           set -e
           /opt/python/${{ matrix.python }}/bin/python - <<'PY'
-          import glob, json, re, zipfile
+          import glob, json, zipfile
           wheel = glob.glob("dist-repaired/*.whl")[0]
-          assert re.search(r"-manylinux_2_28_x86_64\.whl$", wheel), wheel
+          platform_tags = wheel.removesuffix(".whl").rsplit("-", 1)[-1].split(".")
+          assert "manylinux_2_28_x86_64" in platform_tags, wheel
           with zipfile.ZipFile(wheel) as archive:
               names = archive.namelist()
               expected = "symmetrix_backend_cpu_avx512"
