@@ -214,11 +214,18 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - name: Download all wheels
+      - name: Download wheels
         uses: actions/download-artifact@v4
         with:
+          pattern: wheel-*
           path: dist-release
           merge-multiple: true
+
+      - name: Download source distribution
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist-release
 
       - name: Collision gate (one artifact per target)
         run: |
@@ -257,6 +264,7 @@ jobs:
       - name: Download all repaired wheels
         uses: actions/download-artifact@v4
         with:
+          pattern: wheel-*
           path: dist-repaired
           merge-multiple: true
 

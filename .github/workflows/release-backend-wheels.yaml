@@ -105,7 +105,7 @@ jobs:
       - name: Layout sentinels
         run: |
           set -e
-          python - <<'PY'
+          /opt/python/${{ matrix.python }}/bin/python - <<'PY'
           import glob, json, re, zipfile
           wheel = glob.glob("dist-repaired/*.whl")[0]
           assert re.search(r"-manylinux_2_28_x86_64\.whl$", wheel), wheel
@@ -178,6 +178,7 @@ jobs:
       - name: Download all wheels
         uses: actions/download-artifact@v4
         with:
+          pattern: cpu-avx512-*
           path: dist-repaired
           merge-multiple: true
 
