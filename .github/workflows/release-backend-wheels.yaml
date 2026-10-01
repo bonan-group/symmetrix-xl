@@ -159,7 +159,7 @@ jobs:
           PY
           so="$(find /tmp/wheelcheck -type f -name '_native_cpu_avx512*.so' | head -n 1)"
           test -n "$so"
-          objdump -d "$so" | grep -qm1 'zmm' || {
+          objdump -d "$so" | awk '/zmm/ { found=1 } END { exit !found }' || {
             echo "no AVX-512 vector code found in $so"; exit 1;
           }
           echo "AVX-512 codegen sentinel OK: $so"
