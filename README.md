@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/bonan-group/symmetrix-xl/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/bonan-group/symmetrix-xl/actions/workflows/ci.yaml?query=branch%3Amain)
 [![Documentation](https://github.com/bonan-group/symmetrix-xl/actions/workflows/docs-pages.yaml/badge.svg)](https://bonan-group.github.io/symmetrix-xl/)
+[![arXiv](https://img.shields.io/badge/arXiv-2610.01036-b31b1b.svg)](https://arxiv.org/abs/2610.01036)
 
 In Symmetrix-XL, **XL** stands for **eXtreme scale, Low latency**.
 
@@ -10,9 +11,16 @@ and extends it with scalable, low-latency native execution paths for CPUs and
 GPUs. The Python distribution is named `symmetrix-xl`; the import namespace and
 command-line interface remain `symmetrix`.
 
-Symmetrix-XL preserves the learned MACE model while changing how its equivariant
-operations are scheduled, stored, and compiled. Its execution strategy has
-three main components:
+The methods, validation, and benchmark protocol are described in the preprint
+[Train for Accuracy, Execute at Scale: Architecture-Preserving Inference for Equivariant Atomistic Foundation Models](https://arxiv.org/abs/2610.01036).
+
+Symmetrix-XL preserves the MACE checkpoint's architecture and learned weights
+while changing how its equivariant operations are scheduled, stored, and
+compiled. This is architecture-preserving rather than bitwise-identical
+execution: operation ordering and radial spline projection can change the
+floating-point realization, so equivalence is established through explicit
+numerical and downstream validation. Its execution strategy has three main
+components:
 
 1. **Memory-bounded direct execution (a).** Streamed-edge execution avoids
    retaining broad graph-wide radial and tensor-product edge state by generating
@@ -39,42 +47,28 @@ installation, supported workflows, and developer references.
 
 ### Demonstrated scale
 
-An FP32 NVIDIA A100-SXM4-80GB qualification evaluated energy, forces, and
-stress for the standard two-layer MACE-OMAT-0 model on cubic SrTiO3:
+The paper's FP32 single-GPU LAMMPS capacity benchmark uses the MACE-OMAT-0
+medium checkpoint on cubic SrTiO3, with a 6.0 A model cutoff and a 0.5 A
+neighbor-list skin:
 
-| Execution | Maximum atoms | Directed edges | Speed (us/atom) | Sampled peak VRAM (MiB) |
-|---|---:|---:|---:|---:|
-| Standard | 1,373,125 | 141,157,250 | 6.330 | 79,313 |
-| Extended | 13,140,360 | 1,350,829,008 | 6.868 | 80,639 |
+| Execution | A100 80 GB atoms | RTX 5090 32 GB atoms |
+|---|---:|---:|
+| ML-IAP + cuEquivariance | 24,565 | 8,640 |
+| Symmetrix-XL standard streaming | 1,250,235 | 486,680 |
+| Symmetrix-XL tiled streaming | 11,240,455 | 4,152,920 |
 
-Both used a 6.0 A model cutoff and 0.5 A neighbor-list skin, giving a 6.5 A
-effective cutoff, and completed with zero fallbacks. These are workload-specific
-demonstrations, not capacity guarantees.
-
-Fixed-workspace execution traded about 8.5% throughput in this qualification
-for the larger demonstrated capacity. Standard execution remains the default;
-large production systems can also be distributed across multiple GPUs with
-LAMMPS.
+Tiled streaming is an explicitly enabled capacity mode; standard streaming
+remains the default. These values are the largest successful capacity-boundary
+probes under the stated protocol, not general capacity guarantees or sustained
+20-step molecular-dynamics results. On 64 A800 GPUs, tiled streaming weak-scaled
+to 703.04 million atoms at 93.81% efficiency.
 
 ### Demonstrated speed
 
-A matched FP32 RTX 5090 qualification compared complete warmed ASE
-energy/forces/stress calls for the standard OMAT-0-medium checkpoint:
-
-| Atoms | Directed edges: MACE-Torch / Symmetrix-XL | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
-|---:|---:|---:|---:|---:|---:|
-| 864 | 78,624 / 97,762 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
-| 4,000 | 364,000 / 452,342 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
-
-MACE-Torch 0.3.15 with cuEquivariance 0.11.0 used the exact 6.0 A graph.
-Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving a
-candidate graph with an effective cutoff of 6.5 A; the graph policies are not
-identical, and Symmetrix-XL processed more directed candidates.
-
-A separate FP32 RTX 5090 qualification measured complete warmed LAMMPS steps
-for 5,000-atom perturbed cubic SrTiO3 using the same MACE-OMAT-0-medium model.
-It compares the standard MACE-Torch/cuEquivariance deployment through the
-LAMMPS ML-IAP package with the Symmetrix-XL LAMMPS pair style:
+Across the matched FP32 LAMMPS benchmarks reported in the paper, Symmetrix-XL
+reduces complete step time by 3.1-5.0x relative to ML-IAP + cuEquivariance on
+the tested A100 and RTX 5090 workloads. One representative RTX 5090 result uses
+5,000-atom perturbed cubic SrTiO3 with MACE-OMAT-0 medium:
 
 | Implementation | Time (us/atom/step) | Speedup vs. ML-IAP |
 |---|---:|---:|
@@ -83,10 +77,10 @@ LAMMPS ML-IAP package with the Symmetrix-XL LAMMPS pair style:
 
 Each value is the median of three 20-step runs after warmup. Both deployments
 used a 6.0 A model cutoff and a 0.5 A neighbor-list skin (6.5 A effective
-neighbor cutoff); the shared LAMMPS neighbor list contained 511,932 directed
-candidates. The ML-IAP baseline used MACE-Torch 0.3.16 and cuEquivariance
-0.11.1. This is an end-to-end LAMMPS comparison, so it is reported separately
-from the ASE-call measurements above.
+neighbor cutoff), with zero neighbor-list rebuilds during the measured block.
+The paper also reports complete ASE energy/forces/stress calls and treats them
+as end-to-end deployment measurements rather than isolated model-forward
+timings; see the paper for the full benchmark protocol and graph-policy details.
 
 -----
 
@@ -227,15 +221,32 @@ uv pip install -e "./symmetrix[test]"
 
 Run Python formatting and lint checks with `uvx pre-commit run --all-files`.
 
-### Citing Symmetrix
+### Citing Symmetrix-XL
 
-The earliest `symmetrix` results are reported in:
+If you use Symmetrix-XL, please cite:
+
+* L. Fu, Z. Feng, Y. Li, H. Du, X. He, J. Wu, K. Bao, Y. Zhang, Z. Deng, Z. Lu, and B. Zhu, "Train for Accuracy, Execute at Scale: Architecture-Preserving Inference for Equivariant Atomistic Foundation Models," arXiv:2610.01036 (2026). [[arXiv]](https://arxiv.org/abs/2610.01036)
+
+```bibtex
+@article{fu2026symmetrixxl,
+  title   = {Train for Accuracy, Execute at Scale: Architecture-Preserving Inference for Equivariant Atomistic Foundation Models},
+  author  = {Fu, Lei and Feng, Zihui and Li, Yongheng and Du, Hongwei and He, Xin and Wu, Junyi and Bao, Kejie and Zhang, Yueyu and Deng, Zeyu and Lu, Ziheng and Zhu, Bonan},
+  journal = {arXiv preprint arXiv:2610.01036},
+  year    = {2026}
+}
+```
+
+Symmetrix-XL builds on the original Symmetrix project. The earliest `symmetrix`
+results are reported in:
+
 * D. P. Kovács, J. H. Moore, N. J. Browning, I. Batatia, J. T. Horton, Y. Pu, V. Kapil, W. C. Witt, I.-B. Magdău, D. J. Cole, G. Csányi, "MACE-OFF: Short-Range Transferable Machine Learning Force Fields for Organic Molecules", _Journal of the American Chemical Society_ **147**, 17598 (2025). [[arxiv]](https://arxiv.org/abs/2312.15211) [[journal]](https://doi.org/10.1021/jacs.4c07099)
 
 MACE foundation models and implementations are described in:
+
 * I. Batatia, P. Benner, Y. Chiang, A. M. Elena, D. P. Kovács, J. Riebesell, ...+78 others..., W. C. Witt, T. Wolf, F. Zills, G. Csányi, "A foundation model for atomistic materials chemistry," _Journal of Chemical Physics_ **163**, 184110 (2025). [[arxiv]](https://arxiv.org/abs/2401.00096) [[journal]](https://doi.org/10.1063/5.0297006)
 
-Please cite these papers when using Symmetrix-XL.
+Please also cite the model-specific references appropriate to the MACE checkpoint
+you use.
 
 ### Licensing
 
