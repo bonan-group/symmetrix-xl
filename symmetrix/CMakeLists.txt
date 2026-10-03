@@ -347,7 +347,7 @@ if(SYMMETRIX_KOKKOS AND Kokkos_ENABLE_OPENMP)
     set(SYMMETRIX_BUILD_OPENMP_VERSION "${OpenMP_CXX_VERSION}")
   endif()
   foreach(_symmetrix_openmp_library_name IN LISTS OpenMP_CXX_LIB_NAMES)
-    if(_symmetrix_openmp_library_name MATCHES "^(gomp|omp|iomp5)$")
+    if(_symmetrix_openmp_library_name MATCHES "^(gomp|omp|libomp|iomp5)$")
       set(_symmetrix_openmp_library_variable
         "OpenMP_${_symmetrix_openmp_library_name}_LIBRARY")
       if(DEFINED ${_symmetrix_openmp_library_variable}

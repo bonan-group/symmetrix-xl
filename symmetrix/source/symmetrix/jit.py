@@ -1456,6 +1456,35 @@ def _linux_renameat2(library: Any, source: Path, destination: Path) -> int:
     return int(syscall(syscall_number, *_renameat2_arguments(source, destination)))
 
 
+_DARWIN_AT_FDCWD = -2
+_DARWIN_RENAME_EXCL = 0x00000004
+
+
+def _darwin_renameatx_np(library: Any, source: Path, destination: Path) -> int:
+    renameatx_np = getattr(library, "renameatx_np", None)
+    if renameatx_np is None:
+        raise JitPublicationUnsupported(
+            "the C library does not provide renameatx_np for JIT publication"
+        )
+    renameatx_np.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameatx_np.restype = ctypes.c_int
+    return int(
+        renameatx_np(
+            _DARWIN_AT_FDCWD,
+            os.fsencode(source),
+            _DARWIN_AT_FDCWD,
+            os.fsencode(destination),
+            _DARWIN_RENAME_EXCL,
+        )
+    )
+
+
 def _publish_directory_no_replace(source: Path, destination: Path) -> bool:
     """Atomically publish ``source`` without replacing ``destination``.
 
@@ -1463,12 +1492,16 @@ def _publish_directory_no_replace(source: Path, destination: Path) -> bool:
     process already published the destination.
     """
 
-    if sys.platform != "linux":
+    if sys.platform == "linux":
+        library = ctypes.CDLL(None, use_errno=True)
+        result = _linux_renameat2(library, source, destination)
+    elif sys.platform == "darwin":
+        library = ctypes.CDLL(None, use_errno=True)
+        result = _darwin_renameatx_np(library, source, destination)
+    else:
         raise JitPublicationUnsupported(
-            "atomic no-replace JIT publication currently requires Linux"
+            "atomic no-replace JIT publication requires Linux or macOS"
         )
-    library = ctypes.CDLL(None, use_errno=True)
-    result = _linux_renameat2(library, source, destination)
     if result == 0:
         return True
     error = ctypes.get_errno()
