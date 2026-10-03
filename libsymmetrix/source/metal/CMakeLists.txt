@@ -66,13 +66,4 @@ target_compile_definitions(symmetrix_metal PUBLIC SYMMETRIX_ENABLE_METAL)
 if(SYMMETRIX_METAL_SELFTEST)
     add_executable(symmetrix_metal_selftest metal_runtime_selftest.cpp)
     target_link_libraries(symmetrix_metal_selftest PRIVATE symmetrix_metal)
-
-    add_executable(symmetrix_metal_cpu_microbenchmark
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../../benchmarks/metal_cpu_microbenchmark.cpp")
-    target_compile_options(symmetrix_metal_cpu_microbenchmark PRIVATE
-        -O3 -mcpu=native)
-    target_compile_definitions(symmetrix_metal_cpu_microbenchmark PRIVATE
-        ACCELERATE_NEW_LAPACK)
-    target_link_libraries(symmetrix_metal_cpu_microbenchmark PRIVATE
-        symmetrix_metal "-framework Accelerate")
 endif()
