@@ -616,6 +616,10 @@ void MACEKokkos<Precision>::compute_single_layer_tiled(
     Kokkos::View<const double*>,
     Kokkos::View<const double*> r)
 {
+    // The Metal stages run whole edge ranges; a tiled plan would bypass them.
+    if (metal_r0_module || metal_r1_module || metal_m0_module || metal_m1_module)
+        throw std::runtime_error(
+            "Metal execution does not support fixed-workspace tiled plans.");
     if (!single_layer_tiled_plan_active || !single_layer_readout)
         throw std::logic_error(
             "Single-layer tiled execution was entered without an active plan.");
@@ -795,6 +799,10 @@ template <typename Precision>
 void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
     const int num_receivers, const int phase)
 {
+    // The Metal stages run whole edge ranges; a tiled plan would bypass them.
+    if (metal_r0_module || metal_r1_module || metal_m0_module || metal_m1_module)
+        throw std::runtime_error(
+            "Metal execution does not support fixed-workspace tiled plans.");
     if (!dual_layer_tiled_plan_active || single_layer_readout
         || phase < 1 || phase > 3)
         throw std::logic_error("Invalid dual-layer tiled evaluation phase.");

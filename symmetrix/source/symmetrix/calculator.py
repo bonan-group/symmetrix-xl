@@ -770,6 +770,16 @@ class Symmetrix(Calculator):
                 raise ValueError(
                     "metal=True requires dtype='float32'; Metal has no FP64"
                 )
+            # Fixed-workspace tiled plans process edges in chunks that the
+            # Metal stages do not execute; they are a CUDA capacity feature.
+            if (
+                allow_fixed_workspace
+                or _debug_execution_plan in _FIXED_WORKSPACE_TILED_PLANS
+            ):
+                raise ValueError(
+                    "metal=True does not support fixed-workspace tiled plans; "
+                    "leave allow_fixed_workspace unset"
+                )
             if not getattr(symmetrix, "_metal_supported", lambda: False)():
                 raise RuntimeError(
                     "metal=True requires a build with the Metal layer "

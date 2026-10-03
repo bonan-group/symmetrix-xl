@@ -91,5 +91,6 @@ Benchmarks on a laptop are sensitive to other GPU and CPU load. Animated wallpap
 - FP32 only.
 - Two-interaction standard MACE models only. `metal=True` rejects MACEField, MACE-MH-1 (`MACE_Nonlinear`), and single-layer models, which have not been qualified on the Metal stages; evaluate them on the CPU.
 - Edge spherical harmonics up to `l_max` 3, the same limit as the generated `streamed_edges="direct"` path on the CPU and CUDA. This covers the MACE-MP-0, MP-0b3, OMAT-0, and OFF23 foundation models. `metal=True` rejects higher degrees, which run on the CPU with `streamed_edges="generic"`. The fastest R1 edge kernel needs a channel count that is a multiple of 32; other channel counts use a slower per-edge kernel.
+- No fixed-workspace tiled plans (`allow_fixed_workspace=True`), which are a CUDA capacity feature.
 - One process uses one GPU; there is no LAMMPS or MPI support for the Metal backend yet.
 - The first evaluation in a process compiles the GPU kernels, which takes a fraction of a second.

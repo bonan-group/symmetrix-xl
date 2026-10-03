@@ -306,6 +306,23 @@ def test_metal_l_max_matches_the_direct_path(l_max, accepted):
             Symmetrix._require_metal_model_family(calculator)
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"allow_fixed_workspace": True},
+        {"_debug_execution_plan": "mh0-single-layer-tiled-v1"},
+        {"_debug_execution_plan": "mh0-dual-layer-tiled-v1"},
+    ],
+)
+def test_metal_rejects_fixed_workspace_plans(options, tmp_path, monkeypatch):
+    from symmetrix import Symmetrix
+
+    # Tiled plans would run R0 on the CPU while Metal reports it on the GPU.
+    monkeypatch.setattr(sys, "platform", "darwin")
+    with pytest.raises(ValueError, match="fixed-workspace tiled plans"):
+        Symmetrix(tmp_path / "unused.json", dtype="float32", metal=True, **options)
+
+
 def test_metal_r0_reverse_chunks_match_one_chunk(omat_small_model, tmp_path):
     import subprocess
 
