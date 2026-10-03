@@ -319,6 +319,43 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             py::arg("persistent_blocks_per_compute_unit") = 8)
         .def("_load_jit_host_plugin",
             &MACEKokkos<Precision>::load_jit_host_plugin)
+        .def("_load_metal_r1_module",
+            &MACEKokkos<Precision>::load_metal_r1_module,
+            py::arg("source"),
+            py::arg("channels"),
+            py::arg("edge_harmonics"),
+            py::arg("source_harmonics"),
+            py::arg("output_components"))
+        .def("_clear_metal_r1_module",
+            &MACEKokkos<Precision>::clear_metal_r1_module)
+        .def("_metal_r1_module_ready",
+            &MACEKokkos<Precision>::metal_r1_module_ready)
+        .def("_load_metal_r0_module",
+            &MACEKokkos<Precision>::load_metal_r0_module)
+        .def("_metal_r0_module_ready",
+            &MACEKokkos<Precision>::metal_r0_module_ready)
+        .def("_load_metal_m0_module",
+            &MACEKokkos<Precision>::load_metal_m0_module,
+            py::arg("source"),
+            py::arg("channels"),
+            py::arg("input_components"),
+            py::arg("output_components"),
+            py::arg("term_count"))
+        .def("_metal_m0_module_ready",
+            &MACEKokkos<Precision>::metal_m0_module_ready)
+        .def("_load_metal_m1_module",
+            &MACEKokkos<Precision>::load_metal_m1_module,
+            py::arg("source"),
+            py::arg("channels"),
+            py::arg("input_components"),
+            py::arg("output_components"),
+            py::arg("term_count"))
+        .def("_metal_m1_module_ready",
+            &MACEKokkos<Precision>::metal_m1_module_ready)
+        .def("_metal_statistics",
+            &MACEKokkos<Precision>::metal_statistics)
+        .def("_metal_r1_device_name",
+            &MACEKokkos<Precision>::metal_r1_device_name)
         .def("_set_factorized_direct_forward_executor",
             &MACEKokkos<Precision>::set_factorized_direct_forward_executor)
         .def("_set_factorized_direct_reverse_executor",
@@ -2592,6 +2629,13 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
 
 void bind_mace_kokkos(py::module_ &m)
 {
+    m.def("_metal_supported", &symmetrix_metal_supported,
+        "Return whether this build includes the Apple Metal execution layer.");
+    m.def("_metal_device_ready", [] {
+        std::string reason;
+        const bool ready = symmetrix_metal_device_ready(reason);
+        return py::make_tuple(ready, reason);
+    }, "Return (ready, reason) for the Metal GPU used by metal=True.");
     bind_mace_kokkos<double>(m, "MACEKokkos");
     bind_mace_kokkos<float>(m, "MACEKokkosFloat");
 }

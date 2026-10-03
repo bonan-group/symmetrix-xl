@@ -40,6 +40,14 @@ namespace symmetrix::execution {
 struct LaunchProfile;
 }
 
+namespace symmetrix::execution::metal {
+class MetalM0Module;
+class MetalViewRegistry;
+class HostMemoryMap;
+class MetalR0Module;
+class MetalR1Module;
+}
+
 struct ExecutionParameterGradientGroup {
     std::string name;
     std::string layout;
@@ -66,6 +74,12 @@ struct KernelLaunchProfileDiagnostic {
     std::vector<int> calibration_candidates;
     bool calibration_permitted = false;
 };
+
+// True when this build includes the Apple Metal execution layer.
+bool symmetrix_metal_supported();
+// Whether a Metal device usable by the Metal layer is present: a GPU with
+// the Metal 3 family and unified memory. Sets reason when it is not.
+bool symmetrix_metal_device_ready(std::string& reason);
 
 template <typename Precision>
 class MACEKokkos {
@@ -124,6 +138,50 @@ int execution_cuda_runtime_version() const;
 int execution_cuda_driver_version() const;
 void load_jit_host_plugin(std::string path);
 bool jit_host_plugin_ready() const;
+// FP32 Metal execution of the R1 owners; requires a loaded host plugin.
+void load_metal_r1_module(
+    std::string source,
+    int channels,
+    int edge_harmonics,
+    int source_harmonics,
+    int output_components);
+void clear_metal_r1_module();
+bool metal_r1_module_ready() const;
+// FP32 Metal execution of the standard R0 first interaction.
+void load_metal_r0_module();
+bool metal_r0_module_ready() const;
+// FP32 Metal execution of the generated M0 product basis.
+void load_metal_m0_module(
+    std::string source,
+    int channels,
+    int input_components,
+    int output_components,
+    int term_count);
+bool metal_m0_module_ready() const;
+// FP32 Metal execution of the standard M1 contraction with the M0 kernels.
+void load_metal_m1_module(
+    std::string source,
+    int channels,
+    int input_components,
+    int output_components,
+    int term_count);
+bool metal_m1_module_ready() const;
+// Fills the per-degree A1 layout consumed by the Metal R1 module; returns
+// false when the model's A1 blocks fall outside its supported shape.
+bool metal_a1_layout(void* layout) const;
+bool metal_r0_reverse_admitted(int receiver_base, int edge_begin) const;
+template <class ExecutionSpace, class CoordinateView>
+void metal_r0_coordinate_reverse(
+    const ExecutionSpace& execution_space,
+    int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_types,
+    const CoordinateView& coordinates,
+    bool coordinates_are_unit,
+    Kokkos::View<const double*> r);
+std::map<std::string, double> metal_statistics() const;
+std::string metal_r1_device_name() const;
 std::string jit_host_plugin_path() const;
 std::string jit_host_plugin_artifact_id() const;
 void set_factorized_source_strategy(std::string strategy);
@@ -1053,6 +1111,22 @@ std::string factorized_model_payload_fallback_reason;
 std::unique_ptr<JitDevicePlugin> jit_device_plugin;
 #endif
 std::unique_ptr<symmetrix::execution::HostPlugin> jit_host_plugin;
+std::shared_ptr<symmetrix::execution::metal::MetalR1Module> metal_r1_module;
+std::shared_ptr<symmetrix::execution::metal::MetalR0Module> metal_r0_module;
+std::shared_ptr<symmetrix::execution::metal::MetalM0Module> metal_m0_module;
+std::shared_ptr<symmetrix::execution::metal::MetalM0Module> metal_m1_module;
+// Evaluator views that Metal modules access in place; shared by all modules.
+std::shared_ptr<symmetrix::execution::metal::MetalViewRegistry> metal_views;
+#ifdef SYMMETRIX_ENABLE_METAL
+std::shared_ptr<const symmetrix::execution::metal::HostMemoryMap> ensure_metal_views();
+#endif
+// Drops the Metal modules' device copies of host tables after a rebuild.
+void release_metal_tables();
+// Clears results that Metal modules keep for later stages of one evaluation.
+void begin_metal_evaluation();
+// The fused M0 forward writes H1 in place; distributed evaluations rebind H1
+// to caller buffers, so they compute it separately.
+bool metal_h1_fusion_enabled = true;
 Kokkos::View<Precision*> execution_receiver_projection;
 Kokkos::View<Precision*> execution_a1_projection_weights;
 FactorizedSourceStrategy factorized_source_strategy =
@@ -1559,6 +1633,10 @@ bool A1_scaled;
 RadialFunctionSetKokkos<double> A1_splines;
 Kokkos::View<double**,Kokkos::LayoutRight> A1_spline_values;
 Kokkos::View<double**,Kokkos::LayoutRight> A1_spline_derivs;
+// rows[node, :] /= scales[node], on the GPU when Metal maps the rows.
+void scale_A1_rows_by_inverse(
+    Precision* rows, int num_nodes, std::size_t row_length,
+    const std::vector<double>& scales);
 void compute_A1_scaled(
     const int num_nodes,
     Kokkos::View<const int*> node_types,

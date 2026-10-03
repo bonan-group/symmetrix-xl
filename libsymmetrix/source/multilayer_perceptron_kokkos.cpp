@@ -1,8 +1,11 @@
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
+#include <vector>
 
+#include "cblas.hpp"
 #include "multilayer_perceptron_kokkos.hpp"
 #include "tools_kokkos.hpp"
 
@@ -432,6 +435,53 @@ void MultilayerPerceptronKokkos::evaluate_gradient_accumulate_recompute(
     const auto weight_offsets = this->weight_offsets;
     const auto weights = this->weights;
     const int hidden_width = shape_host[1];
+#ifdef SYMMETRIX_ENABLE_METAL
+    // Host fast path, compiled into the Metal build only.
+    if constexpr (std::is_same_v<
+            typename Kokkos::DefaultExecutionSpace::memory_space,
+            Kokkos::HostSpace>) {
+        // One host worker has no batch parallelism to preserve: the hidden
+        // layer and its input gradient are two GEMMs over the whole batch.
+        if (execution_space.concurrency() == 1) {
+            Kokkos::Profiling::pushRegion(
+                "MultilayerPerceptronKokkos::evaluate_gradient_recompute");
+            execution_space.fence();
+            const int inputs = shape_host[0];
+            const double* input_weights = weights.data()+weight_offsets(0);
+            const double* output_weights = weights.data()+weight_offsets(1);
+            std::vector<double> hidden(
+                static_cast<std::size_t>(batch_size)*static_cast<std::size_t>(hidden_width));
+            symmetrix_blas_gemm<double>(
+                CblasRowMajor, CblasNoTrans, CblasTrans,
+                batch_size, hidden_width, inputs,
+                1.0, x.data(), static_cast<int>(x.stride(0)),
+                input_weights, inputs,
+                0.0, hidden.data(), hidden_width);
+            for (int batch=0; batch<batch_size; ++batch) {
+                double* row = hidden.data()
+                    +static_cast<std::size_t>(batch)*static_cast<std::size_t>(hidden_width);
+                double output = 0.0;
+                for (int unit=0; unit<hidden_width; ++unit) {
+                    const double value = row[unit];
+                    const double sigmoid = 1.0/(1.0+std::exp(-value));
+                    const double output_weight = output_weights[unit];
+                    output += output_weight*activation_scale*value*sigmoid;
+                    row[unit] = output_weight*activation_scale
+                        *(sigmoid+value*sigmoid*(1.0-sigmoid));
+                }
+                f(batch) += output;
+            }
+            symmetrix_blas_gemm<double>(
+                CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                batch_size, inputs, hidden_width,
+                1.0, hidden.data(), hidden_width,
+                input_weights, inputs,
+                0.0, g.data(), static_cast<int>(g.stride(0)));
+            Kokkos::Profiling::popRegion();
+            return;
+        }
+    }
+#endif
     using TeamPolicy = Kokkos::TeamPolicy<Kokkos::DefaultExecutionSpace>;
     using Member = TeamPolicy::member_type;
     using ScratchSpace = Member::scratch_memory_space;
