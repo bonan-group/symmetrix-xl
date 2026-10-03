@@ -27,6 +27,8 @@ provides the machine-readable variant for deployment checks.
 steady-state performance in microseconds per atom. Its options select the
 model, backend, precision, execution profile, system size, neighbor skin,
 thread count, sampling protocol, and optional MACE-Torch correctness check.
+On Apple silicon, `--metal` runs the GPU stages on the Metal backend and
+reports the device and the stages it executes.
 
 Artifact preparation commands are exposed as `symmetrix_prepare_jit_host_artifact`
 and `symmetrix_prepare_jit_device_artifact`. The converter is

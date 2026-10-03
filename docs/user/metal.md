@@ -36,6 +36,13 @@ The Mac build uses the Kokkos Serial host backend with Apple's Accelerate BLAS, 
 python benchmarks/metal_md_demo.py
 ```
 
+The maintained `symmetrix bench` SrTiO3 benchmark, which also checks energies, forces, and stress against MACE-Torch, accepts `--metal`:
+
+```bash
+symmetrix bench --metal             # GPU
+symmetrix bench                     # CPU, one core, for comparison
+```
+
 ## Convert a model
 
 Symmetrix evaluates a JSON export of a MACE model. For example, for MACE-MP-0b medium:
