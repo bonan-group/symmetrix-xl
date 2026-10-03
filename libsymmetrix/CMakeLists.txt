@@ -354,6 +354,17 @@ if(SYMMETRIX_KOKKOS)
                 Kokkos::kokkoskernels)
 endif()
 
+option(SYMMETRIX_METAL "Build the Apple Metal runtime layer." OFF)
+if(SYMMETRIX_METAL)
+    if(NOT APPLE)
+        message(FATAL_ERROR "SYMMETRIX_METAL requires an Apple platform.")
+    endif()
+    set(SYMMETRIX_METAL_SELFTEST OFF CACHE BOOL
+        "Build the Metal runtime self-test executable.")
+    add_subdirectory(source/metal)
+    target_link_libraries(symmetrix PRIVATE symmetrix_metal)
+endif()
+
 
 # ----- options -----
 
