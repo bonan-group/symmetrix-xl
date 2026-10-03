@@ -12,6 +12,13 @@ and are selected at process startup. This lets the same Python-facing API be
 used on a host CPU, an NVIDIA GPU, or an AMD GPU without mixing incompatible
 native extensions.
 
+The frontend provides the Python API, ASE calculator, model conversion, and CLI;
+the backend provides the native graph and model evaluation kernels. When a
+matching wheel is available, a pre-compiled pip package avoids the local
+C++/Kokkos/CUDA or HIP toolchain and supplies a tested architecture-specific
+extension. Source builds remain available for unsupported targets and backend
+development.
+
 ## What It Computes
 
 For ordinary MACE models, Symmetrix-XL evaluates total energy, per-atom energies,
@@ -28,32 +35,49 @@ require an R1 artifact.
 
 ## Demonstrated Scale
 
-An FP32 NVIDIA A100-SXM4-80GB qualification evaluated energy, forces, and
-stress for the standard two-layer MACE-OMAT-0 model on cubic SrTiO3:
+The paper's FP32 single-GPU LAMMPS capacity benchmark uses the MACE-OMAT-0
+medium checkpoint on cubic SrTiO3, with a 6.0 A model cutoff and a 0.5 A
+neighbor-list skin:
 
-| Execution | Maximum atoms | Directed edges | Speed (us/atom) | Sampled peak VRAM (MiB) |
-|---|---:|---:|---:|---:|
-| Standard | 1,373,125 | 141,157,250 | 6.330 | 79,313 |
-| Fixed workspace | 13,140,360 | 1,350,829,008 | 6.868 | 80,639 |
+| Execution | A100 80 GB atoms | RTX 5090 32 GB atoms |
+|---|---:|---:|
+| ML-IAP + cuEquivariance | 24,565 | 8,640 |
+| Symmetrix-XL standard streaming | 1,250,235 | 486,680 |
+| Symmetrix-XL tiled streaming | 11,240,455 | 4,152,920 |
 
-Both used a 6.0 A model cutoff and 0.5 A neighbor-list skin, giving a 6.5 A
-effective cutoff, and completed with zero fallbacks. These are workload-specific
-demonstrations, not capacity guarantees.
+Tiled streaming is an explicitly enabled capacity mode; standard streaming
+remains the default. These are capacity-boundary probes under the stated
+protocol, not general capacity guarantees or sustained 20-step MD results. On
+64 A800 GPUs, tiled streaming weak-scaled to 703.04 million atoms at 93.81%
+efficiency.
 
 ## Demonstrated Speed
 
 A matched FP32 RTX 5090 qualification compared complete warmed ASE
-energy/forces/stress calls for the standard OMAT-0-medium checkpoint:
+energy/forces/stress calls for the standard MACE-OMAT-0 medium checkpoint:
 
-| Atoms | Directed edges: MACE-Torch / Symmetrix-XL | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
-|---:|---:|---:|---:|---:|---:|
-| 864 | 78,624 / 97,762 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
-| 4,000 | 364,000 / 452,342 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
+| Atoms | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
+|---:|---:|---:|---:|---:|
+| 864 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
+| 4,000 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
 
-MACE-Torch 0.3.15 with cuEquivariance 0.11.0 used the exact 6.0 A graph.
-Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving a
-candidate graph with an effective cutoff of 6.5 A; the graph policies are not
-identical, and Symmetrix-XL processed more directed candidates.
+The MACE-Torch baseline used cuEquivariance with the exact 6.0 A graph.
+Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving
+an effective cutoff of 6.5 A; the graph policies are therefore not identical.
+
+Across the matched FP32 LAMMPS benchmarks reported in the paper, Symmetrix-XL
+reduces complete step time by 3.1-5.0x relative to ML-IAP + cuEquivariance on
+the tested A100 and RTX 5090 workloads. A representative RTX 5090 result uses
+5,000-atom perturbed cubic SrTiO3 with MACE-OMAT-0 medium:
+
+| Implementation | Time (us/atom/step) | Speedup vs. ML-IAP |
+|---|---:|---:|
+| MACE-Torch + cuEquivariance through LAMMPS ML-IAP | 12.813 | 1.00x |
+| Symmetrix-XL LAMMPS pair style | 2.559 | 5.01x |
+
+Each value is the median of three 20-step runs after warmup. Both deployments
+used a 6.0 A model cutoff and a 0.5 A neighbor-list skin; see the paper for the
+full benchmark protocol and graph-policy details.
 
 ## How Execution Is Chosen
 

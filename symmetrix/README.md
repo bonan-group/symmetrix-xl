@@ -6,6 +6,9 @@ Symmetrix-XL provides native CPU and GPU inference for MACE and
 MACEField models. The published distribution is named `symmetrix-xl`; the
 Python import namespace and command-line interface remain `symmetrix`.
 
+The methods and benchmark protocol are described in
+[Train for Accuracy, Execute at Scale: Architecture-Preserving Inference for Equivariant Atomistic Foundation Models](https://arxiv.org/abs/2610.01036).
+
 This package is a fork of the original
 [`symmetrix`](https://github.com/wcwitt/symmetrix) project. Symmetrix-XL adds
 two execution strategies:
@@ -22,34 +25,58 @@ CUDA and HIP backends are installed as separate, architecture-qualified
 packages so that they can coexist without overwriting the frontend or CPU
 extension.
 
+The **frontend** is the Python API, ASE calculator, model-conversion tools, and
+CLI. The **backend** is the native CPU/OpenMP, CUDA, or HIP extension that
+constructs graphs and evaluates the model. Pre-compiled pip packages are the
+recommended path when available because they provide tested, architecture-
+matched native code without requiring a local C++/Kokkos/CUDA or HIP toolchain;
+build from source when no suitable wheel exists or when developing the backend.
+
 ## Demonstrated scale
 
-An FP32 NVIDIA A100-SXM4-80GB qualification evaluated energy, forces, and
-stress for the standard two-layer MACE-OMAT-0 model on cubic SrTiO3:
+The paper's FP32 single-GPU LAMMPS capacity benchmark uses the MACE-OMAT-0
+medium checkpoint on cubic SrTiO3, with a 6.0 A model cutoff and a 0.5 A
+neighbor-list skin:
 
-| Execution | Maximum atoms | Directed edges | Speed (us/atom) | Sampled peak VRAM (MiB) |
-|---|---:|---:|---:|---:|
-| Standard | 1,373,125 | 141,157,250 | 6.330 | 79,313 |
-| Fixed workspace | 13,140,360 | 1,350,829,008 | 6.868 | 80,639 |
+| Execution | A100 80 GB atoms | RTX 5090 32 GB atoms |
+|---|---:|---:|
+| ML-IAP + cuEquivariance | 24,565 | 8,640 |
+| Symmetrix-XL standard streaming | 1,250,235 | 486,680 |
+| Symmetrix-XL tiled streaming | 11,240,455 | 4,152,920 |
 
-Both used a 6.0 A model cutoff and 0.5 A neighbor-list skin, giving a 6.5 A
-effective cutoff, and completed with zero fallbacks. These are workload-specific
-demonstrations, not capacity guarantees.
+Tiled streaming is an explicitly enabled capacity mode; standard streaming
+remains the default. These values are capacity-boundary probes under the stated
+protocol, not general capacity guarantees or sustained 20-step MD results. On
+64 A800 GPUs, tiled streaming weak-scaled to 703.04 million atoms at 93.81%
+efficiency.
 
 ## Demonstrated speed
 
 A matched FP32 RTX 5090 qualification compared complete warmed ASE
-energy/forces/stress calls for the standard OMAT-0-medium checkpoint:
+energy/forces/stress calls for the standard MACE-OMAT-0 medium checkpoint:
 
-| Atoms | Directed edges: MACE-Torch / Symmetrix-XL | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
-|---:|---:|---:|---:|---:|---:|
-| 864 | 78,624 / 97,762 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
-| 4,000 | 364,000 / 452,342 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
+| Atoms | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
+|---:|---:|---:|---:|---:|
+| 864 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
+| 4,000 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
 
-MACE-Torch 0.3.15 with cuEquivariance 0.11.0 used the exact 6.0 A graph.
-Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving a
-candidate graph with an effective cutoff of 6.5 A; the graph policies are not
-identical, and Symmetrix-XL processed more directed candidates.
+The MACE-Torch baseline used cuEquivariance with the exact 6.0 A graph.
+Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving
+an effective cutoff of 6.5 A; the graph policies are therefore not identical.
+
+Across the matched FP32 LAMMPS benchmarks reported in the paper, Symmetrix-XL
+reduces complete step time by 3.1-5.0x relative to ML-IAP + cuEquivariance on
+the tested A100 and RTX 5090 workloads. A representative RTX 5090 result uses
+5,000-atom perturbed cubic SrTiO3 with MACE-OMAT-0 medium:
+
+| Implementation | Time (us/atom/step) | Speedup vs. ML-IAP |
+|---|---:|---:|
+| MACE-Torch + cuEquivariance through LAMMPS ML-IAP | 12.813 | 1.00x |
+| Symmetrix-XL LAMMPS pair style | 2.559 | 5.01x |
+
+Each value is the median of three 20-step runs after warmup. Both deployments
+used a 6.0 A model cutoff and a 0.5 A neighbor-list skin; see the paper for the
+full benchmark protocol and graph-policy details.
 
 ## Installation
 
@@ -143,9 +170,10 @@ python tools/symmetrix_build.py install \
 ```
 
 Source builds require Python 3.10 or newer, CMake 3.27 or newer, a C++20
-compiler, and a recursive checkout. CPU builds additionally require a Fortran
-compiler and optimized BLAS. CUDA builds require `nvcc`; HIP builds require
-`hipcc`. Do not reuse a build directory across CPU, CUDA, and HIP backends.
+compiler, a Fortran compiler, OpenBLAS or another compatible optimized BLAS,
+and a recursive checkout. CUDA builds additionally require a matching CUDA
+toolkit and `nvcc`; HIP builds require a matching ROCm toolkit and `hipcc`.
+Do not reuse a build directory across CPU, CUDA, and HIP backends.
 
 The maintained build and cluster instructions are in the
 [installation guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/installation.md)
@@ -197,7 +225,8 @@ options.
 
 ## ASE calculator
 
-Use the compact model with the normal ASE calculator interface:
+Use the compact model as a drop-in replacement for the usual MACECalculator in
+ASE workflows:
 
 ```python
 from ase.spacegroup import crystal

@@ -16,11 +16,7 @@ The methods, validation, and benchmark protocol are described in the preprint
 
 Symmetrix-XL preserves the MACE checkpoint's architecture and learned weights
 while changing how its equivariant operations are scheduled, stored, and
-compiled. This is architecture-preserving rather than bitwise-identical
-execution: operation ordering and radial spline projection can change the
-floating-point realization, so equivalence is established through explicit
-numerical and downstream validation. Its execution strategy has three main
-components:
+compiled. Its execution strategy has three main components:
 
 1. **Memory-bounded direct execution (a).** Streamed-edge execution avoids
    retaining broad graph-wide radial and tensor-product edge state by generating
@@ -45,6 +41,16 @@ components:
 See the [documentation](https://bonan-group.github.io/symmetrix-xl/) for
 installation, supported workflows, and developer references.
 
+The **frontend** is the Python package, ASE calculator, model-conversion tools,
+and CLI that users interact with. A **backend** is the native CPU/OpenMP, CUDA,
+or HIP extension that performs graph construction and model evaluation. The
+frontend API is shared across backends, while accelerator packages are built for
+specific device architectures. Pre-compiled pip packages are usually the
+simplest choice: they avoid a local C++/Kokkos/CUDA or HIP toolchain build,
+install a tested architecture-matched extension, and make environments easier
+to reproduce. Build from source when no suitable wheel exists or when developing
+the native implementation.
+
 ### Demonstrated scale
 
 The paper's FP32 single-GPU LAMMPS capacity benchmark uses the MACE-OMAT-0
@@ -65,6 +71,18 @@ to 703.04 million atoms at 93.81% efficiency.
 
 ### Demonstrated speed
 
+A matched FP32 RTX 5090 qualification compared complete warmed ASE
+energy/forces/stress calls for the standard MACE-OMAT-0 medium checkpoint:
+
+| Atoms | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
+|---:|---:|---:|---:|---:|
+| 864 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
+| 4,000 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
+
+The MACE-Torch baseline used cuEquivariance with the exact 6.0 A graph.
+Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving
+an effective cutoff of 6.5 A; the graph policies are therefore not identical.
+
 Across the matched FP32 LAMMPS benchmarks reported in the paper, Symmetrix-XL
 reduces complete step time by 3.1-5.0x relative to ML-IAP + cuEquivariance on
 the tested A100 and RTX 5090 workloads. One representative RTX 5090 result uses
@@ -78,9 +96,8 @@ the tested A100 and RTX 5090 workloads. One representative RTX 5090 result uses
 Each value is the median of three 20-step runs after warmup. Both deployments
 used a 6.0 A model cutoff and a 0.5 A neighbor-list skin (6.5 A effective
 neighbor cutoff), with zero neighbor-list rebuilds during the measured block.
-The paper also reports complete ASE energy/forces/stress calls and treats them
-as end-to-end deployment measurements rather than isolated model-forward
-timings; see the paper for the full benchmark protocol and graph-policy details.
+The paper also reports complete ASE energy/forces/stress calls; see the paper
+for the full benchmark protocol and graph-policy details.
 
 -----
 
@@ -105,7 +122,6 @@ device target:
 ```bash
 python -m pip install symmetrix-xl-cuda12-sm80   # NVIDIA, compute capability 8.0
 python -m pip install symmetrix-xl-cuda13-sm120  # NVIDIA, compute capability 12.0
-python -m pip install symmetrix-xl-rocm6-gfx1151 # AMD, gfx1151 (when published)
 ```
 
 Only install a GPU package whose target matches the deployment device. GPU
@@ -131,6 +147,12 @@ command.
 
 Start from a source checkout to build the CPU backend for the local machine or
 to build a CUDA/HIP target that does not have a published wheel:
+
+Source builds require Python 3.10 or newer, CMake 3.27 or newer, a C++20
+compiler, a Fortran compiler, OpenBLAS or another compatible optimized BLAS,
+and a recursive checkout. CUDA builds additionally require a matching CUDA
+toolkit and `nvcc`; HIP builds require a matching ROCm toolkit and `hipcc`.
+Keep CPU, CUDA, and HIP builds in separate environments and build directories.
 
 ```bash
 git clone --recursive https://github.com/bonan-group/symmetrix-xl.git
@@ -160,27 +182,10 @@ symmetrix backend list
 symmetrix doctor
 ```
 
-Convert a MACE checkpoint to the compact JSON format used by Symmetrix-XL. The
-converter is optional; JSON-only evaluation does not require `mace-torch`.
+### ASE calculator
 
-```bash
-uv pip install mace-torch
-symmetrix_extract_mace \
-    --model mace-omat-0-medium.model \
-    --output mace-omat-0-medium.json
-```
-
-The default is the preferred universal compact export, retaining every element
-supported by the checkpoint. Compact format v2 stores the shared radial model
-once instead of generating pair-specific spline tables, while format v3 also
-retains the complete checkpoint domain. Universal compact files therefore
-avoid quadratic pair-table growth and can be reused across compositions; they
-still include the checkpoint's element-indexed learned parameters. Element
-selectors are intended only for deliberately restricted format-v2 deployments
-or exports in the original Symmetrix pair-spline format (named v1 here);
-format-v3 models reject subsets.
-
-Run an energy, force, or stress calculation with ASE:
+After obtaining a compact JSON model, `Symmetrix` is a drop-in replacement for
+the usual MACECalculator in ASE workflows:
 
 ```python
 from ase.spacegroup import crystal
@@ -201,9 +206,31 @@ print(atoms.get_stress())
 
 The calculator defaults to FP32 model evaluation with generated direct,
 capacity-aware execution. Pass `dtype="float64"` explicitly for high-precision
-calculations. CUDA and HIP backends are installed separately for a matching GPU
-architecture; see the [installation guide](docs/user/installation.md) and
-[Symmetrix-XL package README](symmetrix/README.md) for backend-specific builds.
+calculations.
+
+Convert a MACE checkpoint to the compact JSON format used by Symmetrix-XL. The
+converter is optional; JSON-only evaluation does not require `mace-torch`.
+
+```bash
+uv pip install mace-torch
+symmetrix_extract_mace \
+    --model mace-omat-0-medium.model \
+    --output mace-omat-0-medium.json
+```
+
+The default is the preferred universal compact export, retaining every element
+supported by the checkpoint. Compact format v2 stores the shared radial model
+once instead of generating pair-specific spline tables, while format v3 also
+retains the complete checkpoint domain. Universal compact files therefore
+avoid quadratic pair-table growth and can be reused across compositions; they
+still include the checkpoint's element-indexed learned parameters. Element
+selectors are intended only for deliberately restricted format-v2 deployments
+or exports in the original Symmetrix pair-spline format (named v1 here);
+format-v3 models reject subsets.
+
+CUDA and HIP backends are installed separately for a matching GPU architecture;
+see the [installation guide](docs/user/installation.md) and [Symmetrix-XL
+package README](symmetrix/README.md) for backend-specific builds.
 
 ### LAMMPS integration
 
@@ -238,11 +265,9 @@ If you use Symmetrix-XL, please cite:
 
 Symmetrix-XL builds on the original Symmetrix project. The earliest `symmetrix`
 results are reported in:
-
 * D. P. Kovács, J. H. Moore, N. J. Browning, I. Batatia, J. T. Horton, Y. Pu, V. Kapil, W. C. Witt, I.-B. Magdău, D. J. Cole, G. Csányi, "MACE-OFF: Short-Range Transferable Machine Learning Force Fields for Organic Molecules", _Journal of the American Chemical Society_ **147**, 17598 (2025). [[arxiv]](https://arxiv.org/abs/2312.15211) [[journal]](https://doi.org/10.1021/jacs.4c07099)
 
 MACE foundation models and implementations are described in:
-
 * I. Batatia, P. Benner, Y. Chiang, A. M. Elena, D. P. Kovács, J. Riebesell, ...+78 others..., W. C. Witt, T. Wolf, F. Zills, G. Csányi, "A foundation model for atomistic materials chemistry," _Journal of Chemical Physics_ **163**, 184110 (2025). [[arxiv]](https://arxiv.org/abs/2401.00096) [[journal]](https://doi.org/10.1063/5.0297006)
 
 Please also cite the model-specific references appropriate to the MACE checkpoint
@@ -259,7 +284,7 @@ to maintain consistency with LAMMPS.
 ### Acknowledgements
 
 Symmetrix-XL is based on [Symmetrix](https://github.com/wcwitt/symmetrix),
-developed by Chuck Witt.
+developed by William C. Witt.
 
 The original Symmetrix project also has the following acknowledgement statement:
 
