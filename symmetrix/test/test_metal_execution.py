@@ -287,6 +287,25 @@ def test_metal_follows_changes_of_the_element_set(omat_small_model):
         )
 
 
+@pytest.mark.parametrize(("l_max", "accepted"), [(3, True), (4, False)])
+def test_metal_l_max_matches_the_direct_path(l_max, accepted):
+    from types import SimpleNamespace
+
+    from symmetrix import Symmetrix
+
+    calculator = SimpleNamespace(
+        metal_request=True,
+        _native_model_type="MACE",
+        _model_single_layer_readout=False,
+        evaluator=SimpleNamespace(l_max=l_max),
+    )
+    if accepted:
+        Symmetrix._require_metal_model_family(calculator)
+    else:
+        with pytest.raises(ValueError, match="l_max up to 3"):
+            Symmetrix._require_metal_model_family(calculator)
+
+
 def test_metal_r0_reverse_chunks_match_one_chunk(omat_small_model, tmp_path):
     import subprocess
 

@@ -2005,6 +2005,7 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                 prepare_active_types(self, node_types);
             })
         .def_readonly("r_cut", &MACEKokkos<Precision>::r_cut)
+        .def_readonly("l_max", &MACEKokkos<Precision>::l_max)
         .def_readonly("L_max", &MACEKokkos<Precision>::L_max)
         .def_readonly(
             "single_layer_readout", &MACEKokkos<Precision>::single_layer_readout)

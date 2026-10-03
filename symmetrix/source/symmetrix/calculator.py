@@ -2667,6 +2667,15 @@ class Symmetrix(Calculator):
         if not self.metal_request:
             return
         if self._native_model_type == "MACE" and not self._model_single_layer_readout:
+            # Like the generated direct R1 path on the CPU and CUDA, the Metal
+            # stages support edge harmonics up to l_max 3.
+            l_max = getattr(getattr(self, "evaluator", None), "l_max", None)
+            if l_max is not None and l_max > 3:
+                raise ValueError(
+                    f"metal=True supports l_max up to 3, as does "
+                    f"streamed_edges='direct'; this model has l_max {l_max}. "
+                    "Leave metal unset and use streamed_edges='generic'."
+                )
             return
         # Only two-interaction standard MACE has been qualified on the Metal
         # stages; other families would reach them untested.
