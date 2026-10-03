@@ -4,16 +4,47 @@
 
 #include "spherical_harmonic.hpp"
 
+namespace {
+
+// libc++ does not provide the C++17 mathematical special functions. The
+// fallback follows std::assoc_legendre's convention, which omits the
+// Condon-Shortley phase, and uses the standard upward recurrence in l.
+double assoc_legendre(unsigned l, unsigned m, double x) {
+#if defined(__cpp_lib_math_special_functions) || defined(__STDCPP_MATH_SPEC_FUNCS__)
+    return std::assoc_legendre(l, m, x);
+#else
+    if (m > l)
+        return 0.0;
+    const double s = std::sqrt((1.0-x)*(1.0+x));
+    double p_mm = 1.0;
+    for (unsigned k = 1; k <= m; ++k)
+        p_mm *= (2.0*k-1.0)*s;
+    if (l == m)
+        return p_mm;
+    double p_lm2 = p_mm;
+    double p_lm1 = x*(2.0*m+1.0)*p_mm;
+    for (unsigned n = m+2; n <= l; ++n) {
+        const double p_n =
+            ((2.0*n-1.0)*x*p_lm1-(n+m-1.0)*p_lm2)/static_cast<double>(n-m);
+        p_lm2 = p_lm1;
+        p_lm1 = p_n;
+    }
+    return p_lm1;
+#endif
+}
+
+}  // namespace
+
 std::complex<double> sph_harm(int l, int m, double polar, double azimuth) {
     if (m >=0) {
         return std::pow(-1,m)
             * std::sqrt((2*l+1)/(4*M_PI)*std::tgamma(1+l-m)/std::tgamma(1+l+m))
-            * std::assoc_legendre(l,m,std::cos(polar))
+            * assoc_legendre(l,m,std::cos(polar))
             * std::exp(std::complex<double>(0,1)*double(m)*azimuth);
     } else {
         return std::pow(-1,m)
             * std::sqrt((2*l+1)/(4*M_PI)*std::tgamma(1+l-m)/std::tgamma(1+l+m))
-            * std::pow(-1,m)*std::tgamma(1+l+m)/std::tgamma(1+l-m)*std::assoc_legendre(l,-m,std::cos(polar))
+            * std::pow(-1,m)*std::tgamma(1+l+m)/std::tgamma(1+l-m)*assoc_legendre(l,-m,std::cos(polar))
             * std::exp(std::complex<double>(0,1)*double(m)*azimuth);
     }
 }

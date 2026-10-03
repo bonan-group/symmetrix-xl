@@ -20,6 +20,15 @@ Kokkos_ENABLE_SERIAL = "OFF"
 SYMMETRIX_SPHERICART_CUDA = "OFF"
 SPHERICART_ENABLE_CUDA = "OFF"
 
+# Apple silicon: include the Metal GPU layer and use the Serial host, which
+# avoids loading a second OpenMP runtime next to PyTorch's.
+[[tool.scikit-build.overrides]]
+if.platform-system = "darwin"
+if.platform-machine = "arm64"
+cmake.define.Kokkos_ENABLE_OPENMP = "OFF"
+cmake.define.Kokkos_ENABLE_SERIAL = "ON"
+cmake.define.SYMMETRIX_METAL = "ON"
+
 [project]
 name = "symmetrix-xl"
 version = "0.1.1"

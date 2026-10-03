@@ -389,6 +389,7 @@ void MACEKokkos<Precision>::invalidate_factorized_operator_benchmark()
 template <typename Precision>
 void MACEKokkos<Precision>::begin_factorized_production_evaluation()
 {
+    begin_metal_evaluation();
     if (mace_uses_direct_execution(streamed_edges)) {
         if (!single_layer_readout
             && !jit_host_plugin_ready() && !jit_device_plugin_ready())
@@ -4098,6 +4099,7 @@ void MACEKokkos<Precision>::prepare_active_types(std::vector<int> node_types)
     R0_spline_min = x0;
     R0_spline_coefficients = new_R0_coefficients;
     radial_1 = std::move(new_radial_1);
+    release_metal_tables();
     if (A0_scaled)
         A0_splines = std::move(new_A0_splines);
     if (A1_scaled)
@@ -4384,6 +4386,7 @@ void MACEKokkos<Precision>::prepare_factorized_model(
     Kokkos::deep_copy(receiver_projection, h_receiver_projection);
 
     execution_radial_1 = std::move(new_radial);
+    release_metal_tables();
     factorized_embedding_width = embedding_width;
     execution_group_path_offsets_host = group_path_offsets;
     execution_group_lme_offsets_host = std::move(group_lme_offsets);

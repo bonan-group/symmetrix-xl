@@ -8,6 +8,7 @@ work for the U. S. Government, and is not subject to copyright.
 import json
 import logging
 import os
+import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -748,8 +749,47 @@ class Symmetrix(Calculator):
         dispersion_xc="pbe",
         dispersion_cutoff=None,
         dispersion_device=None,
+        metal=False,
         **kwargs,
     ):
+        self.metal_request = bool(metal)
+        self.metal_status = "disabled"
+        self.metal_device = None
+        self.metal_stages = ()
+        if self.metal_request:
+            # Fail before any model or kernel setup: Metal is an opt-in Apple
+            # GPU backend, and CPU and CUDA selection does not involve it.
+            if sys.platform != "darwin":
+                raise ValueError(
+                    "metal=True is only available on macOS with an Apple GPU; "
+                    "on Linux use the CPU or CUDA backend (selected with "
+                    "SYMMETRIX_BACKEND) and leave metal unset"
+                )
+            # Argument errors come before build and device checks.
+            if dtype != "float32":
+                raise ValueError(
+                    "metal=True requires dtype='float32'; Metal has no FP64"
+                )
+            # Fixed-workspace tiled plans process edges in chunks that the
+            # Metal stages do not execute; they are a CUDA capacity feature.
+            if (
+                allow_fixed_workspace
+                or _debug_execution_plan in _FIXED_WORKSPACE_TILED_PLANS
+            ):
+                raise ValueError(
+                    "metal=True does not support fixed-workspace tiled plans; "
+                    "leave allow_fixed_workspace unset"
+                )
+            if not getattr(symmetrix, "_metal_supported", lambda: False)():
+                raise RuntimeError(
+                    "metal=True requires a build with the Metal layer "
+                    "(SYMMETRIX_METAL=ON); see docs/user/metal.md"
+                )
+            ready, reason = getattr(
+                symmetrix, "_metal_device_ready", lambda: (True, "")
+            )()
+            if not ready:
+                raise RuntimeError(f"metal=True has no usable Metal GPU: {reason}")
         self.dispersion = bool(dispersion)
         self._dispersion_calculator = None
         self._dispersion_properties = ()
@@ -950,6 +990,7 @@ class Symmetrix(Calculator):
         self._native_model_type = (
             json_model_type if json_model_type is not None else "MACE"
         )
+        self._require_metal_model_family()
         MACE = self._native_evaluator_class(
             json_model_type if json_model_type is not None else "MACE",
             dtype,
@@ -1003,6 +1044,7 @@ class Symmetrix(Calculator):
                 self._model_single_layer_readout,
             )
         )
+        self._require_metal_model_family()
         selected_head = getattr(self.evaluator, "selected_head", "")
         self.head = selected_head or None
         self.available_heads = list(getattr(self.evaluator, "available_heads", []))
@@ -1159,6 +1201,11 @@ class Symmetrix(Calculator):
             use_kokkos=use_kokkos,
             streamed_edges=self.streamed_edges,
         )
+        if self.metal_request and self.metal_status != "ready":
+            raise RuntimeError(
+                "metal=True requires generated direct R1 execution on a host "
+                f"backend; JIT status is {self.jit_status!r}"
+            )
         if (
             self._native_execution_plan_available
             and self.execution_profile in _EXECUTION_PROFILES
@@ -1808,6 +1855,81 @@ class Symmetrix(Calculator):
         self.jit_operator_modules.update(modules)
         self.jit_diagnostics = (*self.jit_diagnostics, *diagnostics)
 
+    def _configure_metal_r1(self, model_data):
+        """Move R1, the standard R0 first interaction, and M0 onto the Metal GPU."""
+
+        from .metal_codegen import metal_r1_metadata, render_jit_r1_metal_source
+
+        loader = getattr(self.evaluator, "_load_metal_r1_module", None)
+        if loader is None:
+            raise RuntimeError("the native evaluator does not provide Metal R1 support")
+        contract = model_data.get("execution_contracts", {}).get("R1")
+        if not contract:
+            raise RuntimeError("Metal R1 execution requires an Execution R1 contract")
+        metadata = metal_r1_metadata(contract)
+        loader(
+            render_jit_r1_metal_source(contract),
+            metadata["channels"],
+            metadata["edge_harmonics"],
+            metadata["source_harmonics"],
+            metadata["output_components"],
+        )
+        if not self.evaluator._metal_r1_module_ready():
+            raise RuntimeError("the evaluator did not retain the Metal R1 module")
+        load_r0 = getattr(self.evaluator, "_load_metal_r0_module", None)
+        if load_r0 is not None:
+            load_r0()
+        m0_contract = model_data.get("execution_contracts", {}).get("M0")
+        load_m0 = getattr(self.evaluator, "_load_metal_m0_module", None)
+        if m0_contract and load_m0 is not None:
+            from .metal_codegen import metal_m0_metadata, render_jit_m0_metal_source
+
+            m0 = metal_m0_metadata(m0_contract)
+            load_m0(
+                render_jit_m0_metal_source(m0_contract),
+                m0["channels"],
+                m0["input_components"],
+                m0["output_components"],
+                m0["term_count"],
+            )
+        load_m1 = getattr(self.evaluator, "_load_metal_m1_module", None)
+        if m0_contract and load_m1 is not None:
+            from .metal_codegen import metal_m1_metadata, render_jit_m1_metal_source
+
+            m1 = metal_m1_metadata(m0_contract)
+            load_m1(
+                render_jit_m1_metal_source(m0_contract),
+                m1["channels"],
+                m1["input_components"],
+                m1["output_components"],
+                m1["term_count"],
+            )
+        # Stages without a loaded module, such as M1 for models whose M1
+        # contraction has no standard module, stay on the CPU.
+        evaluator = self.evaluator
+        self.metal_stages = tuple(
+            stage
+            for stage, ready in (
+                ("R0", getattr(evaluator, "_metal_r0_module_ready", lambda: False)()),
+                ("M0", getattr(evaluator, "_metal_m0_module_ready", lambda: False)()),
+                ("R1", True),
+                (
+                    "M1",
+                    getattr(evaluator, "_metal_m1_module_ready", lambda: False)()
+                    and bool(getattr(evaluator, "standard_m1_module_ready", False)),
+                ),
+            )
+            if ready
+        )
+        self.metal_status = "ready"
+        self.metal_device = self.evaluator._metal_r1_device_name()
+
+    def metal_statistics(self):
+        """Return Metal R0/R1 launch counts and GPU/staging seconds."""
+
+        query = getattr(self.evaluator, "_metal_statistics", None)
+        return dict(query()) if callable(query) else {}
+
     def _configure_jit(
         self,
         *,
@@ -2454,6 +2576,8 @@ class Symmetrix(Calculator):
             self.jit_edge_policy = selected_edge_policy
             self.jit_node_state_policy = selected_node_state_policy
             self.jit_variant_id = selected_variant_id
+            if specialization == "r1" and jit_backend == "host" and self.metal_request:
+                self._configure_metal_r1(model_data)
             if specialization == "r1" and self.low_memory_request:
                 if jit_backend in ("cuda", "hip"):
                     self._configure_low_memory_operator_modules(
@@ -2548,6 +2672,33 @@ class Symmetrix(Calculator):
             return None
         except (OSError, ValueError, TypeError, AttributeError):
             return None
+
+    def _require_metal_model_family(self):
+        if not self.metal_request:
+            return
+        if self._native_model_type == "MACE" and not self._model_single_layer_readout:
+            # Like the generated direct R1 path on the CPU and CUDA, the Metal
+            # stages support edge harmonics up to l_max 3.
+            l_max = getattr(getattr(self, "evaluator", None), "l_max", None)
+            if l_max is not None and l_max > 3:
+                raise ValueError(
+                    f"metal=True supports l_max up to 3, as does "
+                    f"streamed_edges='direct'; this model has l_max {l_max}. "
+                    "Leave metal unset and use streamed_edges='generic'."
+                )
+            return
+        # Only two-interaction standard MACE has been qualified on the Metal
+        # stages; other families would reach them untested.
+        family = (
+            "single-layer MACE"
+            if self._native_model_type == "MACE"
+            else self._native_model_type
+        )
+        raise ValueError(
+            "metal=True supports two-interaction standard MACE models; "
+            f"{family} is not qualified on the Metal backend. Leave metal unset "
+            "to evaluate it on the CPU."
+        )
 
     def _raise_if_macefield_checkpoint(self, model_file):
         try:

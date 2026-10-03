@@ -1265,11 +1265,11 @@ void r1_source_owner_impl(
                 scheduled + {_HOST_R1_SOURCE_REVERSE_PREFETCH_DISTANCE}];
             const std::int32_t prefetch_receiver =
                 args->edge_receivers[prefetch_edge];
-            prefetch_read({harmonics}
-                + static_cast<std::size_t>(prefetch_edge) * {edge_harmonics});
-            prefetch_read({output_adjoint}
-                + static_cast<std::size_t>(prefetch_receiver)
-                    * {output_components * channels} + channel);
+            prefetch_read(&{harmonics}[
+                static_cast<std::size_t>(prefetch_edge) * {edge_harmonics}]);
+            prefetch_read(&{output_adjoint}[
+                static_cast<std::size_t>(prefetch_receiver)
+                    * {output_components * channels} + channel]);
         }}
         const std::int32_t edge = args->source_edges[scheduled];
         if (!edge_is_active(args->cutoff, args->radius[edge]))

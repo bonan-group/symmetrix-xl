@@ -13,6 +13,7 @@ installation
 models
 execution
 backends
+metal
 lammps
 troubleshooting
 source_guides
