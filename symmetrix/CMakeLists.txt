@@ -426,16 +426,6 @@ if(SYMMETRIX_KOKKOS)
     list(APPEND SYMMETRIX_BINDINGS ${SYMMETRIX_BINDINGS_KOKKOS})
 endif()
 
-option(SYMMETRIX_BUILD_BENCHMARKS "Build standalone Symmetrix benchmarks." OFF)
-if(SYMMETRIX_KOKKOS AND SYMMETRIX_BUILD_BENCHMARKS)
-    add_executable(
-        factorized_matrix_feasibility
-        ${CMAKE_CURRENT_SOURCE_DIR}/../benchmarks/factorized_matrix_feasibility.cpp)
-    target_link_libraries(
-        factorized_matrix_feasibility
-        PRIVATE Kokkos::kokkos Kokkos::kokkoskernels)
-endif()
-
 pybind11_add_module(symmetrix_bindings MODULE ${SYMMETRIX_BINDINGS} source/cpp/symmetrix.cpp)
 set_target_properties(symmetrix_bindings PROPERTIES
   OUTPUT_NAME "${SYMMETRIX_PYTHON_MODULE_NAME}")

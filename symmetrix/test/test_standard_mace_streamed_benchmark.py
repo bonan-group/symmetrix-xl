@@ -7,8 +7,6 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "benchmarks/standard_mace_streamed_benchmark.py"
-MACEFIELD_SCRIPT = ROOT / "benchmarks/macefield_kokkos_benchmark.py"
-MH1_SCRIPT = ROOT / "benchmarks/mh1_serial_benchmark.py"
 
 
 def _load_benchmark(monkeypatch):
@@ -33,127 +31,6 @@ def _load_benchmark(monkeypatch):
     return module
 
 
-def _load_macefield_benchmark(monkeypatch):
-    native = types.SimpleNamespace(__file__=str(ROOT / "fake-symmetrix.so"))
-    package = types.ModuleType("symmetrix")
-    package.Symmetrix = object
-    package.symmetrix = native
-    ase = types.ModuleType("ase")
-    ase_build = types.ModuleType("ase.build")
-    ase_build.bulk = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "symmetrix", package)
-    monkeypatch.setitem(sys.modules, "symmetrix.symmetrix", native)
-    monkeypatch.setitem(sys.modules, "ase", ase)
-    monkeypatch.setitem(sys.modules, "ase.build", ase_build)
-
-    spec = importlib.util.spec_from_file_location(
-        "macefield_kokkos_benchmark_test", MACEFIELD_SCRIPT
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_mh1_benchmark(monkeypatch):
-    native = types.SimpleNamespace(__file__=str(ROOT / "fake-symmetrix.so"))
-    package = types.ModuleType("symmetrix")
-    package.Symmetrix = object
-    package.symmetrix = native
-    ase = types.ModuleType("ase")
-    ase_build = types.ModuleType("ase.build")
-    ase_build.bulk = lambda *args, **kwargs: None
-    monkeypatch.setitem(sys.modules, "symmetrix", package)
-    monkeypatch.setitem(sys.modules, "symmetrix.symmetrix", native)
-    monkeypatch.setitem(sys.modules, "ase", ase)
-    monkeypatch.setitem(sys.modules, "ase.build", ase_build)
-    monkeypatch.delenv("SYMMETRIX_SOURCE_ROOT", raising=False)
-    monkeypatch.delenv("SYMMETRIX_EXTENSION", raising=False)
-
-    spec = importlib.util.spec_from_file_location(
-        "mh1_serial_benchmark_test", MH1_SCRIPT
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_mh1_benchmark_help_exposes_factorized_controls(monkeypatch, capsys):
-    benchmark = _load_mh1_benchmark(monkeypatch)
-    monkeypatch.setattr(sys, "argv", [str(MH1_SCRIPT), "--help"])
-    with pytest.raises(SystemExit) as exc:
-        benchmark.main()
-    assert exc.value.code == 0
-    output = capsys.readouterr().out
-    assert "--factorized-jit" in output
-    assert "--factorized-mh1-scratch-budget-bytes" in output
-    assert "--neighbor-skin" in output
-    assert "--execution-profile" in output
-    assert "--md-steps" in output
-    assert "--md-timestep-fs" in output
-    assert "--md-temperature-K" in output
-
-
-def test_mh1_md_timing_summary_reports_microseconds_per_atom_step(monkeypatch):
-    benchmark = _load_mh1_benchmark(monkeypatch)
-    summary = benchmark._md_timing_summary([80.0, 40.0, 60.0], 2000)
-    assert summary["median_ms"] == 60.0
-    assert summary["median_us_per_atom_per_step"] == pytest.approx(30.0)
-    assert summary["steps"] == 3
-
-
-def test_mh1_md_protocol_requires_exactly_20_steps(monkeypatch, capsys):
-    benchmark = _load_mh1_benchmark(monkeypatch)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [str(MH1_SCRIPT), "missing.json", "--atom-counts", "2048", "--md-steps", "19"],
-    )
-    with pytest.raises(SystemExit) as exc:
-        benchmark.main()
-    assert exc.value.code == 2
-    assert "--md-steps must be 20" in capsys.readouterr().err
-
-
-def test_mh1_md_protocol_requires_positive_neighbor_skin(monkeypatch, capsys):
-    benchmark = _load_mh1_benchmark(monkeypatch)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            str(MH1_SCRIPT),
-            "missing.json",
-            "--atom-counts",
-            "2048",
-            "--md-steps",
-            "20",
-            "--neighbor-skin",
-            "0",
-        ],
-    )
-    with pytest.raises(SystemExit) as exc:
-        benchmark.main()
-    assert exc.value.code == 2
-    assert "requires a positive --neighbor-skin" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize(
-    ("atom_count", "repeat"),
-    [(4, 1), (256, 4), (864, 6), (87_808, 28), (364_500, 45)],
-)
-def test_mh1_aln_atom_count_maps_to_wurtzite_repeat(monkeypatch, atom_count, repeat):
-    benchmark = _load_mh1_benchmark(monkeypatch)
-    assert benchmark._aln_repeat_from_atom_count(atom_count) == repeat
-
-
-@pytest.mark.parametrize("atom_count", [1, 8, 1000, 4001])
-def test_mh1_aln_atom_count_rejects_non_cubic_supercells(monkeypatch, atom_count):
-    benchmark = _load_mh1_benchmark(monkeypatch)
-    with pytest.raises(ValueError, match=r"wurtzite 4\*n\^3 supercell"):
-        benchmark._aln_repeat_from_atom_count(atom_count)
-
-
 def test_full_benchmark_help_exposes_nvtx_and_storage_policies(monkeypatch, capsys):
     benchmark = _load_benchmark(monkeypatch)
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--help"])
@@ -175,29 +52,12 @@ def test_full_benchmark_help_exposes_nvtx_and_storage_policies(monkeypatch, caps
             "--modes",
             ("materialized", "generic", "direct"),
         ),
-        (
-            "macefield",
-            MACEFIELD_SCRIPT,
-            "--modes",
-            ("materialized", "generic", "direct"),
-        ),
-        (
-            "mh1",
-            MH1_SCRIPT,
-            "--streamed-edges",
-            ("materialized", "generic", "direct"),
-        ),
     ],
 )
 def test_benchmark_cli_rejects_removed_second_interaction(
     monkeypatch, capsys, benchmark_name, script, option, canonical_modes
 ):
-    loaders = {
-        "standard": _load_benchmark,
-        "macefield": _load_macefield_benchmark,
-        "mh1": _load_mh1_benchmark,
-    }
-    benchmark = loaders[benchmark_name](monkeypatch)
+    benchmark = _load_benchmark(monkeypatch)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -641,91 +501,6 @@ def test_standard_m0_report_tracks_provenance_launches_and_workspace(monkeypatch
         "poly_values": {"active_bytes": 0, "capacity_bytes": 1024},
         "poly_adjoints": {"active_bytes": 0, "capacity_bytes": 2048},
     }
-
-
-def test_macefield_standard_m0_report_tracks_measured_launches(monkeypatch):
-    benchmark = _load_macefield_benchmark(monkeypatch)
-    evaluator = types.SimpleNamespace(
-        standard_m0_module_ready=True,
-        standard_m0_module_fallback_reason="",
-        standard_m0_module_id="omat-medium-m0-v1",
-        standard_m0_module_revision=2,
-        standard_m0_model_structure_fingerprint="sha256:fixture",
-        standard_m0_selected_executor="standard",
-        standard_m0_poly_values_active_bytes=0,
-        standard_m0_poly_values_capacity_bytes=1024,
-        standard_m0_poly_adjoints_active_bytes=0,
-        standard_m0_poly_adjoints_capacity_bytes=2048,
-    )
-    before = {
-        "standard_m0_module_forward_launch_count": 2,
-        "standard_m0_module_reverse_launch_count": 3,
-    }
-    after = {
-        "standard_m0_module_forward_launch_count": 7,
-        "standard_m0_module_reverse_launch_count": 8,
-    }
-
-    report = benchmark._standard_m0_report(evaluator, "standard", before, after)
-    assert report["selected_executor"] == "standard"
-    assert report["measured_module_forward_launches"] == 5
-    assert report["measured_module_reverse_launches"] == 5
-    assert report["poly_values"]["active_bytes"] == 0
-    assert report["poly_adjoints"]["active_bytes"] == 0
-
-
-def test_macefield_cli_normalizes_factorized_compatibility_alias(monkeypatch, tmp_path):
-    benchmark = _load_macefield_benchmark(monkeypatch)
-    model = tmp_path / "field-model.json"
-    model.write_text("{}")
-
-    class Atoms:
-        def repeat(self, repeats):
-            assert repeats == (6, 6, 6)
-            return self
-
-        def __len__(self):
-            return 864
-
-    calls = []
-    monkeypatch.setattr(benchmark, "bulk", lambda *args, **kwargs: Atoms())
-    monkeypatch.setattr(
-        benchmark,
-        "_evaluate",
-        lambda *args: calls.append(args) or {"mode": args[4]},
-    )
-    benchmark.native_symmetrix._kokkos_default_execution_space = lambda: "HIP"
-    benchmark.native_symmetrix._kokkos_is_initialized = lambda: False
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            str(MACEFIELD_SCRIPT),
-            str(model),
-            "--modes",
-            "factorized",
-            "--factorized-launch-policy",
-            "static",
-            "--factorized-r0-executor",
-            "v2_edge16",
-            "--factorized-m0-executor",
-            "standard",
-            "--warmups",
-            "0",
-            "--repeats",
-            "1",
-        ],
-    )
-
-    benchmark.main()
-
-    assert len(calls) == 1
-    assert calls[0][4:8] == (
-        "direct",
-        "static",
-        "v2_edge16",
-        "standard",
-    )
 
 
 def test_m1_polynomial_report_tracks_storage_and_launches(monkeypatch):
