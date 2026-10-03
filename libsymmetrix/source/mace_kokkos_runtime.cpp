@@ -1718,7 +1718,8 @@ void MACEKokkos<Precision>::set_mh0_state_policy(std::string policy)
         if (!m0_supports_low_memory())
             throw std::invalid_argument(
                 "MH-0 adjoint reuse requires a state-free M0 implementation.");
-        if (factorized_observer_enabled || execution_parameter_gradients_enabled)
+        if (factorized_observer_enabled || execution_parameter_gradients_enabled
+                || direct_parameter_gradients_enabled)
             throw std::invalid_argument(
                 "MH-0 adjoint reuse does not support observers or parameter "
                 "gradients.");
@@ -1763,7 +1764,8 @@ std::string MACEKokkos<Precision>::mh0_state_policy_fallback_reason_name() const
         return "a state-free M0 implementation is not active";
     if (factorized_observer_enabled)
         return "the factorized observer is active";
-    if (execution_parameter_gradients_enabled)
+    if (execution_parameter_gradients_enabled
+            || direct_parameter_gradients_enabled)
         return "parameter gradients are active";
     return "MH-0 adjoint reuse is unavailable";
 }
@@ -2064,6 +2066,9 @@ void MACEKokkos<Precision>::set_readout_policy(std::string policy)
             "readout policy must be 'retained' or 'recompute'.");
     if (recompute == readout_recompute)
         return;
+    if (recompute && direct_parameter_gradients_enabled)
+        throw std::invalid_argument(
+            "Readout recomputation does not support direct parameter gradients.");
     Kokkos::fence("Change readout policy");
     readout_recompute = recompute;
     if (readout_recompute) {
@@ -2083,7 +2088,8 @@ bool MACEKokkos<Precision>::use_channel_tiled_phi1() const
         && jit_device_plugin_ready()
         && jit_device_plugin->supports_tiled_r1()
         && !factorized_observer_enabled
-        && !execution_parameter_gradients_enabled;
+        && !execution_parameter_gradients_enabled
+        && !direct_parameter_gradients_enabled;
 #else
     return false;
 #endif
@@ -2145,7 +2151,8 @@ void MACEKokkos<Precision>::set_phi1_policy(std::string policy)
         throw std::invalid_argument(
             "experimental Phi1 policies require HIP or CUDA execution.");
 #endif
-        if (factorized_observer_enabled || execution_parameter_gradients_enabled)
+        if (factorized_observer_enabled || execution_parameter_gradients_enabled
+                || direct_parameter_gradients_enabled)
             throw std::invalid_argument(
                 "experimental Phi1 policies do not support observers or parameter gradients.");
         if (requested == Phi1Policy::channel_tiled_64
@@ -2291,7 +2298,8 @@ void MACEKokkos<Precision>::set_harmonic_storage_policy(std::string policy)
         if (phi1_policy != Phi1Policy::retained && !use_channel_tiled_phi1())
             throw std::invalid_argument(
                 "y-only-direct-v1 requires retained or channel-tiled-64 Phi1.");
-        if (factorized_observer_enabled || execution_parameter_gradients_enabled)
+        if (factorized_observer_enabled || execution_parameter_gradients_enabled
+                || direct_parameter_gradients_enabled)
             throw std::invalid_argument(
                 "y-only-direct-v1 does not support observers or parameter gradients.");
         if (l_max != 3)
@@ -2922,7 +2930,9 @@ void MACEKokkos<Precision>::apply_low_memory_policy(
         select_harmonics(HarmonicStoragePolicy::retained);
         set_phi1_policy("retained");
         set_mh0_state_policy("full-retention-v1");
-        set_m1_polynomial_policy(low_memory_speed_m1_policy_request);
+        set_m1_polynomial_policy(
+            direct_parameter_gradients_enabled
+                ? "retained" : low_memory_speed_m1_policy_request);
         set_readout_policy("retained");
         set_edge_geometry_policy("cartesian-f64-v1");
         harmonic_storage_selection_reason =
@@ -3682,7 +3692,8 @@ void MACEKokkos<Precision>::set_low_memory(const bool enabled)
     if (!m0_supports_low_memory())
         throw std::invalid_argument(
             "Low-memory execution requires a state-free M0 implementation.");
-    if (factorized_observer_enabled || execution_parameter_gradients_enabled)
+    if (factorized_observer_enabled || execution_parameter_gradients_enabled
+            || direct_parameter_gradients_enabled)
         throw std::invalid_argument(
             "Low-memory execution does not support observers or parameter gradients.");
 
@@ -4699,7 +4710,8 @@ bool MACEKokkos<Precision>::use_r0_module() const
             || mace_uses_prepared_execution(streamed_edges))
         && selected_r0_implementation != R0Implementation::generic
         && !factorized_observer_enabled
-        && !execution_parameter_gradients_enabled;
+        && !execution_parameter_gradients_enabled
+        && !direct_parameter_gradients_enabled;
 }
 
 template <typename Precision>
@@ -4710,7 +4722,8 @@ bool MACEKokkos<Precision>::use_m0_module() const
         && selected_m0_implementation != M0Implementation::generic
         && standard_m0_executor != StandardM0Executor::runtime
         && !factorized_observer_enabled
-        && !execution_parameter_gradients_enabled;
+        && !execution_parameter_gradients_enabled
+        && !direct_parameter_gradients_enabled;
 }
 
 template <typename Precision>
@@ -4834,7 +4847,8 @@ std::string MACEKokkos<Precision>::factorized_execution_profile_name() const
 template <typename Precision>
 std::string MACEKokkos<Precision>::factorized_derivative_signature_name() const
 {
-    if (execution_parameter_gradients_enabled)
+    if (execution_parameter_gradients_enabled
+            || direct_parameter_gradients_enabled)
         return "parameter_coordinate";
     return use_factorized_direct_inference()
         ? "fixed_weight_coordinate" : "factorized_coordinate";

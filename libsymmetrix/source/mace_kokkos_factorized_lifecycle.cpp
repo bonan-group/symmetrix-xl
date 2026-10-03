@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -50,6 +51,27 @@ using Kokkos::View;
 #include "mace_kokkos_kernel_launch_detail.hpp"
 
 namespace {
+
+bool finite_double_bits(const double value)
+{
+    constexpr std::uint64_t exponent_mask = 0x7ff0000000000000ULL;
+    return (std::bit_cast<std::uint64_t>(value)&exponent_mask)
+        != exponent_mask;
+}
+
+int checked_execution_num_edges(const std::size_t num_edges)
+{
+    if (num_edges > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::length_error(
+            "Prepared Execution R1 graph exceeds 32-bit directed-edge indexing.");
+    return static_cast<int>(num_edges);
+}
+
+bool has_three_component_extent(
+    const std::size_t flattened_size, const std::size_t item_count)
+{
+    return flattened_size%3 == 0 && flattened_size/3 == item_count;
+}
 
 struct DualLayerSourceEdge {
     int source;
@@ -853,6 +875,7 @@ void MACEKokkos<Precision>::compute_prepared_all_interactions_positions(
 template <typename Precision>
 void MACEKokkos<Precision>::invalidate_factorized_prepared_graph()
 {
+    invalidate_direct_training_state();
     factorized_prepared_graph_generation = 0;
     factorized_prepared_geometry_graph_generation = 0;
     factorized_prepared_geometry_fractional = false;
@@ -2772,6 +2795,52 @@ void MACEKokkos<Precision>::update_factorized_cell(
 }
 
 template <typename Precision>
+void MACEKokkos<Precision>::compute_prepared_factorized_device(
+    const std::uint64_t graph_generation,
+    Kokkos::View<const double*> xyz,
+    Kokkos::View<const double*> r)
+{
+    if (!mace_uses_prepared_execution(streamed_edges))
+        throw std::invalid_argument(
+            "An execution graph token requires streamed_edges='direct'.");
+    if (graph_generation == 0
+        || graph_generation != factorized_prepared_graph_generation
+        || factorized_schedule_dirty)
+        throw std::invalid_argument(
+            "Execution R1 graph token is stale; prepare the graph again.");
+    if (execution_prepared_num_feature_nodes
+        != static_cast<int>(execution_prepared_node_types.extent(0)))
+        throw std::invalid_argument(
+            "The monolithic factorized evaluator does not accept distributed graphs.");
+
+    const std::size_t num_edges = execution_prepared_neigh_indices.extent(0);
+    const bool compact_geometry =
+        edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64;
+    if (r.extent(0) < num_edges
+        || (!compact_geometry && xyz.extent(0) < 3*num_edges))
+        throw std::invalid_argument(
+            "Execution R1 prepared coordinates do not match the graph extents.");
+    Kokkos::View<const double*> active_xyz = xyz;
+    if (!compact_geometry)
+        active_xyz = Kokkos::subview(
+            xyz, Kokkos::make_pair(std::size_t(0), 3*num_edges));
+    const auto active_r = Kokkos::subview(
+        r, Kokkos::make_pair(std::size_t(0), num_edges));
+    compact_edge_geometry_active = compact_geometry;
+    try {
+        compute_node_energies_forces(
+            static_cast<int>(execution_prepared_node_types.extent(0)),
+            Kokkos::View<const int*>(), Kokkos::View<const int*>(),
+            Kokkos::View<const int*>(), Kokkos::View<const int*>(),
+            active_xyz, active_r, graph_generation);
+    } catch (...) {
+        compact_edge_geometry_active = false;
+        throw;
+    }
+    compact_edge_geometry_active = false;
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::compute_prepared_factorized(
     const std::uint64_t graph_generation,
     const std::span<const double> xyz,
@@ -2901,6 +2970,130 @@ void MACEKokkos<Precision>::compute_prepared_factorized(
         std::rethrow_exception(failure);
     }
     compact_edge_geometry_active = false;
+}
+
+template <typename Precision>
+DirectBatchEnergyLossResult
+MACEKokkos<Precision>::compute_prepared_factorized_energy_loss(
+    const std::uint64_t graph_generation,
+    const std::span<const double> xyz,
+    const std::span<const double> r,
+    const std::span<const std::size_t> structure_offsets,
+    const std::span<const double> reference_energies,
+    const std::span<const double> energy_residual_scales)
+{
+    begin_factorized_production_evaluation();
+    if (!mace_uses_direct_execution(streamed_edges))
+        throw std::invalid_argument(
+            "Native direct energy-loss batching requires streamed_edges='direct'.");
+    if (!direct_parameter_gradients_enabled)
+        throw std::invalid_argument(
+            "Native direct energy-loss batching requires easy-weight gradients.");
+    validate_direct_parameter_profile();
+    if (graph_generation == 0
+        || graph_generation != factorized_prepared_graph_generation
+        || factorized_schedule_dirty)
+        throw std::invalid_argument(
+            "Execution R1 graph token is stale; prepare the graph again.");
+    if (execution_prepared_num_feature_nodes
+        != static_cast<int>(execution_prepared_node_types.extent(0)))
+        throw std::invalid_argument(
+            "The native batch evaluator does not accept distributed graphs.");
+    if (reference_energies.empty()
+        || structure_offsets.size() != reference_energies.size()+1)
+        throw std::invalid_argument(
+            "Native batch offsets and reference energies are inconsistent.");
+    if (structure_offsets.front() != 0
+        || structure_offsets.back() != execution_prepared_node_types.extent(0))
+        throw std::invalid_argument(
+            "Native batch offsets do not cover the prepared node range.");
+    for (std::size_t index=1; index<structure_offsets.size(); ++index)
+        if (structure_offsets[index] <= structure_offsets[index-1])
+            throw std::invalid_argument(
+                "Native batch structures must be non-empty and ordered.");
+    for (const double reference : reference_energies)
+        if (!finite_double_bits(reference))
+            throw std::invalid_argument(
+                "Native batch reference energies must be finite.");
+    if (!energy_residual_scales.empty()
+        && energy_residual_scales.size() != reference_energies.size())
+        throw std::invalid_argument(
+            "Native batch energy residual scales must match the batch size.");
+    for (const double scale : energy_residual_scales)
+        if (!finite_double_bits(scale) || scale <= 0.0)
+            throw std::invalid_argument(
+                "Native batch energy residual scales must be finite and positive.");
+
+    const std::size_t num_edges = execution_prepared_neigh_indices.extent(0);
+    const int checked_num_edges = checked_execution_num_edges(num_edges);
+    if (r.size() != num_edges || !has_three_component_extent(xyz.size(), num_edges))
+        throw std::invalid_argument(
+            "Native batch coordinates do not match the graph extents.");
+    reserve_execution_geometry_workspace(checked_num_edges);
+    const bool compact_geometry =
+        edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64;
+    const auto xyz_device = execution_prepared_xyz;
+    const auto direction_device = execution_prepared_unit_direction;
+    const auto r_device = Kokkos::subview(
+        execution_prepared_r, Kokkos::make_pair(std::size_t(0), r.size()));
+    const auto xyz_host = Kokkos::View<
+        const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            xyz.data(), xyz.size());
+    const auto r_host = Kokkos::View<
+        const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            r.data(), r.size());
+    std::vector<Precision> direction_storage;
+    try {
+        if (compact_geometry) {
+            direction_storage.resize(xyz.size());
+            for (std::size_t edge=0; edge<num_edges; ++edge)
+                for (int component=0; component<3; ++component)
+                    direction_storage[3*edge+component] =
+                        static_cast<Precision>(
+                            xyz[3*edge+component]/r[edge]);
+            const auto direction_host = Kokkos::View<
+                const Precision*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+                    direction_storage.data(), direction_storage.size());
+            Kokkos::deep_copy(
+                factorized_execution_space,
+                Kokkos::subview(
+                    direction_device,
+                    Kokkos::make_pair(std::size_t(0), xyz.size())),
+                direction_host);
+        } else {
+            Kokkos::deep_copy(
+                factorized_execution_space,
+                Kokkos::subview(
+                    xyz_device,
+                    Kokkos::make_pair(std::size_t(0), xyz.size())),
+                xyz_host);
+        }
+        Kokkos::deep_copy(factorized_execution_space, r_device, r_host);
+        execution_geometry_copy_count += 2;
+        compact_edge_geometry_active = compact_geometry;
+        compute_node_energies_forces(
+            static_cast<int>(execution_prepared_node_types.extent(0)),
+            Kokkos::View<const int*>(), Kokkos::View<const int*>(),
+            Kokkos::View<const int*>(), Kokkos::View<const int*>(),
+            xyz_device, r_device, graph_generation, false,
+            structure_offsets, reference_energies, energy_residual_scales);
+    } catch (...) {
+        compact_edge_geometry_active = false;
+        const auto failure = std::current_exception();
+        factorized_execution_space.fence(
+            "Execution R1 failed batch host input lifetime");
+        factorized_evaluation_fence_count += 1;
+        std::rethrow_exception(failure);
+    }
+    compact_edge_geometry_active = false;
+
+    DirectBatchEnergyLossResult result;
+    result.energies = direct_batch_energies;
+    result.loss = direct_batch_loss;
+    result.batch_size = reference_energies.size();
+    result.num_nodes = execution_prepared_node_types.extent(0);
+    result.num_edges = num_edges;
+    return result;
 }
 
 template <typename Precision>

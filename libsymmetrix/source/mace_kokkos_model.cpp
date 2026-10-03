@@ -498,6 +498,7 @@ void MACEKokkos<Precision>::load_from_json(
             }
         }
     }
+    standard_m0_canonical_rows = canonical_m0_rows;
     this->m0_correlation = m0_correlation;
     m0_module_term_count = std::accumulate(
         m0_term_counts.begin(), m0_term_counts.end(), 0);
@@ -690,6 +691,7 @@ void MACEKokkos<Precision>::load_from_json(
     // M0_poly_coeff
     M0_poly_coeff = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
         Kokkos::view_alloc("M0_poly_coeff",Kokkos::SequentialHostInit), num_LM);
+    M0_term_coefficient_nodes.assign(num_LM, {});
     for (int LM=0; LM<num_LM; ++LM) {
         const auto P = MultivariatePolynomial(
             num_lm,
@@ -697,6 +699,7 @@ void MACEKokkos<Precision>::load_from_json(
             M0_monomials_file[std::to_string(LM)]);
         const auto coefficient_nodes = polynomial_coefficient_nodes(
             P, M0_monomials_file[std::to_string(LM)]);
+        M0_term_coefficient_nodes[LM] = coefficient_nodes;
         M0_poly_coeff(LM) = Kokkos::View<Precision***,Kokkos::LayoutRight>(
             Kokkos::view_alloc(std::string("M0_poly_coeff_")+std::to_string(LM),Kokkos::WithoutInitializing),
             atomic_numbers.size(), P.node_coefficients.size(), num_channels);
@@ -1128,6 +1131,7 @@ void MACEKokkos<Precision>::load_from_json(
             && symmetrix::standard_m1::matches_structure(
                 num_lm, M1_monomials, &canonical_m1_rows);
     }
+    standard_m1_canonical_rows = canonical_m1_rows;
     Kokkos::resize(this->M1_weights, atomic_numbers.size(), num_terms, num_channels);
     auto h_M1_weights = Kokkos::create_mirror_view(this->M1_weights);
     for (int type=0; type<static_cast<int>(atomic_numbers.size()); ++type)
@@ -1147,6 +1151,7 @@ void MACEKokkos<Precision>::load_from_json(
         M1_monomials);
     const auto M1_coefficient_nodes = polynomial_coefficient_nodes(
         P1, M1_monomials);
+    M1_term_coefficient_nodes = M1_coefficient_nodes;
     // M1_poly_spec
     Kokkos::realloc(M1_poly_spec, P1.edges.size(), 2);
     auto h_M1_poly_spec = Kokkos::create_mirror_view(M1_poly_spec);

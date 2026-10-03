@@ -17,9 +17,12 @@ MultilayerPerceptronKokkos();
     MultilayerPerceptronKokkos& operator=(
         const MultilayerPerceptronKokkos&) = delete;
     MultilayerPerceptronKokkos(MultilayerPerceptronKokkos&&) = default;
-    MultilayerPerceptronKokkos& operator=(
-        MultilayerPerceptronKokkos&&) = default;
-    ~MultilayerPerceptronKokkos() = default;
+MultilayerPerceptronKokkos& operator=(
+    MultilayerPerceptronKokkos&&) = default;
+~MultilayerPerceptronKokkos() = default;
+
+std::vector<std::vector<double>> get_weights() const;
+void set_weights(const std::vector<std::vector<double>>& weights);
 
 void evaluate(Kokkos::View<const double**,Kokkos::LayoutRight> x, Kokkos::View<double*,Kokkos::LayoutRight> f);
 void evaluate(
@@ -54,6 +57,20 @@ void evaluate_gradient_directional(
     Kokkos::View<double**,Kokkos::LayoutRight> g,
     Kokkos::View<double**,Kokkos::LayoutRight> g_dot,
     bool completion_fence);
+
+void accumulate_weight_gradients(
+    const Kokkos::DefaultExecutionSpace& execution_space,
+    int batch_size,
+    Kokkos::View<double*,Kokkos::LayoutRight> first_layer_gradient,
+    Kokkos::View<double*,Kokkos::LayoutRight> final_layer_gradient,
+    bool completion_fence = true);
+void accumulate_weight_gradients(
+    const Kokkos::DefaultExecutionSpace& execution_space,
+    int batch_size,
+    Kokkos::View<double*,Kokkos::LayoutRight> first_layer_gradient,
+    Kokkos::View<double*,Kokkos::LayoutRight> final_layer_gradient,
+    Kokkos::View<const double*,Kokkos::LayoutRight> output_weights,
+    bool completion_fence = true);
 void evaluate_gradient_directional_recompute(
     Kokkos::View<const double**,Kokkos::LayoutRight> x,
     Kokkos::View<const double**,Kokkos::LayoutRight> x_dot,

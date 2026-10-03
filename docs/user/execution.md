@@ -75,3 +75,19 @@ described in {doc}`/streamed_edge_execution`.
 The graph-time execution-plan report currently covers MH-0 MACE and MACEField.
 MH-1 direct execution has its own qualified policies but does not yet expose
 the corresponding planner report.
+
+## Native training batches
+
+`DirectMACEEnergyTrainer.step_batch(..., batch_mode="native")` concatenates
+non-empty ASE structures into one disconnected prepared graph. Structure
+offsets keep energies and residual seeds separate, so no cross-structure edges
+are introduced. The prepared graph is owned by its trainer and is invalidated
+when graph generation or structure geometry changes; a prepared batch cannot
+be reused by another trainer. Use `batch_mode="sequential"` when comparing
+against one-structure-at-a-time gradients.
+
+Force training uses the same prepared graph and a fixed central-coordinate
+finite-difference displacement. The displacement must satisfy
+`4 * displacement <= neighbor_skin`, ensuring the candidate graph remains
+valid for both displaced evaluations. Force and joint training are limited to
+the direct, fully retained ordinary-MACE profile.

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -19,6 +20,8 @@ using ContiguousIntArray =
     py::array_t<int, py::array::c_style | py::array::forcecast>;
 using ContiguousDoubleArray =
     py::array_t<double, py::array::c_style | py::array::forcecast>;
+using ContiguousSizeTArray =
+    py::array_t<std::size_t, py::array::c_style | py::array::forcecast>;
 
 template <typename T>
 py::array_t<T> shaped_array(
@@ -1261,6 +1264,174 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                 result["groups"] = std::move(groups);
                 return result;
             })
+        .def_property_readonly("direct_parameter_gradients_enabled",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.direct_parameter_gradients_enabled;
+            })
+        .def_property_readonly("direct_parameter_gradients_ready",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.direct_parameter_gradients_ready;
+            })
+        .def_property_readonly("direct_parameter_gradient_capture_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.direct_parameter_gradient_capture_count;
+            })
+        .def_property_readonly("direct_parameter_gradients_result_bytes",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.direct_parameter_gradients_result_bytes;
+            })
+        .def_property_readonly("direct_parameter_gradient_kernel_policy",
+            &MACEKokkos<Precision>::direct_parameter_gradient_kernel_policy)
+        .def_property_readonly("direct_mlp_parameter_gradient_policy",
+            &MACEKokkos<Precision>::direct_mlp_parameter_gradient_policy)
+        .def_property_readonly("direct_h1_parameter_gradient_policy",
+            &MACEKokkos<Precision>::direct_h1_parameter_gradient_policy)
+        .def_property_readonly("direct_training_workspace_bytes",
+            &MACEKokkos<Precision>::direct_training_workspace_bytes)
+        .def_property_readonly("direct_training_host_to_device_bytes",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.direct_training_host_to_device_bytes;
+            })
+        .def_property_readonly("direct_training_device_to_host_bytes",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.direct_training_device_to_host_bytes;
+            })
+        .def_property_readonly("direct_training_fallback_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.direct_training_fallback_count;
+            })
+        .def_property_readonly("direct_training_fallback_reason",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.direct_training_fallback_reason;
+            })
+        .def("set_direct_parameter_gradients",
+            [] (MACEKokkos<Precision>& self, const bool enabled,
+                const std::size_t max_bytes) {
+                self.set_direct_parameter_gradients(enabled, max_bytes);
+            },
+            py::arg("enabled"),
+            py::arg("max_bytes") = std::size_t(256)*1024*1024)
+        .def("direct_parameter_names",
+            &MACEKokkos<Precision>::direct_parameter_names)
+        .def("direct_parameter_shapes",
+            &MACEKokkos<Precision>::direct_parameter_shapes)
+        .def("get_direct_parameters",
+            &MACEKokkos<Precision>::get_direct_parameters)
+        .def("set_direct_parameters",
+            [] (MACEKokkos<Precision>& self,
+                const std::map<std::string,std::vector<double>>& parameters) {
+                self.set_direct_parameters(parameters);
+            })
+        .def("configure_direct_optimizer",
+            [] (MACEKokkos<Precision>& self, const std::string& optimizer,
+                const double beta1, const double beta2, const double epsilon,
+                const bool amsgrad, const double momentum, const bool nesterov,
+                const double gradient_clip_norm,
+                const std::vector<std::vector<std::string>>& group_names,
+                const std::vector<double>& learning_rates,
+                const std::vector<double>& weight_decays) {
+                self.configure_direct_optimizer(
+                    optimizer, beta1, beta2, epsilon, amsgrad, momentum,
+                    nesterov, gradient_clip_norm, group_names, learning_rates,
+                    weight_decays);
+            },
+            py::arg("optimizer"), py::arg("beta1"), py::arg("beta2"),
+            py::arg("epsilon"), py::arg("amsgrad"), py::arg("momentum"),
+            py::arg("nesterov"), py::arg("gradient_clip_norm"),
+            py::arg("group_names"), py::arg("learning_rates"),
+            py::arg("weight_decays"))
+        .def("set_direct_optimizer_learning_rates",
+            &MACEKokkos<Precision>::set_direct_optimizer_learning_rates,
+            py::arg("learning_rates"))
+        .def("_scale_direct_parameter_gradients",
+            &MACEKokkos<Precision>::scale_direct_parameter_gradients,
+            py::arg("weight"))
+        .def("_stash_direct_parameter_gradients",
+            &MACEKokkos<Precision>::stash_direct_parameter_gradients,
+            py::arg("weight"))
+        .def("_combine_stashed_direct_parameter_gradients",
+            &MACEKokkos<Precision>::combine_stashed_direct_parameter_gradients,
+            py::arg("weight"))
+        .def("_invalidate_direct_training_state",
+            &MACEKokkos<Precision>::invalidate_direct_training_state)
+        .def("apply_direct_optimizer_step",
+            [] (MACEKokkos<Precision>& self) {
+                const auto diagnostics = self.apply_direct_optimizer_step();
+                py::dict result;
+                result["gradient_norm"] = diagnostics.gradient_norm;
+                result["clip_coefficient"] = diagnostics.clip_coefficient;
+                result["clipped"] = diagnostics.clipped;
+                result["step"] = diagnostics.step;
+                return result;
+            })
+        .def_property_readonly("direct_optimizer_step_count",
+            &MACEKokkos<Precision>::direct_optimizer_step_count)
+        .def("direct_optimizer_state",
+            &MACEKokkos<Precision>::direct_optimizer_state)
+        .def("set_direct_optimizer_state",
+            &MACEKokkos<Precision>::set_direct_optimizer_state,
+            py::arg("step"), py::arg("state"))
+        .def("direct_parameter_gradients",
+            [] (const MACEKokkos<Precision>& self) {
+                const auto double_array = [] (
+                    const std::vector<double>& values) {
+                    py::array_t<double> result(values.size());
+                    std::copy(values.begin(), values.end(), result.mutable_data());
+                    return result;
+                };
+                py::dict result;
+                result["schema"] = "symmetrix.direct.parameter-gradients";
+                result["version"] = 1;
+                result["execution"] = self.streamed_edges_mode();
+                result["model"] = "standard-mace-compact-v2";
+                result["profile"] = "easily-trainable-v1";
+                result["coverage"] = "compact-trainable-subset";
+                result["enabled"] = self.direct_parameter_gradients_enabled;
+                result["ready"] = self.direct_parameter_gradients_ready;
+                switch (self.direct_gradient_objective) {
+                case DirectGradientObjective::total_energy:
+                    result["objective"] = "total-energy";
+                    break;
+                case DirectGradientObjective::mean_half_squared_energy:
+                    result["objective"] = "mean-half-squared-energy";
+                    break;
+                case DirectGradientObjective::mean_half_squared_force_finite_difference:
+                    result["objective"] = "mean-half-squared-force";
+                    break;
+                case DirectGradientObjective::weighted_energy_force:
+                    result["objective"] = "weighted-energy-force";
+                    break;
+                }
+                result["finite_difference_displacement"] =
+                    self.direct_gradient_finite_difference_displacement;
+                result["result_bytes"] = self.direct_parameter_gradients_result_bytes;
+                result["max_bytes"] = self.direct_parameter_gradients_max_bytes;
+                result["working_dtype"] = std::is_same_v<Precision,float>
+                    ? "float32" : "float64";
+                result["frozen_families"] = py::make_tuple(
+                    "atomic_energies", "H0_weights", "A0_weights",
+                    "compact_radial", "zbl");
+                self.factorized_execution_space.fence(
+                    "Export direct parameter gradients");
+                const auto host_gradients = Kokkos::create_mirror_view_and_copy(
+                    Kokkos::HostSpace(), self.direct_training_gradients);
+                py::list groups;
+                for (const auto& source : self.direct_parameter_gradient_groups) {
+                    py::dict group;
+                    group["name"] = source.name;
+                    group["layout"] = source.layout;
+                    group["shape"] = source.shape;
+                    std::vector<double> values(source.elements);
+                    for (std::size_t index=0; index<source.elements; ++index)
+                        values[index] = static_cast<double>(
+                            host_gradients(source.offset+index));
+                    group["values"] = double_array(values);
+                    group["trainable"] = true;
+                    groups.append(std::move(group));
+                }
+                result["groups"] = std::move(groups);
+                return result;
+            })
         .def("_set_factorized_observer",
             [] (MACEKokkos<Precision>& self,
                 const bool enabled,
@@ -1718,6 +1889,113 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                     std::span<const double>(r.data(), r.size()));
             },
             py::arg("execution_graph_generation"), py::arg("xyz"), py::arg("r"))
+        .def("_compute_prepared_factorized_energy_loss",
+            [] (MACEKokkos<Precision>& self,
+                    const std::uint64_t execution_graph_generation,
+                    ContiguousDoubleArray xyz,
+                    ContiguousDoubleArray r,
+                    ContiguousSizeTArray structure_offsets,
+                    ContiguousDoubleArray reference_energies,
+                    py::object energy_residual_scales_object) {
+                ContiguousDoubleArray energy_residual_scales;
+                if (!energy_residual_scales_object.is_none())
+                    energy_residual_scales = py::cast<ContiguousDoubleArray>(
+                        energy_residual_scales_object);
+                if (structure_offsets.ndim() != 1
+                    || reference_energies.ndim() != 1
+                    || (!energy_residual_scales_object.is_none()
+                        && energy_residual_scales.ndim() != 1))
+                    throw std::invalid_argument(
+                        "Native batch offsets, references, and scales must be one-dimensional.");
+                const auto result =
+                    self.compute_prepared_factorized_energy_loss(
+                        execution_graph_generation,
+                        std::span<const double>(xyz.data(), xyz.size()),
+                        std::span<const double>(r.data(), r.size()),
+                        std::span<const std::size_t>(
+                            structure_offsets.data(), structure_offsets.size()),
+                        std::span<const double>(
+                            reference_energies.data(), reference_energies.size()),
+                        energy_residual_scales_object.is_none()
+                            ? std::span<const double>()
+                            : std::span<const double>(
+                                energy_residual_scales.data(),
+                                energy_residual_scales.size()));
+                py::dict output;
+                output["energies"] = result.energies;
+                output["loss"] = result.loss;
+                output["batch_size"] = result.batch_size;
+                output["num_nodes"] = result.num_nodes;
+                output["num_edges"] = result.num_edges;
+                return output;
+            },
+            py::arg("execution_graph_generation"), py::arg("xyz"),
+            py::arg("r"), py::arg("structure_offsets"),
+            py::arg("reference_energies"),
+            py::arg("energy_residual_scales") = py::none())
+        .def("_compute_prepared_direct_force_loss",
+            [] (MACEKokkos<Precision>& self,
+                    const std::uint64_t execution_graph_generation,
+                    ContiguousDoubleArray positions,
+                    ContiguousIntArray edge_shifts,
+                    ContiguousDoubleArray cells,
+                    ContiguousIntArray pbc,
+                    ContiguousSizeTArray structure_offsets,
+                    ContiguousIntArray edge_structures,
+                    ContiguousDoubleArray reference_forces,
+                    const double displacement,
+                    const double neighbor_skin,
+                    const bool return_forces) {
+                if (positions.ndim() != 1 || edge_shifts.ndim() != 1
+                    || cells.ndim() != 1 || pbc.ndim() != 1
+                    || structure_offsets.ndim() != 1
+                    || edge_structures.ndim() != 1
+                    || reference_forces.ndim() != 1)
+                    throw std::invalid_argument(
+                        "Native direct force-loss arrays must be one-dimensional.");
+                const auto result = self.compute_prepared_direct_force_loss(
+                    execution_graph_generation,
+                    std::span<const double>(positions.data(), positions.size()),
+                    std::span<const int>(edge_shifts.data(), edge_shifts.size()),
+                    std::span<const double>(cells.data(), cells.size()),
+                    std::span<const int>(pbc.data(), pbc.size()),
+                    std::span<const std::size_t>(
+                        structure_offsets.data(), structure_offsets.size()),
+                    std::span<const int>(
+                        edge_structures.data(), edge_structures.size()),
+                    std::span<const double>(
+                        reference_forces.data(), reference_forces.size()),
+                    displacement, neighbor_skin, return_forces);
+                py::dict output;
+                output["energies"] = result.energies;
+                if (return_forces) {
+                    py::array_t<double> forces(result.forces.size());
+                    std::copy(result.forces.begin(), result.forces.end(),
+                              forces.mutable_data());
+                    output["forces"] = forces;
+                    output["structure_offsets"] = result.structure_offsets;
+                }
+                output["loss"] = result.loss;
+                output["force_rmse"] = result.force_rmse;
+                output["force_mae"] = result.force_mae;
+                output["max_abs_residual"] = result.max_abs_residual;
+                output["displacement"] = result.displacement;
+                output["batch_size"] = result.batch_size;
+                output["num_nodes"] = result.num_nodes;
+                output["num_edges"] = result.num_edges;
+                output["num_force_components"] = result.num_force_components;
+                output["zero_residual"] = result.zero_residual;
+                output["base_evaluation_ms"] = result.base_evaluation_ms;
+                output["negative_evaluation_ms"] = result.negative_evaluation_ms;
+                output["positive_evaluation_ms"] = result.positive_evaluation_ms;
+                output["combination_ms"] = result.combination_ms;
+                return output;
+            },
+            py::arg("execution_graph_generation"), py::arg("positions"),
+            py::arg("edge_shifts"), py::arg("cells"), py::arg("pbc"),
+            py::arg("structure_offsets"), py::arg("edge_structures"),
+            py::arg("reference_forces"), py::arg("displacement"),
+            py::arg("neighbor_skin"), py::arg("return_forces") = true)
         .def("_compute_prepared_factorized_positions",
             [] (MACEKokkos<Precision>& self,
                     const std::uint64_t execution_graph_generation,

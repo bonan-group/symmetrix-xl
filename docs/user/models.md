@@ -65,4 +65,25 @@ stress = atoms.get_stress()
 Use `Symmetrix("srtio3-mace.json", dtype="float64")` when higher numerical
 precision is required.
 
+## Direct training
+
+Training is available for ordinary compact MACE JSON through
+`DirectMACEEnergyTrainer`. The trainer admits `streamed_edges="direct"` with
+fully retained speed state and updates only the direct post-spline parameter
+subset. MACEField, single-layer models, low-memory/recompute profiles, and
+incomplete `reference_forces` inputs are rejected by the training API.
+
+```python
+from symmetrix import DirectMACEEnergyTrainer
+
+trainer = DirectMACEEnergyTrainer("srtio3-mace.json", dtype="float64")
+trainer.configure_optimizer(optimizer="adam", learning_rate=1.0e-4)
+trainer.train_step(atoms, reference_energy=energy)
+trainer.save_model("srtio3-mace-finetuned.json")
+trainer.save_training_state("srtio3-mace-training.npz")
+```
+
+Training checkpoints are state files, not deployment models. Keep them in a
+private training workspace and export a compact JSON model for inference.
+
 See {doc}`/reference/python_api` for the public calculator and ensemble API.
