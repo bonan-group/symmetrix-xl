@@ -174,6 +174,9 @@ Detection requires exactly one visible CUDA architecture. If no GPU is visible
 on the build host, or visible GPUs have different architectures, specify the
 deployment target explicitly, for example `--arch sm120`.
 
+On Apple silicon Macs, a source install builds an FP32 Apple GPU backend;
+see [Apple Metal](docs/user/metal.md).
+
 Inspect the installed backends and test the one selected for the current
 machine:
 
