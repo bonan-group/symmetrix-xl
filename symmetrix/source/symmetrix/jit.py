@@ -64,7 +64,7 @@ HIP_R1_EDGE_BLOCKS_PER_CU_ENVIRONMENT_VARIABLE = (
 )
 CACHE_SCHEMA = "symmetrix.jit.cache-key"
 MANIFEST_SCHEMA = "symmetrix.jit.artifact"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CUDA_BUILD_SCHEMA = "symmetrix.jit.cuda-build"
 CUDA_BUILD_VERSION = 1
 CUDA_MODULE_BUILD_SCHEMA = "symmetrix.jit.cuda-module-build"
@@ -141,6 +141,7 @@ _MANIFEST_FIELDS = {
 _KEY_INPUT_FIELDS = {
     "schema",
     "version",
+    "source_content_sha256",
     "source_sha256",
     "abi",
     "build",
@@ -275,10 +276,46 @@ class _CompilerAdapter:
 _COMPILER_ADAPTERS: dict[str, _CompilerAdapter] = {}
 
 
-def versioned_jit_artifact_name(name: str) -> str:
+def _source_content_digest(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _DIGEST.fullmatch(value):
+        raise ValueError("source_content_sha256 must be a SHA-256 digest")
+    return value
+
+
+def native_source_content_sha256(native_module: Any) -> str:
+    """Return the full source identity for the loaded native backend."""
+
+    query = getattr(native_module, "_backend_build_info", None)
+    if not callable(query):
+        raise JitError("the native extension does not report source build identity")
+    build_info = query()
+    if not isinstance(build_info, Mapping):
+        raise JitError("the native extension reported invalid source build identity")
+    try:
+        value = _source_content_digest(build_info.get("source_content_sha256"))
+        if value is None:
+            from .backend_loader import selected_backend
+
+            descriptor = selected_backend()
+            if descriptor is not None:
+                value = _source_content_digest(descriptor.get("source_content_sha256"))
+    except ValueError as error:
+        raise JitError(str(error)) from error
+    if value is None:
+        raise JitError("the native extension has no source content fingerprint")
+    return value
+
+
+def versioned_jit_artifact_name(
+    name: str, source_content_sha256: str | None = None
+) -> str:
     """Return the cache artifact basename for the current generation."""
 
-    return f"{name}_gen{JIT_GENERATION_VERSION}"
+    source_digest = _source_content_digest(source_content_sha256)
+    source_suffix = "" if source_digest is None else f"_src{source_digest}"
+    return f"{name}_gen{JIT_GENERATION_VERSION}{source_suffix}"
 
 
 def _register_compiler_adapter(adapter: _CompilerAdapter) -> None:
@@ -970,6 +1007,7 @@ def detect_cpu_identity() -> dict[str, Any]:
 def _key_inputs(
     source: str,
     *,
+    source_content_sha256: str | None,
     abi: Any,
     build: Any,
     compiler: Any,
@@ -983,6 +1021,7 @@ def _key_inputs(
         {
             "schema": CACHE_SCHEMA,
             "version": SCHEMA_VERSION,
+            "source_content_sha256": _source_content_digest(source_content_sha256),
             "source_sha256": _sha256_bytes(source.encode("utf-8")),
             "abi": abi,
             "build": build,
@@ -999,6 +1038,7 @@ def _key_inputs(
 def jit_cache_key(
     source: str,
     *,
+    source_content_sha256: str | None = None,
     abi: Any,
     build: Any,
     compiler: Any,
@@ -1010,12 +1050,15 @@ def jit_cache_key(
 
     inputs = _key_inputs(
         source,
+        source_content_sha256=source_content_sha256,
         abi=abi,
         build=build,
         compiler=compiler,
         cpu=cpu,
         cxx_flags=cxx_flags,
-        artifact=_artifact_filename(versioned_jit_artifact_name(artifact_name)),
+        artifact=_artifact_filename(
+            versioned_jit_artifact_name(artifact_name, source_content_sha256)
+        ),
     )
     return _sha256_bytes(_canonical_json(inputs))
 
@@ -1685,6 +1728,7 @@ def remove_jit_quarantine(
 def _prepare_compiled_artifact(
     source: str,
     *,
+    source_content_sha256: str | None,
     abi: Any,
     configure,
     cache_root: str | os.PathLike[str] | None,
@@ -1708,11 +1752,12 @@ def _prepare_compiled_artifact(
         configuration: _CompileConfiguration = configure(diagnostics)
         compiler_command = configuration.command
         artifact_filename = _artifact_filename(
-            versioned_jit_artifact_name(artifact_name),
+            versioned_jit_artifact_name(artifact_name, source_content_sha256),
             configuration.artifact_suffix,
         )
         inputs = _key_inputs(
             source,
+            source_content_sha256=source_content_sha256,
             abi=abi,
             build=configuration.build,
             compiler=configuration.compiler,
@@ -2246,6 +2291,7 @@ def prepare_execution_compiler_artifact(
     *,
     abi: Any,
     request: CompilerRequest,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     artifact_name: str = "execution_gpu_artifact",
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
@@ -2268,6 +2314,7 @@ def prepare_execution_compiler_artifact(
         )
     return _prepare_compiled_artifact(
         source,
+        source_content_sha256=source_content_sha256,
         abi=abi,
         configure=lambda diagnostics: adapter.configure(request, diagnostics),
         cache_root=cache_root,
@@ -2283,6 +2330,7 @@ def prepare_jit_artifact(
     *,
     abi: Any,
     build: Any,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     cxx: str | os.PathLike[str] | Sequence[str] | None = None,
     cxx_flags: Sequence[str] | None = (),
@@ -2298,7 +2346,9 @@ def prepare_jit_artifact(
 
     The caller supplies the Symmetrix ABI and build identities because this
     standalone layer cannot infer the eventual plugin ABI.  It adds compiler,
-    CPU, source, and compile-option identities to the content key.
+    CPU, source, and compile-option identities to the content key. Production
+    native-backed callers should pass the loaded extension's full source
+    fingerprint; omission is retained for standalone compiler diagnostics.
     """
 
     def configure(diagnostics: list[str]) -> _CompileConfiguration:
@@ -2335,6 +2385,7 @@ def prepare_jit_artifact(
 
     return _prepare_compiled_artifact(
         source,
+        source_content_sha256=source_content_sha256,
         abi=abi,
         configure=configure,
         cache_root=cache_root,
@@ -2351,6 +2402,7 @@ def prepare_execution_cuda_jit_artifact(
     abi: Any,
     build: Any,
     compute_capability: Any,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     nvcc: str | os.PathLike[str] | Sequence[str] | None = None,
     nvcc_flags: Sequence[str] = (),
@@ -2386,6 +2438,7 @@ def prepare_execution_cuda_jit_artifact(
         source,
         abi=abi,
         request=request,
+        source_content_sha256=source_content_sha256,
         cache_root=cache_root,
         artifact_name=artifact_name,
         lock_timeout=lock_timeout,
@@ -2400,6 +2453,7 @@ def prepare_execution_hip_jit_artifact(
     abi: Any,
     build: Any,
     target: Any,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     hipcc: str | os.PathLike[str] | Sequence[str] | None = None,
     hipcc_flags: Sequence[str] = (),
@@ -2423,6 +2477,7 @@ def prepare_execution_hip_jit_artifact(
         source,
         abi=abi,
         request=request,
+        source_content_sha256=source_content_sha256,
         cache_root=cache_root,
         artifact_name=artifact_name,
         lock_timeout=lock_timeout,
@@ -2437,6 +2492,7 @@ def prepare_hiprtc_jit_artifact(
     abi: Any,
     build: Any,
     target: Any,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     hiprtc_options: Sequence[str] = (),
     artifact_name: str = "factorized_hip_module",
@@ -2462,6 +2518,7 @@ def prepare_hiprtc_jit_artifact(
         source,
         abi=abi,
         request=request,
+        source_content_sha256=source_content_sha256,
         cache_root=cache_root,
         artifact_name=artifact_name,
         lock_timeout=lock_timeout,
@@ -2821,6 +2878,7 @@ def prepare_nvrtc_jit_artifact(
     abi: Any,
     build: Any,
     compute_capability: Any,
+    source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     nvrtc_options: Sequence[str] = (),
     target: Any | None = None,
@@ -2855,6 +2913,7 @@ def prepare_nvrtc_jit_artifact(
         source,
         abi=abi,
         request=request,
+        source_content_sha256=source_content_sha256,
         cache_root=cache_root,
         artifact_name=artifact_name,
         lock_timeout=lock_timeout,
@@ -2875,13 +2934,13 @@ __all__ = [
     "HIP_R1_EDGE_THREADS_ENVIRONMENT_VARIABLE",
     "HOST_FLAGS_ENVIRONMENT_VARIABLE",
     "HOST_TARGET_ENVIRONMENT_VARIABLE",
+    "JIT_GENERATION_VERSION",
     "NVRTC_LIBRARY_ENVIRONMENT_VARIABLE",
     "CompilerRequest",
     "HostJitPolicy",
     "JitManifestError",
     "JitQuarantine",
     "JitResult",
-    "JIT_GENERATION_VERSION",
     "detect_cpu_identity",
     "execution_compiler_registry",
     "execution_cuda_jit_backend_request",
@@ -2892,6 +2951,7 @@ __all__ = [
     "jit_cache_root",
     "jit_hiprtc_information",
     "jit_nvrtc_information",
+    "native_source_content_sha256",
     "normalize_execution_hip_target_identity",
     "prepare_execution_compiler_artifact",
     "prepare_execution_cuda_jit_artifact",

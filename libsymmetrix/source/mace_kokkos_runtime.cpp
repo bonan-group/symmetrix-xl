@@ -2259,18 +2259,29 @@ void MACEKokkos<Precision>::ensure_mh0_a1_forward_capacity(
         ? num_nodes : std::max(num_nodes, execution_planned_receivers);
     if (A1.extent(0) >= static_cast<std::size_t>(capacity)
         && A1.extent_int(1) == num_lm
-        && A1.extent_int(2) == num_channels)
+        && A1.extent_int(2) == num_channels
+        && A1_inverse_scale.extent(0) >= static_cast<std::size_t>(capacity))
         return;
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
     execution_space.fence("Replace MH0 A1 forward state");
     if (A1.data() != nullptr && A1_adj.data() == A1.data())
         A1_adj = decltype(A1_adj)();
-    A1 = decltype(A1)();
-    A1 = decltype(A1)(
-        Kokkos::view_alloc(
-            "MH0 A1 forward state", Kokkos::WithoutInitializing),
-        capacity, num_lm, num_channels);
+    const bool a1_shape_ready = A1.extent(0) >= static_cast<std::size_t>(capacity)
+        && A1.extent_int(1) == num_lm
+        && A1.extent_int(2) == num_channels;
+    if (!a1_shape_ready) {
+        A1 = decltype(A1)();
+        A1 = decltype(A1)(
+            Kokkos::view_alloc(
+                "MH0 A1 forward state", Kokkos::WithoutInitializing),
+            capacity, num_lm, num_channels);
+    }
+    if (A1_inverse_scale.extent(0) < static_cast<std::size_t>(capacity))
+        A1_inverse_scale = decltype(A1_inverse_scale)(
+            Kokkos::view_alloc(
+                "MH0 A1 inverse scale", Kokkos::WithoutInitializing),
+            capacity);
 }
 
 template <typename Precision>
@@ -2347,7 +2358,8 @@ template <typename Precision>
 std::size_t MACEKokkos<Precision>::mh0_auxiliary_state_bytes() const
 {
     return sizeof(double)*(
-        mh0_a1_scale_adjoint.size()+mh0_a0_scale_adjoint.size());
+        mh0_a1_scale_adjoint.size()+mh0_a0_scale_adjoint.size()
+        +A1_inverse_scale.size());
 }
 
 template <typename Precision>
@@ -5317,6 +5329,13 @@ template <typename Precision>
 std::size_t MACEKokkos<Precision>::factorized_reverse_coupling_workspace_bytes() const
 {
     return factorized_coupling_workspace_bytes;
+}
+
+template <typename Precision>
+std::size_t MACEKokkos<Precision>::a1_blas_flatten_workspace_bytes() const
+{
+    return (A1_blas_flatten_input.span()+A1_blas_flatten_output.span())
+        * sizeof(Precision);
 }
 
 template <typename Precision>

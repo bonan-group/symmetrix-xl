@@ -1,6 +1,7 @@
 import copy
 import gc
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -4169,8 +4170,26 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
         assert evaluator.execution_phi1r_capacity_bytes == 0
         assert evaluator.execution_dphi1r_active_bytes == 0
         assert evaluator.execution_dphi1r_capacity_bytes == 0
-        assert evaluator.factorized_custom_blas_launch_count == 0
-        assert evaluator.factorized_blas_stream_bind_count == 0
+        requested_a1_cublas = os.environ.get("SYMMETRIX_A1_CUBLAS", "")
+        a1_cublas_enabled = requested_a1_cublas in ("", "1", "true", "on")
+        device_environment = getattr(
+            evaluator, "execution_device_execution_environment", {}
+        )
+        batched_blas_available = (
+            device_environment.get("batched_blas_available", False)
+            if isinstance(device_environment, dict)
+            else False
+        )
+        if (
+            _kokkos_execution_space() in ("Cuda", "HIP")
+            and a1_cublas_enabled
+            and batched_blas_available
+        ):
+            assert evaluator.factorized_custom_blas_launch_count > 0
+            assert evaluator.factorized_blas_stream_bind_count == 1
+        else:
+            assert evaluator.factorized_custom_blas_launch_count == 0
+            assert evaluator.factorized_blas_stream_bind_count == 0
 
     evaluator._set_factorized_planner_budget_bytes(evaluator.factorized_workspace_bytes)
     assert evaluator.factorized_graph_generation == 0

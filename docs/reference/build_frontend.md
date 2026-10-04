@@ -44,3 +44,13 @@ such as `cpu:x86-64-v3`, `cuda:13:sm120`, and `hip:7:gfx1151`. Direct CMake
 configuration remains a diagnostic path; the supported installation workflow
 is described in {doc}`/user/installation`, with backend-specific requirements
 in {doc}`/user/backends`.
+
+Within one fixed backend/toolchain configuration, repeated `install` commands
+are incremental and should reuse the same build root. The command installs
+`scikit-build-core`, `pybind11`, and `ninja` into the target environment once,
+then uses no-build-isolation and a forced reinstall of the selected
+distribution. It records the current source content fingerprint and passes
+that fingerprint into the native build metadata. Use a fresh process to verify
+the installed extension after each rebuild. Source changes require new
+fingerprinted JIT artifact keys, not a new package build root or cache
+directory.

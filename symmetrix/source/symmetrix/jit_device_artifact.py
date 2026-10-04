@@ -11,6 +11,7 @@ from . import symmetrix
 from .calculator import _factorized_device_backend_plan
 from .jit import (
     JIT_GENERATION_VERSION,
+    native_source_content_sha256,
     quarantine_jit_artifact,
     remove_jit_quarantine,
 )
@@ -159,6 +160,8 @@ def _prepare_and_validate(
         **prepare_arguments["build"],
         "jit_generation_version": JIT_GENERATION_VERSION,
     }
+    source_content_sha256 = native_source_content_sha256(symmetrix)
+    prepare_arguments["source_content_sha256"] = source_content_sha256
     if cache_root is not None:
         prepare_arguments["cache_root"] = cache_root
     diagnostics: tuple[str, ...] = ()
@@ -236,6 +239,7 @@ def _prepare_and_validate(
                     backend=backend,
                     target=environment,
                     jit_generation_version=JIT_GENERATION_VERSION,
+                    source_content_sha256=source_content_sha256,
                     cache_root=cache_root,
                 )
             )

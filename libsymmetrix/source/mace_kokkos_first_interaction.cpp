@@ -54,6 +54,44 @@ using Kokkos::TeamVectorMDRange;
 using Kokkos::View;
 #include "mace_kokkos_spherical_harmonics_detail.hpp"
 
+namespace {
+
+int resolve_r0_coordinate_reverse_blocks(
+    const std::size_t edge_count,
+    const int persistent_blocks,
+    const int threads_per_block,
+    const int compute_units)
+{
+#if defined(KOKKOS_ENABLE_CUDA)
+    // Coordinate reverse is an edge-grid-stride kernel. Once the selected
+    // grid makes each thread revisit many edge records, add one launch step
+    // while retaining the profile's small-work behavior and ceiling.
+    constexpr std::size_t minimum_grid_stride_waves = 8;
+    constexpr int maximum_blocks_per_compute_unit = 8;
+    if (edge_count == 0 || persistent_blocks <= 0 || threads_per_block <= 0
+        || compute_units <= 0)
+        return persistent_blocks;
+    const auto initial_workers = static_cast<std::size_t>(persistent_blocks)
+        *static_cast<std::size_t>(threads_per_block);
+    if (edge_count < initial_workers * minimum_grid_stride_waves)
+        return persistent_blocks;
+    const auto maximum_blocks = static_cast<std::size_t>(compute_units)
+        *static_cast<std::size_t>(maximum_blocks_per_compute_unit);
+    const auto candidate = std::min(
+        static_cast<std::size_t>(persistent_blocks) * 2, maximum_blocks);
+    return candidate > static_cast<std::size_t>(persistent_blocks)
+        && candidate <= static_cast<std::size_t>(std::numeric_limits<int>::max())
+        ? static_cast<int>(candidate) : persistent_blocks;
+#else
+    static_cast<void>(edge_count);
+    static_cast<void>(threads_per_block);
+    static_cast<void>(compute_units);
+    return persistent_blocks;
+#endif
+}
+
+} // namespace
+
 template <typename Precision>
 void MACEKokkos<Precision>::compute_R0(
     const int num_nodes,
@@ -613,10 +651,17 @@ void MACEKokkos<Precision>::compute_A0_streamed(
             if (!r0_device_module_ready())
                 throw std::runtime_error(
                     "Execution R0 device-module forward is unavailable.");
-            const auto environment = execution_device_execution_environment();
-            const int persistent_blocks = std::max(
-                1, r0_device_persistent_blocks_per_compute_unit
-                    *environment.compute_unit_count);
+            const auto forward_work_items = static_cast<std::size_t>(num_nodes)
+                *static_cast<std::size_t>(num_lm)
+                *static_cast<std::size_t>(num_channels);
+            const int persistent_blocks = resolve_execution_persistent_blocks(
+                symmetrix::standard_r0::module_id,
+                execution_space,
+                forward_work_items,
+                "r0_forward");
+            if (persistent_blocks <= 0)
+                throw std::runtime_error(
+                    "Execution R0 device-module forward has no launch profile.");
             const SymmetrixJitR0SplineV1 radial{
                 sizeof(SymmetrixJitR0SplineV1),
                 static_cast<std::uint32_t>(R0_spline_coefficients.extent(0)),
@@ -983,9 +1028,14 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
                 throw std::runtime_error(
                     "Execution R0 device-module reverse is unavailable.");
             const auto environment = execution_device_execution_environment();
-            const int persistent_blocks = std::max(
+            const int base_persistent_blocks = std::max(
                 1, r0_device_persistent_blocks_per_compute_unit
                     *environment.compute_unit_count);
+            const int persistent_blocks = resolve_r0_coordinate_reverse_blocks(
+                static_cast<std::size_t>(active_edge_count),
+                base_persistent_blocks,
+                r0_device_module->threads_per_block(),
+                environment.compute_unit_count);
             const SymmetrixJitR0SplineV1 radial{
                 sizeof(SymmetrixJitR0SplineV1),
                 static_cast<std::uint32_t>(R0_spline_coefficients.extent(0)),
@@ -1056,13 +1106,19 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
             switch (resolved_executor) {
             case StandardR0Executor::v2_edge16:
             case StandardR0Executor::v2_edge32: {
-                const int persistent_blocks =
+                const int base_persistent_blocks =
                     resolve_execution_persistent_blocks(
                         symmetrix::standard_r0::module_id,
                         execution_space, r.extent(0), "r0_reverse");
-                if (persistent_blocks <= 0)
+                if (base_persistent_blocks <= 0)
                     throw std::runtime_error(
                         "Execution R0 standard-module reverse has no launch profile.");
+                const auto environment = execution_device_execution_environment();
+                const int persistent_blocks =
+                    resolve_r0_coordinate_reverse_blocks(
+                        r.extent(0), base_persistent_blocks,
+                        symmetrix::standard_r0::edge_threads_per_block,
+                        environment.compute_unit_count);
                 if (standard_r0_executor != StandardR0Executor::v2_edge32)
                     symmetrix::standard_r0::launch_coordinate_reverse_edge16(
                         execution_space,

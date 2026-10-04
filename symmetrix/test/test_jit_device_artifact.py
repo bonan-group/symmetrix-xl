@@ -67,6 +67,7 @@ def test_prepare_device_artifact_without_ase_calculator(
     constructed = []
     initialized = []
     prepare_calls = []
+    source_content_sha256 = "a" * 64
     artifact = tmp_path / ("module.cubin" if backend == "cuda" else "module.hsaco")
     manifest = tmp_path / "manifest.json"
 
@@ -124,6 +125,11 @@ def test_prepare_device_artifact_without_ase_calculator(
         "_factorized_device_backend_plan",
         lambda selected_backend, environment, contract, dtype, selected_evaluator: plan,
     )
+    monkeypatch.setattr(
+        device_artifact,
+        "native_source_content_sha256",
+        lambda native: source_content_sha256,
+    )
 
     result = device_artifact.prepare_jit_device_artifact(
         _model(tmp_path, model_type),
@@ -146,6 +152,7 @@ def test_prepare_device_artifact_without_ase_calculator(
                     "compiler": plan.selected_compiler,
                     "jit_generation_version": device_artifact.JIT_GENERATION_VERSION,
                 },
+                "source_content_sha256": source_content_sha256,
                 "cache_root": tmp_path / "cache",
             },
         )

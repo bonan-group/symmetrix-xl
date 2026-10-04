@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import tempfile
 from dataclasses import dataclass
@@ -19,6 +18,10 @@ from .command import (
 )
 from .manifest import TargetManifest
 from .python_build import build_environment, prepare_build_directory
+from .source_provenance import (
+    _hash_file,
+    symmetrix_source_provenance,
+)
 
 MINIMUM_LAMMPS_DATE = 20251210
 MONTHS = {
@@ -313,73 +316,6 @@ def parse_lammps_cmake_definitions(values: tuple[str, ...]) -> dict[str, str]:
             raise BuildError(f"duplicate LAMMPS CMake definition: {name}")
         definitions[name] = value
     return definitions
-
-
-def _hash_file(
-    digest: Any, root: Path, path: Path, content: bytes | None = None
-) -> None:
-    relative = path.relative_to(root).as_posix().encode("utf-8")
-    digest.update(len(relative).to_bytes(8, "little"))
-    digest.update(relative)
-    if content is None:
-        if path.is_symlink():
-            content = os.readlink(path).encode("utf-8")
-        else:
-            content = path.read_bytes()
-    digest.update(len(content).to_bytes(8, "little"))
-    digest.update(content)
-
-
-def symmetrix_source_fingerprint(repo_root: Path) -> str:
-    digest = hashlib.sha256()
-    roots = (
-        repo_root / "tools/_symmetrix_build",
-        repo_root / "libsymmetrix/source",
-        repo_root / "symmetrix/source",
-    )
-    files = [
-        repo_root / "libsymmetrix/CMakeLists.txt",
-        repo_root / "symmetrix/CMakeLists.txt",
-        repo_root / "symmetrix/pyproject.toml",
-        repo_root / "pair_symmetrix/install.sh",
-        repo_root / "tools/mpi_gpu_aware_probe.cpp",
-        *sorted((repo_root / "pair_symmetrix").glob("*.h")),
-        *sorted((repo_root / "pair_symmetrix").glob("*.cpp")),
-    ]
-    for source_root in roots:
-        if source_root.is_dir():
-            files.extend(
-                path
-                for path in sorted(source_root.rglob("*"))
-                if path.is_file() and "__pycache__" not in path.parts
-            )
-    for path in sorted(set(files)):
-        if path.is_file():
-            _hash_file(digest, repo_root, path)
-    return digest.hexdigest()
-
-
-def symmetrix_source_provenance(
-    repo_root: Path, runner: CommandRunner
-) -> dict[str, str]:
-    revision = ""
-    submodules = ""
-    git = runner.which("git") if (repo_root / ".git").exists() else None
-    if git:
-        head = runner.run((git, "-C", str(repo_root), "rev-parse", "HEAD"))
-        if head.returncode == 0:
-            revision = head.stdout.strip()
-        status = runner.run(
-            (git, "-C", str(repo_root), "submodule", "status", "--recursive")
-        )
-        if status.returncode == 0:
-            submodules = status.stdout.strip()
-    return {
-        "path": str(repo_root),
-        "revision": revision,
-        "submodules": submodules,
-        "content_sha256": symmetrix_source_fingerprint(repo_root),
-    }
 
 
 def _normalized_lammps_cmake(path: Path) -> bytes:

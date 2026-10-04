@@ -527,6 +527,39 @@ void launch_reverse_device_overlap_safe(
 
 template <typename ExecutionSpace, typename NodeTypesView,
           typename InputView, typename WeightsView, typename OutputView>
+void launch_forward_device(
+    const ExecutionSpace& execution_space,
+    const int num_nodes,
+    const int channel_count,
+    const NodeTypesView node_types,
+    const InputView input,
+    const WeightsView weights,
+    const OutputView output)
+{
+    using Scalar = typename InputView::non_const_value_type;
+    const std::size_t work = static_cast<std::size_t>(num_nodes)
+        *static_cast<std::size_t>(channel_count);
+    Kokkos::parallel_for(
+        "StandardM1::forward_device",
+        Kokkos::RangePolicy<ExecutionSpace,Kokkos::IndexType<std::size_t>>(
+            execution_space, 0, work),
+        KOKKOS_LAMBDA (const std::size_t index) {
+            const int channel = static_cast<int>(index%channel_count);
+            const std::size_t node = index/channel_count;
+            const int type = node_types(node);
+            Scalar input_values[input_components][1];
+            Scalar output_values[standard_m0::output_components][1] = {};
+            for (int component=0; component<input_components; ++component)
+                input_values[component][0] = input(node,component,channel);
+            standard_m0::accumulate_forward_terms<1>(
+                type, channel, 1, input_values, weights, output_values,
+                std::make_index_sequence<total_terms>{});
+            output(node,channel) = output_values[0][0];
+        });
+}
+
+template <typename ExecutionSpace, typename NodeTypesView,
+          typename InputView, typename WeightsView, typename OutputView>
 bool launch_forward(
     const ExecutionSpace& execution_space,
     const int num_nodes,
@@ -536,10 +569,8 @@ bool launch_forward(
     const WeightsView weights,
     const OutputView output)
 {
-    if constexpr (!std::is_same_v<
+    if constexpr (std::is_same_v<
             typename ExecutionSpace::memory_space, Kokkos::HostSpace>) {
-        return false;
-    } else {
         switch (host_channel_tile()) {
         case 1:
             launch_forward_host_tiled<1>(
@@ -564,6 +595,19 @@ bool launch_forward(
         default:
             return false;
         }
+    }
+#if defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_CUDA)
+    else if constexpr (supports_device_direct_reverse<ExecutionSpace>()
+            && std::is_same_v<
+                typename InputView::non_const_value_type,float>) {
+        launch_forward_device(
+            execution_space, num_nodes, channel_count, node_types,
+            input, weights, output);
+        return true;
+    }
+#endif
+    else {
+        return false;
     }
 }
 

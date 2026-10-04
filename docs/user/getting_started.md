@@ -47,7 +47,8 @@ Timing is finalized before reference validation begins. If the reference
 calculation runs out of memory, Symmetrix-XL retains and reports the benchmark
 result and marks validation unavailable.
 It fails clearly if the selected direct backend or required JIT artifact is
-not available; it does not silently benchmark the slower generic path.
+not available; it does not silently benchmark the slower debug-only
+non-compiled path.
 
 ```python
 from ase.spacegroup import crystal
@@ -72,7 +73,8 @@ They do not need an R1 artifact, although capacity planning may specialize
 their M0/R0 operators.
 Request `dtype="float64"` explicitly for high-precision evaluation and prepare
 the matching FP64 artifact when specialization is required. `non-compiled` is
-only a compiler-free fallback/diagnostic mode and has no performance guarantee:
+only a compiler-free debug mode; it is not optimized and has no performance
+guarantee:
 
 ```python
 atoms.calc = Symmetrix("srtio3-mace.json", streamed_edges="non-compiled")

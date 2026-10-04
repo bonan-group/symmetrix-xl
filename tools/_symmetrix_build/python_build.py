@@ -11,17 +11,24 @@ from pathlib import Path
 from .command import BuildError, CommandRunner
 from .manifest import TargetManifest
 from .package_identity import PackageIdentity, package_identity
+from .source_provenance import symmetrix_source_provenance
 
 
 @dataclass(frozen=True)
 class BuildInvocation:
     command: tuple[str, ...]
+    python_executable: str
     environment: dict[str, str]
     build_directory: Path
     manifest_path: Path
+    source_provenance: dict[str, object]
 
 
-def cmake_definitions(manifest: TargetManifest) -> dict[str, str]:
+def cmake_definitions(
+    manifest: TargetManifest,
+    *,
+    source_provenance: dict[str, object] | None = None,
+) -> dict[str, str]:
     identity = package_identity(manifest)
     definitions = {
         "CMAKE_BUILD_TYPE": "Release",
@@ -34,6 +41,13 @@ def cmake_definitions(manifest: TargetManifest) -> dict[str, str]:
         "SYMMETRIX_BACKEND_SELECTOR": identity.backend,
         "SYMMETRIX_BACKEND_ARCHITECTURE": identity.architecture,
     }
+    if source_provenance is not None:
+        definitions["SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256"] = str(
+            source_provenance["content_sha256"]
+        )
+        definitions["SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256"] = str(
+            source_provenance["native_content_sha256"]
+        )
     backend = manifest.backend
     if backend == "cpu":
         definitions.update(
@@ -276,6 +290,7 @@ def prepare_backend_project(
     build_directory: Path,
     source_project: Path,
     manifest: TargetManifest,
+    source_provenance: dict[str, object] | None = None,
 ) -> Path:
     """Create a native-only project whose installed files cannot overlap frontend files."""
 
@@ -300,6 +315,14 @@ def prepare_backend_project(
         "compiler": manifest.toolchain.cxx_version,
         "target_manifest_fingerprint": manifest.fingerprint,
     }
+    if source_provenance is not None:
+        descriptor["source_commit"] = str(source_provenance.get("revision", ""))
+        descriptor["source_content_sha256"] = str(source_provenance["content_sha256"])
+        descriptor["native_source_content_sha256"] = str(
+            source_provenance["native_content_sha256"]
+        )
+        if source_provenance.get("dirty") is not None:
+            descriptor["source_dirty"] = bool(source_provenance["dirty"])
     (package / "__init__.py").write_text(
         '"""Architecture-qualified Symmetrix native backend."""\n'
     )
@@ -348,6 +371,8 @@ def python_build_invocation(
     if operation not in {"install", "wheel"}:
         raise BuildError(f"unsupported Python build operation: {operation}")
     root = Path(repo_root).resolve()
+    runner = CommandRunner()
+    source_provenance = symmetrix_source_provenance(root, runner)
     source_project = root / "symmetrix"
     if not (source_project / "pyproject.toml").is_file():
         raise BuildError(f"Symmetrix Python project is missing: {source_project}")
@@ -356,8 +381,10 @@ def python_build_invocation(
     else:
         build_directory = Path(build_root).expanduser().resolve() / manifest.fingerprint
     manifest_path = prepare_build_directory(build_directory, manifest)
-    project = prepare_backend_project(build_directory, source_project, manifest)
-    definitions = cmake_definitions(manifest)
+    project = prepare_backend_project(
+        build_directory, source_project, manifest, source_provenance
+    )
+    definitions = cmake_definitions(manifest, source_provenance=source_provenance)
     if operation == "wheel":
         definitions["SYMMETRIX_REDACT_BUILD_PATHS"] = "ON"
 
@@ -365,8 +392,16 @@ def python_build_invocation(
         # Use uv's shared cache while explicitly targeting the selected Python
         # environment. The wheel command below remains pip because uv pip does
         # not provide a wheel-build subcommand.
-        command = ["uv", "pip", "install", "--python", manifest.python_executable]
+        command = [
+            "uv",
+            "pip",
+            "install",
+            "--no-build-isolation",
+            "--python",
+            manifest.python_executable,
+        ]
         command.append("--verbose")
+        command.extend(("--reinstall-package", package_identity(manifest).distribution))
         command.append(str(project))
         command.append(f"--config-setting=build-dir={build_directory}")
         for name, value in definitions.items():
@@ -394,7 +429,9 @@ def python_build_invocation(
     record = {
         "manifest_fingerprint": manifest.fingerprint,
         "operation": operation,
+        "source_provenance": source_provenance,
         "command": command,
+        "build_requirements": ["scikit-build-core", "pybind11", "ninja"],
         "environment": {
             name: value
             for name, value in build_environment(manifest, jobs=jobs).items()
@@ -414,13 +451,28 @@ def python_build_invocation(
     )
     return BuildInvocation(
         tuple(command),
+        manifest.python_executable,
         build_environment(manifest, jobs=jobs),
         build_directory,
         manifest_path,
+        source_provenance,
     )
 
 
 def run_python_build(invocation: BuildInvocation, runner: CommandRunner) -> None:
+    runner.run(
+        (
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            invocation.python_executable,
+            "scikit-build-core",
+            "pybind11",
+            "ninja",
+        ),
+        check=True,
+    )
     log_path = invocation.build_directory / "build.log"
     result = runner.run_logged(
         invocation.command,
@@ -448,14 +500,11 @@ def verify_python_cmake_provenance(
         raise BuildError(f"CMake cache does not record CMAKE_COMMAND: {cache_path}")
     actual = Path(match.group(1))
     if not actual.is_file():
-        raise BuildError(
-            "the CMake executable used by pip build isolation no longer exists: "
-            f"{actual}"
-        )
+        raise BuildError(f"the configured CMake executable no longer exists: {actual}")
     expected = Path(manifest.toolchain.cmake)
     if actual.resolve() != expected.resolve():
         raise BuildError(
-            "pip build isolation used a different CMake than the target manifest: "
+            "the build used a different CMake than the target manifest: "
             f"{actual} instead of {expected}"
         )
     result = runner.run((str(actual), "--version"), check=True)
@@ -463,7 +512,7 @@ def verify_python_cmake_provenance(
     actual_version = version_match.group(1) if version_match else ""
     if actual_version != manifest.toolchain.cmake_version:
         raise BuildError(
-            "pip build isolation used CMake version "
+            "the build used CMake version "
             f"{actual_version or 'unknown'}, but the target manifest records "
             f"{manifest.toolchain.cmake_version}"
         )

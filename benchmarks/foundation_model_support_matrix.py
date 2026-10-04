@@ -382,11 +382,13 @@ def run_worker(args) -> dict:
     directed_edges = len(direct_inputs[6])
     direct_values = evaluate(direct, atoms.copy())
     identity = direct_identity(direct, args.backend, args.profile)
-    generic_options = dict(options)
-    generic_options.pop("_debug_execution_plan", None)
-    generic = Symmetrix(args.compact_model, streamed_edges="generic", **generic_options)
-    generic_values = evaluate(generic, atoms.copy())
-    errors = numerical_errors(generic_values, direct_values, len(atoms))
+    non_compiled_options = dict(options)
+    non_compiled_options.pop("_debug_execution_plan", None)
+    non_compiled = Symmetrix(
+        args.compact_model, streamed_edges="non-compiled", **non_compiled_options
+    )
+    non_compiled_values = evaluate(non_compiled, atoms.copy())
+    errors = numerical_errors(non_compiled_values, direct_values, len(atoms))
     limits = manifest["tolerances"][args.dtype]
     parity_failures = [name for name, value in errors.items() if value > limits[name]]
     failures = [

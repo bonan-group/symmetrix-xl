@@ -44,14 +44,47 @@ def _entry_point(path):
 
 
 def test_descriptor_discovery_does_not_import_native_module(tmp_path, monkeypatch):
-    path = _descriptor(tmp_path)
+    path = _descriptor(tmp_path, source_content_sha256="a" * 64)
     monkeypatch.setattr(backend_loader, "_entry_points", lambda: (_entry_point(path),))
     loaded_before = backend_loader._native_module
 
     descriptors = backend_loader.discover_backends(FRONTEND_VERSION)
 
     assert [item.selector for item in descriptors] == ["cpu", "cuda13-sm120"]
+    assert descriptors[1].source_content_sha256 == "a" * 64
     assert backend_loader._native_module is loaded_before
+
+
+def test_descriptor_rejects_malformed_source_fingerprint(tmp_path):
+    path = _descriptor(tmp_path, source_content_sha256="not-a-sha256")
+    with pytest.raises(
+        backend_loader.BackendError, match="invalid source_content_sha256"
+    ):
+        backend_loader._read_descriptor(path)
+
+
+def test_backend_load_rejects_native_module_without_required_identity(
+    tmp_path, monkeypatch
+):
+    path = _descriptor(
+        tmp_path,
+        native_source_content_sha256="a" * 64,
+    )
+    descriptor = backend_loader._read_descriptor(path)
+    monkeypatch.setattr(
+        backend_loader, "select_backend", lambda *_args, **_kwargs: descriptor
+    )
+    monkeypatch.setattr(
+        backend_loader.importlib,
+        "import_module",
+        lambda _name: object(),
+    )
+    monkeypatch.setattr(backend_loader, "_native_module", None)
+    monkeypatch.setattr(backend_loader, "_selected", None)
+    with pytest.raises(
+        backend_loader.BackendError, match="does not report native source"
+    ):
+        backend_loader.load_backend(FRONTEND_VERSION, "cuda13-sm120")
 
 
 def test_automatic_selection_requires_exact_visible_architecture(tmp_path, monkeypatch):

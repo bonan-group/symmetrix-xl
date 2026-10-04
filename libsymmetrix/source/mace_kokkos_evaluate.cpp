@@ -516,10 +516,13 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
                 num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
         }
         else if ((!mace_uses_prepared_execution(streamed_edges)
-                  || execution_direct_r1)
+                 || execution_direct_r1)
                  && !use_receiver_local_phi1()
-                 && !use_channel_tiled_phi1())
+                 && !use_channel_tiled_phi1()) {
+            prepare_A1_scale_factors(
+                num_nodes, node_types, num_neigh, neigh_types, r);
             compute_A1(num_nodes, !use_factorized_async_inference());
+        }
         compute_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
         compute_M1(num_nodes, node_types);
         compute_H2(num_nodes, node_types);
@@ -1315,10 +1318,13 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
             num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
     }
     else if ((!mace_uses_prepared_execution(streamed_edges)
-              || execution_direct_r1)
+             || execution_direct_r1)
              && !use_receiver_local_phi1()
-             && !use_channel_tiled_phi1())
+             && !use_channel_tiled_phi1()) {
+        prepare_A1_scale_factors(
+            num_nodes, node_types, num_neigh, neigh_types, r);
         compute_A1(num_nodes);
+    }
     compute_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
     compute_M1(num_nodes, node_types);
     compute_H2(num_nodes, node_types);
@@ -1846,8 +1852,11 @@ void MACEKokkos<Precision>::continue_factorized_distributed_evaluation(
             compute_Phi1_streamed(
                 num_receivers, node_types, num_neigh,
                 neigh_indices, neigh_types, r);
-        if (!use_receiver_local_phi1() && !use_channel_tiled_phi1())
+        if (!use_receiver_local_phi1() && !use_channel_tiled_phi1()) {
+            prepare_A1_scale_factors(
+                num_receivers, node_types, num_neigh, neigh_types, r);
             compute_A1(num_receivers, !use_factorized_async_inference());
+        }
     } else {
         compute_factorized(
             num_receivers, node_types, num_neigh,

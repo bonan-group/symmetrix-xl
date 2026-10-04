@@ -212,7 +212,7 @@ std::unique_ptr<MACEKokkos<Precision>> load_mace_kokkos(
                 PyExc_UserWarning,
                 "Loaded the original Symmetrix pair-spline format (named v1 here); using "
                 "streamed_edges='materialized'. Re-export with radial_format='compact' "
-                "to enable streamed_edges='generic' execution.",
+                "to enable streamed_edges='non-compiled' execution.",
                 1) < 0)
             throw py::error_already_set();
     }
@@ -801,6 +801,8 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             [] (const MACEKokkos<Precision>& self) {
                 return self.factorized_workspace_capacity_bytes;
             })
+        .def_property_readonly("a1_blas_flatten_workspace_bytes",
+            &MACEKokkos<Precision>::a1_blas_flatten_workspace_bytes)
         .def_property_readonly("factorized_schedule_build_count",
             [] (const MACEKokkos<Precision>& self) {
                 return self.factorized_schedule_build_count;

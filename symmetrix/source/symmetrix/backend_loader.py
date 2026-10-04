@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ BACKEND_DESCRIPTOR_SCHEMA = 1
 NATIVE_ABI = 1
 ENTRY_POINT_GROUP = "symmetrix.backends"
 BACKEND_ENVIRONMENT = "SYMMETRIX_BACKEND"
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class BackendError(ImportError):
@@ -36,6 +38,8 @@ class BackendDescriptor:
     toolkit: str = ""
     compiler: str = ""
     source_commit: str = ""
+    source_content_sha256: str = ""
+    native_source_content_sha256: str = ""
     source_dirty: bool | None = None
     target_manifest_fingerprint: str = ""
     schema_version: int = BACKEND_DESCRIPTOR_SCHEMA
@@ -63,6 +67,10 @@ class BackendDescriptor:
                 toolkit=str(value.get("toolkit", "")),
                 compiler=str(value.get("compiler", "")),
                 source_commit=str(value.get("source_commit", "")),
+                source_content_sha256=str(value.get("source_content_sha256", "")),
+                native_source_content_sha256=str(
+                    value.get("native_source_content_sha256", "")
+                ),
                 source_dirty=(
                     None
                     if "source_dirty" not in value
@@ -84,6 +92,15 @@ class BackendDescriptor:
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
                 raise BackendError(
                     f"invalid native import component {name!r} in {descriptor_path}"
+                )
+        for name in (
+            "source_content_sha256",
+            "native_source_content_sha256",
+        ):
+            source_hash = getattr(descriptor, name)
+            if source_hash and not _SHA256.fullmatch(source_hash):
+                raise BackendError(
+                    f"invalid {name} {source_hash!r} in {descriptor_path}"
                 )
         return descriptor
 
@@ -436,6 +453,17 @@ def load_backend(frontend_version: str, request: str | None = None):
             ) from error
 
     build_info = getattr(native, "_backend_build_info", lambda: None)()
+    if (
+        descriptor.source_content_sha256 or descriptor.native_source_content_sha256
+    ) and not isinstance(build_info, Mapping):
+        raise BackendError(
+            f"loaded module {module_name} does not report "
+            + (
+                "native source content"
+                if descriptor.native_source_content_sha256
+                else "source content identity"
+            )
+        )
     if build_info is not None:
         if int(build_info.get("native_abi", -1)) != descriptor.native_abi:
             raise BackendError(
@@ -463,6 +491,25 @@ def load_backend(frontend_version: str, request: str | None = None):
             raise BackendError(
                 f"loaded module {module_name} reports architecture "
                 f"{built_architecture!r}, expected {expected_architecture!r}"
+            )
+        built_native_source = str(build_info.get("native_source_content_sha256", ""))
+        if (
+            descriptor.native_source_content_sha256
+            and built_native_source != descriptor.native_source_content_sha256
+        ):
+            raise BackendError(
+                f"loaded module {module_name} reports native source content "
+                f"{built_native_source!r}, expected "
+                f"{descriptor.native_source_content_sha256!r}"
+            )
+        built_source = str(build_info.get("source_content_sha256", ""))
+        if (
+            descriptor.source_content_sha256
+            and built_source != descriptor.source_content_sha256
+        ):
+            raise BackendError(
+                f"loaded module {module_name} reports source content "
+                f"{built_source!r}, expected {descriptor.source_content_sha256!r}"
             )
     _selected = descriptor
     _native_module = native

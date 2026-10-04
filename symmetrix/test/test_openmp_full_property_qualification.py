@@ -93,6 +93,6 @@ def test_qualification_defaults_cover_modes_threads_and_m0_tiles():
     )
 
     assert tuple(args.threads) == (1, 2, 4, 8)
-    assert tuple(args.modes) == ("generic", "direct")
+    assert tuple(args.modes) == ("non-compiled", "direct")
     assert tuple(args.m0_tiles) == (1, 4, 8, 16)
     assert args.min_speedup == 1.25

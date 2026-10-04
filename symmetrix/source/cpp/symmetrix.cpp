@@ -59,6 +59,12 @@ void bind_zbl_kokkos(py::module_ &m);
 #ifndef SYMMETRIX_BUILD_SOURCE_DIRTY
 #define SYMMETRIX_BUILD_SOURCE_DIRTY 0
 #endif
+#ifndef SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256
+#define SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256 "unknown"
+#endif
+#ifndef SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256
+#define SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256 "unknown"
+#endif
 #ifndef SYMMETRIX_BUILD_DEVICE_COMPILER_ID
 #define SYMMETRIX_BUILD_DEVICE_COMPILER_ID ""
 #endif
@@ -81,6 +87,9 @@ PYBIND11_MODULE(SYMMETRIX_PYTHON_MODULE, m)
         result["distribution"] = SYMMETRIX_BUILD_DISTRIBUTION;
         result["source_commit"] = SYMMETRIX_BUILD_SOURCE_COMMIT;
         result["source_dirty"] = bool(SYMMETRIX_BUILD_SOURCE_DIRTY);
+        result["source_content_sha256"] = SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256;
+        result["native_source_content_sha256"] =
+            SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256;
         result["compiler_id"] = SYMMETRIX_BUILD_COMPILER_ID;
         result["compiler_version"] = SYMMETRIX_BUILD_COMPILER_VERSION;
         result["device_compiler_id"] = SYMMETRIX_BUILD_DEVICE_COMPILER_ID;

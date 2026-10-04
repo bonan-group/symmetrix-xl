@@ -10,6 +10,7 @@ from typing import Any
 from . import symmetrix
 from .jit import (
     JIT_GENERATION_VERSION,
+    native_source_content_sha256,
     prepare_jit_artifact,
     quarantine_jit_artifact,
     remove_jit_quarantine,
@@ -160,6 +161,7 @@ def prepare_jit_host_artifact(
         metadata = jit_r1_host_plugin_metadata(contract, precision=precision)
         source = render_jit_r1_host_plugin(contract, precision=precision)
         arguments = {
+            "source_content_sha256": native_source_content_sha256(symmetrix),
             "abi": {"tag": metadata["abi"], "version": metadata["abi_version"]},
             "build": {
                 "generator": "symmetrix.jit.r1-host-v2",

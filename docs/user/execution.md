@@ -18,8 +18,9 @@ symmetrix_prepare_jit_host_artifact \
 For explicit `dtype="float64"` evaluation, prepare the corresponding artifact
 with `--precision float64`.
 
-Use `streamed_edges="non-compiled"` only as a compiler-free fallback or diagnostic;
-it has no performance guarantee and is not the primary execution path.
+Use `streamed_edges="non-compiled"` only for compiler-free debugging or
+compatibility checks. It is not optimized, has no performance guarantee, and is
+not the primary execution path.
 
 `capacity` ranks qualified internal MH-0 plans using an advisory device-memory
 estimate. It chooses the fastest estimated fit; when no candidate fits, it

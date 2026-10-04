@@ -13,14 +13,28 @@ The direct-execution architecture and cache invariants are described in
 `symmetrix/source/symmetrix/jit.py` is authoritative for compiler discovery,
 cache identity, publication, and validation.
 
-Use a task-specific cache and require direct specialization when qualifying it:
+Use a task- and backend-specific cache and require direct specialization when
+qualifying it:
 
 ```bash
-export SYMMETRIX_JIT_CACHE=/tmp/symmetrix-task-jit-cache
+export SYMMETRIX_JIT_CACHE="$HOME/tmp/symmetrix-task-jit-cache"
 export SYMMETRIX_JIT_POLICY=required
 symmetrix_prepare_jit_host_artifact \
     --model srtio3-mace.json --precision float64
 ```
+
+Production native-backed preparation passes the package build's full
+`source_content_sha256` into the canonical artifact key and manifest and
+includes it in the artifact basename as `_src<hash>`. Generated plugins can
+include or interact with native headers and runtime behavior outside their
+generated translation unit, so qualification must reject a stale source
+identity instead of relying on cache-directory rotation. Keep both the
+incremental package build root and task/backend JIT cache root across edits.
+Run artifact preparation and calculation in fresh processes after a package
+reinstall, require the selected artifact path to be below the current cache
+root, and verify its manifest and basename against the loaded extension.
+The low-level compiler API permits an omitted identity for isolated compiler
+diagnostics; those artifacts must not be used for qualification.
 
 Prepare standard MACE or MACEField R1 device artifacts with
 `symmetrix_prepare_jit_device_artifact` on the target GPU. LAMMPS consumes

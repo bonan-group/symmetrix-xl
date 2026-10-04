@@ -1,261 +1,197 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
+## Layout
 
-- `libsymmetrix/source/` contains the C++20 core, Kokkos implementations, standard M0/R0 modules, factorized execution, and runtime JIT support. JIT-generated R1 sources and binaries are runtime cache artifacts, not checked-in source modules.
-- `symmetrix/source/symmetrix/` contains the Python package and ASE calculator; `symmetrix/source/cpp/` provides pybind11 bindings. Python tests live in `symmetrix/test/`.
-- `pair_symmetrix/` provides the LAMMPS pair styles and its separate pytest suite in `pair_symmetrix/test/`.
-- `benchmarks/` holds reproducible performance drivers and result notes. `docs/` documents streamed-edge execution and JIT deployment. Third-party dependencies are Git submodules under `libsymmetrix/external/` and `symmetrix/external/`.
+- `libsymmetrix/source/`: C++20 core, Kokkos backends, standard M0/R0 modules,
+  factorized execution, and runtime JIT support. Generated R1 sources/binaries
+  are cache artifacts, not source files.
+- `symmetrix/source/symmetrix/`: Python package and ASE calculator;
+  `symmetrix/source/cpp/`: pybind11 bindings; `symmetrix/test/`: Python tests.
+- `pair_symmetrix/`: LAMMPS pair styles and tests.
+- `benchmarks/`: reproducible performance drivers and result notes;
+  `docs/`: streamed-edge and JIT documentation.
+- Third-party code is kept in Git submodules under `libsymmetrix/external/` and
+  `symmetrix/external/`.
 
-## Build, Test, and Development Commands
+## Development and tests
 
-Clone with submodules (`git clone --recursive ...`) or run `git submodule update --init --recursive` first. From the repository root:
+Use Python 3.12 for development, testing, and qualification. Initialize
+submodules, then from the repository root:
 
 ```bash
-uv venv
+test -x .venv/bin/python || uv venv .venv
 source .venv/bin/activate
-uv pip install -e "./symmetrix[test]"
+uv pip install scikit-build-core pybind11 ninja
+source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_source_fingerprint; print(symmetrix_source_fingerprint(Path.cwd()))')
+uv pip install --no-build-isolation --reinstall-package symmetrix-xl -e './symmetrix[test]' \
+  --config-setting="cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint"
 pytest symmetrix/test
 uvx pre-commit run --all-files
 ```
 
-The editable install invokes scikit-build-core/CMake and builds the C++ extension. Treat its shared `symmetrix/build/` directory as the default CPU development build only; do not reconfigure it to qualify another backend. The published frontend distribution is named `symmetrix-xl`, while the Python import namespace and source directory remain `symmetrix`. CUDA and explicit CPU build options are documented in `symmetrix/README.md`. LAMMPS integration requires installing `pair_symmetrix` into a compatible LAMMPS checkout with `./pair_symmetrix/install.sh /path/to/lammps`, then running `pytest pair_symmetrix/test` in that built environment.
+The published distribution is `symmetrix-xl`; the import namespace remains
+`symmetrix`. Do not assume an existing `.venv` is complete: install the package
+and verify imports. The shared `symmetrix/build/` is the CPU development build;
+do not reconfigure it for another backend. LAMMPS requires
+`./pair_symmetrix/install.sh /path/to/lammps`, followed by
+`pytest pair_symmetrix/test` in the compatible LAMMPS environment.
 
-## Compilation Environments
+Add focused tests beside changed code and parametrize backend/precision cases.
+Tests requiring unavailable hardware, toolchains, LAMMPS, or checkpoints should
+skip with a clear reason. Run focused tests first, then the applicable full
+suite and pre-commit. In a dirty worktree, run pre-commit only on intended
+files before using `--all-files`; never restore unrelated formatter changes.
 
-Keep CPU, CUDA, HIP, and LAMMPS builds in separate fresh directories and
-virtual environments. Do not reconfigure the developer's editable installation
-to qualify another backend. Use the maintained build frontend with a
-task-specific `--build-root`; it records the resolved toolchain and package
-identity and installs into the active Python environment. If Ninja is
-unavailable, or for CUDA through Kokkos `nvcc_wrapper`, use
-`--generator "Unix Makefiles"`.
+## Builds and qualification
+
+Keep CPU, CUDA, HIP, LAMMPS, and comparison builds in separate fresh virtual
+environments and task-specific build roots. Use
+`python tools/symmetrix_build.py install`; use `--generator 'Unix Makefiles'`
+when Ninja or CUDA `nvcc_wrapper` requires it. Use `uv` for dependencies.
+Discard a build root when the compiler, Python, backend, architecture,
+SpheriCart policy, incompatible CMake options, or cache validity changes;
+never repair a mixed cache in place.
+
+CPU development example:
 
 ```bash
-build_root=$(mktemp -d /tmp/symmetrix-openmp.XXXXXX)
-uv venv "$build_root/venv"
-source "$build_root/venv/bin/activate"
-python tools/symmetrix_build.py install \
-  --backend cpu --cpu-target native \
-  --build-root "$build_root/build" --generator "Unix Makefiles"
-python -c 'import pathlib, symmetrix; print(pathlib.Path(symmetrix.__file__).resolve())'
+root=$(mktemp -d /tmp/symmetrix-cpu.XXXXXX)
+uv venv "$root/venv" && source "$root/venv/bin/activate"
+python tools/symmetrix_build.py install --backend cpu --cpu-target native \
+  --build-root "$root/build" --generator 'Unix Makefiles'
 SYMMETRIX_OPENMP_RUNTIME_CHECK=strict symmetrix doctor --json
 ```
 
-Check the recorded backend summary and use `ldd` on the extension path reported
-by `symmetrix doctor --json` to verify its dynamic OpenBLAS and OpenMP
-dependencies. Verify static BLAS selection from the build manifest and wheel
-audit rather than `ldd`, which cannot report statically linked libraries. For
-OpenMP deployments, run `doctor` with the exact Python executable and module
-stack used for evaluation. It must report the expected compiler/runtime hash,
-one actual loaded OpenMP runtime, and `status: ok`; `ldd` does not model the
-main executable's `DT_RPATH`. Prefer standalone CPython when Anaconda's legacy
-RPATH would substitute libgomp; use a matching compiler-runtime `LD_PRELOAD`
-only as a diagnosed workaround, and do not statically link libgomp.
+For portable deployment use `--cpu-target x86-64-v3`; do not copy a native
+extension to a heterogeneous host. Verify BLAS/OpenMP dependencies with the
+doctor output, `ldd`, the build manifest, and wheel audit as appropriate.
+OpenMP qualification must use the exact interpreter and module stack, report
+one loaded OpenMP runtime, and finish with `status: ok`; do not statically link
+libgomp.
 
-If configure or an
-incremental rebuild loses an imported BLAS target, or if the compiler, Python,
-backend, architecture, or SpheriCart policy changes, discard that task build
-and configure a new one. Do not repair a mixed cache in place. CPU builds
-default to `--cpu-target native` with Kokkos native architecture detection. Do
-not copy that machine-local extension to a heterogeneous node. Use
-`--cpu-target x86-64-v3` for a portable x86-64-v3 deployment build; the build
-frontend disables `Kokkos_ARCH_NATIVE` and applies the baseline to the bundled
-Kokkos, KokkosKernels, SpheriCart, core, and Python bindings.
-
-For CUDA builds, use a fresh environment and separate build roots for the base
-frontend and architecture-qualified accelerator package. Select the exact
-device architecture matching the qualification GPU:
+CUDA example (replace `sm120` with the target compute capability):
 
 ```bash
-cuda_root=/path/to/cuda
-build_root=$(mktemp -d /tmp/symmetrix-cuda.XXXXXX)
-uv venv "$build_root/venv"
-source "$build_root/venv/bin/activate"
-python tools/symmetrix_build.py install \
-  --backend cpu --cpu-target native --build-root "$build_root/cpu"
-python tools/symmetrix_build.py install \
-  --backend cuda --arch sm120 --cuda-root "$cuda_root" \
-  --build-root "$build_root/cuda" --generator "Unix Makefiles"
+root=$(mktemp -d /tmp/symmetrix-cuda.XXXXXX)
+uv venv "$root/venv" && source "$root/venv/bin/activate"
+python tools/symmetrix_build.py install --backend cpu --cpu-target native \
+  --build-root "$root/cpu"
+python tools/symmetrix_build.py install --backend cuda --arch sm120 \
+  --cuda-root /path/to/cuda --build-root "$root/cuda" \
+  --generator 'Unix Makefiles'
 symmetrix backend show --probe
 symmetrix doctor --json
 ```
 
-Replace `sm120` with the compute capability of the qualification target. The
-build frontend selects the pinned Kokkos wrapper, host compiler, Kokkos
-architecture trait, SpheriCart CUDA policy, backend package identity, and
-runtime paths. Direct CMake configuration is a low-level diagnostic path, not
-the supported package-install procedure. If it is required, pin both
-`Python_EXECUTABLE` and `PYTHON_EXECUTABLE` on the first configure so bundled
-pybind11 cannot select a different interpreter.
+Use a fresh backend build for each GPU architecture; NVRTC does not make an
+extension built for another architecture valid. HIP likewise requires a fresh
+build, `hipcc`, Kokkos Serial, and one explicit AMD target. Prefer the
+maintained build frontend over direct CMake; if direct CMake is unavoidable,
+pin both `Python_EXECUTABLE` and `PYTHON_EXECUTABLE` on first configure.
 
-Do not reuse an extension built for another GPU architecture merely because
-NVRTC recompiles the generated direct kernel. Kokkos and SpheriCart device code
-is part of the ahead-of-time extension. HIP likewise requires its own fresh
-build, `hipcc`, Kokkos Serial, and one explicit AMD architecture/offload target;
-follow the qualified recipe in `symmetrix/README.md`.
+After an architecture-qualified build, run `symmetrix version --probe --json`
+with the task interpreter. Require `probe_status: "ok"`, source commit/dirty
+fields, and non-unknown source and native-content hashes in both the backend
+descriptor and `_backend_build_info()`.
 
-Use `uv` when dependency installation is required. Keep backend-specific test
-environments isolated and do not replace the developer's installed extension.
+Compiled comparison packages may not support newer Python versions; keep their
+environment separate and record Python, PyTorch, MACE, cuEquivariance, and CUDA
+runtime versions.
 
-## Runtime Selection
+## Rebuild and runtime provenance
 
-Before every qualification, print and record the imported Python package,
-native extension, Kokkos execution space, and binary hash. An editable
-scikit-build finder can override `PYTHONPATH`; setting `PYTHONPATH` alone does
-not prove that the fresh extension was loaded. Prefer a fresh virtual
-environment. Maintained benchmark drivers that support explicit loading accept
-both variables below and remove the editable finder before importing:
+After edits affecting Python generation, C++, headers, CMake, or packaging:
 
-```bash
-export SYMMETRIX_SOURCE_ROOT="$PWD"
-export SYMMETRIX_EXTENSION=/absolute/path/to/the-built-extension.so
-```
+1. Stop processes that loaded the old extension.
+2. Recompute and record the source fingerprint.
+3. Rerun the same install command and build root; use a fresh root only when
+   the toolchain or cache conditions above require it.
+4. In a fresh process, print `sys.executable`, package and extension paths,
+   extension SHA-256, selected backend, Kokkos execution space, and
+   `_backend_build_info()`. Its content hash must match the fingerprint.
+5. Set one task/backend-specific `SYMMETRIX_JIT_CACHE` before importing or
+   preparing artifacts. Use `SYMMETRIX_JIT_POLICY=required` for direct-mode
+   qualification. Assert the requested algorithm, zero fallback count, and
+   matching source hash in the JIT manifest/artifact name.
+6. For drivers supporting explicit loading, set `SYMMETRIX_SOURCE_ROOT` and
+   `SYMMETRIX_EXTENSION` from the verified build. Warm compilation and module
+   loading before timing.
 
-Use one task-specific RTC cache per backend and source state, for example
-`SYMMETRIX_JIT_CACHE=/tmp/symmetrix-TASK-jit-cache`. Use
-`SYMMETRIX_JIT_POLICY=required` when generated direct execution is part of the
-qualification, assert the selected algorithm/artifact and zero fallback count,
-and warm compilation and module loading before measurement. Host artifacts are
-model-, precision-, ABI-, generation-, and target-specific. Prepare them with
-`symmetrix_prepare_jit_host_artifact`; use `--host-target portable` only when an
-x86-64-v3 deployment artifact is intended.
+Do not compare a result from a process that survived a rebuild. Record source
+fingerprint, extension/model hashes, JIT cache and artifact path, and the exact
+benchmark command for every baseline/candidate result. Initialize only one
+Kokkos backend per process and release native owners before finalization; a
+teardown error may be secondary to an earlier exception.
 
-Initialize only one Kokkos backend per process. Release evaluators and other
-native owners before explicit Kokkos finalization. A teardown error after an
-earlier exception is often secondary; diagnose the first exception before
-changing lifecycle code.
+For CPU timings, apply affinity before importing NumPy/Kokkos/BLAS and set
+Kokkos, OpenMP, BLAS, MKL, BLIS, and NumExpr thread counts to one. Record the
+physical CPU and exclude its SMT sibling. Exclude compilation, graph creation,
+neighbor-list construction, and JIT warmup unless they are the subject of the
+benchmark.
 
-For primary CPU timings, apply process affinity before Python imports NumPy,
-Kokkos, or BLAS, and set `KOKKOS_NUM_THREADS`, `OMP_NUM_THREADS`,
-`OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `BLIS_NUM_THREADS`, and
-`NUMEXPR_NUM_THREADS` to one. Record the selected physical CPU and exclude its
-SMT sibling. Compilation, graph construction, neighbor-list creation, and JIT
-warmup are outside the steady-state region unless the benchmark explicitly
-targets them.
+## GPU, profiling, LAMMPS, and MPI
 
-## Profiling Environments
+Run `nvidia-smi` first and record GPU model, driver, compute capability, memory,
+and competing processes. Before diagnosing a comparison failure, probe
+`torch.cuda.is_available()` and device count using the exact benchmark
+interpreter: a restricted shell can hide the GPU from PyTorch. For a baseline
+using another CUDA major version, verify imports/device execution, inspect
+dependencies with `ldd`, keep matching runtime/NVRTC libraries inside that
+isolated environment, and label the result as cross-major; never prepend those
+libraries to the Symmetrix process.
 
-Run `nvidia-smi` first and record the GPU model, driver, compute capability,
-memory use, and competing processes. Do not stop unrelated GPU services unless
-the user explicitly authorizes it. CUDA profiling requires access to the target
-device and driver. Store reports under a task-specific temporary or benchmark
-artifact directory and retain the exact command, model/binary hashes, warmup
-count, cutoff, skin, effective cutoff, atom count, and directed-edge count.
+Use Nsight Systems first for timelines and kernel families, then narrowly
+filtered Nsight Compute runs. Nsight Compute replays kernels and must not be
+used for end-to-end timing. Use built-in timers, `/usr/bin/time -v`, or
+`strace -c` when `perf` is unavailable; use `rocprofv3 --kernel-trace --stats`
+for AMD after warming hipRTC. Report missing counter permissions instead of
+substituting unsupported estimates.
 
-Use Nsight Systems first to locate expensive kernel families, synchronization,
-and transfers:
+Relink LAMMPS after every native-library change and record its hash. Prepare
+matching FP32/FP64 JIT host/device artifacts first. MPI tests need working
+OpenMPI/PMIx sockets and shared memory; use one rank per GPU and state the rank
+grid and whether MPI is host-staged or CUDA-aware. Positive CUDA-aware evidence
+requires the provider capability query and no `Turning off GPU-aware MPI`
+warning. Report `us/atom/step` with Pair and Comm separated, and qualify
+ownership migration plus multi-step graph reuse, not only `run 0`.
 
-```bash
-nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
-  --force-overwrite=true -o /tmp/symmetrix-profile/system \
-  /path/to/warmed-profile-command
-nsys stats /tmp/symmetrix-profile/system.nsys-rep
-```
+## Coding and benchmark standards
 
-Use Nsight Compute only for the kernel families identified by the timeline.
-Limit kernel names and launch counts before requesting expensive sections:
+Use four-space Python, Ruff formatting/linting (`E741` is intentionally
+ignored), `snake_case` functions/modules, `PascalCase` classes, and
+`test_<behavior>` tests. Keep C++20 style and established snake-case APIs.
+Comments should explain only non-obvious numerical, ownership, or backend
+constraints.
 
-```bash
-ncu \
-  --kernel-name 'regex:.*target_kernel.*' --launch-skip 10 \
-  --launch-count 2 --section SpeedOfLight \
-  --section MemoryWorkloadAnalysis -o /tmp/symmetrix-profile/kernel \
-  /path/to/profile-command
-```
+Use `std::size_t` or an explicitly 64-bit type for flattened indices and large
+execution ranges; widen operands before multiplication. Follow
+`docs/openmp_simd_coding_standard.md`: SIMD writes must be lane-private,
+disjoint, or reduced. Use host-launched KokkosBlas for whole-array operations
+and KokkosBatched/native SIMD inside workers. External CBLAS from OpenMP
+workers is allowed only under the centralized runtime-compatibility policy;
+otherwise use Kokkos contractions. Parallel tests must prove worker
+participation and nontrivial speedup.
 
-Nsight Compute replays kernels and materially perturbs end-to-end timing; do
-not use its elapsed process time as a performance result. Add Occupancy,
-LaunchStatistics, SchedulerStatistics, or WarpStateStatistics only to answer a
-specific hypothesis. Collect a baseline and candidate with identical inputs
-and launch filters. If hardware counters are permission-restricted, report the
-missing capability instead of silently substituting timeline estimates.
+Benchmark records must use `us/atom` (MPI: `us/atom/step`) as the primary
+metric and include model, precision, backend, atom count, cutoff, skin,
+effective cutoff, directed edges, timing, and memory. After every run, parse
+the result record and verify atoms/repeat, cutoff, skin, precision, properties,
+and edges against the command; filenames are not evidence that the requested
+case ran. Primary CPU optimization results use one physical core; scaling runs
+must state physical cores and Kokkos/BLAS thread counts.
 
-When system policy prevents `perf record`, use built-in phase timers,
-`/usr/bin/time -v`, and `strace -c` for CPU attribution. For AMD GPU work,
-prefer `rocprofv3 --kernel-trace --stats` and selected ROCTx regions after
-warming hipRTC.
+OpenMP deployment qualification additionally requires fresh 1/2/4/8-thread
+MACEField processes for energy, forces, stress, polarization, BEC, and
+polarizability in generic and direct modes, using
+`benchmarks/openmp_full_property_qualification.py`. Prove worker participation,
+tile-width 1/4/8/16 parity, and nontrivial speedup; import success, `ldd`, or an
+energy-only test is insufficient.
 
-## LAMMPS and MPI Environments
+## Commits
 
-Relink the LAMMPS executable after every native library change and record its
-hash. LAMMPS does not run the direct-kernel compiler: prepare matching FP32 and
-FP64 host/device artifacts in the Symmetrix environment first. The MPI pytest
-matrix uses `SYMMETRIX_LAMMPS_EXECUTABLE`,
-`SYMMETRIX_LAMMPS_COMPACT_MODEL`, `SYMMETRIX_LAMMPS_FIELD_MODEL`, and the
-precision-specific `SYMMETRIX_LAMMPS_JIT_HOST_ARTIFACT_FLOAT32` and
-`SYMMETRIX_LAMMPS_JIT_HOST_ARTIFACT_FLOAT64` variables.
-
-MPI execution requires an environment in which OpenMPI/PMIx and the selected
-transport can create their sockets and shared-memory resources. For multi-GPU
-tests use one MPI rank per GPU, state the rank grid, and distinguish host-staged
-from CUDA-aware MPI. Positive CUDA-aware evidence requires the provider
-capability query and absence of LAMMPS's `Turning off GPU-aware MPI` warning;
-zero Symmetrix staged bytes alone is not proof because no callback may have run.
-
-Report MPI performance in `us/atom/step`, with Pair and Comm timing separated.
-Staging synchronization can be charged to Pair. Qualify ownership migration
-and multi-step prepared-graph reuse, not only `run 0` or successful process
-exit.
-
-## Coding Style & Naming Conventions
-
-Python uses four-space indentation, Ruff formatting, and Ruff linting; `E741` is intentionally ignored. Use `snake_case` for functions/modules, `PascalCase` for classes, and `test_<behavior>` for tests. For C++, retain the surrounding style, C++20 compatibility, and established `snake_case` APIs. Keep comments focused on non-obvious numerical, ownership, or backend constraints.
-
-Use `std::size_t` or an explicitly 64-bit type for flattened indices and execution ranges whose extents can scale with atom, edge, spline, or channel counts. Cast operands before multiplication so the product cannot overflow in 32-bit arithmetic.
-
-For OpenMP and SIMD kernels, follow `docs/openmp_simd_coding_standard.md`.
-Every value written by an `omp simd` loop must be lane-private, disjointly
-indexed, or covered by an explicit reduction. Use host-launched `KokkosBlas`
-for whole rank-1/rank-2 operations and `KokkosBatched::Team*`, `Serial*`, or
-native SIMD kernels inside Kokkos workers. External CBLAS calls from Kokkos
-OpenMP workers are permitted only through the centralized host-worker policy
-when runtime probing verifies OpenMP OpenBLAS, confirms that its query symbols
-belong to the CBLAS provider, proves that OpenBLAS and Kokkos use the same
-OpenMP runtime, and finds nested active levels disabled. Pthread, unidentified,
-runtime-incompatible, or nested-enabled BLAS configurations must use Kokkos
-contractions inside workers. One BLAS thread alone does not establish
-concurrent-caller safety; the unsafe override is for controlled diagnostics
-only and must fail strict runtime qualification.
-Parallel correctness tests must prove actual worker participation and
-nontrivial speedup, not only requested thread counts.
-
-## Testing Guidelines
-
-Add focused pytest coverage beside the affected component. Parametrize backend/precision variants when behavior differs. Test coverage must not be limited to the currently installed extension. When compatible CUDA or HIP hardware and toolchains are available, create isolated temporary virtual environments and fresh backend-specific build directories, build the corresponding Kokkos backend, and run its applicable tests. Do not replace or reconfigure the developer's installed extension to obtain this coverage. Tests requiring unavailable accelerator hardware, toolchains, compilers, LAMMPS, or downloaded model checkpoints should skip clearly with the missing prerequisite in the reason. Run the smallest relevant test file while iterating, then the full applicable suite and pre-commit before submission.
-
-If the worktree has no usable test environment, create the repository-local
-`.venv` with `uv venv`, activate it, and install the editable test package with
-`uv pip install -e "./symmetrix[test]"`. Do not treat a missing `pytest`
-executable as a reason to skip tests when this CPU development environment can
-be built.
-
-Inspect `git status` before running formatters. In a dirty worktree, run
-pre-commit on the exact intended files first; `--all-files` can rewrite
-unrelated tracked files. Never restore a formatter change unless the file was
-known clean immediately before that invocation.
-
-Benchmark records and result notes must use `us/atom` as the primary performance metric. Total step or call time may also be reported as secondary context, but performance targets, comparisons, and optimization decisions must be stated in `us/atom`. Include the atom count and the exact model cutoff used, in addition to the existing model, backend, precision, timing, and memory context. When a neighbor-list skin or other graph expansion is active, also report that value, the resulting effective neighbor-list cutoff, and the directed-edge count so capacity and performance results can be compared on the same workload.
-
-CPU optimization benchmarks and stage profiles default to one physical CPU
-core, one Kokkos/OpenMP thread, and one BLAS thread, with process affinity
-applied before Python initializes either runtime. Use this one-thread result for
-primary optimization decisions and before/after acceptance. Multithread runs
-are secondary scaling qualifications and must state their physical-core set and
-both Kokkos and BLAS thread counts explicitly.
-
-OpenMP deployment qualification must additionally compare fresh one-, two-,
-four-, and eight-thread MACEField processes for energy, forces, stress,
-polarization, BEC, and polarizability in both generic and direct modes. Use
-`benchmarks/openmp_full_property_qualification.py` with explicit model,
-structure, physical CPU sets, and output record. The gate must prove actual
-worker participation, tile-width 1/4/8/16 parity, and nontrivial multithread
-speedup. A successful import, static `ldd`, or energy-only calculation is not a
-substitute for this gate.
-
-## Commit & Pull Request Guidelines
-
-Follow the history’s short, imperative, sentence-case subjects, for example `Harden indexing for million-atom models`. Keep commits cohesive. Pull requests should explain the behavior and backend impact, list commands run, link relevant issues, and include benchmark evidence for performance changes. Note CPU/CUDA and precision coverage explicitly; attach screenshots only for documentation or user-visible output changes.
-
-Do not include transient agent planning files, scratch notes, or task-state
-files in commits.
+Use short, imperative, sentence-case subjects and cohesive commits. PRs should
+describe behavior/backend impact, list commands run, state CPU/CUDA and
+precision coverage, and include benchmark evidence for performance changes.
+Do not commit transient agent plans, scratch notes, task-state files, generated
+binaries, caches, private models, machine names, or unpublished benchmark
+records.

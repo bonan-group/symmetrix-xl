@@ -746,9 +746,13 @@ def test_cuda_plugin_codegen_metadata_and_source_contract(codegen):
     assert "__shared__ Scalar source_values[4]" in source
     assert "source_args.source_offsets[source]" in source
     assert "source_values[0 * 4 + channel] +=" in source
-    assert "double x;" in source
-    assert "floor((radius - radial.x0) / radial.h)" in source
-    assert "local_radius" not in source
+    assert "const Scalar local_radius" in source
+    assert "floor((local_radius - x0) / h)" in source
+    fp64_source = codegen.render_jit_r1_cuda_plugin(
+        contract, 80, precision="float64"
+    )
+    assert "double x;" in fp64_source
+    assert "floor((radius - radial.x0) / radial.h)" in fp64_source
     assert "#pragma unroll 1" in source
     assert "reverse_path < 1" in source
     assert "switch (reverse_path)" in source

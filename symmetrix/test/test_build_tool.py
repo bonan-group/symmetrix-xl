@@ -25,6 +25,7 @@ build_matrix = importlib.import_module("_symmetrix_build.matrix")
 build_package_identity = importlib.import_module("_symmetrix_build.package_identity")
 build_python = importlib.import_module("_symmetrix_build.python_build")
 build_sdist = importlib.import_module("_symmetrix_build.sdist_build")
+build_source_provenance = importlib.import_module("_symmetrix_build.source_provenance")
 build_targets = importlib.import_module("_symmetrix_build.targets")
 build_wheel_audit = importlib.import_module("_symmetrix_build.wheel_audit")
 
@@ -42,7 +43,7 @@ parse_lammps_version = build_lammps.parse_lammps_version
 probe_mpi_gpu_awareness = build_lammps.probe_mpi_gpu_awareness
 reuse_lammps_qualification = build_lammps.reuse_lammps_qualification
 run_lammps_build = build_lammps.run_lammps_build
-symmetrix_source_fingerprint = build_lammps.symmetrix_source_fingerprint
+symmetrix_source_fingerprint = build_source_provenance.symmetrix_source_fingerprint
 validate_lammps_source = build_lammps.validate_lammps_source
 TargetManifest = build_manifest.TargetManifest
 Toolchain = build_manifest.Toolchain
@@ -827,10 +828,30 @@ def test_python_invocation_uses_fingerprinted_build_directory(tmp_path):
     assert invocation.build_directory.name == manifest.fingerprint
     assert invocation.manifest_path.is_file()
     assert invocation.environment["CMAKE_BUILD_PARALLEL_LEVEL"] == "3"
+    source_sha256 = invocation.source_provenance["content_sha256"]
+    native_source_sha256 = invocation.source_provenance["native_content_sha256"]
+    assert len(source_sha256) == 64
+    assert len(native_source_sha256) == 64
+    invocation_record = json.loads(
+        (invocation.build_directory / "invocation.json").read_text()
+    )
+    assert invocation_record["source_provenance"]["content_sha256"] == source_sha256
+    assert (
+        invocation_record["source_provenance"]["native_content_sha256"]
+        == native_source_sha256
+    )
     assert any(
         value == "--config-settings=cmake.define.Kokkos_ARCH_AMD_GFX1100=ON"
         for value in invocation.command
     )
+    assert (
+        f"--config-settings=cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256="
+        f"{source_sha256}"
+    ) in invocation.command
+    assert (
+        "--config-settings=cmake.define.SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256="
+        f"{native_source_sha256}"
+    ) in invocation.command
 
 
 def test_python_install_uses_uv_for_the_selected_interpreter(tmp_path):
@@ -842,13 +863,18 @@ def test_python_install_uses_uv_for_the_selected_interpreter(tmp_path):
         build_root=tmp_path / "build",
     )
 
-    assert invocation.command[:5] == (
+    assert invocation.command[:6] == (
         "uv",
         "pip",
         "install",
+        "--no-build-isolation",
         "--python",
         manifest.python_executable,
     )
+    assert (
+        "--reinstall-package",
+        "symmetrix-xl",
+    ) == invocation.command[7:9]
     assert any(
         value == "--config-setting=cmake.define.Kokkos_ENABLE_OPENMP=ON"
         for value in invocation.command

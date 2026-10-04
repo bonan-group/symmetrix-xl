@@ -114,7 +114,7 @@ tests that:
   CPUs;
 - include a conservative speedup threshold so an effective one-thread run
   cannot pass as multithreaded;
-- compare generic and direct MACEField execution for energy, forces, stress,
+- compare non-compiled and direct MACEField execution for energy, forces, stress,
   polarization, BECs, and polarizability;
 - exercise affected SIMD tile widths, currently M0 widths 1/4/8/16, with width
   1 as the untiled owner-per-channel reference;

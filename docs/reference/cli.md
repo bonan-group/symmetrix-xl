@@ -1,5 +1,18 @@
 # Command-Line Interface
 
+`symmetrix version [--json] [--probe] [--metadata-only]` reports the imported frontend location
+and the source commit, source-content SHA-256, native-source SHA-256, and dirty state
+recorded in every installed backend descriptor. It reads descriptors without
+loading a native extension, so it can identify a stale virtual environment even
+when the backend cannot initialize on the current host.
+An `unknown` identity means that artifact was built without the provenance
+metadata; it is not evidence that the artifact matches the current worktree.
+The command probes the selected native backend by default, including its
+compiled code identity, extension path, linked runtime/BLAS libraries, and
+Kokkos/device runtime details. If probing fails, it reports the error and falls
+back to metadata-only inspection. Use `--metadata-only` to skip native loading;
+`--probe` is retained as an explicit spelling of the default behavior.
+
 `symmetrix backend list [--json]` reports installed descriptors and their
 usability without loading an extension. `symmetrix backend show [selector]
 [--json] [--probe]` resolves the automatic or explicit selection; an

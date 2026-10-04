@@ -417,6 +417,7 @@ def test_cache_key_is_canonical_and_covers_all_inputs(jit, monkeypatch):
     monkeypatch.setattr(jit, "_shared_library_suffix", lambda: ".so")
     common = {
         "source": _source(),
+        "source_content_sha256": "a" * 64,
         "abi": {"z": 2, "a": 1},
         "build": {"backend": "host"},
         "compiler": {"version": "test", "command": ["c++"]},
@@ -425,11 +426,12 @@ def test_cache_key_is_canonical_and_covers_all_inputs(jit, monkeypatch):
     first = jit.jit_cache_key(**common)
     reordered = jit.jit_cache_key(**{**common, "abi": {"a": 1, "z": 2}})
     assert first == reordered
-    assert first == ("18053499c74e0e7f9a481bb581ca2bcd8b63be62631928a60c1968ee89d6a8ef")
+    assert first == ("84e81864ae64c36fd9aa859522dcc211d0f4fd5a6aabb17a50f6f671caa682a4")
     assert len(first) == 64
 
     variants = [
         {"source": _source(43)},
+        {"source_content_sha256": "b" * 64},
         {"abi": {"a": 1, "z": 3}},
         {"build": {"backend": "cuda"}},
         {"compiler": {"version": "other", "command": ["c++"]}},
@@ -991,6 +993,25 @@ def test_changed_source_publishes_a_distinct_entry(jit, tmp_path, cxx):
     assert first.available and second.available
     assert first.cache_key != second.cache_key
     assert first.artifact_path != second.artifact_path
+
+
+def test_changed_native_source_fingerprint_publishes_distinct_named_artifact(
+    jit, tmp_path, cxx
+):
+    first = _prepare(jit, tmp_path, cxx, source_content_sha256="a" * 64)
+    second = _prepare(jit, tmp_path, cxx, source_content_sha256="b" * 64)
+
+    assert first.available and second.available
+    assert first.cache_key != second.cache_key
+    assert first.artifact_path != second.artifact_path
+    assert first.artifact_path.name == (
+        f"execution_plugin_gen11_src{'a' * 64}{SHARED_SUFFIX}"
+    )
+    assert second.artifact_path.name == (
+        f"execution_plugin_gen11_src{'b' * 64}{SHARED_SUFFIX}"
+    )
+    assert first.manifest["key_inputs"]["source_content_sha256"] == "a" * 64
+    assert second.manifest["key_inputs"]["source_content_sha256"] == "b" * 64
 
 
 def test_invalid_cached_manifest_is_quarantined_and_rebuilt(jit, tmp_path, cxx):

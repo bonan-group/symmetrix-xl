@@ -63,6 +63,63 @@ if(SYMMETRIX_BLAS_LIBRARY)
 else()
     find_package(BLAS REQUIRED)
 endif()
+# KokkosKernels caches BLAS_LIBRARIES as a user-facing string. On a later
+# configure that cache entry can hide FindBLAS' normal variable, and its
+# finder cannot resolve absolute library paths when they are treated as
+# library names. Normalize every absolute result to a stable name while
+# preserving companion libraries (for example `m` and `dl`) and all search
+# directories. This keeps repeated package installs on the same build tree
+# working for both single- and multi-entry FindBLAS results.
+set(_symmetrix_blas_normalized_libraries "")
+set(_symmetrix_blas_normalized_directories "${BLAS_LIBRARY_DIRS}")
+set(_symmetrix_blas_can_normalize TRUE)
+foreach(_symmetrix_blas_library IN LISTS BLAS_LIBRARIES)
+    if(IS_ABSOLUTE "${_symmetrix_blas_library}")
+        if(NOT EXISTS "${_symmetrix_blas_library}")
+            set(_symmetrix_blas_can_normalize FALSE)
+            break()
+        endif()
+        get_filename_component(
+            _symmetrix_blas_library_dir "${_symmetrix_blas_library}" DIRECTORY)
+        get_filename_component(
+            _symmetrix_blas_library_name "${_symmetrix_blas_library}" NAME)
+        string(REGEX MATCH
+            "^lib(.+)[.](a|so|dylib)([.].*)?$"
+            _symmetrix_blas_library_match "${_symmetrix_blas_library_name}")
+        string(REGEX REPLACE
+            "^lib(.+)[.](a|so|dylib)([.].*)?$" "\\1"
+            _symmetrix_blas_library_name "${_symmetrix_blas_library_name}")
+        if(NOT _symmetrix_blas_library_match)
+            set(_symmetrix_blas_can_normalize FALSE)
+            break()
+        endif()
+        list(APPEND _symmetrix_blas_normalized_directories
+            "${_symmetrix_blas_library_dir}")
+        list(APPEND _symmetrix_blas_normalized_libraries
+            "${_symmetrix_blas_library_name}")
+    else()
+        list(APPEND _symmetrix_blas_normalized_libraries
+            "${_symmetrix_blas_library}")
+    endif()
+endforeach()
+if(_symmetrix_blas_can_normalize AND _symmetrix_blas_normalized_libraries)
+    list(REMOVE_DUPLICATES _symmetrix_blas_normalized_directories)
+    set(BLAS_LIBRARIES "${_symmetrix_blas_normalized_libraries}")
+    set(BLAS_LIBRARIES "${_symmetrix_blas_normalized_libraries}" CACHE STRING
+        "Resolved BLAS library names for repeatable configuration." FORCE)
+    if(_symmetrix_blas_normalized_directories)
+        set(BLAS_LIBRARY_DIRS "${_symmetrix_blas_normalized_directories}")
+        set(BLAS_LIBRARY_DIRS "${_symmetrix_blas_normalized_directories}" CACHE STRING
+            "Resolved BLAS library directories for repeatable configuration." FORCE)
+    endif()
+endif()
+unset(_symmetrix_blas_can_normalize)
+unset(_symmetrix_blas_normalized_libraries)
+unset(_symmetrix_blas_normalized_directories)
+unset(_symmetrix_blas_library)
+unset(_symmetrix_blas_library_dir)
+unset(_symmetrix_blas_library_name)
+unset(_symmetrix_blas_library_match)
 find_package(Git REQUIRED)
 
 set(_symmetrix_sphericart_cuda_default OFF)

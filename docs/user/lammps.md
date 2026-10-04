@@ -191,9 +191,9 @@ modify a build directory. It prints one JSON document containing the resolved
 commands, selected environment, fingerprint, and provenance.
 
 For a quick diagnostic CPU run without a prepared artifact, use the
-compiler-free Kokkos `non-compiled` fallback with a compact JSON model. It has no
-performance guarantee. The first-class production path is the direct example
-below. The atom-ID map and Newton pair setting are required:
+compiler-free Kokkos `non-compiled` debug path with a compact JSON model. It is
+not optimized and has no performance guarantee. The first-class production path
+is the direct example below. The atom-ID map and Newton pair setting are required:
 
 ```text
 units metal

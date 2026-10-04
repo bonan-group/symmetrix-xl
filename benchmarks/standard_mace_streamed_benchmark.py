@@ -13,15 +13,17 @@ import statistics
 import subprocess
 import sys
 import time
+import traceback
 
 THREAD_COUNT = os.environ.get("SYMMETRIX_BENCHMARK_THREADS", "1")
 BLAS_THREAD_COUNT = os.environ.get("SYMMETRIX_BENCHMARK_BLAS_THREADS", "1")
 MODE_ALIASES = {
-    "all_interactions": "generic",
+    "generic": "non-compiled",
+    "all_interactions": "non-compiled",
     "factorized": "direct",
     "direct_streamed": "direct",
 }
-CANONICAL_MODES = frozenset(("materialized", "generic", "direct"))
+CANONICAL_MODES = frozenset(("materialized", "non-compiled", "direct"))
 PREPARED_MODES = frozenset(("direct",))
 for variable in ("KOKKOS_NUM_THREADS", "OMP_NUM_THREADS"):
     os.environ[variable] = THREAD_COUNT
@@ -380,6 +382,9 @@ def _phi1_report(evaluator):
     return {
         "selected_policy": getattr(evaluator, "phi1_policy", "retained"),
         "workspace_bytes": int(getattr(evaluator, "phi1_workspace_bytes", 0)),
+        "a1_blas_flatten_workspace_bytes": int(
+            getattr(evaluator, "a1_blas_flatten_workspace_bytes", 0)
+        ),
     }
 
 
@@ -507,7 +512,7 @@ def _make_calculator(
     if mode in PREPARED_MODES and standard_r0_executor is not None:
         calculator.evaluator._set_standard_r0_executor(standard_r0_executor)
     if (
-        mode in ("generic", "direct", "receiver_factorized")
+        mode in ("non-compiled", "direct", "receiver_factorized")
         and standard_m0_executor is not None
     ):
         calculator.evaluator._set_standard_m0_executor(standard_m0_executor)
@@ -1349,7 +1354,7 @@ def main():
     parser.add_argument("model", type=pathlib.Path)
     parser.add_argument("--backend", choices=("serial", "kokkos"), default="kokkos")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float64")
-    parser.add_argument("--modes", default="materialized,generic")
+    parser.add_argument("--modes", default="materialized,direct")
     parser.add_argument("--sizes", default="2,3,4")
     parser.add_argument("--warmups", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=10)
@@ -1477,7 +1482,7 @@ def main():
     modes = [MODE_ALIASES.get(mode, mode) for mode in requested_modes]
     if any(mode not in CANONICAL_MODES for mode in modes):
         parser.error(
-            "--modes must contain only materialized,generic,direct or a "
+            "--modes must contain only materialized,non-compiled,direct or a "
             "compatibility alias"
         )
     if len(set(modes)) != len(modes):
@@ -1512,7 +1517,7 @@ def main():
         parser.error("--standard-r0-executor requires direct")
     if (
         args.standard_m0_executor is not None
-        and "generic" not in modes
+        and "non-compiled" not in modes
         and "direct" not in modes
     ):
         parser.error("--standard-m0-executor requires a streamed mode")
@@ -1781,8 +1786,11 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     finally:
+        exception = sys.exc_info()[1]
+        if exception is not None:
+            traceback.clear_frames(exception.__traceback__)
         gc.collect()
-        native = sys.modules.get("symmetrix.symmetrix")
+        native = native_symmetrix
         is_initialized = getattr(native, "_kokkos_is_initialized", None)
         finalize = getattr(native, "_finalize_kokkos", None)
         if callable(is_initialized) and callable(finalize) and is_initialized():

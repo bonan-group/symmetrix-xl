@@ -54,6 +54,47 @@ using Kokkos::View;
 
 #include "mace_kokkos_jit_plugin_detail.hpp"
 
+namespace {
+
+// The fused CUDA reverse kernel strides over source nodes by gridDim.x. Keep
+// that stride bounded for large graphs so a block does not revisit hundreds of
+// widely separated source records after the first grid wave. The environment
+// override is intentionally retained for backend tuning and profiling.
+int resolve_r1_reverse_grid_blocks(
+    const int num_source_nodes,
+    const int persistent_blocks)
+{
+#if defined(KOKKOS_ENABLE_CUDA)
+    constexpr int default_sources_per_block = 8;
+    int sources_per_block = default_sources_per_block;
+    const char* raw = std::getenv(
+        "SYMMETRIX_JIT_CUDA_R1_REVERSE_SOURCES_PER_BLOCK");
+    if (raw != nullptr && *raw != '\0') {
+        char* end = nullptr;
+        const long requested = std::strtol(raw, &end, 10);
+        if (end != raw && *end == '\0' && requested > 0
+            && requested <= std::numeric_limits<int>::max()) {
+            sources_per_block = static_cast<int>(requested);
+        }
+    }
+    if (num_source_nodes > 0 && persistent_blocks > 0) {
+        const auto source_count = static_cast<std::size_t>(num_source_nodes);
+        const auto target = static_cast<std::size_t>(sources_per_block);
+        const auto blocks = source_count/target
+            + (source_count%target != 0);
+        if (blocks > static_cast<std::size_t>(persistent_blocks)
+            && blocks <= static_cast<std::size_t>(
+                std::numeric_limits<int>::max()))
+            return static_cast<int>(blocks);
+    }
+#else
+    (void)num_source_nodes;
+#endif
+    return persistent_blocks;
+}
+
+} // namespace
+
 template <typename Precision>
 void MACEKokkos<Precision>::compute_factorized(
     int num_nodes,
@@ -846,14 +887,19 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                     dPhi1.data(),
                     node_forces.data(),
                     r_cut};
-                const int persistent_blocks =
+                const int base_persistent_blocks =
                     resolve_jit_device_plugin_persistent_blocks(
                         *jit_device_plugin,
                         execution_space,
                         std::max(
-                            static_cast<std::size_t>(num_feature_nodes)*num_channels,
+                            static_cast<std::size_t>(num_feature_nodes)
+                                *num_channels,
                             neigh_indices.extent(0)),
                         "r1_reverse");
+                int persistent_blocks = base_persistent_blocks;
+                if (jit_device_plugin->r1_reverse_physical_launch_count() == 1)
+                    persistent_blocks = resolve_r1_reverse_grid_blocks(
+                        num_feature_nodes, base_persistent_blocks);
                 ExecutionDeviceBackend::DeviceGuard device_guard(
                     ExecutionDeviceBackend::device_ordinal(execution_space));
                 ExecutionDeviceBackend::check_status(
@@ -1120,6 +1166,14 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
     const auto coefficients = Phi1_clebsch_gordan;
     const auto output_adjoint = dPhi1;
     auto row_adjoint = dPhi1r;
+    const Precision* const output_adjoint_data = output_adjoint.data();
+    Precision* const row_adjoint_data = row_adjoint.data();
+    const std::size_t output_adjoint_channels = output_adjoint.extent(2);
+    const std::size_t row_adjoint_channels = row_adjoint.extent(2);
+    const std::size_t output_adjoint_row_stride = static_cast<std::size_t>(
+        output_adjoint.extent(1))*output_adjoint_channels;
+    const std::size_t row_adjoint_row_stride = static_cast<std::size_t>(
+        row_adjoint.extent(1))*row_adjoint_channels;
 
     const auto artifact_environment =
         kernel_launch_environment(execution_space);
@@ -1132,8 +1186,16 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                 const int receiver = flat/channels;
                 const int channel = flat%channels;
                 for (int term=0; term<coefficients.extent_int(0); ++term)
-                    row_adjoint(receiver,row(term),channel) += coefficients(term)
-                        *output_adjoint(receiver,lme(term),channel);
+                    row_adjoint_data[static_cast<std::size_t>(receiver)
+                            *row_adjoint_row_stride
+                        +static_cast<std::size_t>(row(term))
+                            *row_adjoint_channels
+                        +static_cast<std::size_t>(channel)] += coefficients(term)
+                        *output_adjoint_data[static_cast<std::size_t>(receiver)
+                                *output_adjoint_row_stride
+                            +static_cast<std::size_t>(lme(term))
+                                *output_adjoint_channels
+                            +static_cast<std::size_t>(channel)];
             });
     } else {
         Kokkos::parallel_for(
@@ -1147,8 +1209,17 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                     Kokkos::parallel_for(
                         Kokkos::TeamVectorRange(member, channels),
                         [=] (const int channel) {
-                            row_adjoint(receiver,row(term),channel) += coefficient
-                                *output_adjoint(receiver,lme(term),channel);
+                            row_adjoint_data[static_cast<std::size_t>(receiver)
+                                    *row_adjoint_row_stride
+                                +static_cast<std::size_t>(row(term))
+                                    *row_adjoint_channels
+                                +static_cast<std::size_t>(channel)] += coefficient
+                                *output_adjoint_data[
+                                    static_cast<std::size_t>(receiver)
+                                        *output_adjoint_row_stride
+                                    +static_cast<std::size_t>(lme(term))
+                                        *output_adjoint_channels
+                                    +static_cast<std::size_t>(channel)];
                         });
                 }
             });
@@ -1195,7 +1266,12 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                         const Precision contribution = radial_value
                             *harmonics_values(
                                 edge*harmonics+lm1_rows(sparse_row))
-                            *row_adjoint(receiver,sparse_row,channel);
+                            *row_adjoint_data[
+                                static_cast<std::size_t>(receiver)
+                                    *row_adjoint_row_stride
+                                +static_cast<std::size_t>(sparse_row)
+                                    *row_adjoint_channels
+                                +static_cast<std::size_t>(channel)];
                         const Precision corrected = contribution
                             -compensations[source_lm];
                         const Precision updated = values[source_lm]+corrected;

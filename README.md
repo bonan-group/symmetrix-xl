@@ -241,12 +241,18 @@ See the `pair_symmetrix` [README](pair_symmetrix/README.md) for use from LAMMPS.
 
 ### Development Setup
 
-Use `uv` to create a virtual environment and install the package with its test dependencies:
+Use `uv` to create a worktree-local environment and install the package with
+its test dependencies. Reuse the environment and editable build directory for
+source iterations:
 
 ```bash
-uv venv
+test -x .venv/bin/python || uv venv .venv
 source .venv/bin/activate
-uv pip install -e "./symmetrix[test]"
+uv pip install scikit-build-core pybind11 ninja
+source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_source_fingerprint; print(symmetrix_source_fingerprint(Path.cwd()))')
+uv pip install --no-build-isolation --reinstall-package symmetrix-xl \
+  -e "./symmetrix[test]" \
+  --config-setting="cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint"
 ```
 
 Run Python formatting and lint checks with `uvx pre-commit run --all-files`.

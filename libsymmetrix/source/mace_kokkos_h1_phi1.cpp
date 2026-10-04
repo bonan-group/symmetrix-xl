@@ -38,7 +38,6 @@
 #include "cblas.hpp"
 #include "device_backend.hpp"
 #include "kernel_launch_profile.hpp"
-#include "factorized_blas.hpp"
 #include "host_dense_kernels.hpp"
 #include "host_worker_blas.hpp"
 
@@ -983,6 +982,14 @@ void MACEKokkos<Precision>::compute_Phi1(
     const auto H1 = this->H1;
     auto Phi1 = this->Phi1;
     auto Phi1r = this->Phi1r;
+    auto* const phi1_data = Phi1.data();
+    auto* const phi1r_data = Phi1r.data();
+    const std::size_t phi1_channels = Phi1.extent(2);
+    const std::size_t phi1r_channels = Phi1r.extent(2);
+    const std::size_t phi1_row_stride = static_cast<std::size_t>(
+        Phi1.extent(1))*phi1_channels;
+    const std::size_t phi1r_row_stride = static_cast<std::size_t>(
+        Phi1r.extent(1))*phi1r_channels;
 
     const auto phi1r_scratch_bytes = admitted_team_scratch_bytes<>(
         "MACEKokkos::compute_Phi1r",
@@ -1021,7 +1028,10 @@ void MACEKokkos<Precision>::compute_Phi1(
             Kokkos::parallel_for(
                 Kokkos::TeamVectorRange(team_member, num_channels),
                 [=] (const int k) {
-                    Phi1r(node,lelm1lm2,k) = Phi1r_i_lelm1lm2(k);
+                    phi1r_data[node*phi1r_row_stride
+                        +static_cast<std::size_t>(lelm1lm2)*phi1r_channels
+                        +static_cast<std::size_t>(k)] =
+                        Phi1r_i_lelm1lm2(k);
                 });
         });
     Kokkos::fence();
@@ -1036,7 +1046,12 @@ void MACEKokkos<Precision>::compute_Phi1(
                 Kokkos::parallel_for(
                     Kokkos::TeamVectorRange(team_member, num_channels),
                     [&] (const int k) {
-                        Phi1(node,Phi1_lme(p),k) += C * Phi1r(node,Phi1_lelm1lm2(p),k);
+                        const std::size_t node_offset = node*phi1_row_stride;
+                        phi1_data[node_offset + static_cast<std::size_t>(
+                            Phi1_lme(p))*phi1_channels + static_cast<std::size_t>(k)] +=
+                            C * phi1r_data[node*phi1r_row_stride
+                                +static_cast<std::size_t>(Phi1_lelm1lm2(p))
+                                    *phi1r_channels +static_cast<std::size_t>(k)];
                     });
             }
         });
@@ -1079,6 +1094,10 @@ void MACEKokkos<Precision>::compute_Phi1_streamed(
     const auto Y = this->Y;
     const auto H1 = this->H1;
     auto Phi1r = this->Phi1r;
+    auto* const phi1r_data = Phi1r.data();
+    const std::size_t phi1r_channels = Phi1r.extent(2);
+    const std::size_t phi1r_row_stride = static_cast<std::size_t>(
+        Phi1r.extent(1))*phi1r_channels;
 
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     const Kokkos::TeamPolicy<> streamed_policy(
@@ -1112,7 +1131,9 @@ void MACEKokkos<Precision>::compute_Phi1_streamed(
                         const Precision radial = radial_1.evaluate_function(
                             edge_type, point, path*num_channels+k);
                         for (int row=row_begin; row<row_end; ++row)
-                            Phi1r(node,row,k) += radial
+                            phi1r_data[node*phi1r_row_stride
+                                +static_cast<std::size_t>(row)*phi1r_channels
+                                +static_cast<std::size_t>(k)] += radial
                                 *Y(edge*num_lm+Phi1_lm1(row))
                                 *H1(neigh_indices(ij),Phi1_lm2(row),k);
                     });
@@ -1123,6 +1144,10 @@ void MACEKokkos<Precision>::compute_Phi1_streamed(
     const auto Phi1_lelm1lm2 = this->Phi1_lelm1lm2;
     const auto Phi1_clebsch_gordan = this->Phi1_clebsch_gordan;
     auto Phi1 = this->Phi1;
+    auto* const phi1_data = Phi1.data();
+    const std::size_t phi1_channels = Phi1.extent(2);
+    const std::size_t phi1_row_stride = static_cast<std::size_t>(
+        Phi1.extent(1))*phi1_channels;
     Kokkos::parallel_for(
         "MACEKokkos::compute_Phi1_streamed",
         Kokkos::TeamPolicy<>(
@@ -1135,8 +1160,12 @@ void MACEKokkos<Precision>::compute_Phi1_streamed(
                 Kokkos::parallel_for(
                     Kokkos::TeamVectorRange(team_member, num_channels),
                     [=] (const int k) {
-                        Phi1(node,Phi1_lme(p),k) += coefficient
-                            *Phi1r(node,Phi1_lelm1lm2(p),k);
+                        phi1_data[node*phi1_row_stride
+                            +static_cast<std::size_t>(Phi1_lme(p))*phi1_channels
+                            +static_cast<std::size_t>(k)] += coefficient
+                            *phi1r_data[node*phi1r_row_stride
+                                +static_cast<std::size_t>(Phi1_lelm1lm2(p))
+                                    *phi1r_channels +static_cast<std::size_t>(k)];
                     });
             }
         });
@@ -1646,6 +1675,14 @@ void MACEKokkos<Precision>::reverse_Phi1(
     const auto node_forces = this->node_forces;
     auto dPhi1r = this->dPhi1r;
     auto dPhi1 = this->dPhi1;
+    auto* const dphi1r_data = dPhi1r.data();
+    const Precision* const dphi1_data = dPhi1.data();
+    const std::size_t dphi1r_channels = dPhi1r.extent(2);
+    const std::size_t dphi1_channels = dPhi1.extent(2);
+    const std::size_t dphi1r_row_stride = static_cast<std::size_t>(
+        dPhi1r.extent(1))*dphi1r_channels;
+    const std::size_t dphi1_row_stride = static_cast<std::size_t>(
+        dPhi1.extent(1))*dphi1_channels;
 
     // Compute dE/dPhi1 (named dPhi1)
     Kokkos::parallel_for("Reverse Phi1",
@@ -1658,7 +1695,12 @@ void MACEKokkos<Precision>::reverse_Phi1(
                 Kokkos::parallel_for(
                     Kokkos::TeamVectorRange(team_member, num_channels),
                     [&] (const int k) {
-                        dPhi1r(node,Phi1_lelm1lm2(p),k) += C * dPhi1(node,Phi1_lme(p),k);
+                        dphi1r_data[node*dphi1r_row_stride
+                            +static_cast<std::size_t>(Phi1_lelm1lm2(p))
+                                *dphi1r_channels +static_cast<std::size_t>(k)] +=
+                            C * dphi1_data[node*dphi1_row_stride
+                                +static_cast<std::size_t>(Phi1_lme(p))
+                                    *dphi1_channels +static_cast<std::size_t>(k)];
                     });
             }
         });
@@ -1696,11 +1738,16 @@ void MACEKokkos<Precision>::reverse_Phi1(
                         Kokkos::parallel_reduce(
                             Kokkos::ThreadVectorRange(team_member, num_channels),
                             [=] (const int k, double& t1, double& t2) {
-                                t1 += R1_deriv(ij,lel1l2*num_channels+k) * H1(source,lm2,k) * dPhi1r(node,lelm1lm2,k);
-                                t2 += R1(ij,lel1l2*num_channels+k) * H1(source,lm2,k) * dPhi1r(node,lelm1lm2,k);
+                                const Precision adjoint = dphi1r_data[
+                                    node*dphi1r_row_stride
+                                    +static_cast<std::size_t>(lelm1lm2)
+                                        *dphi1r_channels
+                                    +static_cast<std::size_t>(k)];
+                                t1 += R1_deriv(ij,lel1l2*num_channels+k) * H1(source,lm2,k) * adjoint;
+                                t2 += R1(ij,lel1l2*num_channels+k) * H1(source,lm2,k) * adjoint;
                                 Kokkos::atomic_add(
                                     &H1_adj(source,lm2,k),
-                                    R1(ij,lel1l2*num_channels+k) * Y(edge*num_lm+lm1) * dPhi1r(node,lelm1lm2,k));
+                                    R1(ij,lel1l2*num_channels+k) * Y(edge*num_lm+lm1) * adjoint);
                             }, t1, t2);
                         f_x += t1*xyz(3*edge)/r(ij)*Y(edge*num_lm+lm1) + t2*Y_grad(3*edge*num_lm+lm1);
                         f_y += t1*xyz(3*edge+1)/r(ij)*Y(edge*num_lm+lm1) + t2*Y_grad((3*edge+1)*num_lm+lm1);
@@ -1751,6 +1798,14 @@ void MACEKokkos<Precision>::reverse_Phi1_streamed(
     const auto Phi1_clebsch_gordan = this->Phi1_clebsch_gordan;
     const auto dPhi1 = this->dPhi1;
     auto dPhi1r = this->dPhi1r;
+    auto* const dphi1r_data = dPhi1r.data();
+    const Precision* const dphi1_data = dPhi1.data();
+    const std::size_t dphi1r_channels = dPhi1r.extent(2);
+    const std::size_t dphi1_channels = dPhi1.extent(2);
+    const std::size_t dphi1r_row_stride = static_cast<std::size_t>(
+        dPhi1r.extent(1))*dphi1r_channels;
+    const std::size_t dphi1_row_stride = static_cast<std::size_t>(
+        dPhi1.extent(1))*dphi1_channels;
 
     Kokkos::parallel_for(
         "MACEKokkos::reverse_Phi1_streamed",
@@ -1763,8 +1818,12 @@ void MACEKokkos<Precision>::reverse_Phi1_streamed(
                 Kokkos::parallel_for(
                     Kokkos::TeamVectorRange(team_member, num_channels),
                     [=] (const int k) {
-                        dPhi1r(node,Phi1_lelm1lm2(p),k) += coefficient
-                            *dPhi1(node,Phi1_lme(p),k);
+                        dphi1r_data[node*dphi1r_row_stride
+                            +static_cast<std::size_t>(Phi1_lelm1lm2(p))
+                                *dphi1r_channels +static_cast<std::size_t>(k)] +=
+                            coefficient * dphi1_data[node*dphi1_row_stride
+                                +static_cast<std::size_t>(Phi1_lme(p))
+                                    *dphi1_channels +static_cast<std::size_t>(k)];
                     });
             }
         });
@@ -1874,7 +1933,11 @@ void MACEKokkos<Precision>::reverse_Phi1_streamed(
                                     for (int row=row_begin; row<row_end; ++row) {
                                         const int lm1 = Phi1_lm1(row);
                                         const int lm2 = Phi1_lm2(row);
-                                        const Precision adjoint = dPhi1r(receiver,row,k);
+                                        const Precision adjoint = dphi1r_data[
+                                            receiver*dphi1r_row_stride
+                                            +static_cast<std::size_t>(row)
+                                                *dphi1r_channels
+                                            +static_cast<std::size_t>(k)];
                                         const Precision neighbor_feature =
                                             H1(source,lm2,k);
                                         const Precision radial_force =
@@ -1946,7 +2009,10 @@ void MACEKokkos<Precision>::reverse_Phi1_streamed(
                         for (int row=row_begin; row<row_end; ++row) {
                             const int lm1 = Phi1_lm1(row);
                             const int lm2 = Phi1_lm2(row);
-                            const Precision adjoint = dPhi1r(receiver,row,k);
+                            const Precision adjoint = dphi1r_data[
+                                receiver*dphi1r_row_stride
+                                +static_cast<std::size_t>(row)*dphi1r_channels
+                                +static_cast<std::size_t>(k)];
                             const Precision neighbor_feature = H1(source,lm2,k);
                             const Precision radial_force =
                                 radial_derivative*neighbor_feature*adjoint;
@@ -2049,7 +2115,11 @@ void MACEKokkos<Precision>::reverse_Phi1_streamed(
                                 for (int row=row_begin; row<row_end; ++row) {
                                     const int lm1 = Phi1_lm1(row);
                                     const int lm2 = Phi1_lm2(row);
-                                    const Precision adjoint = dPhi1r(node,row,k);
+                                    const Precision adjoint = dphi1r_data[
+                                        node*dphi1r_row_stride
+                                        +static_cast<std::size_t>(row)
+                                            *dphi1r_channels
+                                        +static_cast<std::size_t>(k)];
                                     const Precision neighbor_feature = H1(source,lm2,k);
                                     const Precision radial_force =
                                         radial_derivative*neighbor_feature*adjoint;

@@ -1,3 +1,4 @@
+import importlib.metadata
 import json
 import os
 import re
@@ -246,6 +247,162 @@ def _unavailable_package_message(candidates):
     )
 
 
+def _version_report(*, probe=False):
+    """Describe the imported frontend and installed backend identities.
+
+    This intentionally reads package metadata and backend descriptors only.  A
+    version check must remain useful when the native extension cannot be loaded
+    (for example, on a host with an incompatible CUDA runtime).
+    """
+
+    from .. import __version__
+    from .. import backend_loader
+
+    try:
+        distribution_version = importlib.metadata.version("symmetrix-xl")
+    except importlib.metadata.PackageNotFoundError:
+        distribution_version = None
+    package = importlib.import_module("symmetrix")
+    report = {
+        "version": __version__,
+        "distribution": "symmetrix-xl",
+        "distribution_version": distribution_version,
+        "package": getattr(package, "__file__", ""),
+        "python_executable": sys.executable,
+        "backends": backend_loader.available_backends(__version__),
+    }
+    if probe:
+        native = package.load_backend()
+        selected = package.selected_backend()
+        build_info_query = getattr(native, "_backend_build_info", None)
+        runtime_query = getattr(native, "_openmp_runtime_info", None)
+        device_query = getattr(native, "_execution_device_execution_environment", None)
+        initialized_here = False
+        is_initialized = getattr(native, "_kokkos_is_initialized", None)
+        initialize = getattr(native, "_init_kokkos", None)
+        finalize = getattr(native, "_finalize_kokkos", None)
+        try:
+            if (
+                selected
+                and selected.get("backend") in {"cuda", "hip"}
+                and callable(initialize)
+                and callable(is_initialized)
+                and not is_initialized()
+            ):
+                initialize()
+                initialized_here = True
+            runtime = runtime_query() if callable(runtime_query) else None
+            linked_libraries = []
+            if isinstance(runtime, dict):
+                linked_libraries.extend(runtime.get("loaded_openmp_libraries") or ())
+                linked_libraries.append(runtime.get("loaded_runtime_path"))
+                host_blas = runtime.get("host_blas") or {}
+                linked_libraries.extend(
+                    host_blas.get(key)
+                    for key in ("library_path", "threading_library_path")
+                )
+            report["probe"] = {
+                "backend": selected,
+                "extension": getattr(native, "__file__", ""),
+                "build_info": build_info_query()
+                if callable(build_info_query)
+                else {},
+                "runtime": runtime,
+                "device_environment": (
+                    device_query() if callable(device_query) else None
+                ),
+                "linked_libraries": sorted(
+                    {str(path) for path in linked_libraries if path}
+                ),
+            }
+        finally:
+            if initialized_here and callable(finalize):
+                finalize()
+    return report
+
+
+def _human_version_report(report):
+    distribution_version = report.get("distribution_version") or "unavailable"
+    print(f"Symmetrix frontend: {report['version']}")
+    print(f"Distribution: {report['distribution']} {distribution_version}")
+    print(f"Python: {report['python_executable']}")
+    print(f"Package: {report['package'] or 'unavailable'}")
+    if report.get("probe_error"):
+        print(
+            "Native probe unavailable; showing metadata-only inspection: "
+            f"{report['probe_error']}"
+        )
+    print("Installed backends:")
+    for backend in report["backends"]:
+        print(
+            f"  {backend['selector']}: {backend['backend']} "
+            f"{backend['architecture']} ({backend['distribution']})"
+        )
+        print(f"    descriptor: {backend.get('descriptor_path') or 'bundled'}")
+        print(f"    source commit: {backend.get('source_commit') or 'unknown'}")
+        print(
+            "    source content sha256: "
+            f"{backend.get('source_content_sha256') or 'unknown'}"
+        )
+        print(
+            "    native source content sha256: "
+            f"{backend.get('native_source_content_sha256') or 'unknown'}"
+        )
+        dirty = backend.get("source_dirty")
+        print(f"    source dirty: {'unknown' if dirty is None else dirty}")
+    probe = report.get("probe") or {}
+    if probe:
+        backend = probe.get("backend") or {}
+        print(
+            "Probed backend: "
+            f"{backend.get('selector', 'unknown')} "
+            f"({backend.get('backend', 'unknown')} "
+            f"{backend.get('architecture', 'unknown')})"
+        )
+        print(f"Native extension: {probe.get('extension') or 'unavailable'}")
+        build = probe.get("build_info") or {}
+        if build:
+            print(
+                "Native build: "
+                f"{build.get('compiler_id', 'unknown')} "
+                f"{build.get('compiler_version', 'unknown')}"
+            )
+            print(f"  source commit: {build.get('source_commit') or 'unknown'}")
+            dirty = build.get("source_dirty")
+            print(f"  source dirty: {'unknown' if dirty is None else dirty}")
+            print(
+                "  source content sha256: "
+                f"{build.get('source_content_sha256') or 'unknown'}"
+            )
+            print(
+                "  native source content sha256: "
+                f"{build.get('native_source_content_sha256') or 'unknown'}"
+            )
+        print("Linked libraries:")
+        for library in probe.get("linked_libraries") or ("unavailable",):
+            print(f"  {library}")
+        runtime = probe.get("runtime") or {}
+        if runtime:
+            loaded_runtime = runtime.get("loaded_runtime_path")
+            if loaded_runtime:
+                print(f"Loaded OpenMP runtime: {loaded_runtime}")
+            print(
+                "Kokkos execution space: "
+                f"{runtime.get('kokkos_execution_space') or 'unknown'}"
+            )
+        device = probe.get("device_environment") or {}
+        if device:
+            print(
+                "Device: "
+                f"{device.get('backend', 'unknown')} "
+                f"{device.get('architecture', 'unknown')}"
+            )
+            for key in ("device_name", "runtime_version", "driver_version"):
+                value = device.get(key)
+                if value not in (None, "", "unknown"):
+                    print(f"  {key.replace('_', ' ').title()}: {value}")
+
+
 def _install_backend(request):
     requested = request.strip().lower()
     resolution = {}
@@ -315,6 +472,24 @@ def main(argv=None):
         return bench_main(command_argv[1:])
     parser = ArgumentParser(prog="symmetrix")
     commands = parser.add_subparsers(dest="command", required=True)
+    version = commands.add_parser(
+        "version",
+        help="Print the installed frontend and backend source identities.",
+    )
+    version.add_argument("--json", action="store_true", help="Emit structured JSON.")
+    version.add_argument(
+        "--probe",
+        dest="probe",
+        action="store_true",
+        default=True,
+        help="Load the selected backend and include native runtime details (default).",
+    )
+    version.add_argument(
+        "--metadata-only",
+        dest="probe",
+        action="store_false",
+        help="Inspect descriptors without loading a native backend.",
+    )
     doctor = commands.add_parser(
         "doctor",
         help="Validate the selected CPU/OpenMP or CUDA/HIP native backend.",
@@ -361,6 +536,29 @@ def main(argv=None):
     )
     bench.set_defaults(_handler="bench")
     args = parser.parse_args(argv)
+
+    if args.command == "version":
+        from ..backend_loader import BackendError
+
+        try:
+            report = _version_report(probe=args.probe)
+            report["probe_status"] = "ok" if args.probe else "skipped"
+        except (BackendError, ImportError, OSError, RuntimeError, ValueError) as error:
+            if not args.probe:
+                print(f"symmetrix version: {error}", file=sys.stderr)
+                return 1
+            try:
+                report = _version_report(probe=False)
+            except (BackendError, ImportError, OSError, RuntimeError, ValueError):
+                print(f"symmetrix version: {error}", file=sys.stderr)
+                return 1
+            report["probe_error"] = str(error)
+            report["probe_status"] = "unavailable"
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            _human_version_report(report)
+        return 0
 
     if args.command == "backend":
         from .. import __version__, load_backend

@@ -50,7 +50,7 @@ def test_full_benchmark_help_exposes_nvtx_and_storage_policies(monkeypatch, caps
             "standard",
             SCRIPT,
             "--modes",
-            ("materialized", "generic", "direct"),
+            ("materialized", "non-compiled", "direct"),
         ),
     ],
 )
@@ -231,6 +231,7 @@ def test_phi1_report_tracks_policy_and_workspace(monkeypatch):
     assert benchmark._phi1_report(evaluator) == {
         "selected_policy": "receiver-local",
         "workspace_bytes": 0,
+        "a1_blas_flatten_workspace_bytes": 0,
     }
 
 
@@ -438,7 +439,7 @@ def test_full_benchmark_m0_executor_requires_fully_streamed_mode(monkeypatch, ca
     assert "--standard-m0-executor requires a streamed mode" in capsys.readouterr().err
 
 
-def test_full_benchmark_rejects_jit_controls_for_generic(monkeypatch, capsys):
+def test_full_benchmark_rejects_jit_controls_for_non_compiled(monkeypatch, capsys):
     benchmark = _load_benchmark(monkeypatch)
     monkeypatch.setattr(
         sys,
@@ -447,7 +448,7 @@ def test_full_benchmark_rejects_jit_controls_for_generic(monkeypatch, capsys):
             str(SCRIPT),
             "missing.json",
             "--modes",
-            "generic",
+            "non-compiled",
             "--factorized-r1-source-strategy",
             "jit_plugin",
         ],

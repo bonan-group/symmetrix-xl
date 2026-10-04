@@ -12,7 +12,7 @@ parallel.
 |---|---|
 | `mace_kokkos_runtime.cpp` | Construction, destruction, backend and plugin policy, workspace admission, diagnostics, observers, and parameter-gradient setup |
 | `mace_kokkos_factorized_lifecycle.cpp` | Streamed modes and schedules, prepared graph state, Cartesian/fractional geometry lifecycle and device mapping, active types, and factorized model preparation |
-| `mace_kokkos_factorized_execution.cpp` | Factorized R1 forward execution and direct and generic reverse execution |
+| `mace_kokkos_factorized_execution.cpp` | Factorized R1 forward execution and direct and non-compiled reverse execution |
 | `mace_kokkos_factorized_analysis.cpp` | Factorized operator benchmarking and parameter-gradient kernels |
 | `mace_kokkos_evaluate.cpp` | Force reductions and ordinary and field evaluator entry points |
 | `mace_kokkos_response.cpp` | Analytic field response; includes `mace_kokkos_response.tpp` as its private implementation body |

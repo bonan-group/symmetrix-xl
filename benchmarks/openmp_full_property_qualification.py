@@ -1,4 +1,4 @@
-"""Qualify 1/2/4/8-thread generic/direct MACEField OpenMP correctness."""
+"""Qualify 1/2/4/8-thread non-compiled/direct MACEField OpenMP correctness."""
 
 from __future__ import annotations
 
@@ -388,8 +388,8 @@ def _parser():
     parser.add_argument(
         "--modes",
         nargs="+",
-        choices=("generic", "direct"),
-        default=("generic", "direct"),
+        choices=("non-compiled", "generic", "direct"),
+        default=("non-compiled", "direct"),
     )
     parser.add_argument(
         "--cpu-sets",
@@ -412,7 +412,9 @@ def _parser():
     parser.add_argument("--worker-threads", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
-        "--worker-mode", choices=("generic", "direct"), help=argparse.SUPPRESS
+        "--worker-mode",
+        choices=("non-compiled", "generic", "direct"),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--worker-cpu-set", help=argparse.SUPPRESS)
     parser.add_argument("--worker-m0-tile", type=int, help=argparse.SUPPRESS)
@@ -489,7 +491,10 @@ def main(argv=None) -> int:
                 m0_tile=tile,
             )
 
-    reference_key = "generic-1" if "generic-1" in workers else "direct-1"
+    reference_key = next(
+        (key for key in ("non-compiled-1", "generic-1", "direct-1") if key in workers),
+        "direct-1",
+    )
     reference = workers[reference_key]
     passed = True
     differences = {}

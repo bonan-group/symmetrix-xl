@@ -149,7 +149,7 @@ def gpu_process_memory_mib() -> int | None:
 
 def finalize_symmetrix_runtime() -> None:
     gc.collect()
-    native = sys.modules.get("symmetrix.symmetrix")
+    from symmetrix import symmetrix as native
     is_initialized = getattr(native, "_kokkos_is_initialized", None)
     finalize = getattr(native, "_finalize_kokkos", None)
     if callable(is_initialized) and callable(finalize) and is_initialized():
@@ -466,7 +466,9 @@ def parser():
     run_parser.add_argument("--compact-model", type=Path)
     run_parser.add_argument("--head", default="default")
     run_parser.add_argument(
-        "--mode", choices=("materialized", "generic", "direct"), default="direct"
+        "--mode",
+        choices=("materialized", "non-compiled", "generic", "direct"),
+        default="direct",
     )
     run_parser.add_argument(
         "--low-memory", action=argparse.BooleanOptionalAction, default=True

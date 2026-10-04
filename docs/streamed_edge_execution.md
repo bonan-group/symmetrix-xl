@@ -41,7 +41,7 @@ The supported public spellings are:
 | Request | Role |
 |---|---|
 | `direct` | Default prepared execution; two-interaction models require a matching R1 specialization, while admitted single-layer models use prepared R0/M0 execution without an R1 specialization. Capacity may still specialize their M0/R0 operators. |
-| `non-compiled` | Compiler-free compatibility and diagnostic path; no performance guarantee. |
+| `non-compiled` | Compiler-free debug path; not optimized and not a performance target. |
 | `materialized` | Original Symmetrix execution path, principally for the original Symmetrix model format (named v1 here) and retained numerical controls. |
 | `auto` | Temporary compatibility request resolved from model and evaluator capability. |
 
@@ -55,7 +55,7 @@ historical benchmark records that mention it describe an earlier
 implementation.
 
 The non-Kokkos evaluator selected with `use_kokkos=False` does not implement
-the prepared direct path: a `direct` request resolves to serial generic
+the prepared direct path: a `direct` request resolves to serial non-compiled
 execution with a warning, while an explicit `materialized` request remains
 materialized.
 
@@ -93,8 +93,8 @@ precision-, ABI-, generation-, and target-specific artifact:
 - LAMMPS loads prepared host or device artifacts and never invokes a compiler.
 
 Compilation or loading failure is fatal for direct execution. Set
-`SYMMETRIX_JIT_POLICY=none` only for diagnosis and select `non-compiled` when a
-compiler-free evaluation is intended.
+`SYMMETRIX_JIT_POLICY=none` only for diagnosis and select `non-compiled` only
+when a compiler-free debug evaluation is intended.
 
 Artifacts are stored below a private per-user cache. Set `SYMMETRIX_JIT_CACHE`
 before Python starts to choose an explicit location. The cache contains

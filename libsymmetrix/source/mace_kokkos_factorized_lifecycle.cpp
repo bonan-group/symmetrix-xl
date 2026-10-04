@@ -1451,6 +1451,8 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
     dPhi1 = {};
     A1 = {};
     A1_adj = {};
+    A1_inverse_scale = {};
+    a1_scale_factors_ready = false;
     M1 = {};
     M1_adj = {};
     H2 = {};
@@ -1618,6 +1620,8 @@ void MACEKokkos<Precision>::bind_dual_layer_phase2_workspace(
     streamed_first_neigh = Kokkos::subview(
         dual_layer_workspace_first_neigh, local_rows);
     A1_adj = {};
+    A1_inverse_scale = {};
+    a1_scale_factors_ready = false;
     dPhi1 = {};
     M1_adj = {};
     H2_adj = {};

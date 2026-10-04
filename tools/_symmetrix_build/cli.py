@@ -491,6 +491,7 @@ def main(argv: list[str] | None = None) -> int:
                         },
                     }
                 record["build_toolchain"] = build_toolchain
+                record["source_provenance"] = invocation.source_provenance
                 _write_qualification(invocation.build_directory, record)
                 print(json.dumps(record, indent=2, sort_keys=True))
             else:

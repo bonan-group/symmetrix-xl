@@ -6,6 +6,9 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CXX_STANDARD_REQUIRED ON)
+# No target uses C++ modules. Scanning regenerates per-object module maps on
+# every configure and defeats incremental rebuilds initiated by packaging.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF CACHE BOOL "Disable IPO.")
 
@@ -335,6 +338,12 @@ elseif(_symmetrix_resolved_device_backend STREQUAL "HIP")
 endif()
 set(SYMMETRIX_BUILD_SOURCE_COMMIT "unknown")
 set(SYMMETRIX_BUILD_SOURCE_DIRTY 0)
+if(NOT DEFINED SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256)
+  set(SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256 "unknown")
+endif()
+if(NOT DEFINED SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256)
+  set(SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256 "unknown")
+endif()
 find_package(Git QUIET)
 if(Git_FOUND)
   execute_process(
@@ -446,7 +455,10 @@ set_target_properties(symmetrix_bindings PROPERTIES
   OUTPUT_NAME "${SYMMETRIX_PYTHON_MODULE_NAME}")
 target_include_directories(symmetrix_bindings PRIVATE
   ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_compile_definitions(symmetrix_bindings PRIVATE
+# These values are consumed only by the module initializer. Keeping them off
+# the target-wide command line prevents provenance changes from recompiling
+# every binding translation unit during an incremental source build.
+set_property(SOURCE source/cpp/symmetrix.cpp APPEND PROPERTY COMPILE_DEFINITIONS
   SYMMETRIX_PYTHON_MODULE=${SYMMETRIX_PYTHON_MODULE_NAME}
   SYMMETRIX_NATIVE_ABI=1
   SYMMETRIX_BUILD_BACKEND="${SYMMETRIX_BACKEND_SELECTOR}"
@@ -454,6 +466,8 @@ target_compile_definitions(symmetrix_bindings PRIVATE
   SYMMETRIX_BUILD_DISTRIBUTION="${SYMMETRIX_DISTRIBUTION_NAME}"
   SYMMETRIX_BUILD_SOURCE_COMMIT="${SYMMETRIX_BUILD_SOURCE_COMMIT}"
   SYMMETRIX_BUILD_SOURCE_DIRTY=${SYMMETRIX_BUILD_SOURCE_DIRTY}
+  SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256="${SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256}"
+  SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256="${SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256}"
   SYMMETRIX_BUILD_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
   SYMMETRIX_BUILD_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
   SYMMETRIX_BUILD_DEVICE_COMPILER_ID="${SYMMETRIX_BUILD_DEVICE_COMPILER_ID}"

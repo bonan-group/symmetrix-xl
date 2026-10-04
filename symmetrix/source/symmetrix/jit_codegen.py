@@ -436,7 +436,6 @@ class GpuDialect:
             value=value, offset=offset, width=width
         )
 
-
 CUDA_DIALECT = GpuDialect(
     "cuda",
     "SymmetrixJitCuda",
@@ -3026,7 +3025,7 @@ def _render_jit_r1_gpu_artifact(
         radial_type,
         device_qualifier,
         precision_matched_coordinates=(
-            dialect.backend == "hip" and program.precision == "float32"
+            program.precision == "float32"
         ),
     )
     harmonic_helpers = _render_direct_harmonic_gradient_helper(

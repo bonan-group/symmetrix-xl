@@ -172,6 +172,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     sampler = GpuMemorySampler(args.gpu_device, args.memory_sample_interval)
     sampler.start()
     calculator = None
+    native = None
+    cache = None
+    evaluator = None
     phase = "calculator_construction"
     record: dict[str, Any] = {
         "schema": "symmetrix.srtio3-capacity-probe/1",
@@ -279,13 +282,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
         atomic_json(args.output, record)
-        cache = None
-        evaluator = None
-        calculator = None
-        atoms = None
-        gc.collect()
-        if native._kokkos_is_initialized():
-            native._finalize_kokkos()
         return record
     except BaseException as error:
         sampler.stop()
@@ -309,6 +305,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         atomic_json(args.output, record)
         raise
+    finally:
+        # Capacity failures can leave CUDA allocations alive.  Release every
+        # Python owner before finalizing Kokkos so its Cuda singleton does not
+        # emit a secondary shutdown warning after the real failure.
+        if calculator is not None:
+            calculator.evaluator = None
+        cache = None
+        evaluator = None
+        calculator = None
+        atoms = None
+        gc.collect()
+        if native is None:
+            native = backend_loader._native_module
+        is_initialized = getattr(native, "_kokkos_is_initialized", None)
+        finalize = getattr(native, "_finalize_kokkos", None)
+        if callable(is_initialized) and callable(finalize) and is_initialized():
+            finalize()
 
 
 def main() -> int:

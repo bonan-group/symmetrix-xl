@@ -13,9 +13,9 @@ metric.
 
 ```bash
 nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
-  --force-overwrite=true -o /tmp/symmetrix-profile/system \
+  --force-overwrite=true -o "$HOME/tmp/symmetrix-profile/system" \
   /path/to/warmed-command
-nsys stats /tmp/symmetrix-profile/system.nsys-rep
+nsys stats "$HOME/tmp/symmetrix-profile/system.nsys-rep"
 ```
 
 Use Nsight Compute only after identifying a kernel family, with identical

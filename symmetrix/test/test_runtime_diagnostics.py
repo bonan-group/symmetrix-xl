@@ -466,6 +466,160 @@ def test_doctor_json_exit_status(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["strict"] is True
 
 
+def test_version_reports_installed_backend_provenance(monkeypatch, capsys):
+    from symmetrix import backend_loader
+
+    source_hash = "a" * 64
+    native_hash = "b" * 64
+    monkeypatch.setattr(cli.importlib.metadata, "version", lambda _: "0.1.1")
+    monkeypatch.setattr(
+        backend_loader,
+        "available_backends",
+        lambda _: [
+            {
+                "selector": "cpu",
+                "backend": "cpu",
+                "architecture": "x86-64-v3",
+                "distribution": "symmetrix-xl",
+                "source_commit": "4e080a5",
+                "source_content_sha256": source_hash,
+                "native_source_content_sha256": native_hash,
+                "source_dirty": False,
+                "descriptor_path": "/site-packages/symmetrix/_backend_cpu.json",
+            }
+        ],
+    )
+
+    assert cli.main(["version", "--metadata-only", "--json"]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["distribution_version"] == "0.1.1"
+    assert report["package"].endswith("symmetrix/__init__.py")
+    assert report["backends"][0]["source_commit"] == "4e080a5"
+    assert report["backends"][0]["source_content_sha256"] == source_hash
+    assert report["backends"][0]["native_source_content_sha256"] == native_hash
+
+
+def test_version_probe_falls_back_to_metadata(monkeypatch, capsys):
+    import symmetrix
+    from symmetrix import backend_loader
+
+    monkeypatch.setattr(cli.importlib.metadata, "version", lambda _: "0.1.1")
+    monkeypatch.setattr(
+        backend_loader,
+        "available_backends",
+        lambda _: [{"selector": "cpu", "backend": "cpu", "architecture": "native"}],
+    )
+    monkeypatch.setattr(
+        symmetrix,
+        "load_backend",
+        lambda: (_ for _ in ()).throw(OSError("native extension unavailable")),
+    )
+
+    assert cli.main(["version", "--json"]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["probe_status"] == "unavailable"
+    assert report["probe_error"] == "native extension unavailable"
+    assert "probe" not in report
+
+
+def test_version_probe_reports_native_runtime(monkeypatch, capsys):
+    import symmetrix
+    from symmetrix import backend_loader
+
+    native = SimpleNamespace(
+        __file__="/site-packages/symmetrix/_native_cpu.so",
+        _backend_build_info=lambda: {
+            "source_commit": "4e080a5",
+            "source_content_sha256": "a" * 64,
+            "native_source_content_sha256": "b" * 64,
+            "compiler_id": "GNU",
+            "compiler_version": "12.3.0",
+        },
+        _openmp_runtime_info=lambda: {
+            "loaded_runtime_path": "/usr/lib/libgomp.so.1",
+            "loaded_openmp_libraries": ["/usr/lib/libgomp.so.1"],
+            "kokkos_execution_space": "OpenMP",
+            "host_blas": {"library_path": "/usr/lib/libopenblas.so"},
+        },
+        _execution_device_execution_environment=lambda: {
+            "backend": "cpu",
+            "architecture": "x86-64-v3",
+        },
+    )
+    monkeypatch.setattr(cli.importlib.metadata, "version", lambda _: "0.1.1")
+    monkeypatch.setattr(
+        backend_loader,
+        "available_backends",
+        lambda _: [{"selector": "cpu", "backend": "cpu", "architecture": "x86-64-v3"}],
+    )
+    monkeypatch.setattr(symmetrix, "load_backend", lambda: native)
+    monkeypatch.setattr(
+        symmetrix,
+        "selected_backend",
+        lambda: {"selector": "cpu", "backend": "cpu", "architecture": "x86-64-v3"},
+    )
+
+    assert cli.main(["version", "--probe", "--json"]) == 0
+
+    probe = json.loads(capsys.readouterr().out)["probe"]
+    assert probe["extension"] == "/site-packages/symmetrix/_native_cpu.so"
+    assert probe["build_info"]["source_commit"] == "4e080a5"
+    assert probe["linked_libraries"] == [
+        "/usr/lib/libgomp.so.1",
+        "/usr/lib/libopenblas.so",
+    ]
+    assert probe["runtime"]["kokkos_execution_space"] == "OpenMP"
+
+
+def test_version_probe_initializes_device_backend(monkeypatch, capsys):
+    import symmetrix
+    from symmetrix import backend_loader
+
+    state = {"initialized": False, "calls": []}
+
+    def initialize():
+        state["calls"].append("init")
+        state["initialized"] = True
+
+    def finalize():
+        state["calls"].append("finalize")
+        state["initialized"] = False
+
+    native = SimpleNamespace(
+        __file__="/site-packages/_native_cuda13_sm120.so",
+        _backend_build_info=lambda: {},
+        _kokkos_is_initialized=lambda: state["initialized"],
+        _init_kokkos=initialize,
+        _finalize_kokkos=finalize,
+        _openmp_runtime_info=lambda: {"kokkos_execution_space": "Cuda"},
+        _execution_device_execution_environment=lambda: {
+            "backend": "cuda",
+            "architecture": "sm_120",
+            "runtime_version": "13.0",
+        },
+    )
+    monkeypatch.setattr(cli.importlib.metadata, "version", lambda _: "0.1.1")
+    monkeypatch.setattr(
+        backend_loader,
+        "available_backends",
+        lambda _: [{"selector": "cuda13-sm120", "backend": "cuda", "architecture": "sm120"}],
+    )
+    monkeypatch.setattr(symmetrix, "load_backend", lambda: native)
+    monkeypatch.setattr(
+        symmetrix,
+        "selected_backend",
+        lambda: {"selector": "cuda13-sm120", "backend": "cuda", "architecture": "sm120"},
+    )
+
+    assert cli.main(["version", "--probe", "--json"]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["probe"]["device_environment"]["architecture"] == "sm_120"
+    assert state["calls"] == ["init", "finalize"]
+
+
 def test_backend_show_accepts_an_explicit_selector(monkeypatch, capsys):
     from symmetrix import backend_loader
 

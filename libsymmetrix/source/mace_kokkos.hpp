@@ -334,6 +334,7 @@ std::size_t standard_m0_poly_adjoints_active_bytes() const;
 std::size_t standard_m0_poly_adjoints_capacity_bytes() const;
 std::size_t factorized_forward_coupling_workspace_bytes() const;
 std::size_t factorized_reverse_coupling_workspace_bytes() const;
+std::size_t a1_blas_flatten_workspace_bytes() const;
 std::size_t factorized_custom_blas_launch_count() const;
 std::size_t factorized_blas_stream_bind_count() const;
 std::uint64_t prepare_all_interactions_graph(
@@ -1036,12 +1037,23 @@ Kokkos::View<int*> Phi1_path_row_offsets;
 
 // A1
 Kokkos::View<Precision***,Kokkos::LayoutRight> A1, A1_adj;
+Kokkos::View<double*> A1_inverse_scale;
+bool a1_scale_factors_ready = false;
 Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace> A1_weights;
 Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace> A1_weights_trans;
 Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>
     A1_channel_tile_weights;
 Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>
     A1_channel_tile_weights_trans;
+// Private staging buffers for the accelerator BLAS A1 path.  The public A1 and
+// Phi1 layouts remain node-major, so direct BLAS still pays a pack/unpack cost.
+// Keep the tile bounded because the staging buffers scale with this extent.
+Kokkos::View<Precision*> A1_blas_flatten_input;
+Kokkos::View<Precision*> A1_blas_flatten_output;
+static constexpr int a1_blas_flatten_tile_nodes = 8192;
+static constexpr int a1_blas_flatten_min_nodes = 512;
+void ensure_a1_blas_flatten_capacity(
+    std::size_t input_elements, std::size_t output_elements);
 static constexpr int phi1_channel_tile_size = 64;
 void compute_A1(int num_nodes, bool completion_fence = true);
 void compute_A1_channel_tile(int num_nodes, int channel_begin);
@@ -1638,6 +1650,12 @@ void scale_A1_rows_by_inverse(
     Precision* rows, int num_nodes, std::size_t row_length,
     const std::vector<double>& scales);
 void compute_A1_scaled(
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_types,
+    Kokkos::View<const double*> r);
+void prepare_A1_scale_factors(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
     Kokkos::View<const int*> num_neigh,

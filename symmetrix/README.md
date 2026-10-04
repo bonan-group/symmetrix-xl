@@ -359,9 +359,13 @@ Detailed diagnostic guidance is available in the
 From a recursive source checkout:
 
 ```bash
-uv venv
+test -x .venv/bin/python || uv venv .venv
 source .venv/bin/activate
-uv pip install -e "./symmetrix[test]"
+uv pip install scikit-build-core pybind11 ninja
+source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_source_fingerprint; print(symmetrix_source_fingerprint(Path.cwd()))')
+uv pip install --no-build-isolation --reinstall-package symmetrix-xl \
+  -e "./symmetrix[test]" \
+  --config-setting="cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint"
 pytest symmetrix/test
 uvx pre-commit run --all-files
 ```

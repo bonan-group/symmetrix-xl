@@ -165,7 +165,7 @@ def synchronize(device: str) -> None:
 
 def finalize_symmetrix() -> None:
     gc.collect()
-    native = sys.modules.get("symmetrix.symmetrix")
+    from symmetrix import symmetrix as native
     is_initialized = getattr(native, "_kokkos_is_initialized", None)
     finalize = getattr(native, "_finalize_kokkos", None)
     if callable(is_initialized) and callable(finalize) and is_initialized():

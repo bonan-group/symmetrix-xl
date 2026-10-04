@@ -94,9 +94,10 @@ capacity mode on CPU and GPU backends. Request `dtype="float64"` explicitly
 when a calculation requires higher numerical precision; JIT artifacts are
 precision-specific.
 
-`non-compiled` is the explicit compiler-free compatibility and diagnostic path.
-It is useful when preparing or diagnosing a direct artifact, but it has no
-performance guarantee. `generic` is its deprecated internal-facing alias.
+`non-compiled` is the explicit compiler-free debug path. It is useful when
+diagnosing a direct artifact or checking compatibility, but it is not optimized
+and has no performance guarantee. `generic` is its deprecated compatibility
+alias.
 Historical `materialized` and other compatibility modes remain available only
 where the current support matrix permits them.
 

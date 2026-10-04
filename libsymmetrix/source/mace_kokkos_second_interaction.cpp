@@ -43,6 +43,7 @@
 #include "host_dense_kernels.hpp"
 #include "standard_m1.hpp"
 #include "host_worker_blas.hpp"
+#include "mace_kokkos_factorized_blas_detail.hpp"
 
 using Kokkos::ALL;
 using Kokkos::LayoutRight;
@@ -60,6 +61,27 @@ namespace {
 
 constexpr int host_h2_blas_max_channels = 1024;
 
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::ensure_a1_blas_flatten_capacity(
+    const std::size_t input_elements,
+    const std::size_t output_elements)
+{
+    if (A1_blas_flatten_input.extent(0) >= input_elements
+        && A1_blas_flatten_output.extent(0) >= output_elements)
+        return;
+    factorized_execution_space.fence("Replace A1 flattened BLAS workspace");
+    if (A1_blas_flatten_input.extent(0) < input_elements)
+        A1_blas_flatten_input = decltype(A1_blas_flatten_input)(
+            Kokkos::view_alloc(
+                "A1 flattened BLAS input", Kokkos::WithoutInitializing),
+            input_elements);
+    if (A1_blas_flatten_output.extent(0) < output_elements)
+        A1_blas_flatten_output = decltype(A1_blas_flatten_output)(
+            Kokkos::view_alloc(
+                "A1 flattened BLAS output", Kokkos::WithoutInitializing),
+            output_elements);
 }
 
 template <typename Precision>
@@ -93,6 +115,16 @@ void MACEKokkos<Precision>::compute_A1(
     const auto Phi1 = this->Phi1;
     auto A1_weights = this->A1_weights;
     auto A1 = this->A1;
+    const Precision* const phi1_data = Phi1.data();
+    Precision* const a1_data = A1.data();
+    const std::size_t phi1_channels = Phi1.extent(2);
+    const std::size_t a1_channels = A1.extent(2);
+    const std::size_t phi1_row_stride = static_cast<std::size_t>(
+        Phi1.extent(1))*phi1_channels;
+    const std::size_t a1_row_stride = static_cast<std::size_t>(
+        A1.extent(1))*a1_channels;
+    const auto inverse_scale = A1_inverse_scale;
+    const bool scale_factors_ready = a1_scale_factors_ready;
 
     // These small fixed-l host contractions need no packing before BLAS.
     if constexpr (std::is_same_v<
@@ -124,9 +156,13 @@ void MACEKokkos<Precision>::compute_A1(
                     symmetrix_blas_gemm<Precision>(
                         CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         component_count, num_channels, input_count,
-                        Precision(1), &Phi1(node,lme,0), input_count,
+                        Precision(1), phi1_data + node*phi1_row_stride
+                            +static_cast<std::size_t>(lme)*phi1_channels,
+                        input_count,
                         weights.data(), num_channels,
-                        Precision(0), &A1(node,l*l,0), num_channels);
+                        Precision(0), a1_data + node*a1_row_stride
+                            +static_cast<std::size_t>(l*l)*a1_channels,
+                        num_channels);
                 });
             if (completion_fence)
                 factorized_execution_space.fence("Compute A1 completion");
@@ -153,8 +189,12 @@ void MACEKokkos<Precision>::compute_A1(
                     }
                     const auto weights = A1_weights(l);
                     symmetrix::host_dense_gemm_nn(
-                        &Phi1(node,lme,0), weights.data(),
-                        &A1(node,l*l,0), 2*l+1,
+                        phi1_data + node*phi1_row_stride
+                            +static_cast<std::size_t>(lme)*phi1_channels,
+                        weights.data(),
+                        a1_data + node*a1_row_stride
+                            +static_cast<std::size_t>(l*l)*a1_channels,
+                        2*l+1,
                         num_eta*num_channels, num_channels);
                 });
             if (completion_fence)
@@ -162,6 +202,154 @@ void MACEKokkos<Precision>::compute_A1(
             return;
         }
     }
+
+#if (defined(KOKKOS_ENABLE_CUDA) \
+        && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)) \
+    || (defined(KOKKOS_ENABLE_HIP) \
+        && defined(KOKKOSKERNELS_ENABLE_TPL_ROCBLAS))
+    // Each l block has the same shape for every node.  Batch the complete
+    // node dimension in one cuBLAS/rocBLAS launch, with the shared weight matrix
+    // represented by a zero batch stride.  Set SYMMETRIX_A1_CUBLAS=0, false,
+    // or off to select the TeamGEMM path for diagnostics.
+    if (execution_a1_blas_enabled()) {
+        // Packing uses the factorized stream.  The unprepared path can build
+        // Phi1 on the default stream, so keep its existing node-batched BLAS
+        // implementation to avoid crossing an asynchronous stream boundary.
+        if (execution_a1_flatten_enabled()
+            && use_factorized_async_inference()
+            && factorized_prepared_graph_count != 0
+            && num_nodes >= a1_blas_flatten_min_nodes) {
+            const int tile_nodes = std::min(
+                num_nodes, a1_blas_flatten_tile_nodes);
+            int max_components = 0;
+            int max_input_columns = 0;
+            for (int l=0; l<=l_max; ++l) {
+                const auto weights = A1_weights(l);
+                max_components = std::max(max_components, 2*l+1);
+                max_input_columns = std::max(
+                    max_input_columns,
+                    weights.extent_int(0));
+            }
+            ensure_a1_blas_flatten_capacity(
+                static_cast<std::size_t>(tile_nodes)
+                    *max_components*max_input_columns,
+                static_cast<std::size_t>(tile_nodes)
+                    *max_components*num_channels);
+            const auto flatten_input = A1_blas_flatten_input;
+            const auto flatten_output = A1_blas_flatten_output;
+            // CudaSpace uses a 32-bit View size_type.  The node-major tensor
+            // row offset exceeds 4 GiB for large cells, so use explicit
+            // 64-bit pointer arithmetic in this staging path.
+            const Precision* phi1_data = Phi1.data();
+            const std::size_t phi1_channels = Phi1.extent(2);
+            const std::size_t phi1_row_stride = static_cast<std::size_t>(
+                Phi1.extent(1))*phi1_channels;
+            Precision* a1_data = A1.data();
+            const std::size_t a1_channels = A1.extent(2);
+            const std::size_t a1_row_stride = static_cast<std::size_t>(
+                A1.extent(1))*a1_channels;
+            int lme = 0;
+            for (int l=0; l<=l_max; ++l) {
+                const auto weights = A1_weights(l);
+                const int components = 2*l+1;
+                const int input_columns = weights.extent_int(0);
+                for (int node_begin=0; node_begin<num_nodes;
+                     node_begin += tile_nodes) {
+                    const int node_count = std::min(
+                        tile_nodes, num_nodes-node_begin);
+                    const std::size_t input_size = static_cast<std::size_t>(
+                        node_count)*components*input_columns;
+                    Kokkos::parallel_for(
+                        "Pack A1 forward BLAS",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                            Kokkos::IndexType<std::size_t>>(
+                            factorized_execution_space, 0, input_size),
+                        KOKKOS_LAMBDA (const std::size_t index) {
+                            const std::size_t row = index/input_columns;
+                            const int node = static_cast<int>(row/components);
+                            const int component = static_cast<int>(
+                                row%components);
+                            const int eta = static_cast<int>(
+                                (index%input_columns)/num_channels);
+                            const int channel = static_cast<int>(
+                                index%num_channels);
+                            const std::size_t phi1_node =
+                                static_cast<std::size_t>(node_begin)
+                                +static_cast<std::size_t>(node);
+                            const std::size_t phi1_column =
+                                static_cast<std::size_t>(lme)
+                                +static_cast<std::size_t>(component)
+                                    * static_cast<std::size_t>(
+                                        input_columns/num_channels)
+                                +static_cast<std::size_t>(eta);
+                            const Precision value = phi1_data[
+                                phi1_node*phi1_row_stride
+                                +phi1_column*phi1_channels
+                                +static_cast<std::size_t>(channel)];
+                            flatten_input(index) = scale_factors_ready
+                                ? static_cast<Precision>(
+                                    value*inverse_scale(node_begin+node))
+                                : value;
+                        });
+                    const int rows = node_count*components;
+                    launch_execution_row_major_strided_batched_gemm(
+                        *factorized_blas_context, factorized_execution_space,
+                        flatten_input.data(), weights.data(),
+                        flatten_output.data(), rows, input_columns,
+                        num_channels, 0, 0, 0, 1,
+                        "A1 forward flattened BLAS");
+                    const std::size_t output_size = static_cast<std::size_t>(
+                        rows)*num_channels;
+                    Kokkos::parallel_for(
+                        "Unpack A1 forward BLAS",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                            Kokkos::IndexType<std::size_t>>(
+                            factorized_execution_space, 0, output_size),
+                        KOKKOS_LAMBDA (const std::size_t index) {
+                            const std::size_t row = index/num_channels;
+                            const int node = static_cast<int>(row/components);
+                            const int component = static_cast<int>(
+                                row%components);
+                            const std::size_t a1_node =
+                                static_cast<std::size_t>(node_begin)
+                                +static_cast<std::size_t>(node);
+                            const std::size_t a1_column =
+                                static_cast<std::size_t>(l*l+component);
+                            a1_data[
+                                a1_node*a1_row_stride
+                                +a1_column*a1_channels
+                                +index%static_cast<std::size_t>(num_channels)] =
+                                flatten_output(index);
+                        });
+                }
+                lme += components*(input_columns/num_channels);
+            }
+            if (completion_fence)
+                factorized_execution_space.fence(
+                    "Compute A1 flattened BLAS completion");
+            return;
+        }
+        int lme = 0;
+        for (int l=0; l<=l_max; ++l) {
+            const auto weights = A1_weights(l);
+            const int num_eta = weights.extent_int(0)/num_channels;
+            launch_execution_row_major_strided_batched_gemm(
+                *factorized_blas_context, factorized_execution_space,
+                Phi1.data()+static_cast<std::size_t>(lme)*num_channels,
+                weights.data(),
+                A1.data()+static_cast<std::size_t>(l*l)*num_channels,
+                2*l+1, num_eta*num_channels, num_channels,
+                static_cast<std::int64_t>(num_lme)*num_channels,
+                0,
+                static_cast<std::int64_t>(num_lm)*num_channels,
+                num_nodes, "A1 forward batched BLAS");
+            lme += (2*l+1)*num_eta;
+        }
+        if (completion_fence)
+            factorized_execution_space.fence("Compute A1 batched BLAS completion");
+        return;
+    }
+#endif
 
     Kokkos::parallel_for("Compute A1",
         Kokkos::TeamPolicy<>(
@@ -180,9 +368,19 @@ void MACEKokkos<Precision>::compute_A1(
                 if (ll == l)
                     num_eta += 1;
             }
-            auto Phi1_il = Kokkos::View<Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
-                &Phi1(node,lme,0), 2*l+1, num_eta*num_channels);
-            auto A1_il = Kokkos::subview(A1, node, Kokkos::make_pair(l*l,l*(l+2)+1), Kokkos::ALL);
+            // LayoutStride makes the wide row offset explicit for Kokkos 5's
+            // mdspan-backed unmanaged views.
+            auto Phi1_il = Kokkos::View<const Precision**,Kokkos::LayoutStride,Kokkos::MemoryUnmanaged>(
+                phi1_data + node*phi1_row_stride
+                    +static_cast<std::size_t>(lme)*phi1_channels,
+                Kokkos::LayoutStride(2*l+1, num_eta*num_channels,
+                    num_eta*num_channels, 1));
+            auto A1_il = Kokkos::View<
+                Precision**,Kokkos::LayoutStride,Kokkos::MemoryUnmanaged>(
+                    a1_data + node*a1_row_stride
+                        +static_cast<std::size_t>(l*l)*a1_channels,
+                    Kokkos::LayoutStride(2*l+1, num_channels,
+                        num_channels, 1));
             KokkosBatched::TeamGemm<Kokkos::TeamPolicy<>::member_type,
                                     KokkosBatched::Trans::NoTranspose,
                                     KokkosBatched::Trans::NoTranspose,
@@ -213,6 +411,14 @@ void MACEKokkos<Precision>::compute_A1_channel_tile(
     const auto Phi1 = this->Phi1;
     const auto tile_weights = this->A1_channel_tile_weights;
     auto A1 = this->A1;
+    const Precision* const phi1_data = Phi1.data();
+    Precision* const a1_data = A1.data();
+    const std::size_t phi1_channels = Phi1.extent(2);
+    const std::size_t a1_channels = A1.extent(2);
+    const std::size_t phi1_row_stride = static_cast<std::size_t>(
+        Phi1.extent(1))*phi1_channels;
+    const std::size_t a1_row_stride = static_cast<std::size_t>(
+        A1.extent(1))*a1_channels;
     const int phase = channel_begin/phi1_channel_tile_size;
     const Precision beta = channel_begin == 0 ? Precision(0) : Precision(1);
     Kokkos::parallel_for(
@@ -234,11 +440,17 @@ void MACEKokkos<Precision>::compute_A1_channel_tile(
                     ++num_eta;
             }
             auto Phi1_il = Kokkos::View<
-                Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
-                    &Phi1(node,lme,0), 2*l+1, num_eta*channel_count);
-            auto A1_il = Kokkos::subview(
-                A1, node,
-                Kokkos::make_pair(l*l,l*l+2*l+1), Kokkos::ALL);
+                const Precision**,Kokkos::LayoutStride,Kokkos::MemoryUnmanaged>(
+                    phi1_data + node*phi1_row_stride
+                        +static_cast<std::size_t>(lme)*phi1_channels,
+                    Kokkos::LayoutStride(2*l+1, num_eta*channel_count,
+                        num_eta*channel_count, 1));
+            auto A1_il = Kokkos::View<
+                Precision**,Kokkos::LayoutStride,Kokkos::MemoryUnmanaged>(
+                    a1_data + node*a1_row_stride
+                        +static_cast<std::size_t>(l*l)*a1_channels,
+                    Kokkos::LayoutStride(2*l+1, num_channels,
+                        num_channels, 1));
             const auto weights = tile_weights(phase*(l_max+1)+l);
             KokkosBatched::TeamGemm<
                 Kokkos::TeamPolicy<>::member_type,
@@ -276,6 +488,14 @@ void MACEKokkos<Precision>::reverse_A1_channel_tile(
     auto Phi1 = this->Phi1;
     const auto tile_weights_trans = this->A1_channel_tile_weights_trans;
     const auto A1_adj = this->A1_adj;
+    const Precision* const a1_adj_data = A1_adj.data();
+    Precision* const phi1_data = Phi1.data();
+    const std::size_t a1_adj_channels = A1_adj.extent(2);
+    const std::size_t phi1_channels = Phi1.extent(2);
+    const std::size_t a1_adj_row_stride = static_cast<std::size_t>(
+        A1_adj.extent(1))*a1_adj_channels;
+    const std::size_t phi1_row_stride = static_cast<std::size_t>(
+        Phi1.extent(1))*phi1_channels;
     const int phase = channel_begin/phi1_channel_tile_size;
     Kokkos::parallel_for(
         "Reverse A1 channel tile",
@@ -295,12 +515,18 @@ void MACEKokkos<Precision>::reverse_A1_channel_tile(
                 if (ll == l)
                     ++num_eta;
             }
-            auto dA1_il = Kokkos::subview(
-                A1_adj, node,
-                Kokkos::make_pair(l*l,l*l+2*l+1), Kokkos::ALL);
+            auto dA1_il = Kokkos::View<
+                const Precision**,Kokkos::LayoutStride,Kokkos::MemoryUnmanaged>(
+                    a1_adj_data + node*a1_adj_row_stride
+                        +static_cast<std::size_t>(l*l)*a1_adj_channels,
+                    Kokkos::LayoutStride(2*l+1, num_channels,
+                        num_channels, 1));
             auto dPhi1_il = Kokkos::View<
-                Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
-                    &Phi1(node,lme,0), 2*l+1, num_eta*channel_count);
+                Precision**,Kokkos::LayoutStride,Kokkos::MemoryUnmanaged>(
+                    phi1_data + node*phi1_row_stride
+                        +static_cast<std::size_t>(lme)*phi1_channels,
+                    Kokkos::LayoutStride(2*l+1, num_eta*channel_count,
+                        num_eta*channel_count, 1));
             const auto weights =
                 tile_weights_trans(phase*(l_max+1)+l);
             KokkosBatched::TeamGemm<
@@ -403,6 +629,14 @@ void MACEKokkos<Precision>::reverse_A1_from(
     const auto Phi1_l = this->Phi1_l;
     const auto A1_weights_trans = this->A1_weights_trans;
     auto dPhi1 = this->dPhi1;
+    const Precision* const output_adjoint_data_base = output_adjoint.data();
+    Precision* const dphi1_data_base = dPhi1.data();
+    const std::size_t output_adjoint_channels = output_adjoint.extent(2);
+    const std::size_t dphi1_channels = dPhi1.extent(2);
+    const std::size_t output_adjoint_row_stride = static_cast<std::size_t>(
+        output_adjoint.extent(1))*output_adjoint_channels;
+    const std::size_t dphi1_row_stride = static_cast<std::size_t>(
+        dPhi1.extent(1))*dphi1_channels;
 
     // Keep device execution on the backend-portable batched team kernel.
     if constexpr (std::is_same_v<
@@ -434,9 +668,14 @@ void MACEKokkos<Precision>::reverse_A1_from(
                     symmetrix_blas_gemm<Precision>(
                         CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         component_count, output_count, num_channels,
-                        Precision(1), &output_adjoint(node,l*l,0), num_channels,
+                        Precision(1), output_adjoint_data_base
+                            +node*output_adjoint_row_stride
+                            +static_cast<std::size_t>(l*l)*output_adjoint_channels,
+                        num_channels,
                         weights.data(), output_count,
-                        Precision(0), &dPhi1(node,lme,0), output_count);
+                        Precision(0), dphi1_data_base + node*dphi1_row_stride
+                            +static_cast<std::size_t>(lme)*dphi1_channels,
+                        output_count);
                 });
             if (completion_fence)
                 factorized_execution_space.fence("Reverse A1 completion");
@@ -463,8 +702,12 @@ void MACEKokkos<Precision>::reverse_A1_from(
                     }
                     const auto weights = A1_weights_trans(l);
                     symmetrix::host_dense_gemm_nn(
-                        &output_adjoint(node,l*l,0), weights.data(),
-                        &dPhi1(node,lme,0), 2*l+1,
+                        output_adjoint_data_base + node*output_adjoint_row_stride
+                            +static_cast<std::size_t>(l*l)*output_adjoint_channels,
+                        weights.data(),
+                        dphi1_data_base + node*dphi1_row_stride
+                            +static_cast<std::size_t>(lme)*dphi1_channels,
+                        2*l+1,
                         num_channels, num_eta*num_channels);
                 });
             if (completion_fence)
@@ -472,6 +715,139 @@ void MACEKokkos<Precision>::reverse_A1_from(
             return;
         }
     }
+
+#if (defined(KOKKOS_ENABLE_CUDA) \
+        && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)) \
+    || (defined(KOKKOS_ENABLE_HIP) \
+        && defined(KOKKOSKERNELS_ENABLE_TPL_ROCBLAS))
+    if (execution_a1_blas_enabled()) {
+        if (execution_a1_flatten_enabled()
+            && use_factorized_async_inference()
+            && factorized_prepared_graph_count != 0
+            && num_nodes >= a1_blas_flatten_min_nodes) {
+            const int tile_nodes = std::min(
+                num_nodes, a1_blas_flatten_tile_nodes);
+            int max_components = 0;
+            int max_output_columns = 0;
+            for (int l=0; l<=l_max; ++l) {
+                const auto weights = A1_weights_trans(l);
+                max_components = std::max(max_components, 2*l+1);
+                max_output_columns = std::max(
+                    max_output_columns, weights.extent_int(1));
+            }
+            ensure_a1_blas_flatten_capacity(
+                static_cast<std::size_t>(tile_nodes)
+                    *max_components*num_channels,
+                static_cast<std::size_t>(tile_nodes)
+                    *max_components*max_output_columns);
+            const auto flatten_input = A1_blas_flatten_input;
+            const auto flatten_output = A1_blas_flatten_output;
+            const Precision* output_adjoint_data = output_adjoint.data();
+            const std::size_t output_adjoint_channels = output_adjoint.extent(2);
+            const std::size_t output_adjoint_row_stride = static_cast<std::size_t>(
+                output_adjoint.extent(1))*output_adjoint_channels;
+            Precision* dphi1_data = dPhi1.data();
+            const std::size_t dphi1_channels = dPhi1.extent(2);
+            const std::size_t dphi1_row_stride = static_cast<std::size_t>(
+                dPhi1.extent(1))*dphi1_channels;
+            int lme = 0;
+            for (int l=0; l<=l_max; ++l) {
+                const auto weights = A1_weights_trans(l);
+                const int components = 2*l+1;
+                const int output_columns = weights.extent_int(1);
+                for (int node_begin=0; node_begin<num_nodes;
+                     node_begin += tile_nodes) {
+                    const int node_count = std::min(
+                        tile_nodes, num_nodes-node_begin);
+                    const std::size_t input_size = static_cast<std::size_t>(
+                        node_count)*components*num_channels;
+                    Kokkos::parallel_for(
+                        "Pack A1 reverse BLAS",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                            Kokkos::IndexType<std::size_t>>(
+                            factorized_execution_space, 0, input_size),
+                        KOKKOS_LAMBDA (const std::size_t index) {
+                            const std::size_t row = index/num_channels;
+                            const int node = static_cast<int>(row/components);
+                            const int component = static_cast<int>(
+                                row%components);
+                            const std::size_t output_node =
+                                static_cast<std::size_t>(node_begin)
+                                +static_cast<std::size_t>(node);
+                            const std::size_t output_column =
+                                static_cast<std::size_t>(l*l+component);
+                            flatten_input(index) = output_adjoint_data[
+                                output_node*output_adjoint_row_stride
+                                +output_column*output_adjoint_channels
+                                +index%static_cast<std::size_t>(num_channels)];
+                        });
+                    const int rows = node_count*components;
+                    launch_execution_row_major_strided_batched_gemm(
+                        *factorized_blas_context, factorized_execution_space,
+                        flatten_input.data(), weights.data(),
+                        flatten_output.data(), rows, num_channels,
+                        output_columns, 0, 0, 0, 1,
+                        "A1 reverse flattened BLAS");
+                    const std::size_t output_size = static_cast<std::size_t>(
+                        rows)*output_columns;
+                    Kokkos::parallel_for(
+                        "Unpack A1 reverse BLAS",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                            Kokkos::IndexType<std::size_t>>(
+                            factorized_execution_space, 0, output_size),
+                        KOKKOS_LAMBDA (const std::size_t index) {
+                            const std::size_t row = index/output_columns;
+                            const int node = static_cast<int>(row/components);
+                            const int component = static_cast<int>(
+                                row%components);
+                            const int eta = static_cast<int>(
+                                (index%output_columns)/num_channels);
+                            const int channel = static_cast<int>(
+                                index%num_channels);
+                            const std::size_t dphi1_node =
+                                static_cast<std::size_t>(node_begin)
+                                +static_cast<std::size_t>(node);
+                            const std::size_t dphi1_column =
+                                static_cast<std::size_t>(lme)
+                                +static_cast<std::size_t>(component)
+                                    *static_cast<std::size_t>(
+                                        output_columns/num_channels)
+                                +static_cast<std::size_t>(eta);
+                            dphi1_data[
+                                dphi1_node*dphi1_row_stride
+                                +dphi1_column*dphi1_channels
+                                +static_cast<std::size_t>(channel)] =
+                                flatten_output(index);
+                        });
+                }
+                lme += components*(output_columns/num_channels);
+            }
+            if (completion_fence)
+                factorized_execution_space.fence(
+                    "Reverse A1 flattened BLAS completion");
+            return;
+        }
+        int lme = 0;
+        for (int l=0; l<=l_max; ++l) {
+            const auto weights = A1_weights_trans(l);
+            const int num_eta = weights.extent_int(1)/num_channels;
+            launch_execution_row_major_strided_batched_gemm(
+                *factorized_blas_context, factorized_execution_space,
+                output_adjoint.data()+static_cast<std::size_t>(l*l)*num_channels,
+                weights.data(),
+                dPhi1.data()+static_cast<std::size_t>(lme)*num_channels,
+                2*l+1, num_channels, num_eta*num_channels,
+                static_cast<std::int64_t>(num_lm)*num_channels,
+                0,
+                static_cast<std::int64_t>(num_lme)*num_channels,
+                num_nodes, "A1 reverse batched BLAS");
+            lme += (2*l+1)*num_eta;
+        }
+        if (completion_fence)
+            factorized_execution_space.fence("Reverse A1 batched BLAS completion");
+        return;
+    }
+#endif
 
     Kokkos::parallel_for("Reverse A1",
         Kokkos::TeamPolicy<>(
@@ -490,11 +866,18 @@ void MACEKokkos<Precision>::reverse_A1_from(
                 if (ll == l)
                     num_eta += 1;
             }
-            auto dA1_il = Kokkos::subview(
-                output_adjoint, node,
-                Kokkos::make_pair(l*l,l*l+2*l+1), Kokkos::ALL);
-            auto dPhi1_il = Kokkos::View<Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>(
-                &dPhi1(node,lme,0), 2*l+1, num_eta*num_channels);
+            auto dA1_il = Kokkos::View<
+                const Precision**,Kokkos::LayoutStride,Kokkos::MemoryUnmanaged>(
+                    output_adjoint_data_base + node*output_adjoint_row_stride
+                        +static_cast<std::size_t>(l*l)*output_adjoint_channels,
+                    Kokkos::LayoutStride(2*l+1, num_channels,
+                        num_channels, 1));
+            auto dPhi1_il = Kokkos::View<
+                Precision**,Kokkos::LayoutStride,Kokkos::MemoryUnmanaged>(
+                    dphi1_data_base + node*dphi1_row_stride
+                        +static_cast<std::size_t>(lme)*dphi1_channels,
+                    Kokkos::LayoutStride(2*l+1, num_eta*num_channels,
+                        num_eta*num_channels, 1));
             KokkosBatched::TeamGemm<Kokkos::TeamPolicy<>::member_type,
                                     KokkosBatched::Trans::NoTranspose,
                                     KokkosBatched::Trans::NoTranspose,
@@ -531,6 +914,101 @@ void MACEKokkos<Precision>::scale_A1_rows_by_inverse(
 }
 
 template <typename Precision>
+void MACEKokkos<Precision>::prepare_A1_scale_factors(
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_types,
+    Kokkos::View<const double*> r)
+{
+    a1_scale_factors_ready = false;
+#if (defined(KOKKOS_ENABLE_CUDA) \
+        && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)) \
+    || (defined(KOKKOS_ENABLE_HIP) \
+        && defined(KOKKOSKERNELS_ENABLE_TPL_ROCBLAS))
+    if (!A1_scaled || !execution_a1_blas_enabled()
+        || !execution_a1_flatten_enabled()
+        || !use_factorized_async_inference()
+        || factorized_prepared_graph_count == 0
+        || num_nodes < a1_blas_flatten_min_nodes)
+        return;
+
+    ensure_mh0_a1_forward_capacity(num_nodes);
+    const bool recompute_splines = use_mh0_adjoint_reuse();
+    if (recompute_splines) {
+        A1_spline_values = decltype(A1_spline_values)();
+        A1_spline_derivs = decltype(A1_spline_derivs)();
+    } else if (A1_spline_values.extent(0) < r.size()) {
+        Kokkos::realloc(A1_spline_values, r.size(), 1);
+        Kokkos::realloc(A1_spline_derivs, r.size(), 1);
+    }
+    if (!recompute_splines) {
+        const auto splines = A1_splines;
+        const auto edge_receivers = execution_edge_receivers;
+        const auto type_map = type_to_active;
+        const int active_type_count = num_active_types;
+        const auto values = A1_spline_values;
+        const auto derivatives = A1_spline_derivs;
+        Kokkos::parallel_for(
+            "Prepare A1 scale splines",
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                factorized_execution_space, 0, r.extent_int(0)),
+            KOKKOS_LAMBDA (const int edge) {
+                const int type_i = type_map(node_types(edge_receivers(edge)));
+                const int type_j = type_map(neigh_types(edge));
+                const int edge_type = type_i <= type_j
+                    ? type_i*(2*active_type_count-type_i-1)/2+type_j
+                    : type_j*(2*active_type_count-type_j-1)/2+type_i;
+                splines.evaluate_function(
+                    edge_type, r(edge), 0,
+                    values(edge,0), derivatives(edge,0));
+            });
+    }
+
+    const auto first_neigh = streamed_first_neigh;
+    const auto inverse_scale = A1_inverse_scale;
+    const auto splines = A1_splines;
+    const auto values = A1_spline_values;
+    const auto type_map = type_to_active;
+    const int active_type_count = num_active_types;
+    Kokkos::parallel_for(
+        "Prepare A1 inverse scale",
+        Kokkos::TeamPolicy<>(
+            factorized_execution_space, num_nodes, Kokkos::AUTO, Kokkos::AUTO),
+        KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type team_member) {
+            const std::size_t node = static_cast<std::size_t>(
+                team_member.league_rank());
+            const int i0 = first_neigh(node);
+            const int type_i = type_map(node_types(node));
+            double scale_factor = 0.0;
+            Kokkos::parallel_reduce(
+                Kokkos::TeamThreadRange(team_member, num_neigh(node)),
+                [=] (const int j, double& lsum) {
+                    const int edge = i0+j;
+                    if (recompute_splines) {
+                        const int type_j = type_map(neigh_types(edge));
+                        const int edge_type = type_i <= type_j
+                            ? type_i*(2*active_type_count-type_i-1)/2+type_j
+                            : type_j*(2*active_type_count-type_j-1)/2+type_i;
+                        lsum += splines.evaluate_function(edge_type, r(edge), 0);
+                    } else
+                        lsum += values(edge,0);
+                }, scale_factor);
+            if (team_member.team_rank() == 0)
+                inverse_scale(node) = 1.0/(scale_factor+1.0);
+        });
+    a1_scale_factors_ready = true;
+    complete_device_stage("MACEKokkos::prepare_A1_scale_factors");
+#else
+    (void)num_nodes;
+    (void)node_types;
+    (void)num_neigh;
+    (void)neigh_types;
+    (void)r;
+#endif
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::compute_A1_scaled(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
@@ -539,6 +1017,11 @@ void MACEKokkos<Precision>::compute_A1_scaled(
     Kokkos::View<const double*> r)
 {
     if (not A1_scaled) return;
+    if (a1_scale_factors_ready) {
+        complete_device_stage("MACEKokkos::compute_A1_scaled_fused");
+        a1_scale_factors_ready = false;
+        return;
+    }
     const bool async_inference = use_factorized_async_inference();
     const auto execution_space = async_inference
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
@@ -596,6 +1079,10 @@ void MACEKokkos<Precision>::compute_A1_scaled(
 
     // perform the scaling
     auto A1 = this->A1;
+    Precision* const a1_data = A1.data();
+    const std::size_t a1_channels = A1.extent(2);
+    const std::size_t a1_row_stride = static_cast<std::size_t>(
+        A1.extent(1))*a1_channels;
     auto A1_spline_values = this->A1_spline_values;
     auto A1_spline_derivs = this->A1_spline_derivs;
     const auto splines = A1_splines;
@@ -687,12 +1174,18 @@ void MACEKokkos<Precision>::compute_A1_scaled(
                         lsum += A1_spline_values(edge,0);
                 }, A1_scale_factor);
             A1_scale_factor += 1.0;
+            const Precision inverse_scale = static_cast<Precision>(
+                1.0/A1_scale_factor);
             team_member.team_barrier();
             // perform the scaling
             Kokkos::parallel_for(
                 Kokkos::TeamThreadRange(team_member, num_lm*num_channels),
                 [=] (int lmk) {
-                    A1(node,lmk/num_channels,lmk%num_channels) /= A1_scale_factor;
+                    a1_data[node*a1_row_stride
+                        +static_cast<std::size_t>(lmk/num_channels)
+                            *a1_channels
+                        +static_cast<std::size_t>(lmk%num_channels)] *=
+                        inverse_scale;
                 });
         });
     complete_device_stage("MACEKokkos::compute_A1_scaled");
@@ -730,6 +1223,14 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
     // Warning: Assumes node_forces have been initialized elsewhere
     const auto A1 = this->A1;
     const auto A1_adj = this->A1_adj;
+    const Precision* const a1_data = A1.data();
+    Precision* const a1_adj_data = A1_adj.data();
+    const std::size_t a1_channels = A1.extent(2);
+    const std::size_t a1_row_stride = static_cast<std::size_t>(
+        A1.extent(1))*a1_channels;
+    const std::size_t a1_adj_channels = A1_adj.extent(2);
+    const std::size_t a1_adj_row_stride = static_cast<std::size_t>(
+        A1_adj.extent(1))*a1_adj_channels;
     const auto A1_spline_values = this->A1_spline_values;
     const auto A1_spline_derivs = this->A1_spline_derivs;
     const bool reuse_adjoint = use_mh0_adjoint_reuse();
@@ -859,6 +1360,8 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
                         lsum += A1_spline_values(edge,0);
                 }, A1_scale_factor);
             A1_scale_factor += 1.0;
+            const Precision inverse_scale = static_cast<Precision>(
+                1.0/A1_scale_factor);
             team_member.team_barrier();
             // update dE/dxyz
             double dA1_dot_A1 = 0.0;
@@ -870,7 +1373,12 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
                     [=] (const int lmk, double& lsum) {
                         const int lm = lmk / num_channels;
                         const int k = lmk % num_channels;
-                        lsum += A1_adj(node,lm,k) * A1(node,lm,k);
+                        lsum += a1_adj_data[node*a1_adj_row_stride
+                            +static_cast<std::size_t>(lm)*a1_adj_channels
+                            +static_cast<std::size_t>(k)]
+                            *a1_data[node*a1_row_stride
+                                +static_cast<std::size_t>(lm)*a1_channels
+                                +static_cast<std::size_t>(k)];
                     }, dA1_dot_A1);
             team_member.team_barrier();
             Kokkos::parallel_for(
@@ -903,10 +1411,15 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
             Kokkos::parallel_for(
                 Kokkos::TeamThreadRange(team_member, num_lm*num_channels),
                 [=] (int lmk) {
-                    A1_adj(node,lmk/num_channels,lmk%num_channels) /= A1_scale_factor;
+                    a1_adj_data[node*a1_adj_row_stride
+                        +static_cast<std::size_t>(lmk/num_channels)
+                            *a1_adj_channels
+                        +static_cast<std::size_t>(lmk%num_channels)]
+                        *= inverse_scale;
                 });
         });
     complete_device_stage("MACEKokkos::reverse_A1_scaled");
+    a1_scale_factors_ready = false;
 }
 
 template <typename Precision>
@@ -934,6 +1447,35 @@ void MACEKokkos<Precision>::compute_M1(int num_nodes, Kokkos::View<const int*> n
             }
         }
 #endif
+        auto M1 = this->M1;
+        const auto M1_weights = this->M1_weights;
+        if constexpr (!std::is_same_v<
+                typename Kokkos::DefaultExecutionSpace::memory_space,
+                Kokkos::HostSpace>) {
+            // The standard M1 structure is the scalar l=0 M0 polynomial.
+            // Reuse its device kernel so CUDA/HIP avoid the generic
+            // polynomial-value scratch and per-tile barriers.
+            if (!single_layer_readout && standard_m1_module_ready
+                && standard_m0_module_ready) {
+                Kokkos::View<Precision***,Kokkos::LayoutRight,
+                    Kokkos::MemoryUnmanaged> M1_scalar(
+                        M1.data(), num_nodes, 1, num_channels);
+                const int persistent_blocks =
+                    resolve_execution_persistent_blocks(
+                        standard_m0_module_id(), execution_space,
+                        static_cast<std::size_t>(num_nodes)*num_channels,
+                        "m1_forward_scalar");
+                if (persistent_blocks > 0
+                    && symmetrix::standard_m0::launch_scalar_forward(
+                        execution_space, persistent_blocks, num_nodes,
+                        node_types, A1, M1_weights, M1_scalar)) {
+                    standard_m1_module_forward_launch_count += 1;
+                    m1_recompute_forward_launch_count += 1;
+                    complete_device_stage("MACEKokkos::compute_M1_standard");
+                    return;
+                }
+            }
+        }
         if (!single_layer_readout && standard_m1_module_ready
             && symmetrix::standard_m1::launch_forward(
                 execution_space, num_nodes, num_channels, node_types,
@@ -953,7 +1495,6 @@ void MACEKokkos<Precision>::compute_M1(int num_nodes, Kokkos::View<const int*> n
         const int tile_channels = m1_recompute_tile_channels;
         const int vector_length = m1_recompute_vector_length();
         const int scratch_level = m1_recompute_scratch_level();
-        auto M1 = this->M1;
         using TeamMember = typename Kokkos::TeamPolicy<>::member_type;
         using ScratchView = Kokkos::View<
             Precision**, Kokkos::LayoutRight,
@@ -1294,11 +1835,6 @@ void MACEKokkos<Precision>::compute_H2(int num_nodes, Kokkos::View<const int*> n
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
     ensure_mh0_h2_forward_capacity(num_nodes);
-    if (use_factorized_async_inference())
-        Kokkos::deep_copy(execution_space, H2, 0.0);
-    else
-        Kokkos::deep_copy(H2, 0.0);
-
     auto num_channels = this->num_channels;
     auto H2 = this->H2;
     auto H2_weights_for_H1 = this->H2_weights_for_H1;
@@ -1379,27 +1915,24 @@ void MACEKokkos<Precision>::compute_H2(int num_nodes, Kokkos::View<const int*> n
         }
     }
 
+    using H2Accum = Precision;
     Kokkos::parallel_for(
-        "Compute H2 from H1",
+        "Compute H2",
         Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
             execution_space, 0, num_nodes*num_channels),
         KOKKOS_LAMBDA (const int ik) {
             const int i = ik / num_channels;
             const int k = ik % num_channels;
-                for (int kp=0; kp<num_channels; ++kp) {
-                    H2(i,k) += H2_weights_for_H1(node_types(i),kp*num_channels+k) * H1(i,0,kp);
-                }
-        });
-    Kokkos::parallel_for(
-        "Compute H2 from M1",
-        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
-            execution_space, 0, num_nodes*num_channels),
-        KOKKOS_LAMBDA (const int ik) {
-            const int i = ik / num_channels;
-            const int k = ik % num_channels;
+            H2Accum output = H2Accum(0);
             for (int kp=0; kp<num_channels; ++kp) {
-                H2(i,k) += H2_weights_for_M1(kp*num_channels+k) * M1(i,kp);
+                output += static_cast<H2Accum>(H2_weights_for_H1(
+                    node_types(i),kp*num_channels+k))
+                    *static_cast<H2Accum>(H1(i,0,kp));
+                output += static_cast<H2Accum>(H2_weights_for_M1(
+                    kp*num_channels+k))
+                    *static_cast<H2Accum>(M1(i,kp));
             }
+            H2(i,k) = static_cast<double>(output);
         });
     complete_device_stage("MACEKokkos::compute_H2");
 }
@@ -1418,11 +1951,9 @@ void MACEKokkos<Precision>::reverse_H2(int num_nodes, Kokkos::View<const int*> n
     if (use_factorized_async_inference()) {
         if (zero_H1_adj)
             Kokkos::deep_copy(execution_space, H1_adj, 0.0);
-        Kokkos::deep_copy(execution_space, M1_adj, 0.0);
     } else {
         if (zero_H1_adj)
             Kokkos::deep_copy(H1_adj, 0.0);
-        Kokkos::deep_copy(M1_adj, 0.0);
     }
 
     auto num_channels = this->num_channels;
@@ -1522,16 +2053,19 @@ void MACEKokkos<Precision>::reverse_H2(int num_nodes, Kokkos::View<const int*> n
             KOKKOS_LAMBDA (const int ik) {
                 const int i = ik / num_channels;
                 const int k = ik % num_channels;
+                Precision m1_adjoint = 0;
                 for (int kp=0; kp<num_channels; ++kp) {
                     const Precision adjoint =
                         static_cast<Precision>(H2_adj(i,kp));
                     H1_adj(i,0,k) += H2_weights_for_H1(
                         node_types(i),k*num_channels+kp)*adjoint;
-                    M1_adj(i,k) +=
+                    m1_adjoint +=
                         H2_weights_for_M1(k*num_channels+kp)*adjoint;
                 }
+                M1_adj(i,k) = m1_adjoint;
             });
     } else {
+        using H2Accum = Precision;
         Kokkos::parallel_for(
             "Reverse H2",
             Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
@@ -1539,12 +2073,19 @@ void MACEKokkos<Precision>::reverse_H2(int num_nodes, Kokkos::View<const int*> n
             KOKKOS_LAMBDA (const int ik) {
                 const int i = ik / num_channels;
                 const int k = ik % num_channels;
+                H2Accum h1_adjoint = H2Accum(0);
+                H2Accum m1_adjoint = H2Accum(0);
                 for (int kp=0; kp<num_channels; ++kp) {
-                    H1_adj(i,0,k) += H2_weights_for_H1_reverse(
-                        node_types(i),kp*num_channels+k)*H2_adj(i,kp);
-                    M1_adj(i,k) += H2_weights_for_M1_reverse(
-                        kp*num_channels+k)*H2_adj(i,kp);
+                    const H2Accum adjoint = static_cast<H2Accum>(H2_adj(i,kp));
+                    h1_adjoint += static_cast<H2Accum>(
+                        H2_weights_for_H1_reverse(
+                            node_types(i),kp*num_channels+k))*adjoint;
+                    m1_adjoint += static_cast<H2Accum>(
+                        H2_weights_for_M1_reverse(
+                            kp*num_channels+k))*adjoint;
                 }
+                H1_adj(i,0,k) += static_cast<Precision>(h1_adjoint);
+                M1_adj(i,k) = static_cast<Precision>(m1_adjoint);
             });
     }
     complete_device_stage("MACEKokkos::reverse_H2");

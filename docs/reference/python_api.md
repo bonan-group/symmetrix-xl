@@ -56,8 +56,8 @@ does not force the planner to select such a plan.
 `direct` is the first-class performance path. Two-interaction models require a
 matching admitted R1 artifact; admitted single-layer models run without R1
 specialization, although capacity planning may still compile or load M0/R0
-operator modules. `non-compiled` is an explicit compiler-free
-fallback/diagnostic mode with no performance guarantee. The `jit` argument is
+operator modules. `non-compiled` is an explicit compiler-free debug mode; it is
+not optimized and has no performance guarantee. The `jit` argument is
 deprecated and ignored;
 `SYMMETRIX_JIT_POLICY` controls required specialization or the explicit
 diagnostic-disabled policy.

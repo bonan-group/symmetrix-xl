@@ -559,8 +559,8 @@ class Symmetrix(Calculator):
         fall back. Admitted single-layer models use built-in direct M0/R0
         execution without an R1 stage, although capacity planning may still
         specialize those operators.
-        ``non-compiled`` is an explicit compiler-free fallback with no
-        performance guarantee. ``materialized`` is the original Symmetrix
+        ``non-compiled`` is an explicit compiler-free debug path with no
+        optimization or performance guarantee. ``materialized`` is the original Symmetrix
         execution mode used by the original format (named v1 here).
         The old ``generic`` and ``all_interactions`` spellings remain accepted
         as deprecated aliases. ``factorized`` and ``direct_streamed`` alias
@@ -665,8 +665,9 @@ class Symmetrix(Calculator):
     neighbor_skin : float, default=0.5
         Verlet-list skin in Angstrom. Candidate neighbors are built at the
         model cutoff plus this skin and reused until any atom has moved by
-        half the skin. With ``streamed_edges="generic"``, current exact-cutoff
-        members are compacted from those candidates in native Kokkos code.
+        half the skin. With ``streamed_edges="non-compiled"``, current
+        exact-cutoff members are compacted from those candidates in native
+        Kokkos code.
         With ``streamed_edges="direct"``, inactive candidates are retained at
         the exact compact-radial cutoff, where their radial contribution is
         zero, so the prepared schedule remains stable. Set to zero to rebuild
@@ -802,8 +803,8 @@ class Symmetrix(Calculator):
         if requested_streamed_edges in ("generic", "all_interactions"):
             warnings.warn(
                 "streamed_edges='generic' is deprecated; use "
-                "streamed_edges='non-compiled' for the uncompiled fallback. "
-                "This path has no performance guarantee.",
+                "streamed_edges='non-compiled' for the compiler-free debug path. "
+                "This path is not optimized and has no performance guarantee.",
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -814,9 +815,9 @@ class Symmetrix(Calculator):
         ):
             raise ValueError(
                 "streamed_edges must be one of "
-                "'auto', 'materialized', 'generic', or 'direct' "
+                "'auto', 'materialized', 'non-compiled', or 'direct' "
                 "(compatibility aliases: "
-                "'all_interactions', 'factorized', 'direct_streamed')."
+                "'generic', 'all_interactions', 'factorized', 'direct_streamed')."
             )
         if execution_profile not in _EXECUTION_PROFILES:
             raise ValueError("execution_profile must be 'capacity' or 'speed'.")
@@ -1051,7 +1052,7 @@ class Symmetrix(Calculator):
 
         if not use_kokkos and canonical_streamed_edges == "direct":
             warnings.warn(
-                "use_kokkos=False selects serial generic execution; direct "
+                "use_kokkos=False selects serial non-compiled execution; direct "
                 "streamed execution is unavailable and performance will be "
                 "substantially lower.",
                 RuntimeWarning,
@@ -1059,7 +1060,7 @@ class Symmetrix(Calculator):
             )
             canonical_streamed_edges = "generic"
             self.streamed_edges_resolution_reason = (
-                "use_kokkos=False selected serial generic execution"
+                "use_kokkos=False selected serial non-compiled execution"
             )
             self.execution_profile = "serial-generic"
             self.low_memory_request = False
@@ -1141,7 +1142,7 @@ class Symmetrix(Calculator):
                     )
                 elif bool(getattr(self.evaluator, "supports_streamed_edges", False)):
                     canonical_streamed_edges = "generic"
-                    self.streamed_edges_resolution_reason = "auto selected generic because generated execution is unavailable"
+                    self.streamed_edges_resolution_reason = "auto selected non-compiled because generated execution is unavailable"
                 else:
                     canonical_streamed_edges = "materialized"
                     self.streamed_edges_resolution_reason = (
@@ -1306,7 +1307,7 @@ class Symmetrix(Calculator):
             warnings.warn(
                 "The jit parameter is deprecated and ignored. Direct execution "
                 "and receiver-factorized execution require RTC specialization; "
-                "select streamed_edges='non-compiled' for compiler-free execution.",
+                "select streamed_edges='non-compiled' for compiler-free debug execution.",
                 FutureWarning,
                 stacklevel=3,
             )
@@ -1725,7 +1726,7 @@ class Symmetrix(Calculator):
         message += (
             "\nRTC specialization for direct and receiver-factorized execution "
             "does not fall back. Select "
-            "streamed_edges='non-compiled' for compiler-free execution."
+            "streamed_edges='non-compiled' for compiler-free debug execution."
         )
         raise _JitRequiredError(message)
 
@@ -1777,7 +1778,7 @@ class Symmetrix(Calculator):
             )
             return
         try:
-            from .jit import prepare_jit_artifact
+            from .jit import native_source_content_sha256, prepare_jit_artifact
             from .receiver_factorized_rtc import (
                 receiver_factorized_host_plugin_metadata,
                 render_receiver_factorized_host_source,
@@ -1788,6 +1789,7 @@ class Symmetrix(Calculator):
             source = render_receiver_factorized_host_source(contract)
             result = prepare_jit_artifact(
                 source,
+                source_content_sha256=native_source_content_sha256(symmetrix),
                 abi={"tag": metadata["abi"], "version": metadata["abi_version"]},
                 build={
                     "generator": "symmetrix.receiver-factorized.host-v1",
@@ -1839,6 +1841,7 @@ class Symmetrix(Calculator):
         jit_generation_version,
         prefer_host_m0_plugin=False,
     ):
+        from .jit import native_source_content_sha256
         from .jit_operator_artifact import (
             prepare_low_memory_operator_modules,
         )
@@ -1850,6 +1853,7 @@ class Symmetrix(Calculator):
             backend=backend,
             target=target,
             jit_generation_version=jit_generation_version,
+            source_content_sha256=native_source_content_sha256(symmetrix),
             prefer_host_m0_plugin=prefer_host_m0_plugin,
         )
         self.jit_operator_modules.update(modules)
@@ -2168,6 +2172,7 @@ class Symmetrix(Calculator):
                 )
 
             from .jit import (
+                native_source_content_sha256,
                 quarantine_jit_artifact,
                 remove_jit_quarantine,
             )
@@ -2502,6 +2507,9 @@ class Symmetrix(Calculator):
                 **prepare_arguments["build"],
                 "jit_generation_version": jit_generation_version,
             }
+            prepare_arguments["source_content_sha256"] = (
+                native_source_content_sha256(symmetrix)
+            )
             retained_quarantines = []
             failed_load_artifacts = set()
             for _load_attempt in range(4):

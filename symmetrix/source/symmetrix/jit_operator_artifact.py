@@ -42,6 +42,7 @@ def prepare_low_memory_operator_modules(
     backend: str,
     target: Mapping[str, Any],
     jit_generation_version: int,
+    source_content_sha256: str | None = None,
     prefer_host_m0_plugin: bool = False,
     cache_root=None,
 ) -> tuple[dict[str, dict[str, Any]], tuple[str, ...]]:
@@ -177,6 +178,7 @@ def prepare_low_memory_operator_modules(
                 contract, precision=precision, target=module_target
             )
         common = {
+            "source_content_sha256": source_content_sha256,
             "abi": {
                 "tag": (
                     "symmetrix.jit.m0-host-plugin/1"
