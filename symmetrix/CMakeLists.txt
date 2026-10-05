@@ -207,6 +207,21 @@ if(_symmetrix_resolved_device_backend STREQUAL "CUDA" AND NOT _cuda_found)
     "Set CMAKE_CUDA_COMPILER or put nvcc on PATH.")
 endif()
 
+# Apple silicon has no CUDA or HIP device: its builds include the Metal layer
+# and use a Serial host, which avoids loading a second OpenMP runtime next to
+# PyTorch's. Explicit selections are preserved.
+if(SYMMETRIX_KOKKOS
+    AND APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$"
+    AND _symmetrix_resolved_device_backend STREQUAL "NONE")
+  if(NOT DEFINED Kokkos_ENABLE_OPENMP AND NOT DEFINED Kokkos_ENABLE_SERIAL)
+    set(Kokkos_ENABLE_SERIAL ON CACHE BOOL "Enable Kokkos Serial backend.")
+    set(Kokkos_ENABLE_OPENMP OFF CACHE BOOL "Enable Kokkos OpenMP backend.")
+  endif()
+  if(NOT DEFINED SYMMETRIX_METAL)
+    set(SYMMETRIX_METAL ON CACHE BOOL "Build the Apple Metal runtime layer.")
+  endif()
+endif()
+
 if(SYMMETRIX_KOKKOS
     AND _symmetrix_resolved_device_backend STREQUAL "NONE"
     AND NOT DEFINED Kokkos_ENABLE_OPENMP
@@ -347,7 +362,7 @@ if(SYMMETRIX_KOKKOS AND Kokkos_ENABLE_OPENMP)
     set(SYMMETRIX_BUILD_OPENMP_VERSION "${OpenMP_CXX_VERSION}")
   endif()
   foreach(_symmetrix_openmp_library_name IN LISTS OpenMP_CXX_LIB_NAMES)
-    if(_symmetrix_openmp_library_name MATCHES "^(gomp|omp|iomp5)$")
+    if(_symmetrix_openmp_library_name MATCHES "^(gomp|omp|libomp|iomp5)$")
       set(_symmetrix_openmp_library_variable
         "OpenMP_${_symmetrix_openmp_library_name}_LIBRARY")
       if(DEFINED ${_symmetrix_openmp_library_variable}

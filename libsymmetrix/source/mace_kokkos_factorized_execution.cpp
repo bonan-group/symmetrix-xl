@@ -30,6 +30,10 @@
 
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
+#ifdef SYMMETRIX_ENABLE_METAL
+#include "metal_r1_module.hpp"
+#include "metal_view_registry.hpp"
+#endif
 #include "device_backend.hpp"
 #include "factorized_blas.hpp"
 
@@ -1045,6 +1049,26 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                     dPhi1.data(),
                     node_forces.data(),
                     r_cut};
+#ifdef SYMMETRIX_ENABLE_METAL
+                if constexpr (std::is_same_v<Precision, float>) {
+                    if (metal_r1_module) {
+                        metal_views->map(Y);
+                        metal_views->map(H1);
+                        metal_views->map(dPhi1);
+                        metal_views->map(H1_adj);
+                        metal_r1_module->reverse(source_args, edge_args, {
+                            node_types.extent(0),
+                            type_to_active.extent(0),
+                            dPhi1.extent(0),
+                            H1.extent(0)});
+                        if (num_edges > 0) {
+                            factorized_jit_launch_count += 2;
+                            factorized_jit_reverse_launch_count += 2;
+                        }
+                        return;
+                    }
+                }
+#endif
                 const auto& descriptor = jit_host_plugin->descriptor_v2();
                 const auto source_owner =
                     descriptor.r1_compensated_source_owner;

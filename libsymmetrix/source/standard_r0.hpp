@@ -473,6 +473,50 @@ void launch_reverse_prepare(
     const int harmonic_count_runtime = output_adjoint.extent_int(1);
     const int value_count = harmonic_count_runtime*channel_count;
     if constexpr (host_execution_space<ExecutionSpace>) {
+#ifdef SYMMETRIX_ENABLE_METAL
+        // Host fast path, compiled into the Metal build only.
+        const bool rows_contiguous =
+            output_adjoint.stride(2) == 1 && output.stride(2) == 1
+            && output_adjoint.stride(1) == static_cast<std::size_t>(channel_count)
+            && output.stride(1) == static_cast<std::size_t>(channel_count)
+            && output.extent_int(1) == harmonic_count_runtime
+            && output.extent_int(2) == channel_count;
+        if (rows_contiguous) {
+            // Contiguous receiver rows; four partial sums break the FP64
+            // add dependency chain of the output-adjoint dot product.
+            Kokkos::parallel_for(
+                "StandardR0::reverse_prepare_host",
+                Kokkos::RangePolicy<ExecutionSpace,
+                    Kokkos::IndexType<std::size_t>>(
+                    execution_space, 0, num_nodes),
+                KOKKOS_LAMBDA (const std::size_t receiver) {
+                    const double inverse_scale = density_state(receiver);
+                    Precision* adjoint = &output_adjoint(receiver,0,0);
+                    double output_dot_adjoint = use_precomputed_dot
+                        ? precomputed_dot(receiver) : 0.0;
+                    if (!use_precomputed_dot) {
+                        const auto* values = &output(receiver,0,0);
+                        double partial[4] = {0.0, 0.0, 0.0, 0.0};
+                        int flat = 0;
+                        for (; flat+4<=value_count; flat+=4)
+                            for (int lane=0; lane<4; ++lane)
+                                partial[lane] += static_cast<double>(
+                                    adjoint[flat+lane])
+                                    *static_cast<double>(values[flat+lane]);
+                        for (; flat<value_count; ++flat)
+                            partial[0] += static_cast<double>(adjoint[flat])
+                                *static_cast<double>(values[flat]);
+                        output_dot_adjoint =
+                            (partial[0]+partial[1])+(partial[2]+partial[3]);
+                    }
+                    const Precision scale = static_cast<Precision>(inverse_scale);
+                    for (int flat=0; flat<value_count; ++flat)
+                        adjoint[flat] *= scale;
+                    density_state(receiver) = output_dot_adjoint*inverse_scale;
+                });
+            return;
+        }
+#endif
         Kokkos::parallel_for(
             "StandardR0::reverse_prepare_host",
             Kokkos::RangePolicy<ExecutionSpace,

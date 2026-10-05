@@ -229,7 +229,19 @@ if(SYMMETRIX_KOKKOS)
     else()
         add_subdirectory(external/kokkos)
     endif()
+    # KokkosKernels hands a nonempty BLAS_LIBRARIES to find_library, which
+    # cannot resolve Apple framework paths. Its empty cache entry hides the
+    # normal variable only on the first configure, so hide it explicitly to
+    # make every configure take KokkosKernels' own FindBLAS path.
+    if(APPLE AND NOT SYMMETRIX_BLAS_LIBRARY)
+        set(_symmetrix_blas_libraries "${BLAS_LIBRARIES}")
+        unset(BLAS_LIBRARIES)
+    endif()
     add_subdirectory(external/kokkos-kernels)
+    if(APPLE AND NOT SYMMETRIX_BLAS_LIBRARY)
+        set(BLAS_LIBRARIES "${_symmetrix_blas_libraries}")
+        unset(_symmetrix_blas_libraries)
+    endif()
 endif()
 message(STATUS "Symmetrix HIP BLAS policy: ${SYMMETRIX_HIP_BLAS}")
 
@@ -314,6 +326,13 @@ if(_symmetrix_host_arch_flag
         $<$<COMPILE_LANGUAGE:CXX>:${_symmetrix_host_arch_flag}>)
 endif()
 
+# The standard M0 term folds expand to several hundred operands, beyond the
+# default 256-level nesting limit of older Apple Clang releases (Xcode 16).
+if(APPLE)
+    target_compile_options(symmetrix PUBLIC
+        $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-fbracket-depth=1024>)
+endif()
+
 target_include_directories(symmetrix
     PUBLIC  source
             "${CMAKE_CURRENT_SOURCE_DIR}/../symmetrix/source/symmetrix"
@@ -333,6 +352,17 @@ if(SYMMETRIX_KOKKOS)
     target_link_libraries(symmetrix
         PRIVATE Kokkos::kokkos
                 Kokkos::kokkoskernels)
+endif()
+
+option(SYMMETRIX_METAL "Build the Apple Metal runtime layer." OFF)
+if(SYMMETRIX_METAL)
+    if(NOT APPLE)
+        message(FATAL_ERROR "SYMMETRIX_METAL requires an Apple platform.")
+    endif()
+    set(SYMMETRIX_METAL_SELFTEST OFF CACHE BOOL
+        "Build the Metal runtime self-test executable.")
+    add_subdirectory(source/metal)
+    target_link_libraries(symmetrix PRIVATE symmetrix_metal)
 endif()
 
 

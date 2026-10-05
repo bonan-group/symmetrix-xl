@@ -60,6 +60,25 @@ validate_cuda_target_for_toolkit = build_targets.validate_cuda_target_for_toolki
 audit_wheel = build_wheel_audit.audit_wheel
 
 
+@pytest.fixture(autouse=True)
+def _linux_x86_64_build_host(monkeypatch):
+    # Detection logic is qualified for Linux x86-64 hosts; simulate one so the
+    # policy checks below run identically on developer machines of any OS.
+    monkeypatch.setattr(build_detect.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(build_detect.platform, "machine", lambda: "x86_64")
+
+
+@pytest.mark.parametrize(
+    ("system", "machine"), [("Darwin", "arm64"), ("Linux", "aarch64")]
+)
+def test_detection_rejects_unqualified_build_hosts(monkeypatch, system, machine):
+    monkeypatch.setattr(build_detect.platform, "system", lambda: system)
+    monkeypatch.setattr(build_detect.platform, "machine", lambda: machine)
+
+    with pytest.raises(BuildError, match="Linux x86-64 only"):
+        build_detect._validate_host()
+
+
 class FakeRunner:
     def __init__(self, executables, results):
         self.executables = executables

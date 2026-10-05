@@ -394,3 +394,44 @@ def test_main_dispatches_bench_arguments(monkeypatch):
 
     assert cli.main(["bench", "--repeats", "4"]) == 0
     assert received == ["--repeats", "4"]
+
+
+def test_metal_flag_reaches_run_and_is_reported(monkeypatch, capsys):
+    seen = {}
+
+    def run(args):
+        seen["metal"] = args.metal
+        return {
+            "model": "/models/mace-omat-0-medium.model",
+            "backend": {"selector": "cpu"},
+            "dtype": "float32",
+            "metal_device": "Apple M1 Max" if args.metal else None,
+            "metal_stages": ["R0", "M0", "R1", "M1"] if args.metal else [],
+            "streamed_edges": "direct",
+            "execution_profile": "capacity",
+            "execution_plan": {"selected_id": "mh0-direct-capacity-y-only"},
+            "atoms": 1080,
+            "directed_edges": 109008,
+            "model_cutoff_angstrom": 6.0,
+            "neighbor_skin_angstrom": 0.5,
+            "effective_cutoff_angstrom": 6.5,
+            "median_us_per_atom": 25.9,
+            "atoms_per_second": 38600.5,
+            "warmups": 3,
+            "repeats": 10,
+            "kokkos_openmp_threads": 1,
+            "blas_threads": 1,
+            "model_setup_seconds": 0.8,
+            "warmup_seconds": 0.6,
+            "measurement_seconds": 0.3,
+        }
+
+    monkeypatch.setattr(bench, "run", run)
+
+    assert bench.main(["--metal"]) == 0
+    assert seen["metal"] is True
+    output = capsys.readouterr().out
+    assert "Metal: Apple M1 Max; GPU stages R0, M0, R1, M1" in output
+    assert bench.main([]) == 0
+    assert seen["metal"] is False
+    assert "Metal:" not in capsys.readouterr().out

@@ -424,6 +424,7 @@ def run(args: argparse.Namespace) -> dict:
             streamed_edges="direct",
             execution_profile=args.profile,
             neighbor_skin=args.neighbor_skin,
+            **({"metal": True} if args.metal else {}),
         )
     except ModuleNotFoundError as error:
         if model.suffix.lower() != ".json":
@@ -471,6 +472,8 @@ def run(args: argparse.Namespace) -> dict:
             native, "_kokkos_default_execution_space", lambda: "unknown"
         )(),
         "dtype": args.dtype,
+        "metal_device": getattr(calculator, "metal_device", None),
+        "metal_stages": list(getattr(calculator, "metal_stages", ())),
         "streamed_edges": calculator.streamed_edges,
         "execution_profile": args.profile,
         "execution_plan": calculator.execution_plan,
@@ -548,6 +551,11 @@ def main(argv=None) -> int:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--neighbor-skin", type=float, default=0.5)
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument(
+        "--metal",
+        action="store_true",
+        help="run the GPU stages on the Apple Metal backend (macOS, float32)",
+    )
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument(
@@ -580,6 +588,11 @@ def main(argv=None) -> int:
             f"Model: {Path(report['model']).name}; backend: "
             f"{backend.get('selector', 'automatic')}"
         )
+        if report.get("metal_device"):
+            print(
+                f"Metal: {report['metal_device']}; GPU stages "
+                f"{', '.join(report.get('metal_stages', ()))}"
+            )
         print(
             f"Structure: {report['atoms']} atoms, {report['directed_edges']} directed edges; "
             f"dtype={report['dtype']}, profile={report['execution_profile']}"

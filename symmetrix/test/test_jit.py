@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+SHARED_SUFFIX = ".dylib" if sys.platform == "darwin" else ".so"
+
 
 def _load_jit():
     repository = Path(__file__).resolve().parents[2]
@@ -409,7 +411,10 @@ def test_cuda13_packaged_nvrtc_library_uses_unified_namespace(
     assert os.environ[jit.NVRTC_LIBRARY_ENVIRONMENT_VARIABLE] == str(library.resolve())
 
 
-def test_cache_key_is_canonical_and_covers_all_inputs(jit):
+def test_cache_key_is_canonical_and_covers_all_inputs(jit, monkeypatch):
+    # The golden key covers the artifact filename, defined here as the Linux
+    # shared-library name so the canonicalization check is platform-neutral.
+    monkeypatch.setattr(jit, "_shared_library_suffix", lambda: ".so")
     common = {
         "source": _source(),
         "abi": {"z": 2, "a": 1},
@@ -744,7 +749,7 @@ def test_cuda_build_publish_validate_and_reuse(jit, monkeypatch, tmp_path):
     assert {path.name for path in built.artifact_path.parent.iterdir()} == {
         "manifest.json",
         "plugin.cu",
-        "factorized_cuda_plugin_gen11.so",
+        "factorized_cuda_plugin_gen11" + SHARED_SUFFIX,
     }
     manifest = jit.validate_jit_manifest(
         built.artifact_path.parent, expected_key=built.cache_key
@@ -783,7 +788,10 @@ def test_cuda_build_publish_validate_and_reuse(jit, monkeypatch, tmp_path):
     assert invocations[0]["argv"] == ["--version"]
     assert Path(invocations[1]["argv"][-3]).name == "plugin.cu"
     assert invocations[1]["argv"][-2] == "-o"
-    assert Path(invocations[1]["argv"][-1]).name == "factorized_cuda_plugin_gen11.so"
+    assert (
+        Path(invocations[1]["argv"][-1]).name
+        == "factorized_cuda_plugin_gen11" + SHARED_SUFFIX
+    )
     assert all(call["prepend"] is None for call in invocations)
     assert all(call["append"] is None for call in invocations)
 
@@ -918,7 +926,7 @@ def test_build_publish_validate_and_reuse(jit, tmp_path, cxx):
     assert {path.name for path in built.artifact_path.parent.iterdir()} == {
         "manifest.json",
         "plugin.cpp",
-        "execution_plugin_gen11.so",
+        "execution_plugin_gen11" + SHARED_SUFFIX,
     }
     manifest = jit.validate_jit_manifest(
         built.artifact_path.parent, expected_key=built.cache_key
@@ -952,13 +960,17 @@ def test_generation_version_publishes_and_preserves_distinct_entries(
 ):
     generation_eleven = _prepare(jit, tmp_path, cxx)
     assert generation_eleven.status == "built"
-    assert generation_eleven.artifact_path.name == "execution_plugin_gen11.so"
+    assert (
+        generation_eleven.artifact_path.name == "execution_plugin_gen11" + SHARED_SUFFIX
+    )
 
     monkeypatch.setattr(jit, "JIT_GENERATION_VERSION", 12)
     generation_twelve = _prepare(jit, tmp_path, cxx)
     assert generation_twelve.status == "built"
     assert generation_twelve.cache_key != generation_eleven.cache_key
-    assert generation_twelve.artifact_path.name == "execution_plugin_gen12.so"
+    assert (
+        generation_twelve.artifact_path.name == "execution_plugin_gen12" + SHARED_SUFFIX
+    )
     assert generation_twelve.manifest["key_inputs"]["jit_generation_version"] == 12
 
     assert generation_eleven.artifact_path.is_file()
@@ -1137,6 +1149,7 @@ def test_no_replace_publication_returns_false_for_eexist(
         if use_syscall
         else SimpleNamespace(renameat2=function)
     )
+    monkeypatch.setattr(jit.sys, "platform", "linux")
     monkeypatch.setattr(jit.ctypes, "CDLL", lambda *args, **kwargs: library)
     monkeypatch.setattr(jit.platform, "machine", lambda: "x86_64")
 
@@ -1152,6 +1165,7 @@ def test_direct_renameat2_syscall_rejects_unsupported_architecture(
     jit, monkeypatch, tmp_path
 ):
     library = SimpleNamespace(renameat2=None, syscall=_FakeCFunction(0))
+    monkeypatch.setattr(jit.sys, "platform", "linux")
     monkeypatch.setattr(jit.ctypes, "CDLL", lambda *args, **kwargs: library)
     monkeypatch.setattr(jit.platform, "machine", lambda: "mystery64")
 
@@ -1164,11 +1178,40 @@ def test_direct_renameat2_syscall_enosys_is_fail_closed(jit, monkeypatch, tmp_pa
         renameat2=None,
         syscall=_FakeCFunction(-1, errno.ENOSYS),
     )
+    monkeypatch.setattr(jit.sys, "platform", "linux")
     monkeypatch.setattr(jit.ctypes, "CDLL", lambda *args, **kwargs: library)
     monkeypatch.setattr(jit.platform, "machine", lambda: "x86_64")
 
     with pytest.raises(jit.JitPublicationUnsupported, match="does not support"):
         jit._publish_directory_no_replace(tmp_path / "source", tmp_path / "destination")
+
+
+def test_darwin_no_replace_publication_uses_rename_excl(jit, monkeypatch, tmp_path):
+    function = _FakeCFunction(-1, errno.EEXIST)
+    library = SimpleNamespace(renameatx_np=function)
+    monkeypatch.setattr(jit.sys, "platform", "darwin")
+    monkeypatch.setattr(jit.ctypes, "CDLL", lambda *args, **kwargs: library)
+
+    assert not jit._publish_directory_no_replace(
+        tmp_path / "source", tmp_path / "destination"
+    )
+    assert len(function.calls) == 1
+    assert function.calls[0][-1] == jit._DARWIN_RENAME_EXCL
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS renameatx_np coverage")
+def test_darwin_no_replace_publication_preserves_existing_destination(jit, tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    destination = tmp_path / "destination"
+    for directory, marker in ((first, "first"), (second, "second")):
+        directory.mkdir()
+        (directory / "marker").write_text(marker)
+
+    assert jit._publish_directory_no_replace(first, destination)
+    assert not jit._publish_directory_no_replace(second, destination)
+    assert (destination / "marker").read_text() == "first"
+    assert second.is_dir()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux renameat2 coverage")
