@@ -139,9 +139,7 @@ def test_neighbor_list_backend_follows_periodicity(monkeypatch):
         return (), (), ()
 
     monkeypatch.setattr(calculator_module, "_ase_neighbor_list", ase_backend)
-    monkeypatch.setattr(
-        calculator_module, "_matscipy_neighbor_list", matscipy_backend
-    )
+    monkeypatch.setattr(calculator_module, "_matscipy_neighbor_list", matscipy_backend)
 
     nonperiodic = Atoms("H", positions=[[0.0, 0.0, 0.0]], pbc=False)
     periodic = Atoms(
