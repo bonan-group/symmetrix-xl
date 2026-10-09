@@ -1054,6 +1054,17 @@ static constexpr int a1_blas_flatten_tile_nodes = 8192;
 static constexpr int a1_blas_flatten_min_nodes = 512;
 void ensure_a1_blas_flatten_capacity(
     std::size_t input_elements, std::size_t output_elements);
+// Host owner-computes blocking of the A1 dense contractions: nodes are grouped
+// so one worker stages a contiguous Phi1 (or A1-adjoint) block, issues one
+// larger GEMM, and unpacks the result.  The staging uses transient host
+// scratch, so it adds no persistent workspace or capacity-plan bytes.
+static constexpr int a1_host_block_nodes = 32;
+static constexpr int a1_host_block_min_block = 4;
+static constexpr int a1_host_block_min_nodes = 8;
+std::size_t a1_host_blocked_forward_launch_count = 0;
+std::size_t a1_host_blocked_reverse_launch_count = 0;
+int a1_host_block_nodes_used = 0;
+std::size_t a1_host_blocked_scratch_bytes = 0;
 static constexpr int phi1_channel_tile_size = 64;
 void compute_A1(int num_nodes, bool completion_fence = true);
 void compute_A1_channel_tile(int num_nodes, int channel_begin);

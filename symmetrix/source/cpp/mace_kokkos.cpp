@@ -803,6 +803,22 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             })
         .def_property_readonly("a1_blas_flatten_workspace_bytes",
             &MACEKokkos<Precision>::a1_blas_flatten_workspace_bytes)
+        .def_property_readonly("a1_host_blocked_forward_launch_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.a1_host_blocked_forward_launch_count;
+            })
+        .def_property_readonly("a1_host_blocked_reverse_launch_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.a1_host_blocked_reverse_launch_count;
+            })
+        .def_property_readonly("a1_host_block_nodes_used",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.a1_host_block_nodes_used;
+            })
+        .def_property_readonly("a1_host_blocked_scratch_bytes",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.a1_host_blocked_scratch_bytes;
+            })
         .def_property_readonly("factorized_schedule_build_count",
             [] (const MACEKokkos<Precision>& self) {
                 return self.factorized_schedule_build_count;

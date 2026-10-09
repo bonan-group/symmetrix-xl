@@ -237,7 +237,9 @@ def test_host_a1_gates_blas_without_replacing_device_team_gemm():
     source = (NATIVE / "mace_kokkos_second_interaction.cpp").read_text()
 
     assert '#include "cblas.hpp"' in source
-    assert source.count("symmetrix_blas_gemm<Precision>(") == 2
+    # One admitted-CBLAS call per direction in the blocked owner kernel and one
+    # in the per-node fallback; the device TeamGEMM path is untouched.
+    assert source.count("symmetrix_blas_gemm<Precision>(") == 4
     assert source.count("KokkosBatched::TeamGemm<") >= 2
     assert source.count("symmetrix::host_worker_cblas_enabled()") >= 4
     assert source.count("typename Kokkos::DefaultExecutionSpace::memory_space") >= 3
@@ -292,6 +294,28 @@ def test_host_dense_backend_uses_qualified_blas_for_parallel_openmp():
     assert "#pragma omp simd" in dense
     assert h1.count("symmetrix::host_flat_dense_enabled()") == 6
     assert second_interaction.count("symmetrix::host_flat_dense_enabled()") == 4
+
+    # The host owner-computes A1 blocks stay inside the admitted-CBLAS gate, so
+    # a pthread OpenBLAS deployment never issues a BLAS call inside a worker.
+    assert 'std::getenv("SYMMETRIX_A1_HOST_BLOCKED")' in dense
+    assert "inline bool host_a1_blocked_enabled()" in dense
+    assert '"SYMMETRIX_A1_HOST_BLOCKED must be' in dense
+    # Each blocked launch names its region and its scratch-admission request.
+    assert second_interaction.count('"Compute A1 host blocked"') == 2
+    assert second_interaction.count('"Reverse A1 host blocked"') == 2
+    assert "make_host_a1_block_plan<Precision>(" in second_interaction
+    tools = (NATIVE / "tools_kokkos.hpp").read_text()
+    assert "std::size_t admitted_team_scratch_limit_bytes(" in tools
+    assert "admitted_team_scratch_limit_bytes<>(1)" in second_interaction
+    gate = "if (symmetrix::host_worker_cblas_enabled()\n"
+    gate += "                && !symmetrix::host_dense_backend_overrides_cblas()) {"
+    assert second_interaction.count(gate) == 2
+    blocked_forward = second_interaction.index('"Compute A1 host blocked"')
+    per_node_forward = second_interaction.index('"Compute A1 host BLAS"')
+    blocked_reverse = second_interaction.index('"Reverse A1 host blocked"')
+    per_node_reverse = second_interaction.index('"Reverse A1 host BLAS"')
+    assert second_interaction.index("host_worker_cblas_enabled()") < blocked_forward
+    assert blocked_forward < per_node_forward < blocked_reverse < per_node_reverse
 
 
 @pytest.mark.parametrize(
