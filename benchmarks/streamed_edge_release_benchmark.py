@@ -150,6 +150,7 @@ def gpu_process_memory_mib() -> int | None:
 def finalize_symmetrix_runtime() -> None:
     gc.collect()
     from symmetrix import symmetrix as native
+
     is_initialized = getattr(native, "_kokkos_is_initialized", None)
     finalize = getattr(native, "_finalize_kokkos", None)
     if callable(is_initialized) and callable(finalize) and is_initialized():

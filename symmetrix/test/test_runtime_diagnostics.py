@@ -604,13 +604,19 @@ def test_version_probe_initializes_device_backend(monkeypatch, capsys):
     monkeypatch.setattr(
         backend_loader,
         "available_backends",
-        lambda _: [{"selector": "cuda13-sm120", "backend": "cuda", "architecture": "sm120"}],
+        lambda _: [
+            {"selector": "cuda13-sm120", "backend": "cuda", "architecture": "sm120"}
+        ],
     )
     monkeypatch.setattr(symmetrix, "load_backend", lambda: native)
     monkeypatch.setattr(
         symmetrix,
         "selected_backend",
-        lambda: {"selector": "cuda13-sm120", "backend": "cuda", "architecture": "sm120"},
+        lambda: {
+            "selector": "cuda13-sm120",
+            "backend": "cuda",
+            "architecture": "sm120",
+        },
     )
 
     assert cli.main(["version", "--probe", "--json"]) == 0
