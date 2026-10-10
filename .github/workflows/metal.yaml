@@ -57,8 +57,12 @@ jobs:
     - name: Build and install Symmetrix with the Metal layer
       run: |
         source .venv/bin/activate
+        source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_source_fingerprint; print(symmetrix_source_fingerprint(Path.cwd()))')
+        native_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_native_source_fingerprint; print(symmetrix_native_source_fingerprint(Path.cwd()))')
         # The default install builds the Metal layer on Apple silicon.
-        uv pip install "./symmetrix[test]" -C build-dir=build-metal
+        uv pip install "./symmetrix[test]" -C build-dir=build-metal \
+          --config-settings="cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint" \
+          --config-settings="cmake.define.SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256=$native_fingerprint"
     - name: Run the Metal tests
       run: |
         source .venv/bin/activate
