@@ -277,6 +277,33 @@ The cache contains executable code and must not be writable by other users.
 Generated artifacts are specific to the model contract, precision, backend,
 compiler/runtime identity, and host or GPU target.
 
+## Direct training and batching
+
+The public trainer fine-tunes the admitted direct parameter subset of an
+ordinary compact MACE model. It does not copy training histories, benchmark
+records, datasets, or checkpoints into the package. Use a private training
+workspace for state files and export compact JSON for deployment:
+
+```python
+from symmetrix import DirectMACEEnergyTrainer
+
+trainer = DirectMACEEnergyTrainer("srtio3-mace.json", dtype="float64")
+trainer.configure_optimizer(
+    optimizer="adamw", learning_rate=1.0e-4, weight_decay=1.0e-5
+)
+trainer.step_batch(
+    batch=[atoms], reference_energies=[energy], batch_mode="native"
+)
+trainer.step_force_batch([atoms], [forces])
+trainer.save_model("srtio3-mace-finetuned.json")
+trainer.save_training_state("srtio3-mace-training.npz")
+```
+
+Native batches are disconnected and retain per-structure loss ownership. The
+trainer rejects MACEField, unsupported profiles, stale prepared graphs, and
+changed structure geometry. Force training requires complete force labels and
+uses the configured neighbor-list skin for a fixed-graph central difference.
+
 ## MACEField
 
 MACEField models expose energy, forces, stress, polarization, Born effective

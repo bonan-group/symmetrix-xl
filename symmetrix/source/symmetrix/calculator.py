@@ -16,11 +16,12 @@ from tempfile import NamedTemporaryFile
 
 import numpy as np
 
+from ase.neighborlist import neighbor_list as _ase_neighbor_list
+
 try:
-    from matscipy.neighbours import neighbour_list as neighbor_list
+    from matscipy.neighbours import neighbour_list as _matscipy_neighbor_list
 except ImportError:
-    logging.warning("Symmetrix using slow ase.neighborlist.neighbor_list")
-    from ase.neighborlist import neighbor_list
+    _matscipy_neighbor_list = None
 
 from ase.calculators.calculator import (
     Calculator,
@@ -32,6 +33,15 @@ from ase.calculators.calculator import (
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from . import symmetrix
+
+
+def neighbor_list(quantities, atoms, cutoff):
+    """Build a host neighbor list using a backend valid for the cell topology."""
+
+    if _matscipy_neighbor_list is not None and np.all(atoms.pbc):
+        return _matscipy_neighbor_list(quantities, atoms, cutoff)
+    return _ase_neighbor_list(quantities, atoms, cutoff)
+
 
 _LOGGER = logging.getLogger(__name__)
 _FIELD_ADDITIVE_PROPERTIES = ["energy", "free_energy", "energies", "forces", "stress"]

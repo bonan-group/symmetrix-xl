@@ -16,6 +16,7 @@ _FRONTEND_EXPORTS = {
     "Symmetrix": (".calculator", "Symmetrix"),
     "FieldAwareCalculator": (".calculator", "FieldAwareCalculator"),
     "FieldContributionCalculator": (".calculator", "FieldContributionCalculator"),
+    "DirectMACEEnergyTrainer": (".training", "DirectMACEEnergyTrainer"),
     "SymmetrixEnsemble": (".ensemble", "SymmetrixEnsemble"),
     "JitDeviceArtifactError": (".jit_device_artifact", "JitDeviceArtifactError"),
     "JitDeviceArtifactResult": (".jit_device_artifact", "JitDeviceArtifactResult"),
@@ -106,6 +107,7 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "BackendError",
+    "DirectMACEEnergyTrainer",
     "FieldAwareCalculator",
     "FieldContributionCalculator",
     "Symmetrix",

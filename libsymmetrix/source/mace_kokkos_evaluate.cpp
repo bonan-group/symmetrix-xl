@@ -320,7 +320,10 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
     Kokkos::View<const double*> xyz,
     Kokkos::View<const double*> r,
     const std::uint64_t execution_graph_generation,
-    const bool streamed_schedule_prepared)
+    const bool streamed_schedule_prepared,
+    const std::span<const std::size_t> loss_structure_offsets,
+    const std::span<const double> loss_reference_energies,
+    const std::span<const double> loss_energy_residual_scales)
 {
     const auto evaluation_start = std::chrono::steady_clock::now();
     if (execution_graph_generation != 0) {
@@ -404,6 +407,7 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
         Kokkos::deep_copy(node_forces, 0.0);
     }
     begin_execution_parameter_gradients();
+    begin_direct_parameter_gradients();
 
     if (streamed_edges != MACEStreamedEdgesMode::materialized
         && !mace_uses_prepared_execution(streamed_edges)
@@ -529,8 +533,19 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
 
         compute_readouts(num_nodes, node_types, false, false);
 
+        if (!loss_reference_energies.empty())
+            apply_direct_batch_loss_seed(
+                num_nodes, loss_structure_offsets, loss_reference_energies,
+                loss_energy_residual_scales);
+        if (direct_batch_node_seed_active)
+            compute_readout_h2_parameter_gradients(
+                num_nodes, node_types, direct_node_energy_adjoints);
+        else
+            compute_readout_h2_parameter_gradients(num_nodes, node_types);
+
         reverse_H2(num_nodes, node_types, false);
         reverse_M1(num_nodes, node_types);
+        compute_M1_parameter_gradients(num_nodes, node_types);
         reverse_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
         if (mace_uses_prepared_execution(streamed_edges)) {
             if (execution_direct_r1) {
@@ -547,6 +562,7 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
         } else {
             reverse_A1(num_nodes);
         }
+        compute_A1_parameter_gradients(num_nodes);
         if (execution_parameter_gradients_enabled) {
             const auto parameter_start = std::chrono::steady_clock::now();
             compute_factorized_parameter_gradients(
@@ -564,10 +580,12 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
     }
 
     reverse_H1(num_nodes);
+    compute_H1_parameter_gradients(num_nodes);
     if (use_m0_module())
         reverse_M0_module(num_nodes, node_types);
     else
         reverse_M0(num_nodes, node_types);
+    compute_M0_parameter_gradients(num_nodes, node_types);
     reverse_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
     if (mace_uses_prepared_execution(streamed_edges))
         begin_standard_r0_reverse_observation(
@@ -601,6 +619,7 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
                     std::chrono::steady_clock::now()-density_start).count();
             execution_parameter_gradients_ready = true;
         }
+        finish_direct_parameter_gradients(true);
         factorized_execution_space.fence("Execution R1 energy and force evaluation");
         factorized_evaluation_fence_count += 1;
         factorized_last_evaluation_ms = std::chrono::duration<double,std::milli>(

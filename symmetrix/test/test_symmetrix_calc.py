@@ -113,6 +113,52 @@ def test_mace_inputs_runs_native_model_cardinality_guard(monkeypatch):
     assert guarded == [(2, 2, 2)]
 
 
+def test_nonperiodic_neighbor_list_handles_zero_cell():
+    atoms = Atoms(
+        "H2",
+        positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        pbc=False,
+    )
+
+    receivers, sources, shifts = calculator_module.neighbor_list("ijS", atoms, 2.0)
+
+    np.testing.assert_array_equal(receivers, [0, 1])
+    np.testing.assert_array_equal(sources, [1, 0])
+    np.testing.assert_array_equal(shifts, np.zeros((2, 3), dtype=np.int32))
+
+
+def test_neighbor_list_backend_follows_periodicity(monkeypatch):
+    calls = []
+
+    def ase_backend(*_args):
+        calls.append("ase")
+        return (), (), ()
+
+    def matscipy_backend(*_args):
+        calls.append("matscipy")
+        return (), (), ()
+
+    monkeypatch.setattr(calculator_module, "_ase_neighbor_list", ase_backend)
+    monkeypatch.setattr(calculator_module, "_matscipy_neighbor_list", matscipy_backend)
+
+    nonperiodic = Atoms("H", positions=[[0.0, 0.0, 0.0]], pbc=False)
+    periodic = Atoms(
+        "H", scaled_positions=[[0.0, 0.0, 0.0]], cell=[4.0, 4.0, 4.0], pbc=True
+    )
+    mixed = Atoms(
+        "H",
+        scaled_positions=[[0.0, 0.0, 0.0]],
+        cell=[4.0, 4.0, 4.0],
+        pbc=[1, 0, 1],
+    )
+
+    calculator_module.neighbor_list("ijS", nonperiodic, 2.0)
+    calculator_module.neighbor_list("ijS", periodic, 2.0)
+    calculator_module.neighbor_list("ijS", mixed, 2.0)
+
+    assert calls == ["ase", "matscipy", "ase"]
+
+
 def test_compute_mace_uses_prepared_execution_capability_and_preserves_fallback():
     inputs = (
         2,

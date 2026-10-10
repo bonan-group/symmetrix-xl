@@ -81,7 +81,10 @@ implementation. On CUDA and HIP, the default `automatic` selects the host
 builder below 512 atoms and Kokkos at 512 atoms or above when native
 construction is eligible. Serial and OpenMP use the host builder by default.
 The calculator attribute `neighbor_graph_backend` reports the implementation
-that built the current cached graph.
+that built the current cached graph. Host neighbor construction uses ASE for
+non-periodic and mixed-periodicity structures, and uses Matscipy for fully
+periodic structures when Matscipy is installed. Fully periodic direct Kokkos
+calculations can use the native Kokkos builder described above.
 
 Useful run-time attributes include `execution_plan`, `jit_status`,
 `jit_reason`, `jit_artifact_id`, `jit_variant_id`, `low_memory_policy`, `head`,
@@ -116,3 +119,36 @@ artifacts for standard MACE and MACEField compact JSON models; MACE-MH-1 uses
 its separate generated program during calculator construction. Artifacts are
 specific to the model contract, precision, ABI, implementation generation, and
 backend target. Use the command-line wrappers for repeatable deployments.
+
+## Direct MACE Training
+
+```python
+DirectMACEEnergyTrainer(
+    model_file, *, dtype="float64", neighbor_skin=0.5,
+    jit_cache=None, head=None,
+)
+```
+
+`DirectMACEEnergyTrainer` trains the public `easily-trainable-v1` subset of an
+ordinary compact MACE model. It requires Kokkos direct execution and fully
+retained speed state; atomic energies, radial tensors, H0/A0, and ZBL values
+remain frozen. `configure_optimizer()` supports SGD, Adam, and AdamW with
+parameter groups, decay, and clipping. Configure learning-rate schedules with
+`configure_lr_scheduler()`.
+
+Use `train_step(atoms, reference_energy)` for one structure or
+`step_batch(batch, reference_energies, batch_mode="native")` for one
+disconnected native graph evaluation. Each method performs one optimizer
+update. The `"sequential"` batch mode is a diagnostic fallback. Force-only
+training accepts `step_force_batch(batch, reference_forces, displacement=None)`;
+joint training accepts
+`step_energy_force_batch(batch, reference_energies, reference_forces, ...)` with
+`energy_weight`, `force_weight`, and `energy_normalization="structure"` or
+`"per_atom"`. Both force APIs require complete `(natoms, 3)` labels and use a
+central coordinate difference on the fixed neighbor graph.
+
+`save_model()` writes compact JSON, while `save_training_state()` and
+`load_training_state()` persist optimizer, scheduler, counters, and history in
+a `.npz` checkpoint. `enable_reporting()` writes training and validation
+records as JSON Lines; `record_validation()` adds metrics to the in-memory
+history, and `export_history_jsonl()` exports a snapshot.

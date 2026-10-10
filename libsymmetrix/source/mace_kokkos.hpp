@@ -55,6 +55,56 @@ struct ExecutionParameterGradientGroup {
     std::vector<double> values;
 };
 
+struct DirectTrainingParameterGroup {
+    std::string name;
+    std::string layout;
+    std::vector<std::size_t> shape;
+    std::size_t offset = 0;
+    std::size_t elements = 0;
+};
+
+struct DirectOptimizerStepResult {
+    double gradient_norm = 0.0;
+    double clip_coefficient = 1.0;
+    bool clipped = false;
+    std::size_t step = 0;
+};
+
+struct DirectBatchEnergyLossResult {
+    std::vector<double> energies;
+    double loss = 0.0;
+    std::size_t batch_size = 0;
+    std::size_t num_nodes = 0;
+    std::size_t num_edges = 0;
+};
+
+enum class DirectGradientObjective {
+    total_energy,
+    mean_half_squared_energy,
+    mean_half_squared_force_finite_difference,
+    weighted_energy_force,
+};
+
+struct DirectBatchForceLossResult {
+    std::vector<double> energies;
+    std::vector<double> forces;
+    std::vector<std::size_t> structure_offsets;
+    double loss = 0.0;
+    double force_rmse = 0.0;
+    double force_mae = 0.0;
+    double max_abs_residual = 0.0;
+    double displacement = 0.0;
+    std::size_t batch_size = 0;
+    std::size_t num_nodes = 0;
+    std::size_t num_edges = 0;
+    std::size_t num_force_components = 0;
+    bool zero_residual = false;
+    double base_evaluation_ms = 0.0;
+    double negative_evaluation_ms = 0.0;
+    double positive_evaluation_ms = 0.0;
+    double combination_ms = 0.0;
+};
+
 struct FactorizedOperatorBenchmarkMeasurement {
     double cold_ms = 0.0;
     std::size_t warmup_count = 0;
@@ -436,6 +486,29 @@ void compute_prepared_factorized(
     std::uint64_t graph_generation,
     std::span<const double> xyz,
     std::span<const double> r);
+void compute_prepared_factorized_device(
+    std::uint64_t graph_generation,
+    Kokkos::View<const double*> xyz,
+    Kokkos::View<const double*> r);
+DirectBatchEnergyLossResult compute_prepared_factorized_energy_loss(
+    std::uint64_t graph_generation,
+    std::span<const double> xyz,
+    std::span<const double> r,
+    std::span<const std::size_t> structure_offsets,
+    std::span<const double> reference_energies,
+    std::span<const double> energy_residual_scales = {});
+DirectBatchForceLossResult compute_prepared_direct_force_loss(
+    std::uint64_t graph_generation,
+    std::span<const double> positions,
+    std::span<const int> edge_shifts,
+    std::span<const double> cells,
+    std::span<const int> pbc,
+    std::span<const std::size_t> structure_offsets,
+    std::span<const int> edge_structures,
+    std::span<const double> reference_forces,
+    double displacement,
+    double neighbor_skin,
+    bool return_forces);
 void compute_prepared_factorized_positions(
     std::uint64_t graph_generation,
     std::span<const double> positions);
@@ -455,6 +528,36 @@ void validate_prepared_factorized_positions_geometry() const;
 std::size_t execution_geometry_workspace_bytes() const;
 void set_factorized_observer(bool enabled, std::size_t max_bytes);
 void set_execution_parameter_gradients(bool enabled, std::size_t max_bytes);
+void set_direct_parameter_gradients(bool enabled, std::size_t max_bytes);
+std::vector<std::string> direct_parameter_names() const;
+std::string direct_parameter_gradient_kernel_policy() const;
+std::string direct_mlp_parameter_gradient_policy() const;
+std::string direct_h1_parameter_gradient_policy() const;
+std::map<std::string, std::vector<std::size_t>> direct_parameter_shapes() const;
+std::map<std::string, std::vector<double>> get_direct_parameters() const;
+void set_direct_parameters(
+    const std::map<std::string, std::vector<double>>& parameters);
+void configure_direct_optimizer(
+    const std::string& optimizer, double beta1, double beta2,
+    double epsilon, bool amsgrad, double momentum, bool nesterov,
+    double gradient_clip_norm,
+    const std::vector<std::vector<std::string>>& group_names,
+    const std::vector<double>& learning_rates,
+    const std::vector<double>& weight_decays);
+void set_direct_optimizer_learning_rates(
+    const std::vector<double>& learning_rates);
+void scale_direct_parameter_gradients(double weight);
+void stash_direct_parameter_gradients(double weight);
+void combine_stashed_direct_parameter_gradients(double weight);
+DirectOptimizerStepResult apply_direct_optimizer_step();
+std::size_t direct_optimizer_step_count() const;
+std::size_t direct_training_workspace_bytes() const;
+void invalidate_direct_training_state();
+std::map<std::string, std::map<std::string, std::vector<double>>>
+direct_optimizer_state() const;
+void set_direct_optimizer_state(
+    std::size_t step,
+    const std::map<std::string, std::map<std::string, std::vector<double>>>& state);
 std::uint64_t prepare_factorized_operator_benchmark(
     std::uint64_t graph_generation,
     std::span<const double> xyz,
@@ -654,7 +757,13 @@ void compute_node_energies_forces(const int num_nodes,
                                   Kokkos::View<const double*> xyz,
                                   Kokkos::View<const double*> r,
                                   std::uint64_t execution_graph_generation = 0,
-                                  bool streamed_schedule_prepared = false);
+                                  bool streamed_schedule_prepared = false,
+                                  std::span<const std::size_t>
+                                      loss_structure_offsets = {},
+                                  std::span<const double>
+                                      loss_reference_energies = {},
+                                  std::span<const double>
+                                      loss_energy_residual_scales = {});
 void compute_node_energies_forces_field(const int num_nodes,
                                         Kokkos::View<const int*> node_types,
                                         Kokkos::View<const int*> num_neigh,
@@ -839,6 +948,7 @@ Kokkos::View<Kokkos::View<int**,Kokkos::LayoutRight>*,Kokkos::SharedSpace> M0_po
 Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace> M0_poly_coeff;
 Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace> M0_poly_values;
 Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace> M0_poly_adjoints;
+std::vector<std::vector<int>> M0_term_coefficient_nodes;
 enum class StandardM0Executor {
     automatic,
     runtime,
@@ -869,6 +979,7 @@ std::string standard_m0_model_semantic_fingerprint;
 std::string standard_m0_model_structure_fingerprint;
 std::string standard_m0_module_fallback_reason;
 Kokkos::View<Precision***,Kokkos::LayoutRight> standard_m0_module_weights;
+std::vector<std::vector<int>> standard_m0_canonical_rows;
 std::unique_ptr<symmetrix::execution::OperatorModule> m0_device_module;
 std::unique_ptr<symmetrix::execution::M0HostPlugin> m0_host_plugin;
 std::string m0_device_module_schedule = "none";
@@ -1446,6 +1557,79 @@ std::size_t execution_parameter_gradients_r1_workers = 0;
 std::size_t execution_parameter_gradients_r0_workers = 0;
 std::vector<ExecutionParameterGradientGroup> execution_parameter_gradient_groups;
 
+bool direct_parameter_gradients_enabled = false;
+bool direct_parameter_gradient_capture_active = true;
+bool direct_parameter_gradients_ready = false;
+std::size_t direct_parameter_gradient_capture_count = 0;
+std::size_t direct_parameter_gradients_max_bytes = 256u*1024u*1024u;
+std::size_t direct_parameter_gradients_result_bytes = 0;
+std::vector<DirectTrainingParameterGroup> direct_parameter_gradient_groups;
+Kokkos::View<double*> direct_training_parameters;
+Kokkos::View<Precision*> direct_training_gradients;
+Kokkos::View<Precision*> direct_training_gradient_scratch;
+Kokkos::View<Precision*> direct_training_gradient_accumulator;
+Kokkos::View<Precision*> direct_A1_packed_inputs;
+Kokkos::View<Precision*> direct_A1_packed_adjoints;
+Kokkos::View<Precision*> direct_H1_packed_inputs;
+Kokkos::View<Precision*> direct_H1_packed_adjoints;
+Kokkos::View<Precision*> direct_mlp_packed_inputs;
+Kokkos::View<Precision*> direct_mlp_packed_hidden_derivatives;
+bool direct_training_gradient_accumulator_ready = false;
+DirectGradientObjective direct_training_gradient_accumulator_objective =
+    DirectGradientObjective::total_energy;
+double direct_training_gradient_accumulator_displacement = 0.0;
+std::size_t direct_training_gradient_accumulator_batch_size = 0;
+DirectGradientObjective direct_gradient_objective =
+    DirectGradientObjective::total_energy;
+double direct_gradient_finite_difference_displacement = 0.0;
+Kokkos::View<int*> direct_optimizer_group_by_parameter;
+Kokkos::View<double*> direct_optimizer_learning_rates;
+Kokkos::View<double*> direct_optimizer_weight_decays;
+Kokkos::View<double*> direct_optimizer_momentum_buffer;
+Kokkos::View<double*> direct_optimizer_first_moment;
+Kokkos::View<double*> direct_optimizer_second_moment;
+Kokkos::View<double*> direct_optimizer_max_second_moment;
+std::string direct_optimizer_name;
+double direct_optimizer_beta1 = 0.9;
+double direct_optimizer_beta2 = 0.999;
+double direct_optimizer_epsilon = 1.0e-8;
+double direct_optimizer_momentum = 0.0;
+double direct_optimizer_gradient_clip_norm = 0.0;
+bool direct_optimizer_amsgrad = false;
+bool direct_optimizer_nesterov = false;
+std::size_t direct_optimizer_steps = 0;
+std::vector<Kokkos::View<int*>> direct_M0_term_nodes;
+std::vector<Kokkos::View<int*>> direct_M0_poly_sources;
+std::vector<Kokkos::View<int*>> direct_standard_M0_sources;
+std::vector<int> direct_A1_lme_begins;
+Kokkos::View<int*> direct_M1_term_nodes;
+Kokkos::View<int*> direct_M1_poly_sources;
+Kokkos::View<int*> direct_M1_weight_sources;
+Kokkos::View<Precision*> direct_node_energy_adjoints;
+Kokkos::View<std::size_t*> direct_batch_structure_offsets;
+Kokkos::View<double*> direct_batch_reference_energies;
+Kokkos::View<double*> direct_batch_energy_residual_scales;
+Kokkos::View<double*> direct_batch_energy_values;
+Kokkos::View<double*> direct_force_positions;
+Kokkos::View<double*> direct_force_cells;
+Kokkos::View<int*> direct_force_edge_shifts;
+Kokkos::View<int*> direct_force_pbc;
+Kokkos::View<int*> direct_force_edge_structures;
+Kokkos::View<double*> direct_force_references;
+Kokkos::View<double*> direct_force_direction;
+Kokkos::View<double*> direct_force_negative_xyz;
+Kokkos::View<double*> direct_force_negative_r;
+Kokkos::View<double*> direct_force_positive_xyz;
+Kokkos::View<double*> direct_force_positive_r;
+std::vector<double> direct_batch_energies;
+double direct_batch_loss = 0.0;
+std::size_t direct_batch_size = 0;
+bool direct_batch_node_seed_active = false;
+std::size_t direct_training_host_to_device_bytes = 0;
+std::size_t direct_training_device_to_host_bytes = 0;
+std::size_t direct_training_fallback_count = 0;
+std::string direct_training_fallback_reason;
+
 enum class MH0StatePolicy {
     full_retention,
     reuse_adjoints,
@@ -1484,6 +1668,32 @@ void compute_execution_density_parameter_gradients(
     Kokkos::View<const double*> r,
     Kokkos::View<Precision***,Kokkos::LayoutRight> output,
     Kokkos::View<Precision***,Kokkos::LayoutRight> output_adjoint);
+DirectTrainingParameterGroup& direct_parameter_gradient_group(
+    const std::string& name);
+const DirectTrainingParameterGroup& direct_parameter_gradient_group(
+    const std::string& name) const;
+void begin_direct_parameter_gradients();
+void finish_direct_parameter_gradients(bool record_capture = false);
+void validate_direct_parameter_profile() const;
+void build_direct_parameter_groups(std::size_t max_bytes);
+void initialize_direct_training_parameters(
+    const std::map<std::string, std::vector<double>>& runtime_parameters);
+void refresh_direct_execution_weights();
+void reserve_direct_parameter_gradient_workspace(
+    std::size_t num_nodes, std::size_t reserved_bytes = 0);
+void compute_readout_h2_parameter_gradients(
+    int num_nodes, Kokkos::View<const int*> node_types,
+    Kokkos::View<const Precision*> node_energy_weights = {});
+void apply_direct_batch_loss_seed(
+    int num_nodes, std::span<const std::size_t> loss_structure_offsets,
+    std::span<const double> loss_reference_energies,
+    std::span<const double> loss_energy_residual_scales = {});
+void compute_M1_parameter_gradients(
+    int num_nodes, Kokkos::View<const int*> node_types);
+void compute_A1_parameter_gradients(int num_nodes);
+void compute_H1_parameter_gradients(int num_nodes);
+void compute_M0_parameter_gradients(
+    int num_nodes, Kokkos::View<const int*> node_types);
 void begin_factorized_observation(int num_nodes, int num_edges);
 void update_factorized_workspace_accounting();
 void refresh_factorized_workspace_readiness();
@@ -1702,6 +1912,8 @@ Kokkos::View<int**,Kokkos::LayoutRight> M1_poly_spec;
 Kokkos::View<Precision***,Kokkos::LayoutRight> M1_poly_coeff;
 Kokkos::View<Precision***,Kokkos::LayoutRight> M1_poly_values;
 Kokkos::View<Precision***,Kokkos::LayoutRight> M1_poly_adjoints;
+std::vector<int> M1_term_coefficient_nodes;
+std::vector<int> standard_m1_canonical_rows;
 void compute_M1(int num_nodes, Kokkos::View<const int*> node_types);
 void reverse_M1(int num_nodes, Kokkos::View<const int*> node_types);
 void release_m1_polynomial_workspace();

@@ -13,6 +13,8 @@ OWNERS = (
     "mace_kokkos_factorized_lifecycle.cpp",
     "mace_kokkos_second_interaction.cpp",
     "mace_kokkos_factorized_analysis.cpp",
+    "mace_kokkos_force_training.cpp",
+    "mace_kokkos_training.cpp",
     "mace_kokkos_runtime.cpp",
     "mace_kokkos_evaluate.cpp",
 )
@@ -27,6 +29,24 @@ def test_cmake_lists_the_semantic_owners_once():
     listed = tuple(re.findall(r"source/(mace_kokkos_[a-z0-9_]+\.cpp)", cmake))
 
     assert listed == OWNERS
+
+
+def test_direct_training_surface_is_part_of_the_public_evaluator():
+    cmake = (ROOT / "libsymmetrix" / "CMakeLists.txt").read_text()
+    header = (SOURCE_ROOT / "mace_kokkos.hpp").read_text()
+
+    assert "source/mace_kokkos_training.cpp" in cmake
+    assert "source/mace_kokkos_force_training.cpp" in cmake
+    for declaration in (
+        "struct DirectTrainingParameterGroup",
+        "struct DirectOptimizerStepResult",
+        "struct DirectBatchEnergyLossResult",
+        "struct DirectBatchForceLossResult",
+        "enum class DirectGradientObjective",
+    ):
+        assert declaration in header
+    assert "source/neighbor_graph_kokkos.cpp" in cmake
+    assert "source/jit_operator_module.cpp" in cmake
 
 
 def test_selector_monolith_is_retired():
@@ -46,10 +66,14 @@ def test_each_owner_instantiates_both_precisions_once():
             for line in source.splitlines()
             if line.strip().startswith("template class MACEKokkos")
         )
-        assert instantiations == (
-            "template class MACEKokkos<float>;",
-            "template class MACEKokkos<double>;",
-        ), name
+        if name == "mace_kokkos_force_training.cpp":
+            assert "MACEKokkos<float>::compute_prepared_direct_force_loss" in source
+            assert "MACEKokkos<double>::compute_prepared_direct_force_loss" in source
+        else:
+            assert instantiations == (
+                "template class MACEKokkos<float>;",
+                "template class MACEKokkos<double>;",
+            ), name
 
 
 def test_representative_methods_have_one_semantic_owner():
@@ -62,6 +86,9 @@ def test_representative_methods_have_one_semantic_owner():
         "mace_kokkos_factorized_execution.cpp": "MACEKokkos<Precision>::compute_factorized(",
         "mace_kokkos_factorized_analysis.cpp": (
             "MACEKokkos<Precision>::compute_execution_density_parameter_gradients("
+        ),
+        "mace_kokkos_training.cpp": (
+            "MACEKokkos<Precision>::initialize_direct_training_parameters("
         ),
         "mace_kokkos_evaluate.cpp": (
             "MACEKokkos<Precision>::compute_node_energies_forces_field("

@@ -353,6 +353,8 @@ if(SYMMETRIX_KOKKOS)
         source/mace_kokkos_factorized_lifecycle.cpp
         source/mace_kokkos_second_interaction.cpp
         source/mace_kokkos_factorized_analysis.cpp
+        source/mace_kokkos_force_training.cpp
+        source/mace_kokkos_training.cpp
         source/mace_kokkos_runtime.cpp
         source/mace_kokkos_evaluate.cpp
         source/jit_operator_module.cpp

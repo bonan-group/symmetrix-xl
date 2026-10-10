@@ -75,6 +75,56 @@ MultilayerPerceptronKokkos::MultilayerPerceptronKokkos(
     this->activation_scale = activation_scale;
 }
 
+std::vector<std::vector<double>> MultilayerPerceptronKokkos::get_weights() const
+{
+    if (shape_host.empty())
+        throw std::logic_error(
+            "MultilayerPerceptronKokkos is not initialized.");
+    const auto host_weights = Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(), weights);
+    const auto host_offsets = Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(), weight_offsets);
+    auto result = std::vector<std::vector<double>>(shape_host.size()-1);
+    for (std::size_t layer=0; layer<result.size(); ++layer) {
+        const auto elements = static_cast<std::size_t>(shape_host[layer+1])
+            *static_cast<std::size_t>(shape_host[layer]);
+        result[layer].resize(elements);
+        for (std::size_t index=0; index<elements; ++index)
+            result[layer][index] = host_weights(
+                static_cast<int>(host_offsets(layer)+index));
+    }
+    return result;
+}
+
+void MultilayerPerceptronKokkos::set_weights(
+    const std::vector<std::vector<double>>& replacement)
+{
+    if (shape_host.empty())
+        throw std::logic_error(
+            "MultilayerPerceptronKokkos is not initialized.");
+    if (replacement.size()+1 != shape_host.size())
+        throw std::invalid_argument(
+            "MultilayerPerceptronKokkos replacement weight layer count differs.");
+    auto host_weights = Kokkos::create_mirror_view(weights);
+    const auto host_offsets = Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(), weight_offsets);
+    for (std::size_t layer=0; layer<replacement.size(); ++layer) {
+        const auto expected = static_cast<std::size_t>(shape_host[layer+1])
+            *static_cast<std::size_t>(shape_host[layer]);
+        if (replacement[layer].size() != expected)
+            throw std::invalid_argument(
+                "MultilayerPerceptronKokkos replacement weight extent differs.");
+        for (const double value : replacement[layer])
+            if (!std::isfinite(value))
+                throw std::invalid_argument(
+                    "MultilayerPerceptronKokkos weights must be finite.");
+        std::copy(
+            replacement[layer].begin(), replacement[layer].end(),
+            host_weights.data()+host_offsets(layer));
+    }
+    Kokkos::deep_copy(weights, host_weights);
+}
+
 void MultilayerPerceptronKokkos::ensure_workspace(
     const int batch_size,
     const bool derivatives,
@@ -723,6 +773,83 @@ void MultilayerPerceptronKokkos::evaluate_gradient_directional(
     if (completion_fence)
         execution_space.fence(
             "MultilayerPerceptronKokkos::evaluate_gradient_directional");
+}
+
+void MultilayerPerceptronKokkos::accumulate_weight_gradients(
+    const Kokkos::DefaultExecutionSpace& execution_space,
+    const int batch_size,
+    Kokkos::View<double*,Kokkos::LayoutRight> first_layer_gradient,
+    Kokkos::View<double*,Kokkos::LayoutRight> final_layer_gradient,
+    const bool completion_fence)
+{
+    accumulate_weight_gradients(
+        execution_space, batch_size, first_layer_gradient,
+        final_layer_gradient,
+        Kokkos::View<const double*,Kokkos::LayoutRight>(), completion_fence);
+}
+
+void MultilayerPerceptronKokkos::accumulate_weight_gradients(
+    const Kokkos::DefaultExecutionSpace& execution_space,
+    const int batch_size,
+    Kokkos::View<double*,Kokkos::LayoutRight> first_layer_gradient,
+    Kokkos::View<double*,Kokkos::LayoutRight> final_layer_gradient,
+    Kokkos::View<const double*,Kokkos::LayoutRight> output_weights,
+    const bool completion_fence)
+{
+    if (shape_host.empty())
+        throw std::logic_error(
+            "MultilayerPerceptronKokkos is not initialized.");
+    if (shape_host.size() != 3 || shape_host.back() != 1)
+        throw std::logic_error(
+            "MultilayerPerceptronKokkos weight gradients require the "
+            "scalar two-layer readout layout.");
+    if (batch_size < 0)
+        throw std::invalid_argument(
+            "MultilayerPerceptronKokkos gradient batch size cannot be negative.");
+    const auto input_width = static_cast<std::size_t>(shape_host[0]);
+    const auto hidden_width = static_cast<std::size_t>(shape_host[1]);
+    if (first_layer_gradient.extent(0) != hidden_width*input_width
+        || final_layer_gradient.extent(0) != hidden_width)
+        throw std::invalid_argument(
+            "MultilayerPerceptronKokkos weight-gradient extents are invalid.");
+    if (batch_size == 0)
+        return;
+    const bool weighted = output_weights.extent(0) != 0;
+    if (weighted && output_weights.extent(0) < static_cast<std::size_t>(batch_size))
+        throw std::invalid_argument(
+            "MultilayerPerceptronKokkos weighted gradient batch size is invalid.");
+    if (node_values.extent(0) < static_cast<std::size_t>(batch_size)
+        || node_derivatives.extent(0) < static_cast<std::size_t>(batch_size))
+        throw std::logic_error(
+            "MultilayerPerceptronKokkos forward derivatives are unavailable.");
+    execution_space.fence(
+        "MultilayerPerceptronKokkos::accumulate_weight_gradients_input");
+    const auto values = Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(), node_values);
+    const auto derivatives = Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(), node_derivatives);
+    auto first_host = Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(), first_layer_gradient);
+    auto final_host = Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(), final_layer_gradient);
+    const auto output_weights_host = Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(), output_weights);
+    for (int batch=0; batch<batch_size; ++batch) {
+        const double weight = weighted ? output_weights_host(batch) : 1.0;
+        for (std::size_t hidden=0; hidden<hidden_width; ++hidden) {
+            const std::size_t hidden_offset = input_width+hidden;
+            final_host(hidden) += weight*values(batch,hidden_offset);
+            const double output_adjoint = derivatives(batch,hidden_offset);
+            for (std::size_t input=0; input<input_width; ++input)
+                first_host(hidden*input_width+input) +=
+                    weight*values(batch,input)*output_adjoint;
+        }
+    }
+    Kokkos::deep_copy(first_layer_gradient, first_host);
+    Kokkos::deep_copy(final_layer_gradient, final_host);
+    if (completion_fence)
+        execution_space.fence(
+            "MultilayerPerceptronKokkos::accumulate_weight_gradients");
 }
 
 void MultilayerPerceptronKokkos::evaluate_gradient_directional_recompute(
