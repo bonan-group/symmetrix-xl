@@ -3660,9 +3660,11 @@ class Symmetrix(Calculator):
 
         field_derivatives_computed = False
         force_derivatives_computed = False
+        force_derivative_bins = False
 
         def compute_field_derivatives(include_forces=False):
             nonlocal field_derivatives_computed, force_derivatives_computed
+            nonlocal force_derivative_bins
             if include_forces and force_derivatives_computed:
                 return
             if field_derivatives_computed and not include_forces:
@@ -3681,24 +3683,26 @@ class Symmetrix(Calculator):
                     self._macefield_response_graph_generation,
                     field,
                     include_forces,
+                    scatter_bec_bins=include_forces,
                 )
                 field_derivatives_computed = True
                 force_derivatives_computed = include_forces
+                force_derivative_bins = include_forces
                 return
 
             num_nodes, node_types, num_neigh, j_list, neigh_types, xyz, r, _ = (
                 mace_inputs
             )
             if include_forces:
+                compute_current_bins = getattr(
+                    self.evaluator,
+                    "_compute_current_electric_field_bec_bins",
+                    None,
+                )
                 compute_current_response = getattr(
                     self.evaluator,
                     "_compute_current_electric_field_force_derivative",
                     None,
-                )
-                compute_response = (
-                    compute_current_response
-                    if callable(compute_current_response)
-                    else self.evaluator.compute_electric_field_force_derivative
                 )
                 response_args = (
                     num_nodes,
@@ -3710,13 +3714,21 @@ class Symmetrix(Calculator):
                     r,
                     field,
                 )
-                if callable(compute_current_response):
-                    compute_response(
+                if callable(compute_current_bins):
+                    compute_current_bins(
+                        *response_args,
+                        self._macefield_response_graph_generation,
+                    )
+                    force_derivative_bins = True
+                elif callable(compute_current_response):
+                    compute_current_response(
                         *response_args,
                         self._macefield_response_graph_generation,
                     )
                 else:
-                    compute_response(*response_args)
+                    self.evaluator.compute_electric_field_force_derivative(
+                        *response_args
+                    )
                 field_derivatives_computed = True
                 force_derivatives_computed = True
             else:
@@ -3761,23 +3773,28 @@ class Symmetrix(Calculator):
 
         if "becs" in properties:
             compute_field_derivatives(include_forces=True)
-            num_nodes, _, _, j_list, _, xyz, _, i_list = mace_inputs
-            pair_derivatives = np.asarray(
-                self.evaluator.electric_field_force_derivative,
-                dtype=float,
-            ).reshape(3, -1, 3)[:, : len(i_list), :]
-            becs = np.zeros((len(atoms), 3, 3))
-            for field_component in range(3):
-                for cartesian in range(3):
-                    becs[:, field_component, cartesian] = np.bincount(
-                        j_list,
-                        weights=pair_derivatives[field_component, :, cartesian],
-                        minlength=num_nodes,
-                    ) - np.bincount(
-                        i_list,
-                        weights=pair_derivatives[field_component, :, cartesian],
-                        minlength=num_nodes,
-                    )
+            if force_derivative_bins:
+                becs = np.array(
+                    self.evaluator.electric_field_bec_bins, dtype=float, copy=True
+                ).reshape(len(atoms), 3, 3)
+            else:
+                num_nodes, _, _, j_list, _, xyz, _, i_list = mace_inputs
+                pair_derivatives = np.asarray(
+                    self.evaluator.electric_field_force_derivative,
+                    dtype=float,
+                ).reshape(3, -1, 3)[:, : len(i_list), :]
+                becs = np.zeros((len(atoms), 3, 3))
+                for field_component in range(3):
+                    for cartesian in range(3):
+                        becs[:, field_component, cartesian] = np.bincount(
+                            j_list,
+                            weights=pair_derivatives[field_component, :, cartesian],
+                            minlength=num_nodes,
+                        ) - np.bincount(
+                            i_list,
+                            weights=pair_derivatives[field_component, :, cartesian],
+                            minlength=num_nodes,
+                        )
             results["becs"] = becs.reshape(len(atoms), 9)
 
         return results

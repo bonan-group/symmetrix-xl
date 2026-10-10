@@ -935,6 +935,7 @@ Kokkos::View<Precision***,Kokkos::LayoutRight> field_path_up_matrix;
 Kokkos::View<double*> electric_field_adj;
 Kokkos::View<double*> electric_field_hessian;
 Kokkos::View<double*> electric_field_force_derivative;
+Kokkos::View<double***,Kokkos::LayoutRight> electric_field_bec_bins;
 Kokkos::View<Precision***,Kokkos::LayoutRight> field_H1_pre_adj;
 Kokkos::View<double**,Kokkos::LayoutRight> field_H1_global_partial;
 void compute_field_H1(const int num_nodes, Kokkos::View<const double*> electric_field);
@@ -974,10 +975,21 @@ void compute_current_electric_field_force_derivative(
     Kokkos::View<const double*> r,
     Kokkos::View<const double*> electric_field,
     std::uint64_t graph_generation);
+void compute_current_electric_field_bec_bins(
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_indices,
+    Kokkos::View<const int*> neigh_types,
+    Kokkos::View<const double*> xyz,
+    Kokkos::View<const double*> r,
+    Kokkos::View<const double*> electric_field,
+    std::uint64_t graph_generation);
 void compute_prepared_factorized_field_response(
     std::uint64_t graph_generation,
     Kokkos::View<const double*> electric_field,
-    bool include_force_derivative);
+    bool include_force_derivative,
+    bool scatter_bec_bins = false);
 void compute_electric_field_response(
     const int num_nodes,
     Kokkos::View<const int*> node_types,
@@ -988,7 +1000,8 @@ void compute_electric_field_response(
     Kokkos::View<const double*> r,
     Kokkos::View<const double*> electric_field,
     bool recompute_primal,
-    bool include_force_derivative);
+    bool include_force_derivative,
+    bool scatter_bec_bins = false);
 void reconstruct_mh0_field_response_state(
     int num_nodes,
     Kokkos::View<const int*> node_types,

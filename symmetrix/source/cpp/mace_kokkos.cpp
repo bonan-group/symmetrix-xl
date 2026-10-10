@@ -1820,14 +1820,17 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             [] (MACEKokkos<Precision>& self,
                     const std::uint64_t execution_graph_generation,
                     ContiguousDoubleArray electric_field,
-                    const bool include_force_derivative) {
+                    const bool include_force_derivative,
+                    const bool scatter_bec_bins) {
                 self.compute_prepared_factorized_field_response(
                     execution_graph_generation,
                     create_kokkos_view("electric_field", electric_field),
-                    include_force_derivative);
+                    include_force_derivative,
+                    scatter_bec_bins);
             },
             py::arg("execution_graph_generation"), py::arg("electric_field"),
-            py::arg("include_force_derivative"))
+            py::arg("include_force_derivative"),
+            py::arg("scatter_bec_bins") = false)
         .def_property_readonly("scalar_size_bytes", [] (const MACEKokkos<Precision>&) {
             return sizeof(Precision);
         })
@@ -2259,6 +2262,43 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                     graph_generation);
             })
         // R0
+        .def("_compute_current_electric_field_bec_bins",
+            [] (MACEKokkos<Precision>& self,
+                    const int num_nodes,
+                    ContiguousIntArray node_types,
+                    ContiguousIntArray num_neigh,
+                    ContiguousIntArray neigh_indices,
+                    ContiguousIntArray neigh_types,
+                    ContiguousDoubleArray xyz,
+                    ContiguousDoubleArray r,
+                    ContiguousDoubleArray electric_field,
+                    std::uint64_t graph_generation) {
+                self.compute_current_electric_field_bec_bins(
+                    num_nodes,
+                    create_kokkos_view("node_types", node_types),
+                    create_kokkos_view("num_neigh", num_neigh),
+                    create_kokkos_view("neigh_indices", neigh_indices),
+                    create_kokkos_view("neigh_types", neigh_types),
+                    create_kokkos_view("xyz", xyz),
+                    create_kokkos_view("r", r),
+                    create_kokkos_view("electric_field", electric_field),
+                    graph_generation);
+            })
+        .def_property_readonly(
+            "electric_field_bec_bins",
+            [] (MACEKokkos<Precision>& self) {
+                auto host_bins = Kokkos::create_mirror_view_and_copy(
+                    Kokkos::HostSpace(), self.electric_field_bec_bins);
+                py::array_t<double, py::array::c_style> bins(
+                    {static_cast<py::ssize_t>(host_bins.extent(0)),
+                     static_cast<py::ssize_t>(host_bins.extent(1)),
+                     static_cast<py::ssize_t>(host_bins.extent(2))});
+                if (host_bins.span() != 0)
+                    std::memcpy(
+                        bins.mutable_data(), host_bins.data(),
+                        host_bins.span()*sizeof(double));
+                return bins;
+            })
         .def_property("R0",
             [] (MACEKokkos<Precision>& self) {
                 return view2vector(self.R0);

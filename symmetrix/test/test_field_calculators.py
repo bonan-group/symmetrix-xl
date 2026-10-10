@@ -150,16 +150,29 @@ def test_macefield_responses_prefer_prepared_device_geometry(atoms):
             self.electric_field_adj = np.array([-1.0, -2.0, -3.0])
             self.electric_field_hessian = np.zeros(9)
             self.electric_field_force_derivative = np.zeros(18)
+            self.electric_field_bec_bins = np.zeros((2, 3, 3))
             self.calls = []
 
         def _compute_prepared_factorized_field_response(
-            self, token, electric_field, include_force_derivative
+            self,
+            token,
+            electric_field,
+            include_force_derivative,
+            scatter_bec_bins=False,
         ):
             self.calls.append(
-                (token, np.array(electric_field, copy=True), include_force_derivative)
+                (
+                    token,
+                    np.array(electric_field, copy=True),
+                    include_force_derivative,
+                    scatter_bec_bins,
+                )
             )
             self.electric_field_hessian = np.arange(9, dtype=float)
             self.electric_field_force_derivative = np.arange(18, dtype=float)
+            self.electric_field_bec_bins = np.arange(2 * 3 * 3, dtype=float).reshape(
+                2, 3, 3
+            )
 
         def _compute_current_electric_field_hessian(self, *args):
             raise AssertionError("legacy response geometry path was used")
@@ -191,10 +204,13 @@ def test_macefield_responses_prefer_prepared_device_geometry(atoms):
     )
 
     assert len(calculator.evaluator.calls) == 1
-    token, actual_field, include_force_derivative = calculator.evaluator.calls[0]
+    token, actual_field, include_force_derivative, scatter_bec_bins = (
+        calculator.evaluator.calls[0]
+    )
     assert token == 17
     np.testing.assert_array_equal(actual_field, electric_field)
     assert include_force_derivative is True
+    assert scatter_bec_bins is True
     assert results["polarization"].shape == (3,)
     assert results["polarizability"].shape == (9,)
     assert results["becs"].shape == (2, 9)

@@ -102,6 +102,36 @@ int response_unordered_edge_type(
         : type_j*(2*active_type_count-type_j-1)/2 + type_i;
 }
 
+
+// Route one per-edge force-derivative contribution to either the legacy
+// per-edge array or per-node BEC bins: the host assembly adds the per-edge
+// value to the neighbor (source) bin and subtracts it from the receiver bin.
+KOKKOS_INLINE_FUNCTION
+void response_route_force_derivative(
+    const Kokkos::View<double***,Kokkos::LayoutRight>& bec_bins,
+    const Kokkos::View<double*>& per_edge,
+    const bool scatter_bec_bins,
+    const int receiver,
+    const int neighbor,
+    const int seed,
+    const std::size_t force_offset,
+    const double force_x,
+    const double force_y,
+    const double force_z)
+{
+    if (scatter_bec_bins) {
+        Kokkos::atomic_add(&bec_bins(neighbor,seed,0), force_x);
+        Kokkos::atomic_add(&bec_bins(neighbor,seed,1), force_y);
+        Kokkos::atomic_add(&bec_bins(neighbor,seed,2), force_z);
+        Kokkos::atomic_add(&bec_bins(receiver,seed,0), -force_x);
+        Kokkos::atomic_add(&bec_bins(receiver,seed,1), -force_y);
+        Kokkos::atomic_add(&bec_bins(receiver,seed,2), -force_z);
+    } else {
+        per_edge(force_offset) += force_x;
+        per_edge(force_offset+1) += force_y;
+        per_edge(force_offset+2) += force_z;
+    }
+}
 template <typename Precision>
 void MACEKokkos<Precision>::compute_electric_field_response(
     const int num_nodes,
@@ -113,7 +143,8 @@ void MACEKokkos<Precision>::compute_electric_field_response(
     Kokkos::View<const double*> r,
     Kokkos::View<const double*> electric_field,
     const bool recompute_primal,
-    const bool include_force_derivative)
+    const bool include_force_derivative,
+    const bool scatter_bec_bins)
 {
     if (!has_field_coupling)
         throw std::invalid_argument(
@@ -199,16 +230,31 @@ void MACEKokkos<Precision>::compute_electric_field_response(
     if (electric_field_hessian.size() != 9)
         Kokkos::realloc(electric_field_hessian, 9);
     if (include_force_derivative) {
-        if (electric_field_force_derivative.size() != 3*coordinate_count)
-            Kokkos::realloc(
-                electric_field_force_derivative, 3*coordinate_count);
+        if (scatter_bec_bins) {
+            electric_field_force_derivative =
+                decltype(electric_field_force_derivative)();
+            if (electric_field_bec_bins.extent(0)
+                    != static_cast<std::size_t>(num_nodes))
+                Kokkos::realloc(electric_field_bec_bins, num_nodes, 3, 3);
+        } else {
+            if (electric_field_force_derivative.size() != 3*coordinate_count)
+                Kokkos::realloc(
+                    electric_field_force_derivative, 3*coordinate_count);
+            electric_field_bec_bins = decltype(electric_field_bec_bins)();
+        }
     } else {
         electric_field_force_derivative =
             decltype(electric_field_force_derivative)();
+        electric_field_bec_bins = decltype(electric_field_bec_bins)();
     }
     Kokkos::deep_copy(electric_field_hessian, 0.0);
-    if (include_force_derivative)
-        Kokkos::deep_copy(electric_field_force_derivative, 0.0);
+    if (include_force_derivative) {
+        if (scatter_bec_bins)
+            Kokkos::deep_copy(electric_field_bec_bins, 0.0);
+        else
+            Kokkos::deep_copy(electric_field_force_derivative, 0.0);
+    }
+    const auto response_bec_bins = electric_field_bec_bins;
 
     Kokkos::View<int*> first_neigh("MACEField response first_neigh", num_nodes);
     Kokkos::parallel_scan(
@@ -1039,22 +1085,33 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                             }
                             const double factor = contraction/scale
                                 *scale_derivative;
-                            response_forces(force_offset) +=
+                            const double scale_force_x =
                                 factor*(compact_geometry
                                     ? static_cast<double>(
                                         unit_direction(coordinate_offset))
                                     : xyz(coordinate_offset)/r(edge));
-                            response_forces(force_offset+1) +=
+                            const double scale_force_y =
                                 factor*(compact_geometry
                                     ? static_cast<double>(
                                         unit_direction(coordinate_offset+1))
                                     : xyz(coordinate_offset+1)/r(edge));
-                            response_forces(force_offset+2) +=
+                            const double scale_force_z =
                                 factor*(compact_geometry
                                     ? static_cast<double>(
                                         unit_direction(coordinate_offset+2))
                                     : xyz(coordinate_offset+2)/r(edge));
-                            });
+                            response_route_force_derivative(
+                                response_bec_bins,
+                                response_forces,
+                                scatter_bec_bins,
+                                i,
+                                neigh_indices(edge),
+                                seed,
+                                force_offset,
+                                scale_force_x,
+                                scale_force_y,
+                                scale_force_z);
+                        });
                     }
                     Kokkos::parallel_for(
                         Kokkos::TeamThreadRange(team, lm_count*channels),
@@ -1364,12 +1421,17 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                         }, force_x, force_y, force_z);
                     if (include_force_derivative) {
                         Kokkos::single(Kokkos::PerThread(team), [=]() {
-                            response_forces(force_offset) +=
-                                static_cast<double>(force_x);
-                            response_forces(force_offset+1) +=
-                                static_cast<double>(force_y);
-                            response_forces(force_offset+2) +=
-                                static_cast<double>(force_z);
+                            response_route_force_derivative(
+                                response_bec_bins,
+                                response_forces,
+                                scatter_bec_bins,
+                                i,
+                                neighbor,
+                                seed,
+                                force_offset,
+                                static_cast<double>(force_x),
+                                static_cast<double>(force_y),
+                                static_cast<double>(force_z));
                         });
                     }
                 });
@@ -1557,9 +1619,17 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                         }, force_x, force_y, force_z);
                     if (include_force_derivative) {
                         Kokkos::single(Kokkos::PerTeam(team), [=]() {
-                            response_forces(force_offset) += force_x;
-                            response_forces(force_offset+1) += force_y;
-                            response_forces(force_offset+2) += force_z;
+                            response_route_force_derivative(
+                                response_bec_bins,
+                                response_forces,
+                                scatter_bec_bins,
+                                i,
+                                neighbor,
+                                seed,
+                                force_offset,
+                                force_x,
+                                force_y,
+                                force_z);
                         });
                     }
                     if (recompute_harmonic_gradients)
@@ -1768,21 +1838,32 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                                 derivative = A0_scale_derivs(edge,0);
                             }
                             const double factor = contraction/scale*derivative;
-                            response_forces(force_offset) +=
+                            const double scale_force_x =
                                 factor*(compact_geometry
                                     ? static_cast<double>(
                                         unit_direction(coordinate_offset))
                                     : xyz(coordinate_offset)/r(edge));
-                            response_forces(force_offset+1) +=
+                            const double scale_force_y =
                                 factor*(compact_geometry
                                     ? static_cast<double>(
                                         unit_direction(coordinate_offset+1))
                                     : xyz(coordinate_offset+1)/r(edge));
-                            response_forces(force_offset+2) +=
+                            const double scale_force_z =
                                 factor*(compact_geometry
                                     ? static_cast<double>(
                                         unit_direction(coordinate_offset+2))
                                     : xyz(coordinate_offset+2)/r(edge));
+                            response_route_force_derivative(
+                                response_bec_bins,
+                                response_forces,
+                                scatter_bec_bins,
+                                i,
+                                neigh_indices(edge),
+                                seed,
+                                force_offset,
+                                scale_force_x,
+                                scale_force_y,
+                                scale_force_z);
                         });
                     Kokkos::parallel_for(
                         Kokkos::TeamThreadRange(team, lm_count*channels),
@@ -1941,12 +2022,17 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                             }
                         }, force_x, force_y, force_z);
                     Kokkos::single(Kokkos::PerThread(team), [=]() {
-                        response_forces(force_offset) +=
-                            static_cast<double>(force_x);
-                        response_forces(force_offset+1) +=
-                            static_cast<double>(force_y);
-                        response_forces(force_offset+2) +=
-                            static_cast<double>(force_z);
+                        response_route_force_derivative(
+                            response_bec_bins,
+                            response_forces,
+                            scatter_bec_bins,
+                            i,
+                            neigh_indices(edge),
+                            seed,
+                            force_offset,
+                            static_cast<double>(force_x),
+                            static_cast<double>(force_y),
+                            static_cast<double>(force_z));
                     });
                 });
         } else
@@ -2083,9 +2169,17 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                             local_z += l_z;
                         }, force_x, force_y, force_z);
                     Kokkos::single(Kokkos::PerTeam(team), [=]() {
-                        response_forces(force_offset) += force_x;
-                        response_forces(force_offset+1) += force_y;
-                        response_forces(force_offset+2) += force_z;
+                        response_route_force_derivative(
+                            response_bec_bins,
+                            response_forces,
+                            scatter_bec_bins,
+                            i,
+                            neigh_indices(edge),
+                            seed,
+                            force_offset,
+                            force_x,
+                            force_y,
+                            force_z);
                     });
                     if (recompute_harmonic_gradients)
                         team.team_barrier();
@@ -2242,10 +2336,37 @@ void MACEKokkos<Precision>::compute_current_electric_field_force_derivative(
 }
 
 template <typename Precision>
+void MACEKokkos<Precision>::compute_current_electric_field_bec_bins(
+    const int num_nodes,
+    Kokkos::View<const int*> node_types,
+    Kokkos::View<const int*> num_neigh,
+    Kokkos::View<const int*> neigh_indices,
+    Kokkos::View<const int*> neigh_types,
+    Kokkos::View<const double*> xyz,
+    Kokkos::View<const double*> r,
+    Kokkos::View<const double*> electric_field,
+    const std::uint64_t graph_generation)
+{
+    if (mace_uses_prepared_execution(streamed_edges)
+        && (graph_generation == 0
+            || graph_generation != factorized_prepared_graph_generation
+            || factorized_completed_evaluation_epoch == 0
+            || factorized_completed_evaluation_graph_generation
+                != graph_generation))
+        throw std::logic_error(
+            "MACEField current response requires a completed prepared Execution "
+            "evaluation for the current graph token.");
+    compute_electric_field_response(
+        num_nodes, node_types, num_neigh, neigh_indices, neigh_types,
+        xyz, r, electric_field, false, true, true);
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::compute_prepared_factorized_field_response(
     const std::uint64_t graph_generation,
     Kokkos::View<const double*> electric_field,
-    const bool include_force_derivative)
+    const bool include_force_derivative,
+    const bool scatter_bec_bins)
 {
     if (!mace_uses_prepared_execution(streamed_edges)
         || graph_generation == 0
@@ -2272,7 +2393,8 @@ void MACEKokkos<Precision>::compute_prepared_factorized_field_response(
                 Kokkos::make_pair(std::size_t(0), num_edges)),
             electric_field,
             false,
-            include_force_derivative);
+            include_force_derivative,
+            scatter_bec_bins);
     } catch (...) {
         compact_edge_geometry_active = false;
         throw;
