@@ -24,9 +24,14 @@ deprecation warning. The removed `receiver_factorized` selector is rejected.
 
 Ordinary MACE exposes energy, free energy, per-atom energies, forces, and
 stress. MACEField additionally exposes polarization and admitted analytical
-Born effective charge and polarizability calculations. Property, precision,
-and MPI qualification can be narrower than implementation availability; dated
-benchmark reports provide the evidence for a specific backend and workload.
+Born effective charge and polarizability calculations. On prepared and
+generic execution the analytical response evaluates its radial splines inline
+from coefficient tables instead of materializing edge-sized radial caches, so
+response memory is dominated by node-sized adjoint tangents;
+`SYMMETRIX_DEBUG_RESPONSE_MATERIALIZED_RADIAL=1` restores the former
+materialized caches for diagnosis. Property, precision, and MPI qualification
+can be narrower than implementation availability; dated benchmark reports
+provide the evidence for a specific backend and workload.
 
 `execution_profile="capacity"` and `"speed"` select resource objectives inside
 the direct algorithm. `allow_fixed_workspace=True` separately permits bounded

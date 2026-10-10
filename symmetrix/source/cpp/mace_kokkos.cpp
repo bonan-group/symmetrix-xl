@@ -690,6 +690,28 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                 return self.macefield_response_a0_generic_launch_count;
             })
         .def_property_readonly(
+            "macefield_response_radial_inline_evaluation_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self
+                    .macefield_response_radial_inline_evaluation_count;
+            })
+        .def_property_readonly(
+            "macefield_response_radial_materialized_evaluation_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self
+                    .macefield_response_radial_materialized_evaluation_count;
+            })
+        .def_property_readonly(
+            "macefield_response_phi1r_slab_launch_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.macefield_response_phi1r_slab_launch_count;
+            })
+        .def_property_readonly(
+            "macefield_response_phi1r_generic_launch_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.macefield_response_phi1r_generic_launch_count;
+            })
+        .def_property_readonly(
             "streamed_edges_mode", &MACEKokkos<Precision>::streamed_edges_mode)
         .def_property_readonly(
             "supports_streamed_edges", &MACEKokkos<Precision>::supports_streamed_edges)
