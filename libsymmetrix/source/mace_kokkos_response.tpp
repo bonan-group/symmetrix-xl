@@ -1171,11 +1171,39 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         Kokkos::fence();
         A1_dot = decltype(A1_dot)();
 
+        const auto radial1_deriv = R1_deriv;
+        const auto harmonics_grad = Y_grad;
+        const bool recompute_harmonic_gradients =
+            include_force_derivative && harmonics_grad.data() == nullptr;
+        const auto H1_base = H1;
+        const int phi_paths = Phi1_l.extent(0);
+        const auto path_row_offsets = Phi1_path_row_offsets;
+        using ResponseTeamMember =
+            typename Kokkos::TeamPolicy<>::member_type;
+        using ResponseScratchView = Kokkos::View<
+            Precision*, typename ResponseTeamMember::scratch_memory_space,
+            Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+
+        // Channel-tiled reverse: the Phi1 tangents and the response reverse
+        // cover one 64-channel tile at a time so the reverse never holds a
+        // full-width dPhi1 pair. The tile weights are the model's pre-tiled
+        // transposes; the tile buffer keeps the (m, eta, local) flat packing,
+        // so a (row, channel) read is lme*tile_channels + local.
         const auto A1_matrix_trans = A1_weights_trans;
+        const auto A1_tile_matrix_trans = A1_channel_tile_weights_trans;
+        const int phi1_tile = phi1_channel_tile_size;
+        const bool phi1_tile_ready =
+            phi1_tile < channels && A1_tile_matrix_trans.size() > 0;
+        const int phi1_tile_stride = phi1_tile_ready ? phi1_tile : channels;
+        for (int phi1_tile_begin=0; phi1_tile_begin<channels;
+             phi1_tile_begin+=phi1_tile_stride) {
+        const int phi1_tile_channels = Kokkos::min(
+            phi1_tile_stride, channels-phi1_tile_begin);
+        const int phi1_tile_phase = phi1_tile_begin/phi1_tile_stride;
         dPhi1_local = decltype(dPhi1_local)(
-            "MACEField dPhi1", num_nodes, phi_outputs, channels);
+            "MACEField dPhi1", num_nodes, phi_outputs, phi1_tile_channels);
         dPhi1_dot = decltype(dPhi1_dot)(
-            "MACEField dPhi1_dot", num_nodes, phi_outputs, channels);
+            "MACEField dPhi1_dot", num_nodes, phi_outputs, phi1_tile_channels);
         Kokkos::parallel_for(
             "MACEField analytic A1 reverse",
             Kokkos::TeamPolicy<>(num_nodes*(lmax+1), Kokkos::AUTO),
@@ -1198,16 +1226,22 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                     Kokkos::make_pair(l*l,l*l+2*l+1), Kokkos::ALL);
                 auto base_output = Kokkos::View<Precision**,Kokkos::LayoutRight,
                     Kokkos::MemoryUnmanaged>(
-                        &dPhi1_local(i,lme,0), 2*l+1, multiplicity*channels);
+                        &dPhi1_local(i,lme,0), 2*l+1,
+                        multiplicity*phi1_tile_channels);
                 auto dot_output = Kokkos::View<Precision**,Kokkos::LayoutRight,
                     Kokkos::MemoryUnmanaged>(
-                        &dPhi1_dot(i,lme,0), 2*l+1, multiplicity*channels);
+                        &dPhi1_dot(i,lme,0), 2*l+1,
+                        multiplicity*phi1_tile_channels);
+                const auto base_weights = phi1_tile_ready
+                    ? A1_tile_matrix_trans(
+                        phi1_tile_phase*(lmax+1)+l)
+                    : A1_matrix_trans(l);
                 KokkosBatched::TeamGemm<
                     Kokkos::TeamPolicy<>::member_type,
                     KokkosBatched::Trans::NoTranspose,
                     KokkosBatched::Trans::NoTranspose,
                     KokkosBatched::Algo::Gemm::Blocked>::invoke(
-                        team, 1.0, base_input, A1_matrix_trans(l),
+                        team, 1.0, base_input, base_weights,
                         0.0, base_output);
                 team.team_barrier();
                 KokkosBatched::TeamGemm<
@@ -1215,26 +1249,12 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                     KokkosBatched::Trans::NoTranspose,
                     KokkosBatched::Trans::NoTranspose,
                     KokkosBatched::Algo::Gemm::Blocked>::invoke(
-                        team, 1.0, dot_input, A1_matrix_trans(l),
+                        team, 1.0, dot_input, base_weights,
                         0.0, dot_output);
             });
 
         Kokkos::fence();
-        A1_adj_local = decltype(A1_adj_local)();
-        A1_adj_dot = decltype(A1_adj_dot)();
 
-        const auto radial1_deriv = R1_deriv;
-        const auto harmonics_grad = Y_grad;
-        const bool recompute_harmonic_gradients =
-            include_force_derivative && harmonics_grad.data() == nullptr;
-        const auto H1_base = H1;
-        const int phi_paths = Phi1_l.extent(0);
-        const auto path_row_offsets = Phi1_path_row_offsets;
-        using ResponseTeamMember =
-            typename Kokkos::TeamPolicy<>::member_type;
-        using ResponseScratchView = Kokkos::View<
-            Precision*, typename ResponseTeamMember::scratch_memory_space,
-            Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
 #ifdef KOKKOS_ENABLE_CUDA
         const auto edge_receivers = response_edge_receivers;
         if (response_mode != MACEStreamedEdgesMode::materialized
@@ -1332,7 +1352,7 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                     }
                     Precision force_x, force_y, force_z;
                     Kokkos::parallel_reduce(
-                        Kokkos::ThreadVectorRange(team, channels),
+                        Kokkos::ThreadVectorRange(team, phi1_tile_channels),
                         [=] (const int channel,
                              Precision& local_x,
                              Precision& local_y,
@@ -1346,20 +1366,20 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                                     ? response_radial_set.evaluate_function(
                                         radial_type,
                                         radial_point,
-                                        path*channels+channel)
-                                    : radial1(edge,path*channels+channel);
+                                        path*channels+(phi1_tile_begin+channel))
+                                    : radial1(edge,path*channels+(phi1_tile_begin+channel));
                                 Precision radial_derivative = 0;
                                 if (include_force_derivative
                                     && response_radial_inline)
                                     response_radial_set.evaluate_function(
                                         radial_type,
                                         radial_point,
-                                        path*channels+channel,
+                                        path*channels+(phi1_tile_begin+channel),
                                         radial,
                                         radial_derivative);
                                 else if (include_force_derivative)
                                     radial_derivative = radial1_deriv(
-                                        edge,path*channels+channel);
+                                        edge,path*channels+(phi1_tile_begin+channel));
                                 const int row_begin = path_row_offsets(path);
                                 const int row_end = path_row_offsets(path+1);
                                 for (int row=row_begin; row<row_end; ++row) {
@@ -1387,9 +1407,9 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                                     }
                                     if (include_force_derivative) {
                                         const Precision base_feature =
-                                            H1_base(neighbor,lm2,channel);
+                                            H1_base(neighbor,lm2,phi1_tile_begin+channel);
                                         const Precision feature_dot =
-                                            H1_dot(neighbor,lm2,channel);
+                                            H1_dot(neighbor,lm2,phi1_tile_begin+channel);
                                         const Precision radial_base =
                                             radial_derivative*y*base_feature;
                                         const Precision radial_dot =
@@ -1441,10 +1461,10 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                             }
                             for (int lm2=0; lm2<LM_count; ++lm2) {
                                 Kokkos::atomic_add(
-                                    &H1_adj_local(neighbor,lm2,channel),
+                                    &H1_adj_local(neighbor,lm2,phi1_tile_begin+channel),
                                     base_contributions[lm2]);
                                 Kokkos::atomic_add(
-                                    &H1_adj_dot(neighbor,lm2,channel),
+                                    &H1_adj_dot(neighbor,lm2,phi1_tile_begin+channel),
                                     dot_contributions[lm2]);
                             }
                         }, force_x, force_y, force_z);
@@ -1540,7 +1560,7 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                             const Precision y = harmonics(harmonic_offset+lm1);
                             double row_x, row_y, row_z;
                             Kokkos::parallel_reduce(
-                                Kokkos::ThreadVectorRange(team, channels),
+                                Kokkos::ThreadVectorRange(team, phi1_tile_channels),
                                 [=] (const int channel,
                                      double& channel_x,
                                      double& channel_y,
@@ -1551,9 +1571,9 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                                             .evaluate_function(
                                                 radial_type,
                                                 radial_point,
-                                                path*channels+channel)
+                                                path*channels+(phi1_tile_begin+channel))
                                         : radial1(
-                                            edge,path*channels+channel);
+                                            edge,path*channels+(phi1_tile_begin+channel));
                                     Precision radial_derivative = 0;
                                     if (include_force_derivative
                                         && response_radial_inline) {
@@ -1561,12 +1581,12 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                                             .evaluate_function(
                                                 radial_type,
                                                 radial_point,
-                                                path*channels+channel,
+                                                path*channels+(phi1_tile_begin+channel),
                                                 radial,
                                                 radial_derivative);
                                     } else if (include_force_derivative) {
                                         radial_derivative = radial1_deriv(
-                                            edge,path*channels+channel);
+                                            edge,path*channels+(phi1_tile_begin+channel));
                                     }
                                     Precision base_adjoint = 0;
                                     Precision adjoint_dot = 0;
@@ -1588,9 +1608,9 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                                     }
                                     if (include_force_derivative) {
                                         const Precision base_feature =
-                                            H1_base(neighbor,lm2,channel);
+                                            H1_base(neighbor,lm2,phi1_tile_begin+channel);
                                         const Precision feature_dot =
-                                            H1_dot(neighbor,lm2,channel);
+                                            H1_dot(neighbor,lm2,phi1_tile_begin+channel);
                                         const double radial_base =
                                             static_cast<double>(
                                                 radial_derivative*y
@@ -1650,10 +1670,10 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                                     }
                                     const Precision source_factor = radial*y;
                                     Kokkos::atomic_add(
-                                        &H1_adj_local(neighbor,lm2,channel),
+                                        &H1_adj_local(neighbor,lm2,phi1_tile_begin+channel),
                                         source_factor*base_adjoint);
                                     Kokkos::atomic_add(
-                                        &H1_adj_dot(neighbor,lm2,channel),
+                                        &H1_adj_dot(neighbor,lm2,phi1_tile_begin+channel),
                                         source_factor*adjoint_dot);
                                 }, row_x, row_y, row_z);
                             local_x += row_x;
@@ -1682,8 +1702,16 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         }
 
         Kokkos::fence();
+        if (phi1_tile_begin+phi1_tile_channels < channels) {
+            dPhi1_local = decltype(dPhi1_local)();
+            dPhi1_dot = decltype(dPhi1_dot)();
+            continue;
+        }
         dPhi1_local = decltype(dPhi1_local)();
         dPhi1_dot = decltype(dPhi1_dot)();
+        A1_adj_local = decltype(A1_adj_local)();
+        A1_adj_dot = decltype(A1_adj_dot)();
+        }
         H1_dot = decltype(H1_dot)();
 
         H1_product_adj_dot = decltype(H1_product_adj_dot)(

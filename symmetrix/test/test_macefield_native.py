@@ -2201,7 +2201,10 @@ def test_kokkos_current_execution_response_reuses_completed_primal(
         atol=2e-6,
     )
     if native_symmetrix._kokkos_default_execution_space() == "Cuda":
-        assert current.macefield_response_phi1_fused_launch_count == 6
+        # The Phi1 response reverse launches once per 64-channel phase.
+        grid = json.loads(macefield_full_json_path.read_text())
+        tile_phases = max(1, -(-int(grid["num_channels"]) // 64))
+        assert current.macefield_response_phi1_fused_launch_count == 6 * tile_phases
         assert current.macefield_response_phi1_generic_launch_count == 0
         assert current.macefield_response_a0_fused_launch_count == 3
         assert current.macefield_response_a0_generic_launch_count == 0
