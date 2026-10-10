@@ -40,7 +40,7 @@ endif()
 # ----- dependencies -----
 
 set(SYMMETRIX_BLAS_LIBRARY "" CACHE FILEPATH
-    "Optional exact BLAS archive used by accelerator release builds.")
+    "Optional exact BLAS library used by release builds.")
 set(SYMMETRIX_BLAS_INCLUDE_DIR "" CACHE PATH
     "Optional CBLAS include directory paired with SYMMETRIX_BLAS_LIBRARY.")
 option(SYMMETRIX_HIDE_STATIC_BLAS_SYMBOLS

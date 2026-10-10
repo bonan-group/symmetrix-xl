@@ -53,6 +53,14 @@ def _add_target_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--blas", choices=("auto", "openblas", "mkl", "mkl-sequential"))
     parser.add_argument("--mkl-root", type=Path)
     parser.add_argument(
+        "--openblas-root",
+        type=Path,
+        help=(
+            "OpenBLAS prefix containing the shared OpenMP (or serial) library "
+            "and cblas.h."
+        ),
+    )
+    parser.add_argument(
         "--accelerator-blas-root",
         type=Path,
         help="Static serial OpenBLAS prefix for a self-contained accelerator wheel.",
@@ -76,6 +84,11 @@ def _base_request(
                 generator=args.generator or "",
                 blas=args.blas or "auto",
                 mkl_root=os.fspath(args.mkl_root) if args.mkl_root else "",
+                openblas_root=(
+                    os.fspath(args.openblas_root)
+                    if getattr(args, "openblas_root", None)
+                    else ""
+                ),
                 accelerator_blas_root=(
                     os.fspath(getattr(args, "accelerator_blas_root", None))
                     if getattr(args, "accelerator_blas_root", None)
@@ -126,6 +139,15 @@ def _base_request(
             os.fspath(args.mkl_root)
             if args.mkl_root
             else (base.blas_root if same_backend else "")
+        ),
+        openblas_root=(
+            os.fspath(args.openblas_root)
+            if getattr(args, "openblas_root", None)
+            else (
+                base.blas_root
+                if same_backend and base.blas_policy == "openblas"
+                else ""
+            )
         ),
         accelerator_blas_root=(
             os.fspath(getattr(args, "accelerator_blas_root", None))
@@ -198,6 +220,8 @@ def _human_manifest(manifest: TargetManifest) -> str:
     else:
         lines.append(f"Host target: {manifest.host_target}")
         lines.append(f"BLAS policy: {manifest.blas_policy}")
+        if manifest.blas_root:
+            lines.append(f"Host BLAS root: {manifest.blas_root}")
     return "\n".join(lines)
 
 
@@ -341,6 +365,7 @@ def _parser() -> argparse.ArgumentParser:
     matrix.add_argument("--cuda-root", type=Path)
     matrix.add_argument("--rocm-root", type=Path)
     matrix.add_argument("--accelerator-blas-root", type=Path)
+    matrix.add_argument("--openblas-root", type=Path)
     matrix.add_argument(
         "--jobs",
         type=int,
@@ -405,6 +430,7 @@ def main(argv: list[str] | None = None) -> int:
                 cuda_root=args.cuda_root,
                 rocm_root=args.rocm_root,
                 accelerator_blas_root=args.accelerator_blas_root,
+                openblas_root=args.openblas_root,
                 jobs=args.jobs,
                 dry_run=args.dry_run,
             )

@@ -6,6 +6,7 @@ import ctypes.util
 import os
 import platform
 import re
+import subprocess
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ class DetectionRequest:
     generator: str = ""
     blas: str = "auto"
     mkl_root: str = ""
+    openblas_root: str = ""
     accelerator_blas_root: str = ""
 
 
@@ -358,11 +360,159 @@ def _mkl_root(explicit: str = "") -> Path | None:
     return None
 
 
-def _cpu_blas_policy(requested: str = "auto", mkl_root: str = "") -> tuple[str, str]:
+def _openblas_installation(explicit: str) -> tuple[str, str, str, str]:
+    """Return ``(root, shared_library, library_dir, include_dir)``."""
+    root = Path(explicit).expanduser().resolve()
+    if not root.is_dir():
+        raise BuildError(f"OpenBLAS root is not a directory: {root}")
+
+    libraries = {
+        path
+        # Covers the canonical name (`libopenblas.so`, `.so.0`), Debian's
+        # `libopenblasp-*.so`, and the names upstream's own build produces for a
+        # single target (for example `libopenblas_zenp-r0.3.30.so`), so a prefix
+        # without the development symlinks still validates.
+        for pattern in ("lib*/**/libopenblas*.so*",)
+        for path in root.glob(pattern)
+        if path.is_file()
+    }
+    if not libraries:
+        raise BuildError(
+            "OpenBLAS root must contain a shared libopenblas.so under lib or "
+            f"lib64: {root}"
+        )
+    # Debian-family packages keep pthread and OpenMP variants in sibling
+    # directories. Prefer the OpenMP variant when the requested prefix exposes
+    # both; an explicit root remains the authority for other installations.
+    library = sorted(
+        libraries,
+        key=lambda path: (
+            "openmp" not in str(path).lower(),
+            path.name != "libopenblas.so",
+            str(path),
+        ),
+    )[0]
+    includes = {
+        path.parent for path in root.glob("include*/**/cblas.h") if path.is_file()
+    }
+    if not includes:
+        raise BuildError(
+            "OpenBLAS root must contain cblas.h under include or include/*: " f"{root}"
+        )
+    include = sorted(
+        includes,
+        key=lambda path: (
+            "openmp" not in str(path).lower() and "openblas" not in str(path).lower(),
+            str(path),
+        ),
+    )[0]
+    return str(root), str(library), str(library.parent), str(include)
+
+
+# Prefixes that commonly carry an OpenBLAS installation.  ``/usr`` covers the
+# Debian-family layout, where the OpenMP and pthread variants live in sibling
+# ``openblas-openmp`` / ``openblas-pthread`` directories under lib/<triplet>.
+_OPENBLAS_CANDIDATE_ROOTS = ("/usr/local", "/usr", "/opt/OpenBLAS", "/opt/openblas")
+
+
+def _openblas_uses_openmp(library: str) -> bool:
+    """True when an OpenBLAS shared library is an OpenMP-threaded build.
+
+    Debian-family packages ship identically named sonames in both variant
+    directories, so the file name proves nothing and the library's own
+    configuration string is authoritative.  Both checks run out of process: a
+    truncated or corrupted object can terminate a ``dlopen`` with a signal
+    instead of raising, and a damaged library under a scanned prefix must not
+    take the build tool down with it.
+    """
+    config = _openblas_config_string(library)
+    if config is not None:
+        return "USE_OPENMP" in config
+    return _openblas_links_openmp_runtime(library)
+
+
+# Runs in a child interpreter: `dlopen` on a damaged object can die by signal.
+_OPENBLAS_CONFIG_PROBE = (
+    "import ctypes, sys\n"
+    "handle = ctypes.CDLL(sys.argv[1])\n"
+    "handle.openblas_get_config.restype = ctypes.c_char_p\n"
+    "sys.stdout.write((handle.openblas_get_config() or b'').decode('latin-1'))\n"
+)
+
+
+def _openblas_config_string(library: str) -> str | None:
+    """Return the library's own build string, or None when probing fails."""
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", _OPENBLAS_CONFIG_PROBE, library],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout
+
+
+def _openblas_links_openmp_runtime(library: str) -> bool:
+    """Whether the library's dynamic dependencies include an OpenMP runtime."""
+    try:
+        dependencies = subprocess.run(
+            ["ldd", library], capture_output=True, text=True, check=False, timeout=20
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(runtime in dependencies for runtime in ("libgomp", "libomp", "libiomp"))
+
+
+def _discover_openblas_installation(
+    roots: Iterable[str] | None = None,
+) -> tuple[str, str, str, str] | None:
+    """Return the first candidate prefix whose library is OpenMP-threaded.
+
+    ``roots`` defaults to the candidate list at call time so tests (and
+    callers) can redirect the search.  A pthread-only prefix is deliberately
+    not returned: the caller then keeps the previous unpinned system linkage
+    instead of pinning a library that would serialise inside the OpenMP
+    regions, and a pthread build in an earlier root cannot shadow an OpenMP
+    build in a later one.
+    """
+    for root in _OPENBLAS_CANDIDATE_ROOTS if roots is None else roots:
+        if not Path(root).is_dir():
+            continue
+        try:
+            candidate = _openblas_installation(root)
+        except BuildError:
+            continue
+        if _openblas_uses_openmp(candidate[1]):
+            return candidate
+    return None
+
+
+def _cpu_blas_policy(
+    requested: str = "auto", mkl_root: str = "", openblas_root: str = ""
+) -> tuple[str, str]:
     normalized = requested.lower()
     if normalized not in {"auto", "openblas", "mkl", "mkl-sequential"}:
         raise BuildError("CPU BLAS must be auto, openblas, mkl, or mkl-sequential")
     root = _mkl_root(mkl_root)
+    if openblas_root:
+        if normalized not in {"auto", "openblas"}:
+            raise BuildError("--openblas-root requires --blas openblas or auto")
+        validated_root, _, _, _ = _openblas_installation(openblas_root)
+        return "openblas", validated_root
+    if normalized in {"auto", "openblas"}:
+        # Prefer a discoverable OpenMP-threaded OpenBLAS: the pthread build
+        # serialises inside this project's OpenMP regions, which costs roughly
+        # 8-13% on the direct CPU path.  Discovery only returns a prefix whose
+        # library is OpenMP, so a pthread-only installation keeps the previous
+        # behaviour (system default, no pinned root).
+        discovered = _discover_openblas_installation()
+        if discovered is not None:
+            return "openblas", discovered[0]
     if normalized == "openblas" and ctypes.util.find_library("openblas"):
         return "openblas", ""
     if normalized == "openblas":
@@ -483,7 +633,9 @@ def detect_target(
         architecture = cpu_architecture(request.cpu_target)
         toolchain = _cpu_toolchain(request, active_runner, cmake, cmake_version)
         host_target = architecture.device_target
-        blas_policy, blas_root = _cpu_blas_policy(request.blas, request.mkl_root)
+        blas_policy, blas_root = _cpu_blas_policy(
+            request.blas, request.mkl_root, request.openblas_root
+        )
         if not toolchain.fortran:
             raise BuildError(
                 "CPU builds require a Fortran compiler for BLAS configuration; "
