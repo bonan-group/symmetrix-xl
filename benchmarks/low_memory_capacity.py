@@ -47,9 +47,9 @@ def _bootstrap_explicit_symmetrix() -> None:
         package_dir / "__init__.py",
         submodule_search_locations=[str(package_dir)],
     )
-    native_spec = importlib.util.spec_from_file_location(
-        "symmetrix.symmetrix", extension
-    )
+    extension_module = extension.name.split(".", 1)[0]
+    native_module_name = f"symmetrix.{extension_module}"
+    native_spec = importlib.util.spec_from_file_location(native_module_name, extension)
     if package_spec is None or package_spec.loader is None:
         raise RuntimeError("could not load the requested Symmetrix source package")
     if native_spec is None or native_spec.loader is None:
@@ -57,9 +57,14 @@ def _bootstrap_explicit_symmetrix() -> None:
     package = importlib.util.module_from_spec(package_spec)
     native = importlib.util.module_from_spec(native_spec)
     sys.modules["symmetrix"] = package
+    sys.modules[native_module_name] = native
     sys.modules["symmetrix.symmetrix"] = native
     native_spec.loader.exec_module(native)
     package_spec.loader.exec_module(package)
+    from symmetrix import backend_loader
+
+    backend_loader._native_module = native
+    backend_loader._selected = backend_loader._cpu_descriptor(package.__version__)
 
 
 def _sha256(path: Path) -> str:
@@ -375,7 +380,7 @@ def _worker(args: argparse.Namespace) -> int:
         cache = calculator._neighbor_cache
         if cache is None:
             raise RuntimeError("capacity worker did not retain the neighbor cache")
-        directed_edges = int(cache.receivers.size)
+        directed_edges = int(cache.num_edges)
         partial_record["workload"]["directed_edges"] = directed_edges
         partial_record["completed_phase"] = phase
         phase = "first_model_evaluation"
@@ -418,12 +423,9 @@ def _worker(args: argparse.Namespace) -> int:
 
     assert calculator is not None
     evaluator = calculator.evaluator
-    if (
-        int(_metric(evaluator, "execution_geometry_capacity_edges", 0))
-        != directed_edges
-    ):
+    if int(_metric(evaluator, "execution_geometry_capacity_edges", 0)) < directed_edges:
         raise RuntimeError(
-            "native geometry capacity does not match the candidate graph"
+            "native geometry capacity does not cover the candidate graph"
         )
     if not is_mh1 and calculator.low_memory is not low_memory:
         raise RuntimeError("effective low-memory policy does not match the request")
