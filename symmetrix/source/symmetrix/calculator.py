@@ -2507,8 +2507,8 @@ class Symmetrix(Calculator):
                 **prepare_arguments["build"],
                 "jit_generation_version": jit_generation_version,
             }
-            prepare_arguments["source_content_sha256"] = (
-                native_source_content_sha256(symmetrix)
+            prepare_arguments["source_content_sha256"] = native_source_content_sha256(
+                symmetrix
             )
             retained_quarantines = []
             failed_load_artifacts = set()

@@ -304,9 +304,7 @@ def _version_report(*, probe=False):
             report["probe"] = {
                 "backend": selected,
                 "extension": getattr(native, "__file__", ""),
-                "build_info": build_info_query()
-                if callable(build_info_query)
-                else {},
+                "build_info": build_info_query() if callable(build_info_query) else {},
                 "runtime": runtime,
                 "device_environment": (
                     device_query() if callable(device_query) else None

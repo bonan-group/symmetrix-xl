@@ -1,6 +1,7 @@
 [build-system]
 requires = ["scikit-build-core", "pybind11"]
-build-backend = "scikit_build_core.build"
+build-backend = "build_backend"
+backend-path = ["."]
 
 [tool.scikit-build]
 cmake.version = ">=3.27"

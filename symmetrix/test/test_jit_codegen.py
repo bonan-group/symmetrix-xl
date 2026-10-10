@@ -748,9 +748,7 @@ def test_cuda_plugin_codegen_metadata_and_source_contract(codegen):
     assert "source_values[0 * 4 + channel] +=" in source
     assert "const Scalar local_radius" in source
     assert "floor((local_radius - x0) / h)" in source
-    fp64_source = codegen.render_jit_r1_cuda_plugin(
-        contract, 80, precision="float64"
-    )
+    fp64_source = codegen.render_jit_r1_cuda_plugin(contract, 80, precision="float64")
     assert "double x;" in fp64_source
     assert "floor((radius - radial.x0) / radial.h)" in fp64_source
     assert "#pragma unroll 1" in source
