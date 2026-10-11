@@ -298,9 +298,9 @@ def _assert_active_prefix_close(actual, expected, atol, name):
     )
     longer = actual if actual.size > active else expected
     if longer.size > active:
-        assert not np.any(longer[active:]), (
-            f"{name}: capacity tail beyond the active region must stay zero"
-        )
+        assert not np.any(
+            longer[active:]
+        ), f"{name}: capacity tail beyond the active region must stay zero"
 
 
 def _assert_field_results_close(actual, expected, atol, *, capacity_padded=False):

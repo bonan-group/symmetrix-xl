@@ -990,13 +990,9 @@ def test_direct_execution_rejects_parameter_gradients(streamed_model_paths):
         # mace_kokkos_runtime.cpp:5048). That admission refuses first, before
         # `begin_factorized_production_evaluation` reaches its direct-mode
         # observer/gradient guard.
-        expected_message = (
-            "MH-0 adjoint reuse requires a state-free R0 implementation"
-        )
+        expected_message = "MH-0 adjoint reuse requires a state-free R0 implementation"
     else:
-        expected_message = (
-            "does not support Execution observers or parameter gradients"
-        )
+        expected_message = "does not support Execution observers or parameter gradients"
     evaluator.set_execution_parameter_gradients(True)
     try:
         with pytest.raises(ValueError, match=expected_message):
