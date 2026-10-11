@@ -415,6 +415,36 @@ def test_cpu_manifest_replay_inherits_openblas_root(tmp_path):
     assert (request.blas, request.openblas_root) == ("openblas", "/opt/openblas")
 
 
+def test_cpu_manifest_replay_drops_openblas_root_for_mkl_override(tmp_path):
+    manifest = replace(
+        _manifest("cpu", "x86-64-v3"),
+        blas_policy="openblas",
+        blas_root="/opt/openblas",
+    )
+    path = tmp_path / "target.json"
+    manifest.write(path)
+    args = SimpleNamespace(
+        target_manifest=path,
+        backend=None,
+        arch=None,
+        cpu_target=None,
+        cuda_root=None,
+        rocm_root=None,
+        cxx=None,
+        host_cxx=None,
+        generator=None,
+        blas="mkl",
+        mkl_root=Path("/opt/mkl"),
+        openblas_root=None,
+    )
+
+    request, _ = build_cli._base_request(args)
+
+    assert request.blas == "mkl"
+    assert request.mkl_root == "/opt/mkl"
+    assert request.openblas_root == ""
+
+
 def test_matrix_child_commands_forward_openblas_root_for_cpu_targets(tmp_path):
     cpu_spec = build_matrix.parse_matrix_spec("cpu:x86-64-v4")
     cuda_spec = build_matrix.parse_matrix_spec("cuda:12:sm86")
@@ -582,6 +612,17 @@ def test_openblas_root_accepts_upstream_library_name(tmp_path):
 
     assert library.endswith("libopenblas_zenp-r0.3.30.so")
     assert library_dir == str(root / "lib")
+
+
+def test_openblas_root_rejects_versioned_soname_without_link_name(tmp_path):
+    root = tmp_path / "openblas"
+    (root / "lib").mkdir(parents=True)
+    (root / "include").mkdir(parents=True)
+    (root / "lib/libopenblas.so.0").write_bytes(b"shared")
+    (root / "include/cblas.h").write_text("/* cblas */\n")
+
+    with pytest.raises(BuildError, match="linkable"):
+        build_detect._openblas_installation(str(root))
 
 
 def test_openblas_uses_openmp_follows_the_library_not_the_directory_name(

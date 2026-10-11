@@ -307,9 +307,8 @@ def test_host_dense_backend_uses_qualified_blas_for_parallel_openmp():
     tools = (NATIVE / "tools_kokkos.hpp").read_text()
     assert "std::size_t admitted_team_scratch_limit_bytes(" in tools
     assert "admitted_team_scratch_limit_bytes<>(1)" in second_interaction
-    gate = "if (symmetrix::host_worker_cblas_enabled()\n"
-    gate += "                && !symmetrix::host_dense_backend_overrides_cblas()) {"
-    assert second_interaction.count(gate) == 2
+    gate = "if (symmetrix::host_worker_cblas_enabled() && !symmetrix::host_dense_backend_overrides_cblas()) {"
+    assert " ".join(second_interaction.split()).count(gate) == 2
     blocked_forward = second_interaction.index('"Compute A1 host blocked"')
     per_node_forward = second_interaction.index('"Compute A1 host BLAS"')
     blocked_reverse = second_interaction.index('"Reverse A1 host blocked"')

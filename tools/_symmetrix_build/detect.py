@@ -368,18 +368,18 @@ def _openblas_installation(explicit: str) -> tuple[str, str, str, str]:
 
     libraries = {
         path
-        # Covers the canonical name (`libopenblas.so`, `.so.0`), Debian's
-        # `libopenblasp-*.so`, and the names upstream's own build produces for a
-        # single target (for example `libopenblas_zenp-r0.3.30.so`), so a prefix
-        # without the development symlinks still validates.
+        # Covers linkable names such as the canonical library, Debian's
+        # libopenblasp-*.so, and upstream's target-suffixed libraries. A bare
+        # versioned soname (libopenblas.so.0) cannot be resolved by the -l name
+        # derived by the CMake wiring below.
         for pattern in ("lib*/**/libopenblas*.so*",)
         for path in root.glob(pattern)
-        if path.is_file()
+        if path.is_file() and not re.search(r"\.so\.[0-9]", path.name)
     }
     if not libraries:
         raise BuildError(
-            "OpenBLAS root must contain a shared libopenblas.so under lib or "
-            f"lib64: {root}"
+            "OpenBLAS root must contain a linkable shared libopenblas.so under "
+            f"lib or lib64: {root}"
         )
     # Debian-family packages keep pthread and OpenMP variants in sibling
     # directories. Prefer the OpenMP variant when the requested prefix exposes

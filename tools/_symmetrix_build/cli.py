@@ -145,7 +145,9 @@ def _base_request(
             if getattr(args, "openblas_root", None)
             else (
                 base.blas_root
-                if same_backend and base.blas_policy == "openblas"
+                if same_backend
+                and base.blas_policy == "openblas"
+                and args.blas in (None, "auto", "openblas")
                 else ""
             )
         ),

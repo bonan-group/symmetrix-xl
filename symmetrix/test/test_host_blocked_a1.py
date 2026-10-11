@@ -84,8 +84,17 @@ def _run_evaluation(model_path, overrides):
 
 
 def test_host_blocked_a1_matches_per_node_and_records_launches(a1_model_path):
-    blocked = _run_evaluation(a1_model_path, {"SYMMETRIX_A1_HOST_BLOCKED": "1"})
-    per_node = _run_evaluation(a1_model_path, {"SYMMETRIX_A1_HOST_BLOCKED": "0"})
+    # The blocked kernel is only reachable from the admitted-CBLAS branch, so
+    # force that branch to keep this A/B independent of the host BLAS.
+    forced = {"SYMMETRIX_HOST_WORKER_BLAS": "unsafe"}
+    blocked = _run_evaluation(
+        a1_model_path,
+        {**forced, "SYMMETRIX_A1_HOST_BLOCKED": "1"},
+    )
+    per_node = _run_evaluation(
+        a1_model_path,
+        {**forced, "SYMMETRIX_A1_HOST_BLOCKED": "0"},
+    )
 
     assert blocked["a1_host_blocked_forward_launch_count"] >= 1
     assert blocked["a1_host_blocked_reverse_launch_count"] >= 1
