@@ -1466,6 +1466,14 @@ enum class MH0StatePolicy {
 MH0StatePolicy mh0_state_policy = MH0StatePolicy::full_retention;
 std::string mh0_state_policy_request = "full-retention-v1";
 bool readout_recompute = false;
+// Explicit _set_* requests recorded by the pybind layer. A pinned policy is
+// never rewritten by the automatic throughput bundle, so a caller-selected
+// policy survives calculate(); the flags stay set for the evaluator lifetime.
+bool readout_policy_pinned = false;
+bool m1_polynomial_policy_pinned = false;
+bool mh0_state_policy_pinned = false;
+bool harmonic_storage_policy_pinned = false;
+bool edge_geometry_policy_pinned = false;
 Kokkos::View<double*> mh0_a1_scale_adjoint;
 Kokkos::View<double*> mh0_a0_scale_adjoint;
 bool use_mh0_adjoint_reuse() const;

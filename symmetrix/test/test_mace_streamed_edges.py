@@ -2781,6 +2781,27 @@ def test_speed_uses_backend_throughput_policy_and_debug_override_is_exact(
     assert "debug override selected" in retained.low_memory_selection_reason
 
 
+def test_explicit_evaluator_policy_pins_survive_the_automatic_bundle(
+    streamed_model_paths,
+):
+    """A pin set through the evaluator must not be reverted by the bundle."""
+
+    standard_path, _ = streamed_model_paths
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+    calculator = Symmetrix(
+        standard_path,
+        use_kokkos=True,
+        dtype="float64",
+        streamed_edges="factorized",
+    )
+    evaluator = calculator.evaluator
+    evaluator._set_readout_policy("retained")
+    calculator.calculate(atoms, properties=["energy", "forces", "stress"])
+    assert evaluator.readout_policy == "retained"
+    assert evaluator.readout_workspace_bytes > 0
+
+
 def test_low_memory_high_water_reuses_graph_and_mh0_state_capacity(
     streamed_model_paths,
     monkeypatch,

@@ -1389,6 +1389,22 @@ class Symmetrix(Calculator):
             raise ValueError(f"m1_polynomial_policy must be one of {choices}.")
         return policy
 
+    @staticmethod
+    def _apply_default_policy(setter, request):
+        """Apply a construction-time default that the bundle may override.
+
+        Kokkos evaluators take a ``pin`` flag on their ``_set_*_policy`` hooks:
+        a pinned request keeps its value across the automatic throughput
+        bundle, while the defaults applied here must stay overridable. An
+        evaluator without the flag (test doubles, legacy evaluators) accepts
+        the request alone.
+        """
+
+        try:
+            setter(request, pin=False)
+        except TypeError:
+            setter(request)
+
     def _configure_m1_polynomial_policy(self):
         setter = getattr(self.evaluator, "_set_m1_polynomial_policy", None)
         request = self.m1_polynomial_policy_request
@@ -1402,7 +1418,7 @@ class Symmetrix(Calculator):
                 "m1_polynomial_policy='recompute' requires a compatible "
                 "Kokkos MACE evaluator."
             )
-        setter(request)
+        self._apply_default_policy(setter, request)
         self.m1_polynomial_policy = str(
             getattr(self.evaluator, "m1_polynomial_policy", request)
         )
@@ -1422,7 +1438,7 @@ class Symmetrix(Calculator):
                 "execution_mh0_state_policy='reuse-adjoints-v1' requires a "
                 "compatible Kokkos MACE evaluator."
             )
-        setter(request)
+        self._apply_default_policy(setter, request)
         self.mh0_state_policy = str(
             getattr(self.evaluator, "mh0_state_policy", request)
         )
@@ -1438,7 +1454,7 @@ class Symmetrix(Calculator):
                 "edge_geometry_policy='unit-f32-radius-f64-v1' requires a "
                 "compatible Kokkos MACE evaluator."
             )
-        setter(self.edge_geometry_policy)
+        self._apply_default_policy(setter, self.edge_geometry_policy)
         self.edge_geometry_policy = str(
             getattr(self.evaluator, "edge_geometry_policy", self.edge_geometry_policy)
         )

@@ -400,17 +400,37 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                 return result;
             })
         .def("_set_m1_polynomial_policy",
-            &MACEKokkos<Precision>::set_m1_polynomial_policy)
+            [] (MACEKokkos<Precision>& self, const std::string& policy,
+                const bool pin) {
+                if (pin)
+                    self.m1_polynomial_policy_pinned = true;
+                self.set_m1_polynomial_policy(policy);
+            }, py::arg("policy"), py::arg("pin") = true)
         .def("_set_m1_recompute_tile_channels",
             &MACEKokkos<Precision>::set_m1_recompute_tile_channels)
         .def("_set_m1_recompute_scratch_limit_for_testing",
             &MACEKokkos<Precision>::set_m1_recompute_scratch_limit_for_testing)
         .def("_set_mh0_state_policy",
-            &MACEKokkos<Precision>::set_mh0_state_policy)
+            [] (MACEKokkos<Precision>& self, const std::string& policy,
+                const bool pin) {
+                if (pin)
+                    self.mh0_state_policy_pinned = true;
+                self.set_mh0_state_policy(policy);
+            }, py::arg("policy"), py::arg("pin") = true)
         .def("_set_edge_geometry_policy",
-            &MACEKokkos<Precision>::set_edge_geometry_policy)
+            [] (MACEKokkos<Precision>& self, const std::string& policy,
+                const bool pin) {
+                if (pin)
+                    self.edge_geometry_policy_pinned = true;
+                self.set_edge_geometry_policy(policy);
+            }, py::arg("policy"), py::arg("pin") = true)
         .def("_set_harmonic_storage_policy",
-            &MACEKokkos<Precision>::set_harmonic_storage_policy)
+            [] (MACEKokkos<Precision>& self, const std::string& policy,
+                const bool pin) {
+                if (pin)
+                    self.harmonic_storage_policy_pinned = true;
+                self.set_harmonic_storage_policy(policy);
+            }, py::arg("policy"), py::arg("pin") = true)
         .def("_set_low_memory_device_memory_info_for_testing",
             &MACEKokkos<Precision>::set_low_memory_device_memory_info_for_testing)
         .def("_set_single_layer_workspace_receiver_limit_for_testing",
@@ -428,7 +448,12 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
         .def("_set_low_memory",
             &MACEKokkos<Precision>::set_low_memory)
         .def("_set_readout_policy",
-            &MACEKokkos<Precision>::set_readout_policy)
+            [] (MACEKokkos<Precision>& self, const std::string& policy,
+                const bool pin) {
+                if (pin)
+                    self.readout_policy_pinned = true;
+                self.set_readout_policy(policy);
+            }, py::arg("policy"), py::arg("pin") = true)
         .def("_set_phi1_policy",
             &MACEKokkos<Precision>::set_phi1_policy)
         .def_property_readonly("m1_polynomial_policy",

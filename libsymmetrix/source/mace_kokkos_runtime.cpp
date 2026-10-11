@@ -3243,29 +3243,40 @@ void MACEKokkos<Precision>::apply_low_memory_policy(
     };
 
     if (!capacity) {
-        select_harmonics(HarmonicStoragePolicy::retained);
+        if (!harmonic_storage_policy_pinned)
+            select_harmonics(HarmonicStoragePolicy::retained);
         set_phi1_policy("retained");
-        set_mh0_state_policy("full-retention-v1");
-        set_m1_polynomial_policy(low_memory_speed_m1_policy_request);
-        set_readout_policy("retained");
-        set_edge_geometry_policy("cartesian-f64-v1");
+        if (!mh0_state_policy_pinned)
+            set_mh0_state_policy("full-retention-v1");
+        if (!m1_polynomial_policy_pinned)
+            set_m1_polynomial_policy(low_memory_speed_m1_policy_request);
+        if (!readout_policy_pinned)
+            set_readout_policy("retained");
+        if (!edge_geometry_policy_pinned)
+            set_edge_geometry_policy("cartesian-f64-v1");
         harmonic_storage_selection_reason =
             "automatic retained selection: speed bundle is active";
     } else {
-        set_m1_polynomial_policy("recompute");
-        set_mh0_state_policy("reuse-adjoints-v1");
+        if (!m1_polynomial_policy_pinned)
+            set_m1_polynomial_policy("recompute");
+        if (!mh0_state_policy_pinned)
+            set_mh0_state_policy("reuse-adjoints-v1");
         set_phi1_policy("retained");
-        if constexpr (std::is_same_v<Precision,float>)
-            set_edge_geometry_policy("unit-f32-radius-f64-v1");
-        else
-            set_edge_geometry_policy("cartesian-f64-v1");
-        set_readout_policy("recompute");
+        if (!edge_geometry_policy_pinned) {
+            if constexpr (std::is_same_v<Precision,float>)
+                set_edge_geometry_policy("unit-f32-radius-f64-v1");
+            else
+                set_edge_geometry_policy("cartesian-f64-v1");
+        }
+        if (!readout_policy_pinned)
+            set_readout_policy("recompute");
         if (symmetrix::standard_r0::host_execution_space<
                 Kokkos::DefaultExecutionSpace>)
             set_standard_r0_executor("v2_receiver");
-        select_harmonics(policy == LowMemoryPolicy::capacity_y_only
-            ? HarmonicStoragePolicy::y_only_direct
-            : HarmonicStoragePolicy::retained);
+        if (!harmonic_storage_policy_pinned)
+            select_harmonics(policy == LowMemoryPolicy::capacity_y_only
+                ? HarmonicStoragePolicy::y_only_direct
+                : HarmonicStoragePolicy::retained);
         harmonic_storage_selection_reason = policy
                 == LowMemoryPolicy::capacity_y_only
             ? "automatic Y-only selection: capacity bundle is active"
