@@ -2481,7 +2481,7 @@ void MACEKokkos<Precision>::set_phi1_policy(std::string policy)
         return;
     if (requested == Phi1Policy::receiver_local
         && harmonic_storage_policy == HarmonicStoragePolicy::y_only_direct)
-        set_harmonic_storage_policy("retained");
+        apply_harmonic_storage_policy("retained");
     factorized_execution_space.fence("Change Phi1 policy");
     phi1_policy = requested;
     if (phi1_policy != Phi1Policy::retained) {
@@ -2652,6 +2652,14 @@ void MACEKokkos<Precision>::set_harmonic_storage_policy(std::string policy)
     execution_geometry_capacity_edges = 0;
     execution_geometry_planned_capacity_edges = 0;
     execution_geometry_growth_reason = "geometric growth";
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::apply_harmonic_storage_policy(const char* policy)
+{
+    if (harmonic_storage_policy_pinned)
+        return;
+    set_harmonic_storage_policy(policy);
 }
 
 template <typename Precision>
@@ -3957,7 +3965,7 @@ void MACEKokkos<Precision>::set_edge_geometry_policy(std::string policy)
         return;
     if (requested != EdgeGeometryPolicy::unit_f32_radius_f64
         && harmonic_storage_policy == HarmonicStoragePolicy::y_only_direct)
-        set_harmonic_storage_policy("retained");
+        apply_harmonic_storage_policy("retained");
     factorized_execution_space.fence("Change compact edge geometry policy");
     invalidate_factorized_prepared_graph();
     edge_geometry_policy = requested;
@@ -4000,7 +4008,7 @@ void MACEKokkos<Precision>::set_low_memory(const bool enabled)
         low_memory_available = 0;
         low_memory_speed_estimate = 0;
         low_memory_selected_estimate = 0;
-        set_harmonic_storage_policy("retained");
+        apply_harmonic_storage_policy("retained");
         return;
     }
 

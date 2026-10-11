@@ -204,6 +204,10 @@ void set_readout_policy(std::string policy);
 void set_phi1_policy(std::string policy);
 void set_edge_geometry_policy(std::string policy);
 void set_harmonic_storage_policy(std::string policy);
+// Internal harmonic-storage writes (bundle and consistency resets) decline
+// when the caller pinned the policy through the pybind layer, so a pinned
+// harmonic policy survives for the evaluator's lifetime.
+void apply_harmonic_storage_policy(const char* policy);
 void set_low_memory_device_memory_info_for_testing(
     std::size_t free_bytes, std::size_t total_bytes);
 void set_single_layer_workspace_receiver_limit_for_testing(int receivers);

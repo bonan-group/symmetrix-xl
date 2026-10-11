@@ -2802,6 +2802,54 @@ def test_explicit_evaluator_policy_pins_survive_the_automatic_bundle(
     assert evaluator.readout_workspace_bytes > 0
 
 
+def test_pinned_harmonic_storage_survives_indirect_bundle_writes(
+    streamed_model_paths,
+    monkeypatch,
+    tmp_path,
+):
+    """A pinned harmonic policy must outlive the bundle's indirect writers."""
+
+    _require_execution_fixed_weight_backend()
+
+    standard_path, _ = streamed_model_paths
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
+    calculator = Symmetrix(
+        standard_path,
+        use_kokkos=True,
+        dtype="float32",
+        streamed_edges="factorized",
+        execution_profile="speed",
+    )
+    evaluator = calculator.evaluator
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+    calculator.calculate(atoms, properties=["energy", "forces", "stress"])
+    assert evaluator.harmonic_storage_policy == "retained"
+    # Admission is capability based: the resolved plan selects compact
+    # unit-direction geometry, so the Y-only pin is accepted.
+    evaluator._set_harmonic_storage_policy("y-only-direct-v1")
+    assert evaluator.harmonic_storage_policy == "y-only-direct-v1"
+
+    # The speed profile resolves its plan by disabling the low-memory request,
+    # whose bundle run used to reset the harmonic storage behind the pin.
+    evaluator._resolve_execution_plan()
+    assert evaluator.harmonic_storage_policy_request == "y-only-direct-v1"
+
+    # The companion write is the terminal reset of set_low_memory(False),
+    # touched here directly and again through the plan resolution above. It
+    # leaves Cartesian geometry, which masks an admissible Y-only policy, so
+    # the pin is asserted on the ungated request until a fresh bundle run
+    # restores compact geometry.
+    evaluator._set_low_memory(False)
+    assert evaluator.harmonic_storage_policy_request == "y-only-direct-v1"
+
+    displaced = _small_structure()
+    displaced.set_pbc(True)
+    displaced.positions[0] = [0.0, 0.0, 0.05]
+    calculator.calculate(displaced, properties=["energy", "forces", "stress"])
+    assert evaluator.harmonic_storage_policy == "y-only-direct-v1"
+
+
 def test_low_memory_high_water_reuses_graph_and_mh0_state_capacity(
     streamed_model_paths,
     monkeypatch,
