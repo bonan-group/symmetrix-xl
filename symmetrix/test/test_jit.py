@@ -1008,6 +1008,122 @@ def test_cache_reuses_foreign_root_only_with_explicit_trust(
     assert reused.available and reused.cache_hit
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_rejects_group_writable_artifacts_directory(jit, tmp_path, cxx):
+    cache = tmp_path / "open-artifacts-cache"
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o755)
+    artifacts = cache / "artifacts"
+    artifacts.mkdir(mode=0o700)
+    artifacts.chmod(0o770)
+
+    result = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="artifacts-permission-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+
+    assert not result.available
+    assert "artifacts" in result.reason
+    assert "private" in result.reason
+    assert list(artifacts.iterdir()) == []
+    assert not (cache / ".staging").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_requires_non_sticky_ancestors(jit, tmp_path, cxx):
+    # pytest's tmp_path sits below a sticky world-writable /tmp, where other
+    # users cannot rename an entry owned by this user; it must stay acceptable.
+    accepted = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="sticky-ancestor-test",
+        cpu="test-cpu",
+        cache_root=tmp_path / "sticky-cache",
+        cxx=cxx,
+    )
+    assert accepted.available
+
+    open_parent = tmp_path / "open-parent"
+    open_parent.mkdir(mode=0o700)
+    open_parent.chmod(0o777)
+    cache = open_parent / "cache"
+    cache.mkdir(mode=0o700)
+
+    refused = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="ancestor-permission-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+
+    assert not refused.available
+    assert str(cache.resolve().parent) in refused.reason
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_rejects_foreign_owned_artifacts_without_explicit_trust(
+    jit, monkeypatch, tmp_path, cxx
+):
+    cache = tmp_path / "artifacts-owner-cache"
+    prepared = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="artifacts-owner-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert prepared.available and prepared.status == "built"
+
+    # A root owned by the current user can still hold an artifacts directory
+    # owned by another user, so report only that path as foreign-owned; the
+    # existing foreign-root test cannot reach this branch because the root
+    # ownership check runs first.
+    artifacts = cache / "artifacts"
+    foreign_uid = os.getuid() + 1
+    real_stat = os.stat
+
+    def fake_stat(path, *args, **kwargs):
+        metadata = real_stat(path, *args, **kwargs)
+        if Path(os.fspath(path)) == artifacts:
+            fields = list(metadata)
+            fields[4] = foreign_uid
+            return os.stat_result(fields)
+        return metadata
+
+    monkeypatch.setattr(jit.os, "stat", fake_stat)
+    monkeypatch.delenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, raising=False)
+
+    refused = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="artifacts-owner-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert not refused.available
+    assert "artifacts" in refused.reason
+    assert jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE in refused.reason
+
+    monkeypatch.setenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, "1")
+    reused = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="artifacts-owner-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert reused.available and reused.cache_hit
+
+
 def test_build_publish_validate_and_reuse(jit, tmp_path, cxx):
     built = _prepare(jit, tmp_path, cxx)
     assert built.status == "built"

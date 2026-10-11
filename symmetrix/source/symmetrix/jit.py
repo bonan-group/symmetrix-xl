@@ -384,14 +384,56 @@ def _cache_root_metadata(path: Path) -> os.stat_result | None:
     return metadata
 
 
+def _artifacts_directory_metadata(path: Path) -> os.stat_result | None:
+    """Return resolved artifacts-directory metadata, or None when it is absent.
+
+    Symbolic links are followed, matching the cache-root rule, so a link to a
+    directory writable by other users is rejected like that directory itself.
+    """
+
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise JitError(
+            "Execution JIT artifacts path must be a private directory: it is not "
+            "a directory"
+        )
+    return metadata
+
+
+def _ensure_private_ancestors(path: Path) -> None:
+    """Reject ancestors another user could rename or replace.
+
+    Sticky ancestors such as ``/tmp`` are admitted: only the owner of an entry
+    may rename it there, so the resolved root cannot be swapped between manifest
+    validation and loading.
+    """
+
+    if os.name != "posix":
+        return
+    for ancestor in path.resolve().parents:
+        mode = stat.S_IMODE(ancestor.stat().st_mode)
+        if mode & 0o022 and not mode & 0o1000:
+            raise JitError(
+                f"Execution JIT cache ancestor {ancestor} is writable by other "
+                "users and is not sticky; cached artifacts could be replaced "
+                "before they are loaded"
+            )
+
+
 def _ensure_reusable_cache_root(path: Path) -> bool:
     """Validate an existing cache root for artifact reuse.
 
     Returns False when the root does not exist yet. Cached artifacts are
-    executable code, so a root writable by other users cannot be reused;
-    reading it cannot be made safe by digest validation alone. A root owned by
-    another user is reused only when the caller opts in explicitly, since it
-    means trusting code compiled by that user.
+    executable code, so a root or artifacts directory writable by other users
+    cannot be reused; reading them cannot be made safe by digest validation
+    alone. A root or artifacts directory owned by another user is reused only
+    when the caller opts in explicitly, since it means trusting code compiled by
+    that user. Ancestors of the resolved root must not be writable by others
+    unless they are sticky, because a writable ancestor could rename the root
+    away before it is loaded.
     """
 
     metadata = _cache_root_metadata(path)
@@ -412,6 +454,24 @@ def _ensure_reusable_cache_root(path: Path) -> bool:
             f"{TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE}=1 to reuse prebuilt "
             "artifacts from a shared cache"
         )
+    artifacts = _artifacts_directory_metadata(path / "artifacts")
+    if artifacts is not None:
+        if os.name == "posix" and stat.S_IMODE(artifacts.st_mode) & 0o022:
+            raise JitError(
+                "Execution JIT artifacts directory must be private: it must not "
+                "be writable by other users"
+            )
+        if (
+            hasattr(os, "getuid")
+            and artifacts.st_uid != os.getuid()
+            and not _trust_shared_cache_root()
+        ):
+            raise JitError(
+                "Execution JIT artifacts directory is owned by another user; set "
+                f"{TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE}=1 to reuse prebuilt "
+                "artifacts from a shared cache"
+            )
+    _ensure_private_ancestors(path)
     return True
 
 
@@ -429,6 +489,7 @@ def _ensure_private_cache_root(path: Path) -> None:
             "Execution JIT cache root must be private: it must not be writable "
             "by other users"
         )
+    _ensure_private_ancestors(path)
 
 
 def _json_value(value: Any, path: str = "value") -> Any:
