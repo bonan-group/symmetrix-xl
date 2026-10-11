@@ -33,6 +33,14 @@ _EXECUTION_FIXED_WEIGHT_EXECUTION_SPACES = frozenset(
     {"Cuda", "HIP", "OpenMP", "Serial"}
 )
 
+# Measured receiver/feature high-water increment for the 128-node MACE float32
+# direct plan (per-node forward and adjoint state). The planner admits
+# receiver/feature headroom only from post-reserve bytes beyond the exact
+# estimate, and a capacity-policy budget spends its whole speed-capacity window
+# (measured 2448 B for the 12-edge graph here) on edge headroom first, so
+# in-capacity node growth needs a speed-policy budget with this headroom.
+_RECEIVER_FEATURE_INCREMENT_BYTES = 46_752
+
 
 def _kokkos_execution_space():
     if not native_symmetrix._kokkos_is_initialized():
@@ -2375,7 +2383,12 @@ def test_mh0_adjoint_reuse_matches_full_retention_and_rolls_back(
         "a state-free M0 implementation is not active"
     )
     assert evaluator.mh0_reused_state_bytes == 0
-    assert evaluator.mh0_auxiliary_state_bytes == 0
+    # The policy rollback drops the two adjoint-only scale buffers but keeps the
+    # always-allocated A1 inverse-scale forward buffer: one double per receiver,
+    # measured 8*4 B for this four-atom graph (and 8*N when N nodes are used).
+    assert evaluator.mh0_auxiliary_state_bytes == (
+        np.dtype(np.float64).itemsize * len(atoms)
+    )
     assert not evaluator.h1_m0_adjoint_ping_pong_active
     assert evaluator.h1_m0_adjoint_ping_pong_bytes == 0
     assert fallback["energy"] == pytest.approx(retained["energy"], rel=0.0, abs=3e-5)
@@ -2386,7 +2399,10 @@ def test_mh0_adjoint_reuse_matches_full_retention_and_rolls_back(
     restored = evaluate("full-retention-v1")
     assert evaluator.mh0_state_policy == "full-retention-v1"
     assert evaluator.mh0_reused_state_bytes == 0
-    assert evaluator.mh0_auxiliary_state_bytes == 0
+    # Same forward-buffer floor as the fallback state above.
+    assert evaluator.mh0_auxiliary_state_bytes == (
+        np.dtype(np.float64).itemsize * len(atoms)
+    )
     assert not evaluator.h1_m0_adjoint_ping_pong_active
     assert evaluator.h1_m0_adjoint_ping_pong_bytes == 0
     assert restored["energy"] == retained["energy"]
@@ -2605,14 +2621,17 @@ def test_low_memory_selects_speed_or_capacity_from_graph_memory_estimate(
         "unit-f32-radius-f64-v1" if dtype == "float32" else "cartesian-f64-v1"
     )
     assert evaluator.low_memory_speed_estimated_bytes > 0
-    # The throughput-qualified speed bundle applies the capacity storage
-    # policies, so the selected estimate is the matching capacity estimate.
-    expected_selection = (
-        evaluator.low_memory_capacity_y_only_estimated_bytes
-        if evaluator.harmonic_storage_policy == "y-only-direct-v1"
-        else evaluator.low_memory_capacity_retained_estimated_bytes
+    # The speed selection ("speed selection: estimated speed graph bytes fit
+    # available device memory after reserve") was followed by the post-reserve
+    # high-water admission ("admitted 0.25% repeated-run high-water within
+    # post-reserve bytes; active=(4,4,12), previous=(0,0,0), planned=(68,68,76)"),
+    # so the selected estimate is the admitted plan, above the exact estimate.
+    assert evaluator.low_memory_selected_estimated_bytes == (
+        evaluator.execution_planned_capacity_bytes
     )
-    assert evaluator.low_memory_selected_estimated_bytes == expected_selection
+    assert evaluator.low_memory_selected_estimated_bytes > (
+        evaluator.low_memory_speed_estimated_bytes
+    )
     calculator._sync_low_memory_policy_state()
     assert calculator.low_memory is True
     assert calculator.low_memory_policy == "speed"
@@ -2894,16 +2913,18 @@ def test_low_memory_high_water_reuses_graph_and_mh0_state_capacity(
     capacity_estimate = evaluator.low_memory_capacity_estimated_bytes
     speed_estimate = evaluator.low_memory_speed_estimated_bytes
     reserve = device_bytes // 20
-    admitted_headroom = speed_estimate - capacity_estimate - 1
-    assert admitted_headroom > 0
-    # Changing the synthetic device limit invalidates the prepared graph, so
-    # no previous selected allocation is reclaimable by the next admission.
-    constrained_free = reserve + capacity_estimate + admitted_headroom
+    # A capacity-policy budget (post-reserve bytes below the speed estimate)
+    # spends its whole speed-capacity window on edge headroom, so its plan can
+    # never cover node growth; the speed policy admits the receiver/feature
+    # high-water ("planned=(129,129,76)" for the 128-node active graph) out of
+    # the wider post-reserve budget. Two increments cover the re-plan at the
+    # grown 129-node active size.
+    constrained_free = reserve + speed_estimate + 2 * _RECEIVER_FEATURE_INCREMENT_BYTES
     assert 0 < constrained_free < device_bytes
 
-    # Use a fresh evaluator for admission. The estimator above deliberately
-    # selected the speed policy and established an exact active-size plan;
-    # retained plans are reused unchanged until active size exceeds them.
+    # Use a fresh evaluator for admission: changing the synthetic device limit
+    # invalidates the prepared graph, so no previous selected allocation is
+    # reclaimable by the next admission (previous=(0,0,0) in the reason above).
     del evaluator
     del calculator
     gc.collect()
@@ -2936,7 +2957,10 @@ def test_low_memory_high_water_reuses_graph_and_mh0_state_capacity(
     evaluator._compute_prepared_factorized(
         token, np.asarray(reordered[5]).reshape(-1), reordered[6]
     )
-    assert evaluator.low_memory_policy.startswith("capacity-")
+    # "speed selection: estimated speed graph bytes fit available device memory
+    # after reserve": the high-water admission that covers the growth below
+    # needs the speed policy's wider post-reserve budget.
+    assert evaluator.low_memory_policy == "speed"
     assert evaluator.execution_planned_receiver_capacity >= inputs[0], {
         "capacity_estimate": capacity_estimate,
         "speed_estimate": speed_estimate,
@@ -3110,10 +3134,12 @@ def test_low_memory_high_water_reuses_prepared_geometry_state_capacity(
     evaluator._prepare_factorized_graph(
         base_nodes, node_types, num_neigh, small_inputs[3], small_inputs[4]
     )
-    capacity_estimate = evaluator.low_memory_capacity_estimated_bytes
     speed_estimate = evaluator.low_memory_speed_estimated_bytes
+    # See test_low_memory_high_water_reuses_graph_and_mh0_state_capacity: the
+    # speed policy's wider post-reserve budget is what admits the
+    # receiver/feature high-water the 129-node growth below reuses.
     constrained_free = (
-        device_bytes // 20 + capacity_estimate + speed_estimate - capacity_estimate - 1
+        device_bytes // 20 + speed_estimate + 2 * _RECEIVER_FEATURE_INCREMENT_BYTES
     )
 
     del evaluator
@@ -3146,7 +3172,9 @@ def test_low_memory_high_water_reuses_prepared_geometry_state_capacity(
         np.zeros(3, dtype=np.int32),
     )
     geometry_allocations = evaluator.factorized_geometry_state_allocation_count
-    # The admitted geometry covers the graph without padding headroom.
+    # "admitted 0.25% repeated-run high-water within post-reserve bytes;
+    # active=(128,128,12), previous=(0,0,0), planned=(129,129,76)": the admitted
+    # plan already covers the single-node growth below.
     assert evaluator.execution_planned_receiver_capacity >= base_nodes
     assert evaluator.execution_planned_edge_capacity >= len(small_inputs[3])
 
@@ -3218,7 +3246,10 @@ def test_speed_policy_narrows_geometry_growth_before_device_boundary(
     # The speed plan fits the grown graph exactly instead of doubling.
     assert probe.execution_geometry_capacity_edges == len(probe_repeated[3])
     assert probe.execution_geometry_capacity_edges >= probe_initial_capacity
-    assert probe.low_memory_selected_estimated_bytes > exact_repeated_estimate
+    # "low_memory=False: exact speed graph fits advisory device-memory budget":
+    # a speed request never runs the post-reserve high-water admission, so the
+    # selected estimate is the exact speed estimate of the repeated graph.
+    assert probe.low_memory_selected_estimated_bytes == exact_repeated_estimate
 
     calculator = Symmetrix(
         standard_path,
@@ -3241,7 +3272,10 @@ def test_speed_policy_narrows_geometry_growth_before_device_boundary(
     )
 
     evaluator._prepare_factorized_graph(*repeated)
-    assert evaluator.low_memory_policy == "disabled"
+    # The speed request records the throughput plan ("mh0-direct-speed",
+    # "low_memory=False: exact speed graph fits advisory device-memory budget"),
+    # so the policy label is "speed", not the unused "disabled".
+    assert evaluator.low_memory_policy == "speed"
     assert evaluator.execution_geometry_capacity_edges == len(repeated[3])
     assert evaluator.low_memory_selected_estimated_bytes == (
         evaluator.low_memory_speed_estimated_bytes
@@ -3265,7 +3299,7 @@ def test_speed_policy_narrows_geometry_growth_before_device_boundary(
     )
     evaluator._set_low_memory_device_memory_info_for_testing(1, device_bytes)
     evaluator._prepare_factorized_graph(*too_large)
-    assert evaluator.low_memory_policy == "disabled"
+    assert evaluator.low_memory_policy == "speed"
     assert evaluator.execution_geometry_capacity_edges == len(too_large[3])
     assert evaluator.low_memory_selected_estimated_bytes == (
         evaluator.low_memory_speed_estimated_bytes

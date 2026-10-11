@@ -3699,8 +3699,17 @@ void MACEKokkos<Precision>::select_low_memory_policy_for_graph(
     if (capacity_bundle) {
         execution_geometry_planned_capacity_edges = static_cast<int>(num_edges);
         low_memory_selected_estimate = exact_estimate;
-        execution_geometry_growth_reason =
-            "capacity high-water pending post-reserve admission";
+        // Only a low-memory request reaches the post-reserve high-water
+        // admission below; a speed request plans the active graph exactly.
+        if (!low_memory_request)
+            execution_geometry_growth_reason =
+                num_edges <= static_cast<std::size_t>(
+                    execution_geometry_capacity_edges)
+                ? "existing capacity reused"
+                : "exact growth: speed profile plans the active graph exactly";
+        else
+            execution_geometry_growth_reason =
+                "capacity high-water pending post-reserve admission";
     } else if (num_edges <= static_cast<std::size_t>(
             execution_geometry_capacity_edges)) {
         execution_geometry_planned_capacity_edges = geometric_capacity;
