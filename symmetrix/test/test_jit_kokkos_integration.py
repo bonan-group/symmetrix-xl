@@ -282,8 +282,32 @@ def _evaluate_field(calculator, atoms, electric_field):
     }
 
 
-def _assert_field_results_close(actual, expected, atol):
+def _assert_active_prefix_close(actual, expected, atol, name):
+    """Compare the active prefix of a possibly capacity-padded result.
+
+    A prepared (admitted-capacity) evaluation keeps its planned edge capacity in
+    the result buffers, so `node_forces` reports `3 * planned_edges` while the
+    compiler-free reference reports `3 * active_edges`; the trailing entries are
+    unused and must stay zero.
+    """
+    actual = np.asarray(actual).reshape(-1)
+    expected = np.asarray(expected).reshape(-1)
+    active = min(actual.size, expected.size)
+    np.testing.assert_allclose(
+        actual[:active], expected[:active], rtol=0.0, atol=atol, err_msg=name
+    )
+    longer = actual if actual.size > active else expected
+    if longer.size > active:
+        assert not np.any(longer[active:]), (
+            f"{name}: capacity tail beyond the active region must stay zero"
+        )
+
+
+def _assert_field_results_close(actual, expected, atol, *, capacity_padded=False):
     for name in ("node_energies", "node_forces", "field_adjoint"):
+        if capacity_padded:
+            _assert_active_prefix_close(actual[name], expected[name], atol, name)
+            continue
         np.testing.assert_allclose(actual[name], expected[name], rtol=0.0, atol=atol)
 
 
@@ -464,7 +488,10 @@ def test_cuda_macefield_jit_matches_runtime_and_prepared_execution(
         "node_forces": np.array(evaluator.node_forces, copy=True),
         "field_adjoint": np.array(evaluator.electric_field_adj, copy=True),
     }
-    _assert_field_results_close(prepared, expected, tolerance)
+    # Preparing the graph admits a planned edge capacity (76 edges here versus
+    # the 12 active edges), so the prepared `node_forces` buffer keeps its
+    # planned extent with a zeroed tail.
+    _assert_field_results_close(prepared, expected, tolerance, capacity_padded=True)
     assert evaluator.factorized_schedule_build_count == 1
     assert evaluator.factorized_prepared_evaluation_count == 1
 
