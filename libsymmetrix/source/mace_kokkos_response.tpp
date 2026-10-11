@@ -307,9 +307,6 @@ void MACEKokkos<Precision>::compute_electric_field_response(
     Kokkos::View<Precision***,Kokkos::LayoutRight> A1_adj_dot;
     Kokkos::View<Precision***,Kokkos::LayoutRight> dPhi1_local;
     Kokkos::View<Precision***,Kokkos::LayoutRight> dPhi1_dot;
-    Kokkos::View<int*> phi1_cg_row_offsets;
-    Kokkos::View<Precision*> phi1_cg_values;
-    Kokkos::View<int*> phi1_cg_outputs;
     Kokkos::View<Precision***,Kokkos::LayoutRight> H1_product_adj_dot;
     Kokkos::View<Precision***,Kokkos::LayoutRight> M0_adj_dot(
         "MACEField M0 adjoint tangent",
@@ -318,9 +315,12 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         "MACEField A0 adjoint tangent",
         include_force_derivative ? num_nodes : 0, lm_count, channels);
 
-    {
+    if (!macefield_response_cg_tables_built) {
         // Build a per-row CG lookup so the response reverse evaluates the CG
         // reduction of dPhi1 inline instead of materializing dPhi1r tangents.
+        // Phi1_clebsch_gordan/Phi1_l1/Phi1_l2/Phi1_lelm1lm2/num_channels are
+        // written only by load_from_json, so the lookup is model-immutable and
+        // is built once per evaluator.
         const int cg_count = static_cast<int>(Phi1_clebsch_gordan.size());
         auto host_rows = Kokkos::create_mirror_view_and_copy(
             Kokkos::HostSpace(), Phi1_lelm1lm2);
@@ -333,15 +333,18 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         std::stable_sort(entries.begin(), entries.end(), [&] (int a, int b) {
             return host_rows(a) < host_rows(b);
         });
-        phi1_cg_row_offsets =
+        macefield_response_cg_row_offsets =
             Kokkos::View<int*>("MACEField CG row offsets", phi_rows+1);
-        phi1_cg_values =
+        macefield_response_cg_values =
             Kokkos::View<Precision*>("MACEField CG values", cg_count);
-        phi1_cg_outputs =
+        macefield_response_cg_outputs =
             Kokkos::View<int*>("MACEField CG outputs", cg_count);
-        auto h_offsets = Kokkos::create_mirror_view(phi1_cg_row_offsets);
-        auto h_values = Kokkos::create_mirror_view(phi1_cg_values);
-        auto h_outputs = Kokkos::create_mirror_view(phi1_cg_outputs);
+        auto h_offsets = Kokkos::create_mirror_view(
+            macefield_response_cg_row_offsets);
+        auto h_values = Kokkos::create_mirror_view(
+            macefield_response_cg_values);
+        auto h_outputs = Kokkos::create_mirror_view(
+            macefield_response_cg_outputs);
         int cursor = 0;
         for (int row=0; row<phi_rows; ++row) {
             h_offsets(row) = cursor;
@@ -353,10 +356,15 @@ void MACEKokkos<Precision>::compute_electric_field_response(
             }
         }
         h_offsets(phi_rows) = cursor;
-        Kokkos::deep_copy(phi1_cg_row_offsets, h_offsets);
-        Kokkos::deep_copy(phi1_cg_values, h_values);
-        Kokkos::deep_copy(phi1_cg_outputs, h_outputs);
+        Kokkos::deep_copy(macefield_response_cg_row_offsets, h_offsets);
+        Kokkos::deep_copy(macefield_response_cg_values, h_values);
+        Kokkos::deep_copy(macefield_response_cg_outputs, h_outputs);
+        macefield_response_cg_tables_built = true;
+        macefield_response_cg_table_build_count += 1;
     }
+    const auto phi1_cg_row_offsets = macefield_response_cg_row_offsets;
+    const auto phi1_cg_values = macefield_response_cg_values;
+    const auto phi1_cg_outputs = macefield_response_cg_outputs;
 
     for (int seed=0; seed<3; ++seed) {
         H1_dot = decltype(H1_dot)(
@@ -2022,10 +2030,14 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                             +response_type_map(
                                 response_neigh_types(edge))
                         : -1;
+                    // An empty radial spline has no interval to index, so the
+                    // materialized path must not evaluate a spline point; the
+                    // value is unused when the radial is not inline.
                     const auto radial0_point =
                         response_radial_inline
+                            && response_r0_spline.num_intervals > 0
                         ? response_r0_spline.point(r(edge))
-                        : response_r0_spline.point(0.0);
+                        : typename ResponseR0Spline<Precision>::Point{};
                     const Precision x_over_r = compact_geometry
                         ? unit_direction(coordinate_offset)
                         : static_cast<Precision>(
@@ -2139,10 +2151,14 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                             +response_type_map(
                                 response_neigh_types(edge))
                         : -1;
+                    // An empty radial spline has no interval to index, so the
+                    // materialized path must not evaluate a spline point; the
+                    // value is unused when the radial is not inline.
                     const auto radial0_point =
                         response_radial_inline
+                            && response_r0_spline.num_intervals > 0
                         ? response_r0_spline.point(r(edge))
-                        : response_r0_spline.point(0.0);
+                        : typename ResponseR0Spline<Precision>::Point{};
                     const double direction_x = compact_geometry
                         ? static_cast<double>(unit_direction(coordinate_offset))
                         : xyz(coordinate_offset)/r(edge);

@@ -1813,6 +1813,43 @@ def test_kokkos_low_memory_prepared_field_primal_and_responses_match_retained(
         )
 
 
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_kokkos_response_cg_tables_are_built_once_per_evaluator(
+    macefield_full_json_path,
+    dtype,
+):
+    _skip_without_kokkos()
+
+    evaluator = _configured_low_memory_field_evaluator(
+        macefield_full_json_path, "cartesian-f64-v1", dtype=dtype
+    )
+    inputs = _field_backend_inputs(evaluator)[:7]
+    topology = inputs[:5]
+    xyz = np.ascontiguousarray(inputs[5], dtype=np.float64).reshape(-1)
+    distances = np.ascontiguousarray(inputs[6], dtype=np.float64)
+    token = evaluator._prepare_factorized_graph(*topology)
+    assert evaluator.macefield_response_cg_table_build_count == 0
+    evaluator._compute_prepared_factorized_field(
+        token,
+        xyz,
+        distances,
+        np.array([0.01, -0.02, 0.03], dtype=np.float64),
+    )
+    # The primal evaluation does not touch the response CG lookup.
+    assert evaluator.macefield_response_cg_table_build_count == 0
+    for electric_field in (
+        np.array([0.01, -0.02, 0.03], dtype=np.float64),
+        np.array([-0.04, 0.01, 0.02], dtype=np.float64),
+    ):
+        evaluator._compute_prepared_factorized_field_response(
+            token, electric_field, False
+        )
+    assert evaluator.macefield_response_call_count == 2
+    # The per-row CG lookup depends only on model-immutable tables, so the
+    # second response reuses the first call's build.
+    assert evaluator.macefield_response_cg_table_build_count == 1
+
+
 @pytest.mark.parametrize(
     ("dtype", "geometry_policy", "parity_atol"),
     (
