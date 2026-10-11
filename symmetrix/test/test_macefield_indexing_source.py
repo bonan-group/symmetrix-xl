@@ -14,13 +14,19 @@ def test_macefield_response_uses_widened_edge_offsets():
 
     assert 3 * 44_739_243 * 16 > 2**31 - 1
     assert source.count("const std::size_t coordinate_offset = 3*edge;") == 8
-    assert source.count("const std::size_t harmonic_offset =") == 5
+    # Six widened harmonic offsets: the tangent producer slab and the
+    # channel-tiled weight tables each index rows with std::size_t.
+    assert source.count("const std::size_t harmonic_offset =") == 6
     assert source.count("const std::size_t gradient_offset =") == 4
     assert source.count("Kokkos::IndexType<std::size_t>") == 5
     assert (
-        "response_mode == MACEStreamedEdgesMode::generic\n"
-        "            || mace_uses_prepared_execution(response_mode)"
-    ) in source
+        re.search(
+            r"response_mode == MACEStreamedEdgesMode::generic\s*\n\s*"
+            r"\|\| mace_uses_prepared_execution\(response_mode\)",
+            source,
+        )
+        is not None
+    )
 
     forbidden = (
         r"\bedge\s*\*\s*lm_count",

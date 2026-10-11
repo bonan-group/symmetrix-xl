@@ -42,6 +42,13 @@ skip with a clear reason. Run focused tests first, then the applicable full
 suite and pre-commit. In a dirty worktree, run pre-commit only on intended
 files before using `--all-files`; never restore unrelated formatter changes.
 
+Direct-execution tests that build prepared calculators generate execution JIT
+artifacts on demand into the JIT cache root (`SYMMETRIX_JIT_CACHE` when set,
+otherwise `~/.cache/symmetrix/execution-jit`). That root must not be writable
+by other users, because the cached artifacts are compiled modules loaded into
+the test process; reusing a root owned by another user additionally requires
+`SYMMETRIX_JIT_TRUST_SHARED_CACHE=1`.
+
 ## Builds and qualification
 
 Keep CPU, CUDA, HIP, LAMMPS, and comparison builds in separate fresh virtual

@@ -657,7 +657,10 @@ class Symmetrix(Calculator):
         their adjoints and requires M1 polynomial recomputation. It is an
         expert policy and is incompatible with execution observers and
         parameter gradients. Prefer ``low_memory=True`` for the supported
-        policy bundle.
+        policy bundle. Throughput-qualified direct models apply the
+        ``reuse-adjoints-v1`` storage policy under both execution profiles;
+        enabling execution observers or parameter gradients forces
+        ``full-retention-v1``.
     edge_geometry_policy : {"cartesian-f64-v1", "unit-f32-radius-f64-v1"}, default="cartesian-f64-v1"
         Active edge-geometry representation for ordinary factorized inference.
         ``unit-f32-radius-f64-v1`` retains float32 unit directions and float64
@@ -3897,6 +3900,21 @@ class Symmetrix(Calculator):
             )
         return results
 
+    def _becs_requires_host_neighbor_graph(self, properties):
+        """Report whether BEC assembly still needs host receiver/source lists.
+
+        The device-bins reduction owns BEC accumulation natively, so only the
+        legacy pair-derivative fallback (evaluators without the bins API)
+        consumes host edge geometry.
+        """
+        if "becs" not in properties:
+            return False
+        bins = getattr(self.evaluator, "_compute_current_electric_field_bec_bins", None)
+        prepared_response = getattr(
+            self.evaluator, "_compute_prepared_factorized_field_response", None
+        )
+        return not (callable(bins) and callable(prepared_response))
+
     def calculate(self, atoms=None, properties=["energy"], system_changes=all_changes):
         Calculator.calculate(self, atoms, properties, system_changes)
 
@@ -3913,7 +3931,9 @@ class Symmetrix(Calculator):
             mace_inputs = self._mace_inputs(
                 self.atoms,
                 native_geometry=True,
-                allow_device_neighbor_graph="becs" not in evaluation_properties,
+                allow_device_neighbor_graph=(
+                    not self._becs_requires_host_neighbor_graph(evaluation_properties)
+                ),
             )
         else:
             mace_inputs = self._mace_inputs(self.atoms)
@@ -3951,7 +3971,9 @@ class Symmetrix(Calculator):
             mace_inputs = self._mace_inputs(
                 self.atoms,
                 native_geometry=True,
-                allow_device_neighbor_graph="becs" not in evaluation_properties,
+                allow_device_neighbor_graph=(
+                    not self._becs_requires_host_neighbor_graph(evaluation_properties)
+                ),
             )
             (
                 num_nodes,

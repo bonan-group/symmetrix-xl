@@ -918,6 +918,96 @@ def test_cache_rejects_group_writable_root(jit, tmp_path, cxx):
     assert not (cache / "artifacts").exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_accepts_group_readable_root(jit, tmp_path, cxx):
+    cache = tmp_path / "readable-cache"
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o755)
+
+    result = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="readable-permission-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+
+    assert result.available
+    assert (cache / "artifacts").is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_follows_symbolic_link_root(jit, tmp_path, cxx):
+    target = tmp_path / "resolved-cache"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "cache-link"
+    link.symlink_to(target, target_is_directory=True)
+
+    first = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="symlink-root-test",
+        cpu="test-cpu",
+        cache_root=link,
+        cxx=cxx,
+    )
+    second = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="symlink-root-test",
+        cpu="test-cpu",
+        cache_root=link,
+        cxx=cxx,
+    )
+
+    assert first.available and first.status == "built"
+    assert second.available and second.cache_hit
+    assert (target / "artifacts").is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_reuses_foreign_root_only_with_explicit_trust(
+    jit, monkeypatch, tmp_path, cxx
+):
+    cache = tmp_path / "site-cache"
+    prepared = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="trusted-shared-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert prepared.available and prepared.status == "built"
+
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+    monkeypatch.delenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, raising=False)
+
+    refused = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="trusted-shared-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert not refused.available
+    assert jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE in refused.reason
+
+    monkeypatch.setenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, "1")
+    reused = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="trusted-shared-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+    assert reused.available and reused.cache_hit
+
+
 def test_build_publish_validate_and_reuse(jit, tmp_path, cxx):
     built = _prepare(jit, tmp_path, cxx)
     assert built.status == "built"

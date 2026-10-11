@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms
 
 
 CACHE_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_CACHE"
+TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_TRUST_SHARED_CACHE"
 HOST_TARGET_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_HOST_TARGET"
 HOST_FLAGS_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_HOST_FLAGS"
 HOST_FP_MODE_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_HOST_FP_MODE"
@@ -358,19 +359,76 @@ def jit_cache_root(
     return Path.home() / ".cache" / "symmetrix" / "execution-jit"
 
 
-def _ensure_private_cache_root(path: Path) -> None:
-    """Create or validate the same-UID trust boundary for executable artifacts."""
+def _trust_shared_cache_root() -> bool:
+    """Report whether the caller accepted artifacts owned by another user."""
 
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.is_symlink():
-        raise JitError("Execution JIT cache root must not be a symbolic link")
-    metadata = path.stat()
+    return os.environ.get(TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, "") not in (
+        "",
+        "0",
+    )
+
+
+def _cache_root_metadata(path: Path) -> os.stat_result | None:
+    """Return resolved cache-root metadata, or None when the root is absent.
+
+    Symbolic links are followed, so the trust checks below apply to the
+    directory that actually stores the artifacts.
+    """
+
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return None
     if not stat.S_ISDIR(metadata.st_mode):
         raise JitError("Execution JIT cache root is not a directory")
+    return metadata
+
+
+def _ensure_reusable_cache_root(path: Path) -> bool:
+    """Validate an existing cache root for artifact reuse.
+
+    Returns False when the root does not exist yet. Cached artifacts are
+    executable code, so a root writable by other users cannot be reused;
+    reading it cannot be made safe by digest validation alone. A root owned by
+    another user is reused only when the caller opts in explicitly, since it
+    means trusting code compiled by that user.
+    """
+
+    metadata = _cache_root_metadata(path)
+    if metadata is None:
+        return False
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise JitError(
+            "Execution JIT cache root must be private: it must not be writable "
+            "by other users"
+        )
+    if (
+        hasattr(os, "getuid")
+        and metadata.st_uid != os.getuid()
+        and not _trust_shared_cache_root()
+    ):
+        raise JitError(
+            "Execution JIT cache root is owned by another user; set "
+            f"{TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE}=1 to reuse prebuilt "
+            "artifacts from a shared cache"
+        )
+    return True
+
+
+def _ensure_private_cache_root(path: Path) -> None:
+    """Create or validate the same-UID trust boundary for publishing artifacts."""
+
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = _cache_root_metadata(path)
+    if metadata is None:  # pragma: no cover - mkdir created the directory
+        raise JitError("Execution JIT cache root is unavailable")
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
         raise JitError("Execution JIT cache root must be owned by the current user")
-    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise JitError("Execution JIT cache root must be private; use permissions 0700")
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise JitError(
+            "Execution JIT cache root must be private: it must not be writable "
+            "by other users"
+        )
 
 
 def _json_value(value: Any, path: str = "value") -> Any:
@@ -1767,9 +1825,11 @@ def _prepare_compiled_artifact(
         )
         cache_key = _sha256_bytes(_canonical_json(inputs))
         root = jit_cache_root(cache_root)
-        _ensure_private_cache_root(root)
         entry, _, lock_path = _entry_paths(root, cache_key)
 
+        # Reuse only reads artifacts, so an existing shared root is admitted
+        # here; publishing below needs the same-UID trust boundary.
+        _ensure_reusable_cache_root(root)
         try:
             return _result_from_entry(
                 "cached", cache_key, entry, inputs, compiler_command, diagnostics
@@ -1778,6 +1838,7 @@ def _prepare_compiled_artifact(
             if entry.exists() or entry.is_symlink():
                 diagnostics.append(f"invalid cached JIT entry: {exc}")
 
+        _ensure_private_cache_root(root)
         (root / "artifacts").mkdir(parents=True, exist_ok=True, mode=0o700)
         staging_root = root / ".staging"
         staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
