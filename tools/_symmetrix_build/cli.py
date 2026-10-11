@@ -138,7 +138,14 @@ def _base_request(
         mkl_root=(
             os.fspath(args.mkl_root)
             if args.mkl_root
-            else (base.blas_root if same_backend else "")
+            # An explicit MKL root suppresses MKLROOT and standard-location
+            # discovery, so only an MKL manifest may supply one.
+            else (
+                base.blas_root
+                if same_backend
+                and base.blas_policy in ("mkl_gnu_thread", "mkl_sequential")
+                else ""
+            )
         ),
         openblas_root=(
             os.fspath(args.openblas_root)

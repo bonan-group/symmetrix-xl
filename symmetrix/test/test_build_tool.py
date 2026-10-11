@@ -445,6 +445,42 @@ def test_cpu_manifest_replay_drops_openblas_root_for_mkl_override(tmp_path):
     assert request.openblas_root == ""
 
 
+def test_cpu_manifest_replay_does_not_offer_openblas_root_as_mkl_root(tmp_path):
+    """A recorded OpenBLAS prefix must not be replayed as an explicit MKL root.
+
+    An explicit MKL root disables the MKLROOT and standard-location search, so
+    leaking one makes `--blas mkl` fail on a host where MKL would otherwise be
+    discovered.
+    """
+    manifest = replace(
+        _manifest("cpu", "x86-64-v3"),
+        blas_policy="openblas",
+        blas_root="/opt/openblas",
+    )
+    path = tmp_path / "target.json"
+    manifest.write(path)
+    args = SimpleNamespace(
+        target_manifest=path,
+        backend=None,
+        arch=None,
+        cpu_target=None,
+        cuda_root=None,
+        rocm_root=None,
+        cxx=None,
+        host_cxx=None,
+        generator=None,
+        blas="mkl",
+        mkl_root=None,
+        openblas_root=None,
+    )
+
+    request, _ = build_cli._base_request(args)
+
+    assert request.blas == "mkl"
+    assert request.mkl_root == ""
+    assert request.openblas_root == ""
+
+
 def test_matrix_child_commands_forward_openblas_root_for_cpu_targets(tmp_path):
     cpu_spec = build_matrix.parse_matrix_spec("cpu:x86-64-v4")
     cuda_spec = build_matrix.parse_matrix_spec("cuda:12:sm86")
