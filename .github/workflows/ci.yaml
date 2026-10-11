@@ -177,11 +177,17 @@ jobs:
         deactivate
     - name: Test compact MACEField conversion and ASE integration
       if: matrix.mace_field_compatible
+      env:
+        SYMMETRIX_JIT_CACHE: ${{ runner.temp }}/symmetrix-jit-cache
       run: |
         source .venv/bin/activate
         cd symmetrix/test
         pytest -q \
           test_extract_mace_data.py \
+          test_field_calculators.py \
+          test_macefield_native.py \
+          test_macefield_indexing_source.py \
+          test_mace_streamed_edges.py \
           test_symmetrix_calc.py::test_compact_macefield_calculator_replaces_active_composition_cache \
           test_symmetrix_calc.py::test_macefield_native_json_ase_response_properties_match_pytorch \
           test_symmetrix_calc.py::test_macefield_json_kokkos_response_properties_match_native \
