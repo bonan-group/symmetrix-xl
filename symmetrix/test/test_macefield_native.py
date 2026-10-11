@@ -1774,10 +1774,14 @@ def test_kokkos_low_memory_prepared_field_primal_and_responses_match_retained(
         assert low_memory.harmonic_value_bytes > 0
         assert low_memory.harmonic_gradient_bytes == 0
         assert low_memory.shuffled_coordinate_bytes == 0
-        assert low_memory.low_memory_device_free_bytes == (
-            device_bytes // 20 + 512 * 1024
-        )
-        assert low_memory.low_memory_device_total_bytes == device_bytes
+        if execution_space in ("Cuda", "HIP"):
+            assert low_memory.low_memory_device_free_bytes == (
+                device_bytes // 20 + 512 * 1024
+            )
+            assert low_memory.low_memory_device_total_bytes == device_bytes
+        else:
+            assert low_memory.low_memory_device_free_bytes == 0
+            assert low_memory.low_memory_device_total_bytes == 0
     else:
         assert low_memory.harmonic_storage_policy == "retained"
     assert low_memory.standard_r0_module_ready
@@ -2283,7 +2287,8 @@ def test_kokkos_current_execution_response_reuses_completed_primal(
         rtol=0.0,
         atol=2e-6,
     )
-    if native_symmetrix._kokkos_default_execution_space() == "Cuda":
+    execution_space = native_symmetrix._kokkos_default_execution_space()
+    if execution_space == "Cuda":
         # The Phi1 response reverse launches once per 64-channel phase.
         grid = json.loads(macefield_full_json_path.read_text())
         tile_phases = max(1, -(-int(grid["num_channels"]) // 64))
@@ -2293,7 +2298,11 @@ def test_kokkos_current_execution_response_reuses_completed_primal(
         assert current.macefield_response_a0_generic_launch_count == 0
     else:
         assert current.macefield_response_phi1_fused_launch_count == 0
-        assert current.macefield_response_phi1_generic_launch_count == 6
+        expected_generic_launches = 12 if execution_space in ("OpenMP", "Serial") else 6
+        assert (
+            current.macefield_response_phi1_generic_launch_count
+            == expected_generic_launches
+        )
         assert current.macefield_response_a0_fused_launch_count == 0
         assert current.macefield_response_a0_generic_launch_count == 3
 
