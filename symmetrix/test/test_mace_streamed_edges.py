@@ -76,6 +76,24 @@ def _skip_removed_observer_gradient_support():
     )
 
 
+def _pin_forward_mh0_state(evaluator):
+    """Keep the M0/M1/A0/A1 forward buffers readable across an evaluation.
+
+    The throughput-qualified speed bundle requests MH-0 adjoint reuse, and that
+    request is honored exactly while a state-free M0 implementation is selected
+    (the built-in standard module). Under ``reuse-adjoints-v1`` the forward
+    buffers are aliased to their adjoint storage, so ``A0``, ``M0``, ``A1`` and
+    ``M1`` hold adjoints once an evaluation returns - measured for this graph:
+    the exposed ``A0`` is bit-identical to the reverse ``A0_adj``. Forward-state
+    oracles must therefore compare two executors under the same retention
+    policy; the reuse policy itself is covered by
+    ``test_mh0_adjoint_reuse_matches_full_retention_and_rolls_back`` and
+    ``test_scalar_standard_m0_low_memory_matches_retained_direct``.
+    """
+
+    evaluator._set_mh0_state_policy("full-retention-v1")
+
+
 def _load_direct_artifact(evaluator, model_path, dtype="float64"):
     """Prepare and load the generated plugin a direct evaluator needs."""
 
@@ -1808,6 +1826,7 @@ def test_execution_standard_m0_matches_runtime_forward_reverse_oracle(
         evaluator._set_factorized_direct_forward_executor("jit_all")
         evaluator._set_factorized_direct_reverse_executor("jit")
         evaluator._set_standard_r0_executor("v2_edge16")
+    _pin_forward_mh0_state(evaluator)
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 
@@ -2155,6 +2174,7 @@ def test_m1_recompute_matches_retained_and_releases_polynomial_storage(
         evaluator._set_factorized_direct_reverse_executor("jit")
         evaluator._set_standard_r0_executor("v2_edge16")
     evaluator._set_standard_m0_executor("standard")
+    _pin_forward_mh0_state(evaluator)
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 
@@ -3548,6 +3568,7 @@ def test_execution_structural_m0_generalizes_species_count(
     evaluator._set_factorized_direct_forward_executor("jit_all")
     evaluator._set_factorized_direct_reverse_executor("jit")
     evaluator._set_standard_r0_executor("v2_edge16")
+    _pin_forward_mh0_state(evaluator)
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 
