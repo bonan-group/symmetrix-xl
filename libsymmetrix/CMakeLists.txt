@@ -40,7 +40,7 @@ endif()
 # ----- dependencies -----
 
 set(SYMMETRIX_BLAS_LIBRARY "" CACHE FILEPATH
-    "Optional exact BLAS archive used by accelerator release builds.")
+    "Optional exact BLAS library used by release builds.")
 set(SYMMETRIX_BLAS_INCLUDE_DIR "" CACHE PATH
     "Optional CBLAS include directory paired with SYMMETRIX_BLAS_LIBRARY.")
 option(SYMMETRIX_HIDE_STATIC_BLAS_SYMBOLS
@@ -97,6 +97,23 @@ foreach(_symmetrix_blas_library IN LISTS BLAS_LIBRARIES)
             "${_symmetrix_blas_library_dir}")
         list(APPEND _symmetrix_blas_normalized_libraries
             "${_symmetrix_blas_library_name}")
+    elseif(_symmetrix_blas_library MATCHES "^-l(.+)$")
+        # FindBLAS' MKL result carries link flags such as `-lm` and `-ldl`.
+        # KokkosKernels resolves every entry only inside the recorded
+        # directories, so a flag has to bring its own directory with it.
+        set(_symmetrix_blas_flag_name "${CMAKE_MATCH_1}")
+        find_library(_symmetrix_blas_flag_library
+            NAMES "${_symmetrix_blas_flag_name}")
+        if(NOT _symmetrix_blas_flag_library)
+            set(_symmetrix_blas_can_normalize FALSE)
+            break()
+        endif()
+        get_filename_component(_symmetrix_blas_flag_dir
+            "${_symmetrix_blas_flag_library}" DIRECTORY)
+        list(APPEND _symmetrix_blas_normalized_directories
+            "${_symmetrix_blas_flag_dir}")
+        list(APPEND _symmetrix_blas_normalized_libraries
+            "${_symmetrix_blas_flag_name}")
     else()
         list(APPEND _symmetrix_blas_normalized_libraries
             "${_symmetrix_blas_library}")
@@ -120,6 +137,25 @@ unset(_symmetrix_blas_library)
 unset(_symmetrix_blas_library_dir)
 unset(_symmetrix_blas_library_name)
 unset(_symmetrix_blas_library_match)
+unset(_symmetrix_blas_flag_name)
+unset(_symmetrix_blas_flag_library)
+unset(_symmetrix_blas_flag_dir)
+# MKL bundles LAPACK inside its BLAS libraries and ships no `mkl_lapack`, which
+# is the only name CMake's FindLAPACK Intel path accepts, so that search always
+# fails for a modern oneAPI installation. Seed KokkosKernels' LAPACK TPL from
+# the libraries already resolved above instead of running it. The cache entries
+# matter: KokkosKernels' TPL import clears a normal variable of the same name.
+if(NOT LAPACK_LIBRARIES AND BLAS_LIBRARIES AND BLA_VENDOR MATCHES "Intel")
+    set(LAPACK_LIBRARIES "${BLAS_LIBRARIES}")
+    set(LAPACK_LIBRARIES "${BLAS_LIBRARIES}" CACHE STRING
+        "LAPACK libraries resolved from the MKL BLAS result." FORCE)
+    if(BLAS_LIBRARY_DIRS)
+        set(LAPACK_LIBRARY_DIRS "${BLAS_LIBRARY_DIRS}")
+        set(LAPACK_LIBRARY_DIRS "${BLAS_LIBRARY_DIRS}" CACHE STRING
+            "LAPACK library directories resolved from the MKL BLAS result."
+            FORCE)
+    endif()
+endif()
 find_package(Git REQUIRED)
 
 set(_symmetrix_sphericart_cuda_default OFF)
@@ -399,6 +435,14 @@ if(SYMMETRIX_BLAS_INCLUDE_DIR)
     target_include_directories(symmetrix PRIVATE "${SYMMETRIX_BLAS_INCLUDE_DIR}")
 endif()
 
+if(BLAS_LIBRARY_DIRS)
+    # The normalized names above are searched only in the default linker
+    # directories otherwise, so a pinned BLAS prefix would be resolved from
+    # whatever the system happens to expose and a non-default prefix would fail
+    # to link at all. `symmetrix` is a static archive, so the directories have to
+    # reach the target that performs the link.
+    target_link_directories(symmetrix PUBLIC ${BLAS_LIBRARY_DIRS})
+endif()
 target_link_libraries(symmetrix
     PRIVATE ${BLAS_LIBRARIES}
             sphericart)

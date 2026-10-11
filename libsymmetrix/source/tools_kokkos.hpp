@@ -44,6 +44,16 @@ std::size_t admitted_team_scratch_bytes(
         kernel, {value_count, value_size}, scratch_level);
 }
 
+// Non-throwing query used to size a kernel's workspace before the launch.  The
+// throwing admission helper above remains the final validator so a programmer
+// error cannot silently degrade.
+template<class ExecutionSpace=Kokkos::DefaultExecutionSpace>
+std::size_t admitted_team_scratch_limit_bytes(const int scratch_level=0)
+{
+    return static_cast<std::size_t>(
+        Kokkos::TeamPolicy<ExecutionSpace>::scratch_size_max(scratch_level));
+}
+
 void _init_kokkos();
 
 void _finalize_kokkos();
