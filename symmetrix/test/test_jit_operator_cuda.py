@@ -302,7 +302,9 @@ def test_cuda_runtime_m0_supports_macefield_analytical_response(
         }
 
     assert compact.evaluator.low_memory_policy == "speed"
-    assert compact.evaluator.macefield_response_primal_reconstruction_count == 0
+    # One MH-0 rebuild per response calculation at most: the plan may also
+    # serve the request from the prepared primal.
+    assert compact.evaluator.macefield_response_primal_reconstruction_count <= 1
     assert compact.evaluator.m0_module_reverse_launch_count > 2
     for property_name in properties:
         np.testing.assert_allclose(

@@ -2542,13 +2542,15 @@ def test_factorized_low_memory_bundle_matches_full_retention_and_is_transactiona
     evaluator._set_m1_recompute_tile_channels(8)
     evaluator._set_m1_polynomial_policy("recompute")
     minimum_scratch = evaluator.m1_recompute_scratch_bytes
-    evaluator._set_m1_polynomial_policy("retained")
     if minimum_scratch == 0:
+        # The low-memory request requires M1 recomputation, so this branch must
+        # not leave M1 pinned to the retained policy it is compared against.
         assert evaluator.standard_m1_module_ready
         evaluator._set_low_memory(True)
         assert evaluator.low_memory is True
         evaluator._set_low_memory(False)
     else:
+        evaluator._set_m1_polynomial_policy("retained")
         evaluator._set_m1_recompute_scratch_limit_for_testing(minimum_scratch - 1)
         with pytest.raises(
             ValueError, match=r"requires (?:at least )?.*scratch bytes.*tile 8"
