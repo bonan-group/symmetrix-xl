@@ -3511,21 +3511,22 @@ void MaceNonlinearKokkosT<Precision>::compute_Y(
         ++execution_sphericart_launches;
         ++execution_sphericart_async_launches;
     }
+    // One thread per (edge, lm) keeps the strided accesses coalesced.
     Kokkos::parallel_for(
         "nonlinear normalize harmonics",
         Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
             Kokkos::IndexType<std::size_t>>(
-            execution_space,0,edges),
-        KOKKOS_LAMBDA(const std::size_t edge) {
-            for(int lm=0;lm<nlm;++lm) {
-                y(edge*nlm+lm)*=factor;
-                grad((3*edge+0)*nlm+lm)=factor
-                    *raw_grad((3*edge+1)*nlm+lm);
-                grad((3*edge+1)*nlm+lm)=factor
-                    *raw_grad((3*edge+2)*nlm+lm);
-                grad((3*edge+2)*nlm+lm)=factor
-                    *raw_grad((3*edge+0)*nlm+lm);
-            }
+            execution_space,0,harmonic_values),
+        KOKKOS_LAMBDA(const std::size_t i) {
+            const std::size_t edge=i/nlm;
+            const std::size_t lm=i-edge*nlm;
+            y(i)*=factor;
+            grad((3*edge+0)*nlm+lm)=factor
+                *raw_grad((3*edge+1)*nlm+lm);
+            grad((3*edge+1)*nlm+lm)=factor
+                *raw_grad((3*edge+2)*nlm+lm);
+            grad((3*edge+2)*nlm+lm)=factor
+                *raw_grad((3*edge+0)*nlm+lm);
         });
 #elif !defined(SYMMETRIX_SPHERICART_CUDA)
     static_cast<void>(evaluator_stream);

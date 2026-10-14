@@ -345,27 +345,26 @@ void MACEKokkos<Precision>::compute_Y(
         "normalize_Y", large_range_policy(
             execution_space, 0, harmonic_values),
         KOKKOS_LAMBDA (const std::size_t i) { Y(i) *= normalization_factor; });
+    // One thread per (edge, lm) so neighbouring lanes touch neighbouring
+    // addresses; a thread per edge strides by 3*harmonics and is ~100x slower.
     Kokkos::parallel_for(
-        "unshuffle_normalize_Y_grad",
-        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
-            execution_space, 0, num),
-        KOKKOS_LAMBDA (const int i) {
-            const std::size_t edge = static_cast<std::size_t>(i);
+        "unshuffle_normalize_Y_grad", large_range_policy(
+            execution_space, 0, harmonic_values),
+        KOKKOS_LAMBDA (const std::size_t i) {
+            const std::size_t edge = i/harmonics;
+            const std::size_t lm = i - edge*harmonics;
             const Precision gradient_scale = static_cast<Precision>(
                 normalization_factor)
                 *(compact_geometry
                     ? Precision(1)/static_cast<Precision>(r(edge))
                     : Precision(1));
-            for (int lm=0; lm<harmonics; ++lm) {
-                const auto x = Y_grad_shuffled(3*edge*harmonics+lm);
-                const auto y = Y_grad_shuffled(
-                    3*edge*harmonics+harmonics+lm);
-                const auto z = Y_grad_shuffled(
-                    3*edge*harmonics+2*harmonics+lm);
-                Y_grad(3*edge*harmonics+lm) = gradient_scale*y;
-                Y_grad(3*edge*harmonics+harmonics+lm) = gradient_scale*z;
-                Y_grad(3*edge*harmonics+2*harmonics+lm) = gradient_scale*x;
-            }
+            const std::size_t base = 3*edge*harmonics+lm;
+            const auto x = Y_grad_shuffled(base);
+            const auto y = Y_grad_shuffled(base+harmonics);
+            const auto z = Y_grad_shuffled(base+2*harmonics);
+            Y_grad(base) = gradient_scale*y;
+            Y_grad(base+harmonics) = gradient_scale*z;
+            Y_grad(base+2*harmonics) = gradient_scale*x;
         });
 #elif !defined(SYMMETRIX_SPHERICART_CUDA)
     static_cast<void>(evaluator_stream);

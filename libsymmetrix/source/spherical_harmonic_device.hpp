@@ -142,16 +142,44 @@ void launch_spherical_harmonics_device_impl(
     const ValueView& values, const GradientView& gradients, const int samples)
 {
     constexpr int size = (LMax + 1) * (LMax + 1);
+    using Precision = typename ValueView::non_const_value_type;
+    // A thread per sample writes size (and 3*size) consecutive outputs, so
+    // neighbouring lanes are far apart in memory. Stage a team's samples in
+    // scratch instead and write its contiguous output span cooperatively.
+    constexpr int stride = 4*size + 1;  // values+gradients, padded for LDS banks
+    constexpr int fit = 32768 / (stride * static_cast<int>(sizeof(Precision)));
+    constexpr int team_samples = fit >= 64 ? 64 : fit >= 32 ? 32 : 16;
+    using policy_type = Kokkos::TeamPolicy<ExecutionSpace>;
+    using scratch_view = Kokkos::View<Precision*,
+        typename ExecutionSpace::scratch_memory_space,
+        Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    const int teams = (samples + team_samples - 1) / team_samples;
+    if (teams <= 0)
+        return;
+    const auto* coordinates = xyz.data();
+    auto* out_values = values.data();
+    auto* out_gradients = gradients.data();
     Kokkos::parallel_for(
         "Symmetrix device spherical harmonics",
-        Kokkos::RangePolicy<ExecutionSpace>(execution_space, 0, samples),
-        KOKKOS_LAMBDA(const int sample) {
-            const std::size_t sample_index = static_cast<std::size_t>(sample);
-            spherical_harmonic_device_sample<LMax>(
-                xyz.data() + 3*sample_index,
-                values.data() + static_cast<std::size_t>(size)*sample_index,
-                gradients.data()
-                    +3*static_cast<std::size_t>(size)*sample_index);
+        policy_type(execution_space, teams, team_samples).set_scratch_size(
+            0, Kokkos::PerTeam(scratch_view::shmem_size(team_samples*stride))),
+        KOKKOS_LAMBDA(const typename policy_type::member_type& team) {
+            scratch_view staged(team.team_scratch(0), team_samples*stride);
+            const int first_sample = team.league_rank()*team_samples;
+            const int count = Kokkos::min(team_samples, samples - first_sample);
+            const int local = team.team_rank();
+            const std::size_t first = static_cast<std::size_t>(first_sample);
+            if (local < count) {
+                Precision* slot = staged.data() + local*stride;
+                spherical_harmonic_device_sample<LMax>(
+                    coordinates + 3*(first + local), slot, slot + size);
+            }
+            team.team_barrier();
+            for (int k = local; k < count*size; k += team_samples)
+                out_values[first*size + k] = staged((k/size)*stride + k%size);
+            for (int k = local; k < 3*count*size; k += team_samples)
+                out_gradients[3*first*size + k] =
+                    staged((k/(3*size))*stride + size + k%(3*size));
         });
 }
 
