@@ -418,6 +418,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
 
   utils::logmesg(lmp, "Loading MACEKokkos model from \'{}\' ... ", arg[2]);
   mace = std::make_unique<MACEKokkos<Precision>>(arg[2], prediction_head);
+  utils::logmesg(lmp, "(h1_affine_mode {}) ", mace->h1_affine_mode_name());
   mace->set_allow_fixed_workspace(allow_fixed_workspace);
   if (debug_single_layer_workspace_receivers != 0)
     mace->set_single_layer_workspace_receiver_limit_for_testing(

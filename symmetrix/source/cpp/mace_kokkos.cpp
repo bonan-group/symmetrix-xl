@@ -2082,6 +2082,8 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
         .def_readonly("L_max", &MACEKokkos<Precision>::L_max)
         .def_readonly(
             "single_layer_readout", &MACEKokkos<Precision>::single_layer_readout)
+        .def_property_readonly(
+            "h1_affine_mode", &MACEKokkos<Precision>::h1_affine_mode_name)
         // node energies
         .def_property("node_energies",
             [] (MACEKokkos<Precision>& self) {

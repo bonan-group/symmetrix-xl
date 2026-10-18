@@ -52,6 +52,16 @@ def main(argv=None):
         default=256,
         help="Number of radial spline grid points.",
     )
+    parser.add_argument(
+        "--h1-affine-mode",
+        choices=("legacy", "m0_composite"),
+        default="legacy",
+        help=(
+            "legacy: format v2, readout/skip in the post-linear_up basis (inverse of "
+            "linear_up). m0_composite: format v4, inverse-free composite readout/skip "
+            "maps on the scalar M0 block (single-head two-interaction compact MACE)."
+        ),
+    )
     parser.add_argument("--output", "-o", help="Output filename.")
     parser.add_argument(
         "--export-model",
@@ -100,6 +110,7 @@ def main(argv=None):
         head=args.head,
         num_spline_points=args.num_spline_points,
         radial_format=args.radial_format,
+        h1_affine_mode=args.h1_affine_mode,
     )
 
     ### ----- WRITE JSON -----

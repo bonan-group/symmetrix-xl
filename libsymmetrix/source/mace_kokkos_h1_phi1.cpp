@@ -204,6 +204,102 @@ double deterministic_gpu_wave32_sum(double value) {
     return value;
 }
 template <typename Precision>
+void MACEKokkos<Precision>::ensure_h1_affine_capacity(
+    const int local_rows, const int graph_rows)
+{
+    if (!h1_affine_m0_composite())
+        return;
+    const auto channels = static_cast<std::size_t>(num_channels);
+    const auto local = static_cast<std::size_t>(std::max(local_rows, 0));
+    const auto graph = static_cast<std::size_t>(std::max(graph_rows, 0));
+    const bool local_fits = h1_affine_M0_scalar.extent(0) >= local
+        && h1_affine_M0_scalar.extent(2) == channels
+        && h1_affine_M0_direct_adj.extent(0) >= local
+        && h1_affine_M0_direct_adj.extent(1) == channels;
+    const bool graph_fits = graph == 0
+        || (h1_affine_graph_M0_scalar.extent(0) >= graph
+            && h1_affine_graph_M0_scalar.extent(1) == channels
+            && h1_affine_graph_M0_direct_adj.extent(0) >= graph
+            && h1_affine_graph_M0_direct_adj.extent(1) == channels);
+    if (local_fits && graph_fits)
+        return;
+    // In-flight kernels may still read the old views.
+    Kokkos::fence("Replace m0_composite H1 affine state");
+    if (!local_fits) {
+        const auto rows = std::max(local, h1_affine_M0_scalar.extent(0));
+        h1_affine_M0_scalar = decltype(h1_affine_M0_scalar)(
+            Kokkos::view_alloc(
+                "MACE m0_composite scalar M0", Kokkos::WithoutInitializing),
+            rows, 1, channels);
+        h1_affine_M0_direct_adj = decltype(h1_affine_M0_direct_adj)(
+            Kokkos::view_alloc(
+                "MACE m0_composite direct M0 adjoint", Kokkos::WithoutInitializing),
+            rows, channels);
+    }
+    if (!graph_fits) {
+        const auto rows = std::max(graph, h1_affine_graph_M0_scalar.extent(0));
+        h1_affine_graph_M0_scalar = decltype(h1_affine_graph_M0_scalar)(
+            Kokkos::view_alloc(
+                "MACE m0_composite graph scalar M0", Kokkos::WithoutInitializing),
+            rows, channels);
+        h1_affine_graph_M0_direct_adj = decltype(h1_affine_graph_M0_direct_adj)(
+            Kokkos::view_alloc(
+                "MACE m0_composite graph direct M0 adjoint",
+                Kokkos::WithoutInitializing),
+            rows, channels);
+    }
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::capture_h1_affine_M0_scalar(const int num_nodes)
+{
+    ensure_h1_affine_capacity(num_nodes);
+    const auto execution_space = use_factorized_async_inference()
+        ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
+    if (num_nodes <= 0)
+        return;
+    const int channels = num_channels;
+    auto M0 = this->M0;
+    auto scalar = this->h1_affine_M0_scalar;
+    Kokkos::parallel_for(
+        "MACEKokkos::capture_m0_composite_scalar_M0",
+        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+            execution_space, 0, num_nodes*channels),
+        KOKKOS_LAMBDA (const int ik) {
+            const int i = ik / channels;
+            const int k = ik % channels;
+            scalar(i,0,k) = M0(i,0,k);
+        });
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::add_h1_affine_direct_adjoint(const int num_nodes)
+{
+    if (h1_affine_M0_direct_adj.extent(0) < static_cast<std::size_t>(num_nodes))
+        throw std::logic_error(
+            "m0_composite reverse_H1 requires reverse_H2 for the same nodes first.");
+    const auto execution_space = use_factorized_async_inference()
+        ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
+    if (num_nodes <= 0)
+        return;
+    const int channels = num_channels;
+    auto M0_adj = this->M0_adj;
+    auto direct = this->h1_affine_M0_direct_adj;
+    Kokkos::parallel_for(
+        "MACEKokkos::add_m0_composite_direct_adjoint",
+        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+            execution_space, 0, num_nodes*channels),
+        KOKKOS_LAMBDA (const int ik) {
+            const int i = ik / channels;
+            const int k = ik % channels;
+            // One rounding of the sum: message part (fused reverse) + direct part.
+            M0_adj(i,0,k) = static_cast<Precision>(
+                static_cast<double>(M0_adj(i,0,k)) + direct(i,k));
+        });
+    complete_device_stage("MACEKokkos::add_m0_composite_direct_adjoint");
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::compute_H1(
     const int num_nodes)
 {
@@ -211,6 +307,9 @@ void MACEKokkos<Precision>::compute_H1(
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
     if (H1.extent(0) < M0.extent(0))
         Kokkos::realloc(H1, M0.extent(0), M0.extent(1), M0.extent(2));
+    // m0_composite: retain the scalar M0 block before any adjoint reuses M0.
+    if (h1_affine_m0_composite())
+        capture_h1_affine_M0_scalar(num_nodes);
 #ifdef SYMMETRIX_ENABLE_METAL
     if constexpr (std::is_same_v<Precision, float>) {
         // The Metal M0 forward already wrote H1 in its submission.
@@ -445,6 +544,15 @@ void MACEKokkos<Precision>::compute_H1_linear_up(
 
 template <typename Precision>
 void MACEKokkos<Precision>::reverse_H1(
+    const int num_nodes)
+{
+    reverse_H1_fused(num_nodes);
+    if (h1_affine_m0_composite())
+        add_h1_affine_direct_adjoint(num_nodes);
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::reverse_H1_fused(
     const int num_nodes)
 {
     const auto execution_space = use_factorized_async_inference()

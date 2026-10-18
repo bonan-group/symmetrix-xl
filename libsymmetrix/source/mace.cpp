@@ -329,6 +329,9 @@ void MACECPU<Precision>::compute_node_energies_forces_field(
     std::span<const double> r,
     std::span<const double> electric_field)
 {
+    if (h1_affine_m0_composite())
+        throw std::invalid_argument(
+            "The m0_composite H1 affine basis is not supported by the field-coupled MACE sequence.");
     node_energies.resize(num_nodes);
     std::fill(node_energies.begin(), node_energies.end(), 0.0);
     node_forces.resize(xyz.size());
@@ -1693,6 +1696,19 @@ void MACECPU<Precision>::reverse_H1(
                 num_channels);  // const MKL_INT ldc
         }
     }
+    if (h1_affine_m0_composite()) {
+        // Direct scalar adjoint q + T_z H2_adj (formed in reverse_H2); H1_adj held
+        // only the message-passing adjoint, so nothing is counted twice.
+        if (M0_direct_adj.size() < static_cast<std::size_t>(num_nodes)*num_channels)
+            throw std::logic_error(
+                "m0_composite reverse_H1 requires reverse_H2 for the same nodes first.");
+        for (int i=0; i<num_nodes; ++i) {
+            auto M0_adj_i0 = M0_adj.data()+i*num_LM*num_channels;
+            const auto direct_i = M0_direct_adj.data()+i*num_channels;
+            for (int k=0; k<num_channels; ++k)
+                M0_adj_i0[k] += direct_i[k];
+        }
+    }
 }
 
 template <typename Precision>
@@ -2384,16 +2400,20 @@ void MACECPU<Precision>::compute_H2(
     std::span<const int> node_types)
 {
     H2.resize(static_cast<std::size_t>(num_nodes)*num_channels);
+    // legacy: H2 = S_z^T H1 (scalar block); m0_composite: H2 = T_z^T M0 (scalar block).
+    const bool m0_composite = h1_affine_m0_composite();
+    const auto& skip_weights = m0_composite ? H2_weights_for_M0 : H2_weights_for_H1;
+    const auto& skip_input = m0_composite ? M0 : H1;
     for (int i=0; i<num_nodes; ++i) {
         auto H2_i = H2.data()+i*num_channels;
-        auto H1_i = H1.data()+i*num_LM*num_channels;
+        auto H1_i = skip_input.data()+i*num_LM*num_channels;
         symmetrix_blas_gemv<Precision>(
             CblasRowMajor,                            // const CBLAS_LAYOUT Layout
             CblasTrans,                               // const CBLAS_TRANSPOSE trans
             num_channels,                             // const MKL_INT m
             num_channels,                             // const MKL_INT n
             1.0,                                      // const double alpha
-            H2_weights_for_H1[node_types[i]].data(),  // const double *a
+            skip_weights[node_types[i]].data(),       // const double *a
             num_channels,                             // const MKL_INT lda
             H1_i,                                     // const double *x
             1,                                        // const MKL_INT incx
@@ -2427,6 +2447,25 @@ void MACECPU<Precision>::reverse_H2(
     M1_adj.resize(M1.size());
     if (zero_H1_adj)
         std::fill(H1_adj.begin(), H1_adj.end(), 0.0);
+    if (h1_affine_m0_composite()) {
+        // Direct scalar M0 adjoint q + T_z H2_adj; H1_adj is not touched.
+        M0_direct_adj.resize(static_cast<std::size_t>(num_nodes)*num_channels);
+        for (int i=0; i<num_nodes; ++i) {
+            auto H2_adj_i = H2_adj.data()+i*num_channels;
+            auto direct_i = M0_direct_adj.data()+i*num_channels;
+            std::copy(readout_1_weights_for_M0.begin(), readout_1_weights_for_M0.end(), direct_i);
+            symmetrix_blas_gemv<Precision>(
+                CblasRowMajor, CblasNoTrans, num_channels, num_channels,
+                1.0, H2_weights_for_M0[node_types[i]].data(), num_channels,
+                H2_adj_i, 1, 1.0, direct_i, 1);
+            auto M1_adj_i = M1_adj.data()+i*num_channels;
+            symmetrix_blas_gemv<Precision>(
+                CblasRowMajor, CblasNoTrans, num_channels, num_channels,
+                1.0, H2_weights_for_M1.data(), num_channels,
+                H2_adj_i, 1, 0.0, M1_adj_i, 1);
+        }
+        return;
+    }
     for (int i=0; i<num_nodes; ++i) {
         auto H2_adj_i = H2_adj.data()+i*num_channels;
         auto H1_adj_i = H1_adj.data()+i*num_LM*num_channels;
@@ -2472,13 +2511,21 @@ void MACECPU<Precision>::compute_readouts(
     //          There is probably a better way to manage this.
     std::fill(H1_adj.begin(), H1_adj.end(), 0.0);
     H2_adj.resize(H2.size());
+    const bool m0_composite = h1_affine_m0_composite();
     for (int i=0; i<num_nodes; ++i) {
         // atomic energies
         node_energies[i] += atomic_energies[node_types[i]];
         // first readout
-        for (int k=0; k<num_channels; ++k) {
-            node_energies[i] += readout_1_weights[k]*H1[i*num_LM*num_channels+k];
-            H1_adj[i*num_LM*num_channels+k] = readout_1_weights[k];
+        if (m0_composite) {
+            // E1 = q . M0 (scalar block); its adjoint q enters M0_direct_adj in
+            // reverse_H2, H1_adj stays zero for the message-passing reverse.
+            for (int k=0; k<num_channels; ++k)
+                node_energies[i] += readout_1_weights_for_M0[k]*M0[i*num_LM*num_channels+k];
+        } else {
+            for (int k=0; k<num_channels; ++k) {
+                node_energies[i] += readout_1_weights[k]*H1[i*num_LM*num_channels+k];
+                H1_adj[i*num_LM*num_channels+k] = readout_1_weights[k];
+            }
         }
         // second readout
         auto x = std::vector<Precision>(H2.begin()+i*num_channels, H2.begin()+(i+1)*num_channels);
@@ -2534,10 +2581,12 @@ void MACECPU<Precision>::load_from_json(
 
     // Radial representation
     const int format_version = file.value("symmetrix_format_version", 1);
-    uses_compact_radial = format_version == 2;
+    h1_affine_mode = symmetrix::h1_affine::validate(file, num_elements, num_channels);
+    uses_compact_radial = format_version == 2
+        || format_version == symmetrix::h1_affine::m0_composite_format_version;
     if (uses_compact_radial) {
         if (file.value("radial_representation", std::string()) != "compact")
-            throw std::invalid_argument("Symmetrix format version 2 requires compact radial data.");
+            throw std::invalid_argument("Symmetrix format versions 2 and 4 require compact radial data.");
         compact_radial_model = std::make_unique<CompactRadialModel>(
             file.at("compact_radial").dump(), atomic_numbers, r_cut);
         type_to_active.assign(atomic_numbers.size(), -1);
@@ -2740,14 +2789,29 @@ void MACECPU<Precision>::load_from_json(
     }
 
     // H2
-    H2_weights_for_H1 = checked_precision_data<Precision>(
-        file["H2_weights_for_H1"].get<std::vector<std::vector<double>>>());
+    H2_weights_for_H1.clear();
+    H2_weights_for_M0.clear();
+    readout_1_weights.clear();
+    readout_1_weights_for_M0.clear();
+    M0_direct_adj.clear();
+    if (h1_affine_m0_composite()) {
+        H2_weights_for_M0 = checked_precision_data<Precision>(
+            file["H2_weights_for_M0"].get<std::vector<std::vector<double>>>());
+    } else {
+        H2_weights_for_H1 = checked_precision_data<Precision>(
+            file["H2_weights_for_H1"].get<std::vector<std::vector<double>>>());
+    }
     H2_weights_for_M1 = checked_precision_data<Precision>(
         file["H2_weights_for_M1"].get<std::vector<double>>());
 
     // Readouts
-    readout_1_weights = checked_precision_data<Precision>(
-        file["readout_1_weights"].get<std::vector<double>>());
+    if (h1_affine_m0_composite()) {
+        readout_1_weights_for_M0 = checked_precision_data<Precision>(
+            file["readout_1_weights_for_M0"].get<std::vector<double>>());
+    } else {
+        readout_1_weights = checked_precision_data<Precision>(
+            file["readout_1_weights"].get<std::vector<double>>());
+    }
     auto readout_2_weights_1 = checked_precision_data<Precision>(
         file["readout_2_weights_1"].get<std::vector<double>>());
     auto readout_2_weights_2 = checked_precision_data<Precision>(
