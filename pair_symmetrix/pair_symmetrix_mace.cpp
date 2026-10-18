@@ -165,6 +165,7 @@ void PairSymmetrixMACE::coeff(int narg, char **arg)
 
   utils::logmesg(lmp, "Loading MACE model from \'{}\' ... ", arg[2]);
   mace = std::make_unique<MACE>(arg[2], prediction_head);
+  utils::logmesg(lmp, "(h1_affine_mode {}) ", mace->h1_affine_mode_name());
   utils::logmesg(lmp, "success\n");
   execution_pair_seconds = 0.0;
   execution_pair_evaluation_count = 0.0;

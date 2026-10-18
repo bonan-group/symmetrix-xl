@@ -8,6 +8,7 @@
 #include "cubic_spline.hpp"
 #include "cubic_spline_set.hpp"
 #include "field_coupling.hpp"
+#include "h1_affine_schema.hpp"
 #include "mace_streamed_edges.hpp"
 #include "multilayer_perceptron.hpp"
 #include "multivariate_polynomial.hpp"
@@ -255,15 +256,30 @@ void compute_M1(const int num_nodes, std::span<const int> node_types);
 // TODO: node_types here only for consistency with Kokkos
 void reverse_M1(const int num_nodes, std::span<const int> node_types);
 
+// H1 affine basis (format v4 "m0_composite"): readout_1 and the H1->H2 skip act
+// on the scalar M0 block with q = C r and T_z = C S_z; the scalar M0 adjoint
+// receives q + T_z H2_adj directly (M0_direct_adj, added after reverse_H1) and
+// H1_adj carries only the message-passing (R1) adjoint.
+symmetrix::h1_affine::Mode h1_affine_mode = symmetrix::h1_affine::Mode::legacy;
+bool h1_affine_m0_composite() const {
+    return h1_affine_mode == symmetrix::h1_affine::Mode::m0_composite;
+}
+std::string h1_affine_mode_name() const {
+    return symmetrix::h1_affine::mode_name(h1_affine_mode);
+}
+std::vector<Precision> M0_direct_adj;
+
 // H2
 std::vector<Precision> H2, H2_adj;
 std::vector<std::vector<Precision>> H2_weights_for_H1;
+std::vector<std::vector<Precision>> H2_weights_for_M0;
 std::vector<Precision> H2_weights_for_M1;
 void compute_H2(const int num_nodes, std::span<const int> node_types);
 void reverse_H2(const int num_nodes, std::span<const int> node_types, bool zero_H1_adj = true);
 
 // Readouts
 std::vector<Precision> readout_1_weights;
+std::vector<Precision> readout_1_weights_for_M0;
 std::unique_ptr<MultilayerPerceptronT<Precision>> readout_2;
 void compute_readouts(const int num_nodes, std::span<const int> node_types);
 

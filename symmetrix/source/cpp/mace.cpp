@@ -126,6 +126,9 @@ void bind_mace_cpu(py::module_ &m, const char* class_name)
         .def_readwrite("M1_adj", &Evaluator::M1_adj)
         .def_readwrite("H2", &Evaluator::H2)
         .def_readwrite("H2_adj", &Evaluator::H2_adj)
+        .def_property_readonly("h1_affine_mode", &Evaluator::h1_affine_mode_name)
+        .def_readwrite("M0_direct_adj", &Evaluator::M0_direct_adj)
+        .def_readonly("readout_1_weights_for_M0", &Evaluator::readout_1_weights_for_M0)
         .def("compute_node_energies_forces",
             [](Evaluator& self, const int num_nodes,
                            ContiguousIntArray node_types,

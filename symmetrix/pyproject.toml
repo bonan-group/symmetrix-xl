@@ -92,6 +92,7 @@ docs = [
 [project.scripts]
 symmetrix = "symmetrix.cli.main:main"
 symmetrix_extract_mace = "symmetrix.cli.extract_mace:main"
+symmetrix_recompose_mace_json = "symmetrix.cli.recompose_mace_json:main"
 symmetrix_calibrate_kernel_launch = "symmetrix.cli.calibrate_kernel_launch:main"
 symmetrix_prepare_jit_device_artifact = "symmetrix.cli.prepare_jit_device_artifact:main"
 symmetrix_prepare_jit_host_artifact = "symmetrix.cli.prepare_jit_host_artifact:main"

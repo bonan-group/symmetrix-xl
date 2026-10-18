@@ -17,6 +17,7 @@
 
 #include "compact_radial.hpp"
 #include "field_coupling.hpp"
+#include "h1_affine_schema.hpp"
 #include "cubic_spline_kokkos.hpp"
 #include "cubic_spline_set_kokkos.hpp"
 #include "device_backend.hpp"
@@ -907,7 +908,33 @@ bool first_interaction_residual = false;
 Kokkos::View<Precision***,Kokkos::LayoutRight> H1_first_residual_weights;
 Kokkos::View<Precision***,Kokkos::LayoutRight> H1_first_residual_fused_weights;
 void compute_H1(const int num_nodes);
+// reverse_H1 = fused H1 reverse (H1_adj C^T -> M0_adj) followed, in the
+// m0_composite basis, by the direct scalar M0 adjoint.
 void reverse_H1(const int num_nodes);
+void reverse_H1_fused(const int num_nodes);
+
+// H1 affine basis (format v4 "m0_composite"): readout_1 and the
+// H1->H2 skip act on the scalar M0 block with q = C r and T_z = C S_z.  The
+// scalar M0 block is retained in its own view at compute_H1 (M0 storage may
+// later hold the H1 adjoint or the M0 adjoint), the direct scalar adjoint
+// q + T_z H2_adj is formed in double in reverse_H2 and added to M0_adj(:,0,:)
+// after the fused H1 reverse, so H1_adj carries only the message-passing (R1)
+// adjoint.  The tiled dual-layer plan keeps both per receiver feature in the
+// graph-level views between its phases.  Legacy JSONs never touch these views.
+symmetrix::h1_affine::Mode h1_affine_mode = symmetrix::h1_affine::Mode::legacy;
+bool h1_affine_m0_composite() const {
+    return h1_affine_mode == symmetrix::h1_affine::Mode::m0_composite;
+}
+std::string h1_affine_mode_name() const {
+    return symmetrix::h1_affine::mode_name(h1_affine_mode);
+}
+Kokkos::View<Precision***,Kokkos::LayoutRight> h1_affine_M0_scalar;   // (rows, 1, K)
+Kokkos::View<double**,Kokkos::LayoutRight> h1_affine_M0_direct_adj;   // (rows, K)
+Kokkos::View<Precision**,Kokkos::LayoutRight> h1_affine_graph_M0_scalar;
+Kokkos::View<double**,Kokkos::LayoutRight> h1_affine_graph_M0_direct_adj;
+void ensure_h1_affine_capacity(int local_rows, int graph_rows = 0);
+void capture_h1_affine_M0_scalar(int num_nodes);
+void add_h1_affine_direct_adjoint(int num_nodes);
 void compute_H1_product(const int num_nodes);
 void compute_H1_linear_up(const int num_nodes);
 void reverse_H1_linear_up(const int num_nodes);
@@ -1714,12 +1741,16 @@ Kokkos::View<H2WeightPrecision*> H2_weights_for_M1;
 Kokkos::View<H2WeightPrecision**,Kokkos::LayoutRight>
     H2_weights_for_H1_reverse;
 Kokkos::View<H2WeightPrecision*> H2_weights_for_M1_reverse;
+// m0_composite skip maps T_z (same layouts as H2_weights_for_H1(_reverse)).
+Kokkos::View<H2WeightPrecision**,Kokkos::LayoutRight>
+    H2_weights_for_M0, H2_weights_for_M0_reverse;
 void compute_H2(int num_nodes, Kokkos::View<const int*> node_types);
 void reverse_H2(int num_nodes, Kokkos::View<const int*> node_types, bool zero_H1_adj = true);
 void ensure_h1_adjoint_capacity();
 
 // Readouts
 Kokkos::View<double*> readout_1_weights;
+Kokkos::View<double*> readout_1_weights_for_M0;   // m0_composite q
 MultilayerPerceptronKokkos readout_2;
 Kokkos::View<double*> readout_2_output;
 double compute_readouts(
