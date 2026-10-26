@@ -278,7 +278,7 @@ def _extract_single_head_data(
     model,
     species=None,
     head=None,
-    num_spline_points=256,
+    num_spline_points=None,
     radial_format="compact",
 ):
     """Extract data from pytorch model file into structure that can be
@@ -294,8 +294,10 @@ def _extract_single_head_data(
         if omitted, retain every element supported by the checkpoint.
     head: str, default None
         head to keep, if multihead model, default same as mace.tools.scripts_utils.remove_pt_head
-    num_spline_points: int, default 256
-        number of spline points to approximate various functions
+    num_spline_points: int, default None
+        number of spline points to approximate various functions (256 if
+        omitted). For MACE_Nonlinear models it sets the runtime pair-spline
+        table size and is only written to the JSON when given.
     radial_format: str, default "compact"
         compact stores the shared radial model and materializes splines for
         active compositions at runtime. pair-splines stores the original
@@ -316,7 +318,11 @@ def _extract_single_head_data(
             f"Unsupported radial_format '{radial_format}'. "
             "Expected 'compact' or 'pair-splines'."
         )
-    if radial_format == "compact" and num_spline_points < 4:
+    if (
+        radial_format == "compact"
+        and num_spline_points is not None
+        and num_spline_points < 4
+    ):
         raise ValueError("Compact radial output requires at least 4 spline points.")
     if radial_format == "pair-splines":
         logging.warning(
@@ -366,8 +372,10 @@ def _extract_single_head_data(
             )
         from .extract_mace_nonlinear import extract_mace_nonlinear_data
 
-        return extract_mace_nonlinear_data(model)
+        return extract_mace_nonlinear_data(model, num_spline_points=num_spline_points)
 
+    if num_spline_points is None:
+        num_spline_points = 256
     if species is None:
         species = []
 
@@ -1708,7 +1716,7 @@ def extract_mace_data(
     model,
     species=None,
     head=None,
-    num_spline_points=256,
+    num_spline_points=None,
     radial_format="compact",
 ):
     """Extract a checkpoint while retaining every compatible prediction head.
