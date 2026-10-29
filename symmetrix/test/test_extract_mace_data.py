@@ -314,7 +314,8 @@ def test_macefield_extractor_includes_field_schema(macefield_model_path, tmp_pat
     assert len(data["H1_product_weights"]) == 32768
     assert len(data["H1_linear_up_weights"]) == 32768
 
-    assert data["symmetrix_format_version"] == 2
+    assert data["symmetrix_format_version"] == 4
+    assert data["h1_affine_mode"] == "pre_linear_up"
     assert data["radial_representation"] == "compact"
     assert "radial_spline_values_0" not in data
     assert "radial_spline_values_1" not in data
@@ -399,7 +400,8 @@ def test_macefield_extractor_retains_legacy_pair_splines(
         radial_format="pair-splines",
     )
 
-    assert "symmetrix_format_version" not in data
+    assert data["symmetrix_format_version"] == 4
+    assert data["radial_representation"] == "pair-splines"
     assert "compact_radial" not in data
     assert "execution_contracts" not in data
     assert data["radial_spline_min"] == pytest.approx(1e-12)
@@ -409,7 +411,7 @@ def test_macefield_extractor_retains_legacy_pair_splines(
     assert len(data["radial_spline_values_1"]) == 3
     assert len(data["A0_spline_values"]) == 3
     assert len(data["A1_spline_values"]) == 3
-    assert "original Symmetrix pair-spline format (named v1 here)" in caplog.text
+    assert "per-pair radial spline tables" in caplog.text
 
 
 @pytest.mark.skipif(

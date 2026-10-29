@@ -918,21 +918,31 @@ void compute_H1(const int num_nodes);
 void reverse_H1(const int num_nodes);
 void reverse_H1_fused(const int num_nodes);
 
-// H1 affine basis (format v4 "m0_composite"): readout_1 and the
-// H1->H2 skip act on the scalar M0 block with q = C r and T_z = C S_z.  The
-// scalar M0 block is retained in its own view at compute_H1 (M0 storage may
-// later hold the H1 adjoint or the M0 adjoint), the direct scalar adjoint
-// q + T_z H2_adj is formed in double in reverse_H2 and added to M0_adj(:,0,:)
-// after the fused H1 reverse, so H1_adj carries only the message-passing (R1)
-// adjoint.  The tiled dual-layer plan keeps both per receiver feature in the
-// graph-level views between its phases.  Legacy JSONs never touch these views.
+// H1 affine basis (format v4, h1_affine_schema.hpp): readout_1 and the
+// H1->H2 skip act on a retained scalar block (h1_affine_M0_scalar, rows x 1 x K):
+// m0_composite: the scalar M0 block (q = P0 r0, T_z = P0 S0_z);
+// pre_linear_up: the scalar block of the pre-linear_up features (r0, S0_z),
+// i.e. M0 P0 + first-interaction residual, or the field-coupled H1 before
+// linear_up (captured in compute_H1_linear_up).  The scalar block is retained
+// in its own view (M0 storage may later hold the H1 adjoint or the M0
+// adjoint).  The direct adjoint q + T_z H2_adj is formed in double in reverse_H2
+// and added after the H1 reverse (to M0_adj, through P0 for pre_linear_up) or,
+// with field coupling, to the pre-linear_up H1_adj in reverse_H1_linear_up, so
+// H1_adj carries only the message-passing (R1) adjoint.  The tiled dual-layer
+// plan keeps both per receiver feature in the graph-level views between its
+// phases.  readout_1_weights_for_M0 / H2_weights_for_M0(_reverse) hold the maps
+// of either basis; the old-basis views are unused (format 1/2 is refused).
 symmetrix::h1_affine::Mode h1_affine_mode = symmetrix::h1_affine::Mode::legacy;
-bool h1_affine_m0_composite() const {
-    return h1_affine_mode == symmetrix::h1_affine::Mode::m0_composite;
+bool h1_affine_v4() const {
+    return h1_affine_mode != symmetrix::h1_affine::Mode::legacy;
+}
+bool h1_affine_pre_linear_up() const {
+    return h1_affine_mode == symmetrix::h1_affine::Mode::pre_linear_up;
 }
 std::string h1_affine_mode_name() const {
     return symmetrix::h1_affine::mode_name(h1_affine_mode);
 }
+int h1_affine_direct_rows = 0;   // rows of h1_affine_M0_direct_adj written by reverse_H2
 Kokkos::View<Precision***,Kokkos::LayoutRight> h1_affine_M0_scalar;   // (rows, 1, K)
 Kokkos::View<double**,Kokkos::LayoutRight> h1_affine_M0_direct_adj;   // (rows, K)
 Kokkos::View<Precision**,Kokkos::LayoutRight> h1_affine_graph_M0_scalar;

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""JSON-only migration of a legacy (format v2) MACE export to the v4 m0_composite basis.
+"""Convert a format-1/2 MACE JSON to format 4 (no inverse of linear_up) without the checkpoint.
 
-Writes a NEW file; never overwrites an existing path.  No checkpoint is read.
-Refuses multi-head, field-coupled, first-interaction-residual, single-layer,
-nonlinear and pair-spline (v1) payloads.
+Covers every old standard-MACE kind: compact (v2) and pair-splines (v1), plain
+two-interaction models (h1_affine_mode m0_composite), first-interaction residual
+and MACEField models (pre_linear_up), single-layer models and multi-head JSON.
+MACE_Nonlinear (format 3) needs no conversion.  Writes a NEW file; never
+overwrites an existing path.
 
-  python -m symmetrix.cli.recompose_mace_json --input old.json --output new.json \
-      [--h1-affine-mode m0_composite] [--receipt new.recompose.json]
-  python -m symmetrix.cli.recompose_mace_json --validate-only file.json [file.json ...]
+  symmetrix_recompose_mace_json --input old.json --output new.json [--receipt new.recompose.json]
+  symmetrix_recompose_mace_json --validate-only file.json [file.json ...]
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 from ..h1_affine import (
-    H1_AFFINE_MODE_M0_COMPOSITE,
+    BASIS_KEYS,
     H1AffineError,
     recompose_legacy_payload,
     sha256_bytes,
@@ -66,11 +67,6 @@ def main(argv=None) -> int:
     parser = ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--input", "-i")
     parser.add_argument("--output", "-o")
-    parser.add_argument(
-        "--h1-affine-mode",
-        choices=(H1_AFFINE_MODE_M0_COMPOSITE,),
-        default=H1_AFFINE_MODE_M0_COMPOSITE,
-    )
     parser.add_argument("--receipt", help="Optional NEW receipt JSON path.")
     parser.add_argument("--validate-only", nargs="+", metavar="JSON")
     args = parser.parse_args(argv)
@@ -119,9 +115,10 @@ def main(argv=None) -> int:
     # Round-trip check of the serialized payload before it is published.
     reparsed = json.loads(text)
     validate_payload(reparsed)
-    if reparsed["readout_1_weights_for_M0"] != new["readout_1_weights_for_M0"]:
-        print("REFUSED: serialization round-trip changed readout_1_weights_for_M0",
-              file=sys.stderr)
+    mode = new["h1_affine_mode"]
+    readout_key = BASIS_KEYS[mode][0]
+    if reparsed[readout_key] != new[readout_key]:
+        print(f"REFUSED: serialization round-trip changed {readout_key}", file=sys.stderr)
         return 5
     dst.parent.mkdir(parents=True, exist_ok=True)
     _write_new(dst, text)
@@ -131,7 +128,7 @@ def main(argv=None) -> int:
         "input": str(src.resolve()), "input_sha256": source_sha, "input_bytes": len(raw),
         "output": str(dst.resolve()), "output_sha256": out_sha,
         "output_bytes": len(text.encode()),
-        "h1_affine_mode": H1_AFFINE_MODE_M0_COMPOSITE,
+        "h1_affine_mode": mode,
         "identity_fp64": {"E1_max_rel": worst_e, "H2_max_rel": worst_h2, "detail": checks},
         "conditioning": new["h1_affine_provenance"]["conditioning"],
     }
@@ -142,7 +139,7 @@ def main(argv=None) -> int:
                         "worst_rel_terms": checks["worst_rel_terms"],
                         "sigma_min_C": receipt["conditioning"]["sigma_min_C"],
                         "legacy_readout_1_l2": receipt["conditioning"]["legacy_readout_1_l2"],
-                        "readout_1_for_M0_l2": receipt["conditioning"]["readout_1_for_M0_l2"]}))
+                        "readout_1_l2": receipt["conditioning"]["readout_1_l2"]}))
     return 0
 
 

@@ -198,22 +198,18 @@ void MACEKokkos<Precision>::load_from_json(
             file["zbl_p"].get<int>());
 
     A0_scaled = file["A0_scaled"].get<bool>();
-    const int format_version = file.value("symmetrix_format_version", 1);
-    // H1 affine basis: v1/v2 -> legacy (unchanged arithmetic); v4 -> m0_composite.
+    // H1 affine basis (format 4, or the old basis of format 1/2 with a
+    // warning) selects the readout_1 / skip maps (h1_affine_schema.hpp); the
+    // radial loader follows the radial representation.
     h1_affine_mode = symmetrix::h1_affine::validate(file, num_elements, num_channels);
-#ifdef SYMMETRIX_ENABLE_METAL
-    if (h1_affine_m0_composite())
-        throw std::invalid_argument(
-            "The m0_composite H1 affine basis is not supported by Metal builds "
-            "(fused Metal H1 path); use a legacy format-v2 export.");
-#endif
+    const int format_version = file.value("symmetrix_format_version", 1);
+    const std::string radial_representation = file.value(
+        "radial_representation",
+        std::string(format_version == 1 ? "pair-splines" : ""));
     std::string standard_m0_contract_diagnostic;
     nlohmann::json m0_contract_metadata;
-    uses_compact_radial = format_version == 2
-        || format_version == symmetrix::h1_affine::m0_composite_format_version;
+    uses_compact_radial = radial_representation == "compact";
     if (uses_compact_radial) {
-        if (file.value("radial_representation", std::string()) != "compact")
-            throw std::invalid_argument("Symmetrix format versions 2 and 4 require compact radial data.");
         compact_radial_model = std::make_unique<CompactRadialModel>(
             file.at("compact_radial").dump(), atomic_numbers_host, r_cut);
         if (A0_scaled != compact_radial_model->has_A0())
@@ -370,7 +366,7 @@ void MACEKokkos<Precision>::load_from_json(
                     +error.what();
             }
         }
-    } else if (format_version == 1) {
+    } else if (radial_representation == "pair-splines") {
         const double spl_h = file["radial_spline_h"];
         const double spl_min = file.value("radial_spline_min", 0.0);
         auto spl_values_0 = file["radial_spline_values_0"].get<std::vector<std::vector<std::vector<double>>>>();
@@ -813,6 +809,19 @@ void MACEKokkos<Precision>::load_from_json(
         throw std::invalid_argument(
             "Non-residual MACE JSON must not contain H1 residual weights.");
     }
+    if (h1_affine_pre_linear_up()) {
+        // M0 P0 is the scalar input of the pre_linear_up maps without field coupling.
+        if (H1_product_weights_vec.size() != H1_weights.size())
+            throw std::invalid_argument(
+                "The pre_linear_up basis requires H1_product_weights of the H1_weights extent.");
+        if (!first_interaction_residual)
+            set_kokkos_view(
+                H1_product_weights,
+                H1_product_weights_vec,
+                L_max+1,
+                num_channels,
+                num_channels);
+    }
 
     // MACEField H1 coupling
     has_field_coupling = file.value("has_field_coupling", false);
@@ -1184,12 +1193,12 @@ void MACEKokkos<Precision>::load_from_json(
     Kokkos::deep_copy(M1_poly_coeff, h_M1_poly_coeff);
 
     record_phase("m1_weights_and_polynomials");
-    // H2 skip maps: legacy S_z (H2_weights_for_H1) or m0_composite T_z
-    // (H2_weights_for_M0); the views of the other basis stay empty.  Values are
+    // H2 skip maps of the format-4 basis (T_z = P0 S0_z or S0_z) go into the
+    // H2_weights_for_M0 views; the old-basis views stay empty.  Values are
     // converted from the JSON doubles directly into H2WeightPrecision.
-    const bool m0_composite = h1_affine_m0_composite();
+    const bool m0_composite = h1_affine_v4();
     auto H2_weights_for_H1_vec = file[
-        m0_composite ? "H2_weights_for_M0" : "H2_weights_for_H1"]
+        m0_composite ? symmetrix::h1_affine::skip_key(h1_affine_mode) : "H2_weights_for_H1"]
         .get<std::vector<std::vector<double>>>();
     H2_weights_for_H1 = {};
     H2_weights_for_H1_reverse = {};
@@ -1265,7 +1274,8 @@ void MACEKokkos<Precision>::load_from_json(
     if (m0_composite)
         readout_1_weights_for_M0 = toKokkosView(
             "readout_1_weights_for_M0",
-            file["readout_1_weights_for_M0"].get<std::vector<double>>());
+            file[symmetrix::h1_affine::readout_key(h1_affine_mode)]
+                .get<std::vector<double>>());
     else
         readout_1_weights = toKokkosView("readout_1_weights", file["readout_1_weights"].get<std::vector<double>>());
     auto readout_2_weights_1 = file["readout_2_weights_1"].get<std::vector<double>>();

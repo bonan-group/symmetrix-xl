@@ -256,17 +256,30 @@ void compute_M1(const int num_nodes, std::span<const int> node_types);
 // TODO: node_types here only for consistency with Kokkos
 void reverse_M1(const int num_nodes, std::span<const int> node_types);
 
-// H1 affine basis (format v4 "m0_composite"): readout_1 and the H1->H2 skip act
-// on the scalar M0 block with q = C r and T_z = C S_z; the scalar M0 adjoint
-// receives q + T_z H2_adj directly (M0_direct_adj, added after reverse_H1) and
-// H1_adj carries only the message-passing (R1) adjoint.
+// H1 affine basis (format v4, h1_affine_schema.hpp).  readout_1 and the H1->H2
+// skip act on h1_affine_scalar (num_nodes x K): the scalar M0 block
+// (m0_composite: q = P0 r0, T_z = P0 S0_z) or the scalar block of the
+// pre-linear_up features (pre_linear_up: r0, S0_z; M0 P0 + residual, or the
+// field-coupled H1 before linear_up).  reverse_H2 forms the direct adjoint
+// q + T_z H2_adj (M0_direct_adj) without touching H1_adj, which carries only the
+// message-passing (R1) adjoint; add_h1_affine_direct_adjoint adds it to M0_adj
+// (after reverse_H1) or, with field coupling, to the pre-linear_up H1_adj
+// (after reverse_H1_linear_up).  readout_1_weights_for_M0 / H2_weights_for_M0
+// hold the maps of either basis.  The old-basis members below are unused:
+// format 1/2 files are refused at load.
 symmetrix::h1_affine::Mode h1_affine_mode = symmetrix::h1_affine::Mode::legacy;
-bool h1_affine_m0_composite() const {
-    return h1_affine_mode == symmetrix::h1_affine::Mode::m0_composite;
+bool h1_affine_v4() const {
+    return h1_affine_mode != symmetrix::h1_affine::Mode::legacy;
+}
+bool h1_affine_pre_linear_up() const {
+    return h1_affine_mode == symmetrix::h1_affine::Mode::pre_linear_up;
 }
 std::string h1_affine_mode_name() const {
     return symmetrix::h1_affine::mode_name(h1_affine_mode);
 }
+std::vector<Precision> h1_affine_scalar;
+void capture_h1_affine_scalar(const int num_nodes);
+void add_h1_affine_direct_adjoint(const int num_nodes);
 std::vector<Precision> M0_direct_adj;
 
 // H2

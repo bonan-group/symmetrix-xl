@@ -21,13 +21,12 @@ from .execution_contract import (
 )
 from .prediction_heads import PREDICTION_HEADS_SCHEMA_VERSION
 from .h1_affine import (
-    H1_AFFINE_MODE_LEGACY,
+    BASIS_KEYS,
+    FORMAT_VERSION,
     H1_AFFINE_MODE_M0_COMPOSITE,
-    H1_AFFINE_MODES,
+    H1_AFFINE_MODE_PRE_LINEAR_UP,
     H1_AFFINE_TOOL_VERSION,
     H1_AFFINE_VERSION,
-    M0_COMPOSITE_FORMAT_VERSION,
-    H1AffineError,
 )
 
 
@@ -230,20 +229,6 @@ def _load_legacy_mace_field_checkpoint(model_path, device):
             del mace_models.ScaleShiftFieldMACE
 
 
-def _native_checkpoint_identity(model_path):
-    """Identity of the native checkpoint file recorded by a v4 (m0_composite) export."""
-    import hashlib
-
-    path = Path(model_path)
-    digest = hashlib.sha256()
-    size = 0
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1 << 22), b""):
-            digest.update(block)
-            size += len(block)
-    return {"path": str(path.resolve()), "sha256": digest.hexdigest(), "bytes": size}
-
-
 def _load_mace_checkpoint(model_path, device):
     """Load an ordinary checkpoint, with a lazy legacy MACEField fallback."""
     try:
@@ -303,11 +288,9 @@ def _extract_single_head_data(
     head=None,
     num_spline_points=256,
     radial_format="compact",
-    h1_affine_mode=H1_AFFINE_MODE_LEGACY,
-    native_identity=None,
 ):
     """Extract data from pytorch model file into structure that can be
-    written as symmetrix JSON data file
+    written as symmetrix JSON data file (format version 4)
 
     Parameters
     ----------
@@ -323,42 +306,24 @@ def _extract_single_head_data(
         number of spline points to approximate various functions
     radial_format: str, default "compact"
         compact stores the shared radial model and materializes splines for
-        active compositions at runtime. pair-splines stores the original
-        Symmetrix format (named v1 here) with pair tables.
-    h1_affine_mode: str, default "legacy"
-        "legacy" writes readout_1_weights / H2_weights_for_H1 in the post-linear_up
-        basis (inverse of interactions[1].linear_up, format v2). "m0_composite"
-        writes format v4 with readout_1_weights_for_M0 = P0 r0 * scale and
-        H2_weights_for_M0[z] = P0 S0_z built from the native weights without any
-        inverse (single-head two-interaction compact MACE only).
-    native_identity: dict, optional
-        Provenance of the native checkpoint recorded in a v4 payload.
+        active compositions at runtime. pair-splines stores per-pair radial
+        tables (the original Symmetrix radial layout).
+
+    The first readout and the H1->H2 skip are written without the inverse of
+    interactions[1].linear_up (see symmetrix.h1_affine): as composite maps on
+    the scalar M0 block (h1_affine_mode "m0_composite") or, for models with a
+    first-interaction residual or field coupling, as the checkpoint's own maps
+    on the pre-linear_up features ("pre_linear_up").
 
     Returns
     -------
     output_data: dict with symmetrix model data
     """
-    if h1_affine_mode not in H1_AFFINE_MODES:
-        raise ValueError(
-            f"Unsupported h1_affine_mode {h1_affine_mode!r}; expected one of {H1_AFFINE_MODES}."
-        )
-    m0_composite = h1_affine_mode == H1_AFFINE_MODE_M0_COMPOSITE
-    if m0_composite and radial_format != "compact":
-        raise H1AffineError(
-            "h1_affine_mode 'm0_composite' (format v4) requires radial_format 'compact'."
-        )
     device = torch.device("cpu")
     if not isinstance(model, torch.nn.Module):
-        if native_identity is None:
-            native_identity = _native_checkpoint_identity(model)
         model = _load_mace_checkpoint(model, device)
     model = model.to(device=device, dtype=torch.float64)
     model.eval()
-    if m0_composite and hasattr(model, "heads") and len(model.heads) > 1:
-        raise H1AffineError(
-            "h1_affine_mode 'm0_composite' refuses multi-head checkpoints "
-            f"(heads={list(model.heads)}); use the legacy mode."
-        )
 
     if radial_format not in ("compact", "pair-splines"):
         raise ValueError(
@@ -369,9 +334,8 @@ def _extract_single_head_data(
         raise ValueError("Compact radial output requires at least 4 spline points.")
     if radial_format == "pair-splines":
         logging.warning(
-            "Generating the original Symmetrix pair-spline format "
-            "(named v1 here). "
-            "Use radial_format='compact' for the optimized format-v2 runtime."
+            "Generating per-pair radial spline tables. "
+            "Use radial_format='compact' for the optimized compact-radial runtime."
         )
 
     # ensure that splines goes smoothly to 0 at outer cutoff
@@ -412,11 +376,6 @@ def _extract_single_head_data(
             raise ValueError(
                 "MACE_Nonlinear models require the format-version-3 compact schema; "
                 "pair-splines is only available for standard MACE interactions."
-            )
-        if m0_composite:
-            raise H1AffineError(
-                "h1_affine_mode 'm0_composite' refuses MACE_Nonlinear models "
-                "(format version 3 keeps its own schema); use the legacy mode."
             )
         from .extract_mace_nonlinear import extract_mace_nonlinear_data
 
@@ -518,22 +477,13 @@ def _extract_single_head_data(
             f"residual interaction={first_interaction_residual}, "
             f"products[0].use_sc={bool(model.products[0].use_sc)}."
         )
-    if m0_composite:
-        refused = []
-        if num_interactions != 2:
-            refused.append(f"num_interactions={num_interactions}")
-        if single_layer_invariant_readout:
-            refused.append("single-layer invariant readout")
-        if is_macefield:
-            refused.append("field coupling (MACEField)")
-        if first_interaction_residual:
-            refused.append("first-interaction residual")
-        if refused:
-            raise H1AffineError(
-                "h1_affine_mode 'm0_composite' supports only two-interaction MACE "
-                "without field coupling, first-interaction residual or single-layer "
-                "readout; refused because: " + "; ".join(refused)
-            )
+    # H1 affine basis of the first readout and the H1->H2 skip (no inverse).
+    h1_affine_mode = (
+        H1_AFFINE_MODE_PRE_LINEAR_UP
+        if num_interactions == 2 and (is_macefield or first_interaction_residual)
+        else H1_AFFINE_MODE_M0_COMPOSITE
+    )
+    readout_1_key, h2_skip_key = BASIS_KEYS[h1_affine_mode]
 
     if single_layer_invariant_readout:
         readout_product = model.readout_products[0]
@@ -882,14 +832,11 @@ def _extract_single_head_data(
     output["num_elements"] = len(atomic_numbers)
     output["atomic_energies"] = atomic_energies
 
+    output["symmetrix_format_version"] = FORMAT_VERSION
+    output["h1_affine_mode"] = h1_affine_mode
+    output["h1_affine_version"] = H1_AFFINE_VERSION
+    output["radial_representation"] = radial_format
     if radial_format == "compact":
-        if m0_composite:
-            output["symmetrix_format_version"] = M0_COMPOSITE_FORMAT_VERSION
-            output["h1_affine_mode"] = H1_AFFINE_MODE_M0_COMPOSITE
-            output["h1_affine_version"] = H1_AFFINE_VERSION
-        else:
-            output["symmetrix_format_version"] = 2
-        output["radial_representation"] = "compact"
         output["compact_radial"] = serialize_compact_radial(model, atomic_numbers)
 
     ### --- ZBL ---
@@ -1227,7 +1174,7 @@ def _extract_single_head_data(
     for l in range(L_max + 1):
         H1_weights[l, :, :] = weights_0[l, :, :] @ weights_1[l, :, :]
     output["H1_weights"] = H1_weights.flatten().tolist()
-    # Native scalar product map P0 (M0 -> pre-linear_up H1); used by m0_composite.
+    # Native scalar product map P0 (M0 -> pre-linear_up H1) and linear_up U0.
     h1_product_scalar_weights = np.array(weights_0[0, :, :], dtype=np.float64, copy=True)
     h1_linear_up_scalar_weights = np.array(weights_1[0, :, :], dtype=np.float64, copy=True)
     if is_macefield or first_interaction_residual:
@@ -1274,14 +1221,15 @@ def _extract_single_head_data(
         output["M1_weights"], output["M1_monomials"] = extract_scalar_contraction(
             readout_product, L_max
         )
-        output["H2_weights_for_H1"] = [
+        # No second interaction: the first readout and the skip are zero.
+        output[h2_skip_key] = [
             [0.0] * (num_channels * num_channels) for _ in atomic_numbers
         ]
         output["H2_weights_for_M1"] = (
             readout_product.linear.weight.numpy(force=True).flatten()
             / np.sqrt(num_channels)
         ).tolist()
-        output["readout_1_weights"] = [0.0] * num_channels
+        output[readout_1_key] = [0.0] * num_channels
         output["Phi1_l"] = []
         output["Phi1_l1"] = []
         output["Phi1_l2"] = []
@@ -1625,47 +1573,26 @@ def _extract_single_head_data(
     ### ----- H2 -----
 
     logging.info("H2")
-    if m0_composite:
-        # Inverse-free composite skip map T_z = P0 S0_z acting on the scalar M0
-        # block; branches before any rank test or inverse of linear_up.
-        H2_weights_for_M0 = []
-        for i, a in enumerate(atomic_numbers):
-            model_i = model.atomic_numbers.tolist().index(a)
-            native_skip = (
-                model.interactions[1]
-                .skip_tp.weight_view_for_instruction(0)[:, model_i, :]
-                .numpy(force=True)
-            ) / np.sqrt(len(model.atomic_numbers) * num_channels)
-            if native_skip.shape != (num_channels, num_channels):
-                raise H1AffineError(
-                    f"skip_tp instruction 0 has shape {native_skip.shape}, "
-                    f"expected ({num_channels}, {num_channels})"
-                )
-            composite = h1_product_scalar_weights @ np.asarray(native_skip, dtype=np.float64)
-            H2_weights_for_M0.append(composite.flatten().tolist())
-        output["H2_weights_for_M0"] = H2_weights_for_M0
-    else:
-        weights_to_fuse = model.interactions[1].linear_up.weight_view_for_instruction(
-            0
-        ).numpy(force=True) / np.sqrt(num_channels)
-        weights_to_fuse_rank = np.linalg.matrix_rank(weights_to_fuse)
-        if weights_to_fuse_rank < num_channels:
+    # Native skip S0_z (pre-linear_up features -> H2).  m0_composite stores the
+    # composite T_z = P0 S0_z on the scalar M0 block, pre_linear_up stores S0_z.
+    H2_skip = []
+    for i, a in enumerate(atomic_numbers):
+        model_i = model.atomic_numbers.tolist().index(a)
+        native_skip = np.asarray(
+            model.interactions[1]
+            .skip_tp.weight_view_for_instruction(0)[:, model_i, :]
+            .numpy(force=True),
+            dtype=np.float64,
+        ) / np.sqrt(len(model.atomic_numbers) * num_channels)
+        if native_skip.shape != (num_channels, num_channels):
             raise RuntimeError(
-                "ERROR: fusing weights have too low rank {weights_to_fuse_rank} < {num_channels}"
+                f"skip_tp instruction 0 has shape {native_skip.shape}, "
+                f"expected ({num_channels}, {num_channels})"
             )
-        # H2 weights for H1
-        H2_weights_for_H1 = []
-        for i, a in enumerate(atomic_numbers):
-            model_i = model.atomic_numbers.tolist().index(a)
-            w = (
-                model.interactions[1]
-                .skip_tp.weight_view_for_instruction(0)[:, model_i, :]
-                .numpy(force=True)
-            )
-            H2_weights_for_H1.append(w / np.sqrt(len(model.atomic_numbers) * num_channels))
-            H2_weights_for_H1[i] = np.linalg.inv(weights_to_fuse) @ H2_weights_for_H1[i]
-            H2_weights_for_H1[i] = H2_weights_for_H1[i].flatten().tolist()
-        output["H2_weights_for_H1"] = H2_weights_for_H1
+        if h1_affine_mode == H1_AFFINE_MODE_M0_COMPOSITE:
+            native_skip = h1_product_scalar_weights @ native_skip
+        H2_skip.append(native_skip.flatten().tolist())
+    output[h2_skip_key] = H2_skip
     # H2 weights for M1
     output["H2_weights_for_M1"] = (
         model.products[1].linear.weight.numpy(force=True) / np.sqrt(num_channels)
@@ -1673,57 +1600,38 @@ def _extract_single_head_data(
 
     ### ----- READOUTS -----
 
-    # linear readout
-    if m0_composite:
-        native_readout = np.asarray(
-            model.readouts[0].linear.weight.numpy(force=True), dtype=np.float64
-        ) / np.sqrt(num_channels)
-        if native_readout.size != num_channels:
-            raise H1AffineError(
-                f"readouts[0].linear has {native_readout.size} weights, expected {num_channels}"
-            )
-        readout_1_for_M0 = h1_product_scalar_weights @ native_readout.reshape(num_channels)
-        output["readout_1_weights_for_M0"] = (
-            readout_1_for_M0 * model.scale_shift.scale.item()
-        ).tolist()
-        singular_P0 = np.linalg.svd(h1_product_scalar_weights, compute_uv=False)
-        singular_U0 = np.linalg.svd(h1_linear_up_scalar_weights, compute_uv=False)
-        singular_C0 = np.linalg.svd(H1_weights[0], compute_uv=False)
-        output["h1_affine_provenance"] = {
-            "source": "native_checkpoint",
-            "native_identity": native_identity,
-            "exporter": "symmetrix.extract_mace_data",
-            "exporter_version": H1_AFFINE_TOOL_VERSION,
-            "torch_version": torch.__version__,
-            "numpy_version": np.__version__,
-            "conditioning": {
-                "sigma_min_C": float(singular_C0[-1]),
-                "sigma_max_C": float(singular_C0[0]),
-                "sigma_min_U0": float(singular_U0[-1]),
-                "sigma_max_U0": float(singular_U0[0]),
-                "sigma_min_P0": float(singular_P0[-1]),
-                "sigma_max_P0": float(singular_P0[0]),
-                "readout_1_for_M0_l2": float(
-                    np.linalg.norm(readout_1_for_M0 * model.scale_shift.scale.item())
-                ),
-                "skip_for_M0_fro": float(
-                    np.linalg.norm(np.asarray(output["H2_weights_for_M0"]))
-                ),
-            },
-        }
-    else:
-        weights_to_fuse = np.reshape(
-            model.interactions[1].linear_up.weight.numpy(force=True)
-            / np.sqrt(num_channels),
-            [L_max + 1, num_channels, num_channels],
+    # linear readout (no inverse of linear_up; see symmetrix.h1_affine)
+    native_readout = np.asarray(
+        model.readouts[0].linear.weight.numpy(force=True), dtype=np.float64
+    ) / np.sqrt(num_channels)
+    if native_readout.size != num_channels:
+        raise RuntimeError(
+            f"readouts[0].linear has {native_readout.size} weights, expected {num_channels}"
         )
-        readout_1_weights = model.readouts[0].linear.weight.numpy(force=True) / np.sqrt(
-            num_channels
-        )
-        readout_1_weights = np.linalg.inv(weights_to_fuse[0, :, :]) @ readout_1_weights
-        output["readout_1_weights"] = (
-            readout_1_weights * model.scale_shift.scale.item()
-        ).tolist()
+    readout_1 = native_readout.reshape(num_channels) * model.scale_shift.scale.item()
+    if h1_affine_mode == H1_AFFINE_MODE_M0_COMPOSITE:
+        readout_1 = h1_product_scalar_weights @ readout_1
+    output[readout_1_key] = readout_1.tolist()
+    singular_P0 = np.linalg.svd(h1_product_scalar_weights, compute_uv=False)
+    singular_U0 = np.linalg.svd(h1_linear_up_scalar_weights, compute_uv=False)
+    singular_C0 = np.linalg.svd(H1_weights[0], compute_uv=False)
+    output["h1_affine_provenance"] = {
+        "source": "native_checkpoint",
+        "exporter": "symmetrix.extract_mace_data",
+        "exporter_version": H1_AFFINE_TOOL_VERSION,
+        "torch_version": torch.__version__,
+        "numpy_version": np.__version__,
+        "conditioning": {
+            "sigma_min_C": float(singular_C0[-1]),
+            "sigma_max_C": float(singular_C0[0]),
+            "sigma_min_U0": float(singular_U0[-1]),
+            "sigma_max_U0": float(singular_U0[0]),
+            "sigma_min_P0": float(singular_P0[-1]),
+            "sigma_max_P0": float(singular_P0[0]),
+            "readout_1_l2": float(np.linalg.norm(readout_1)),
+            "skip_fro": float(np.linalg.norm(np.asarray(H2_skip))),
+        },
+    }
 
     # nonlinear readout
     readout_2_weights_1 = model.readouts[1].linear_1.weight
@@ -1762,7 +1670,7 @@ def _prediction_head_payload(data):
     else:
         fields = (
             "atomic_energies",
-            "readout_1_weights",
+            BASIS_KEYS[data["h1_affine_mode"]][0],
             "readout_2_weights_1",
             "readout_2_weights_2",
         )
@@ -1771,7 +1679,7 @@ def _prediction_head_payload(data):
     return {name: data[name] for name in fields}
 
 
-def _extract_mh0_head_payload(model, atomic_numbers):
+def _extract_mh0_head_payload(model, atomic_numbers, h1_affine_mode):
     num_channels = model.node_embedding.linear.irreps_out.count("0e")
     L_max = model.products[0].linear.irreps_out.lmax
     atomic_energies = [
@@ -1781,20 +1689,23 @@ def _extract_mh0_head_payload(model, atomic_numbers):
         + model.scale_shift.shift.item()
         for number in atomic_numbers
     ]
-    weights_to_fuse = np.reshape(
-        model.interactions[1].linear_up.weight.numpy(force=True)
-        / np.sqrt(num_channels),
-        [L_max + 1, num_channels, num_channels],
-    )
-    readout_1 = model.readouts[0].linear.weight.numpy(force=True) / np.sqrt(
-        num_channels
-    )
-    readout_1 = np.linalg.inv(weights_to_fuse[0]) @ readout_1
+    # Same basis as the default head (no inverse of linear_up).
+    readout_1 = np.asarray(
+        model.readouts[0].linear.weight.numpy(force=True), dtype=np.float64
+    ).reshape(num_channels) / np.sqrt(num_channels)
+    if h1_affine_mode == H1_AFFINE_MODE_M0_COMPOSITE:
+        product_weights = np.reshape(
+            model.products[0].linear.weight.numpy(force=True),
+            [L_max + 1, num_channels, num_channels],
+        ) / np.sqrt(num_channels)
+        readout_1 = np.asarray(product_weights[0], dtype=np.float64) @ readout_1
     readout_2_weights_1 = model.readouts[1].linear_1.weight
     hidden_size = readout_2_weights_1.numel() // num_channels
     payload = {
         "atomic_energies": atomic_energies,
-        "readout_1_weights": (readout_1 * model.scale_shift.scale.item()).tolist(),
+        BASIS_KEYS[h1_affine_mode][0]: (
+            readout_1 * model.scale_shift.scale.item()
+        ).tolist(),
         "readout_2_weights_1": (
             torch.reshape(readout_2_weights_1, (num_channels, hidden_size))
             .T.numpy(force=True)
@@ -1846,7 +1757,6 @@ def extract_mace_data(
     head=None,
     num_spline_points=256,
     radial_format="compact",
-    h1_affine_mode=H1_AFFINE_MODE_LEGACY,
 ):
     """Extract a checkpoint while retaining every compatible prediction head.
 
@@ -1855,29 +1765,14 @@ def extract_mace_data(
     stored in ``prediction_heads`` and the default payload is also retained at
     top level for compatibility with older Symmetrix loaders.
 
-    ``h1_affine_mode="m0_composite"`` writes the inverse-free format-v4 payload
-    (single-head two-interaction compact MACE only; multi-head is refused so that
-    no head payload is ever written in a mixed basis).
+    Standard-MACE payloads are written in format version 4 (no inverse of
+    interactions[1].linear_up; every head payload uses the same basis).
     """
 
-    if h1_affine_mode not in H1_AFFINE_MODES:
-        raise ValueError(
-            f"Unsupported h1_affine_mode {h1_affine_mode!r}; expected one of {H1_AFFINE_MODES}."
-        )
     device = torch.device("cpu")
-    native_identity = None
-    if h1_affine_mode == H1_AFFINE_MODE_M0_COMPOSITE and not isinstance(
-        model, torch.nn.Module
-    ):
-        native_identity = _native_checkpoint_identity(model)
     loaded = _load_mace_checkpoint(model, device).to(device=device, dtype=torch.float64)
     loaded.eval()
     heads = list(getattr(loaded, "heads", []))
-    if h1_affine_mode == H1_AFFINE_MODE_M0_COMPOSITE and len(heads) > 1:
-        raise H1AffineError(
-            "h1_affine_mode 'm0_composite' refuses multi-head checkpoints "
-            f"(heads={heads}); use the legacy mode."
-        )
     if len(heads) <= 1:
         return _extract_single_head_data(
             loaded,
@@ -1885,8 +1780,6 @@ def extract_mace_data(
             head=head,
             num_spline_points=num_spline_points,
             radial_format=radial_format,
-            h1_affine_mode=h1_affine_mode,
-            native_identity=native_identity,
         )
 
     default_head = _default_prediction_head(heads, head)
@@ -1918,7 +1811,9 @@ def extract_mace_data(
 
             payload = extract_mace_nonlinear_head_payload(single_model)
         else:
-            payload = _extract_mh0_head_payload(single_model, atomic_numbers)
+            payload = _extract_mh0_head_payload(
+                single_model, atomic_numbers, default_data["h1_affine_mode"]
+            )
         if _prediction_head_payload_layout(payload, nonlinear) != expected_layout:
             raise ValueError(
                 f"Prediction head {name!r} changes the shared model topology; "

@@ -35,13 +35,14 @@ types `1`, `2`, and `3`, respectively. A compact universal JSON can be reused by
 different input with another element mapping; active radial tables are built
 once during `pair_coeff` for that mapping.
 
-Compact universal files use Symmetrix-XL format version 2 and require an updated
-pair style. The original Symmetrix format (named v1 here), which was
-unversioned, remains supported. When an artifact must also work with an older
-Symmetrix-XL/LAMMPS installation, generate it with `symmetrix_extract_mace
---radial-format pair-splines` and an explicit element subset.
+Model files use Symmetrix-XL format version 4, with compact or pair-spline
+radial data. Format-1/2 files (including the unversioned original Symmetrix
+format) store readout and skip weights multiplied by the inverse of
+`linear_up`; they still load and print a warning with an fp32 cancellation
+estimate. Convert them with
+`symmetrix_recompose_mace_json --input old.json --output new.json` or re-export.
 
-Format-version-3 `MACE_Nonlinear` models, including MACE-MH-1, are currently
+`MACE_Nonlinear` models, including MACE-MH-1, are currently
 supported by the Python ASE calculator and native library only. Both LAMMPS
 pair styles reject these models explicitly at `pair_coeff`.
 
@@ -258,7 +259,7 @@ symmetrix_extract_mace --model mace-omat-0-medium.model \
     --prepare-jit-device-artifact
 ```
 
-This produces the preferred universal format-v2 JSON. Its compact radial model
+This produces the preferred universal compact JSON. Its compact radial model
 is shared across the checkpoint's element domain rather than expanded into
 pair-specific spline tables, so the same file can be mapped to different LAMMPS
 type compositions without quadratic pair-table growth. The file still contains

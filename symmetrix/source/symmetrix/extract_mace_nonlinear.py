@@ -338,7 +338,9 @@ def extract_mace_nonlinear_data(
             )
 
     output = {
-        "symmetrix_format_version": 3,
+        # Format 4 for every export; the nonlinear schema is unchanged from
+        # format 3 (linear_up stays a native layer, no inverse).
+        "symmetrix_format_version": 4,
         "model_type": "MACE_Nonlinear",
         "head": model.heads[0]
         if hasattr(model, "heads") and len(model.heads) == 1

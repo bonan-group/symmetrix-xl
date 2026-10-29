@@ -2136,7 +2136,7 @@ void MACEKokkos<Precision>::compute_H2(int num_nodes, Kokkos::View<const int*> n
     // legacy: skip input = fused H1 scalar block with S_z = U^-1 S0_z;
     // m0_composite: skip input = retained scalar M0 block with T_z = C S_z.
     // Both have the (node, 0, channel) indexing used by every path below.
-    const bool m0_composite = h1_affine_m0_composite();
+    const bool m0_composite = h1_affine_v4();
     if (m0_composite
         && h1_affine_M0_scalar.extent(0) < static_cast<std::size_t>(num_nodes))
         throw std::logic_error(
@@ -2270,12 +2270,13 @@ void MACEKokkos<Precision>::reverse_H2(int num_nodes, Kokkos::View<const int*> n
     auto H2_weights_for_H1_reverse = this->H2_weights_for_H1_reverse;
     auto H2_weights_for_M1_reverse = this->H2_weights_for_M1_reverse;
 
-    if (h1_affine_m0_composite()) {
+    if (h1_affine_v4()) {
         // Direct scalar M0 adjoint q + T_z H2_adj, summed in double and stored
         // in its own view (never in H1_adj, which keeps only the message
         // adjoint); M1_adj as in the legacy path but summed in double.  One
         // generic loop serves host and device builds.
         ensure_h1_affine_capacity(num_nodes);
+        h1_affine_direct_rows = num_nodes;
         auto direct = this->h1_affine_M0_direct_adj;
         auto readout_for_M0 = this->readout_1_weights_for_M0;
         auto skip_for_M0 = this->H2_weights_for_M0;
@@ -2308,7 +2309,8 @@ void MACEKokkos<Precision>::reverse_H2(int num_nodes, Kokkos::View<const int*> n
                     m1_sum += m1*adjoint;
                 }
                 direct(i,k) = direct_sum;
-                M1_adj(i,k) += static_cast<Precision>(m1_sum);
+                // Assignment: M1_adj may alias M1 (MH0 adjoint reuse) and is not zeroed.
+                M1_adj(i,k) = static_cast<Precision>(m1_sum);
             });
         complete_device_stage("MACEKokkos::reverse_H2");
         return;
@@ -2488,7 +2490,7 @@ void MACEKokkos<Precision>::compute_readout_1(
     auto atomic_energies = this->atomic_energies;
     // m0_composite: E1 = q . M0 (retained scalar block); its adjoint q enters
     // the direct scalar M0 adjoint in reverse_H2, so H1_adj is only zeroed.
-    const bool m0_composite = h1_affine_m0_composite();
+    const bool m0_composite = h1_affine_v4();
     if (m0_composite
         && h1_affine_M0_scalar.extent(0) < static_cast<std::size_t>(num_nodes))
         throw std::logic_error(
