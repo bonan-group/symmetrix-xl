@@ -2,6 +2,8 @@ import importlib
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tarfile
 import zipfile
@@ -385,6 +387,161 @@ def test_cpu_manifest_replay_preserves_blas_policy(tmp_path, policy, expected):
     assert request.mkl_root == manifest.blas_root
 
 
+def test_cpu_manifest_replay_inherits_openblas_root(tmp_path):
+    manifest = replace(
+        _manifest("cpu", "x86-64-v4"),
+        blas_policy="openblas",
+        blas_root="/opt/openblas",
+    )
+    path = tmp_path / "target.json"
+    manifest.write(path)
+    args = SimpleNamespace(
+        target_manifest=path,
+        backend=None,
+        arch=None,
+        cpu_target=None,
+        cuda_root=None,
+        rocm_root=None,
+        cxx=None,
+        host_cxx=None,
+        generator=None,
+        blas=None,
+        mkl_root=None,
+        openblas_root=None,
+    )
+
+    request, _ = build_cli._base_request(args)
+
+    assert (request.blas, request.openblas_root) == ("openblas", "/opt/openblas")
+
+
+def test_cpu_manifest_replay_drops_openblas_root_for_mkl_override(tmp_path):
+    manifest = replace(
+        _manifest("cpu", "x86-64-v3"),
+        blas_policy="openblas",
+        blas_root="/opt/openblas",
+    )
+    path = tmp_path / "target.json"
+    manifest.write(path)
+    args = SimpleNamespace(
+        target_manifest=path,
+        backend=None,
+        arch=None,
+        cpu_target=None,
+        cuda_root=None,
+        rocm_root=None,
+        cxx=None,
+        host_cxx=None,
+        generator=None,
+        blas="mkl",
+        mkl_root=Path("/opt/mkl"),
+        openblas_root=None,
+    )
+
+    request, _ = build_cli._base_request(args)
+
+    assert request.blas == "mkl"
+    assert request.mkl_root == "/opt/mkl"
+    assert request.openblas_root == ""
+
+
+def test_cpu_manifest_replay_does_not_offer_openblas_root_as_mkl_root(tmp_path):
+    """A recorded OpenBLAS prefix must not be replayed as an explicit MKL root.
+
+    An explicit MKL root disables the MKLROOT and standard-location search, so
+    leaking one makes `--blas mkl` fail on a host where MKL would otherwise be
+    discovered.
+    """
+    manifest = replace(
+        _manifest("cpu", "x86-64-v3"),
+        blas_policy="openblas",
+        blas_root="/opt/openblas",
+    )
+    path = tmp_path / "target.json"
+    manifest.write(path)
+    args = SimpleNamespace(
+        target_manifest=path,
+        backend=None,
+        arch=None,
+        cpu_target=None,
+        cuda_root=None,
+        rocm_root=None,
+        cxx=None,
+        host_cxx=None,
+        generator=None,
+        blas="mkl",
+        mkl_root=None,
+        openblas_root=None,
+    )
+
+    request, _ = build_cli._base_request(args)
+
+    assert request.blas == "mkl"
+    assert request.mkl_root == ""
+    assert request.openblas_root == ""
+
+
+def test_matrix_child_commands_forward_openblas_root_for_cpu_targets(tmp_path):
+    cpu_spec = build_matrix.parse_matrix_spec("cpu:x86-64-v4")
+    cuda_spec = build_matrix.parse_matrix_spec("cuda:12:sm86")
+
+    for command in build_matrix.child_commands(
+        cpu_spec,
+        script=tmp_path / "symmetrix_build.py",
+        wheel_directory=tmp_path / "dist",
+        build_root=tmp_path / "build",
+        openblas_root=Path("/opt/openblas"),
+    ):
+        assert command[command.index("--openblas-root") + 1] == "/opt/openblas"
+
+    for command in build_matrix.child_commands(
+        cuda_spec,
+        script=tmp_path / "symmetrix_build.py",
+        wheel_directory=tmp_path / "dist",
+        openblas_root=Path("/opt/openblas"),
+    ):
+        assert "--openblas-root" not in command
+
+
+def _compile_probe_stub(base, compiler, config, name):
+    """Compile a stub shared library exporting ``openblas_get_config``."""
+    source = base / f"{name}.c"
+    source.write_text(
+        "#include <stddef.h>\n"
+        f'const char* openblas_get_config(void) {{ return "{config}"; }}\n'
+    )
+    library = base / f"libopenblas_{name}.so"
+    subprocess.run(
+        [compiler, "-shared", "-fPIC", "-o", str(library), str(source)],
+        check=True,
+        capture_output=True,
+    )
+    return library
+
+
+def test_openblas_probe_reads_a_real_library_config_string(tmp_path):
+    """Exercise the real child-process probe, not a monkeypatched helper.
+
+    A revert experiment that neutered the probe script left the suite green, so
+    the success path of the probe itself needs its own coverage: build stub
+    libraries that export ``openblas_get_config`` and let the probe read them.
+    """
+    compiler = shutil.which("cc") or shutil.which("gcc")
+    if compiler is None:
+        pytest.skip("no C compiler available for the probe stub")
+
+    openmp_library = _compile_probe_stub(
+        tmp_path, compiler, "OpenBLAS 0.3.30 USE_OPENMP ZEN", "openmp"
+    )
+    pthread_library = _compile_probe_stub(
+        tmp_path, compiler, "OpenBLAS 0.3.30 ZEN", "pthread"
+    )
+
+    assert "USE_OPENMP" in build_detect._openblas_config_string(str(openmp_library))
+    assert build_detect._openblas_uses_openmp(str(openmp_library))
+    assert not build_detect._openblas_uses_openmp(str(pthread_library))
+
+
 def test_explicit_invalid_mkl_root_does_not_fall_back(monkeypatch, tmp_path):
     monkeypatch.setenv("MKLROOT", "/opt/intel/oneapi/mkl/latest")
 
@@ -396,8 +553,248 @@ def test_automatic_blas_prefers_openblas(monkeypatch):
     monkeypatch.setattr(
         build_detect.ctypes.util, "find_library", lambda name: f"lib{name}.so"
     )
+    # No discoverable OpenBLAS prefix: the policy falls back to the system
+    # library exactly as before.
+    monkeypatch.setattr(build_detect, "_OPENBLAS_CANDIDATE_ROOTS", ())
 
     assert build_detect._cpu_blas_policy("auto") == ("openblas", "")
+
+
+def _openblas_prefix(base, variants, library_name="libopenblas.so"):
+    """Build a fake OpenBLAS prefix with the given variant directories."""
+    root = base / "openblas"
+    for variant in variants:
+        library_dir = root / "lib/x86_64-linux-gnu" / variant
+        include_dir = root / "include/x86_64-linux-gnu" / variant
+        library_dir.mkdir(parents=True)
+        include_dir.mkdir(parents=True)
+        (library_dir / library_name).write_bytes(b"shared")
+        (include_dir / "cblas.h").write_text("/* cblas */\n")
+    return root
+
+
+def test_automatic_blas_selects_discovered_openmp_openblas(tmp_path, monkeypatch):
+    root = _openblas_prefix(tmp_path, ("openblas-openmp", "openblas-pthread"))
+    monkeypatch.setattr(build_detect, "_OPENBLAS_CANDIDATE_ROOTS", (str(root),))
+    monkeypatch.setattr(build_detect.ctypes.util, "find_library", lambda name: None)
+    monkeypatch.setattr(
+        build_detect,
+        "_openblas_config_string",
+        lambda library: "OpenBLAS 0.3.30 USE_OPENMP ZEN MAX_THREADS=32",
+    )
+
+    policy, selected_root = build_detect._cpu_blas_policy("auto")
+
+    assert policy == "openblas"
+    assert selected_root == str(root.resolve())
+    assert "openmp" in build_detect._openblas_installation(selected_root)[1]
+
+
+def test_automatic_blas_ignores_pthread_only_installation(tmp_path, monkeypatch):
+    root = _openblas_prefix(tmp_path, ("openblas-pthread",))
+    monkeypatch.setattr(build_detect, "_OPENBLAS_CANDIDATE_ROOTS", (str(root),))
+    monkeypatch.setattr(
+        build_detect.ctypes.util, "find_library", lambda name: f"lib{name}.so"
+    )
+    monkeypatch.setattr(
+        build_detect,
+        "_openblas_config_string",
+        lambda library: "OpenBLAS 0.3.30 ZEN MAX_THREADS=32",
+    )
+    monkeypatch.setattr(
+        build_detect, "_openblas_links_openmp_runtime", lambda library: False
+    )
+
+    # A pthread-only installation keeps the previous behaviour: system default
+    # OpenBLAS without a pinned root.
+    assert build_detect._cpu_blas_policy("auto") == ("openblas", "")
+
+
+def test_openblas_discovery_prefers_a_later_openmp_prefix(tmp_path, monkeypatch):
+    """A pthread build in an earlier root must not shadow a later OpenMP one."""
+    pthread = _openblas_prefix(tmp_path / "first", ("openblas-pthread",))
+    openmp = _openblas_prefix(tmp_path / "second", ("openblas-openmp",))
+    monkeypatch.setattr(
+        build_detect, "_OPENBLAS_CANDIDATE_ROOTS", (str(pthread), str(openmp))
+    )
+    monkeypatch.setattr(
+        build_detect,
+        "_openblas_config_string",
+        lambda library: "USE_OPENMP" if "openmp" in library else "OpenBLAS",
+    )
+    monkeypatch.setattr(build_detect.ctypes.util, "find_library", lambda name: None)
+
+    assert build_detect._cpu_blas_policy("auto") == ("openblas", str(openmp.resolve()))
+
+
+def test_openblas_discovery_skips_prefixes_without_cblas(tmp_path, monkeypatch):
+    root = tmp_path / "openblas"
+    (root / "lib/openblas-openmp").mkdir(parents=True)
+    (root / "lib/openblas-openmp/libopenblas.so").write_bytes(b"shared")
+    monkeypatch.setattr(build_detect, "_OPENBLAS_CANDIDATE_ROOTS", (str(root),))
+
+    assert build_detect._discover_openblas_installation() is None
+
+
+def test_openblas_root_accepts_upstream_library_name(tmp_path):
+    """A prefix without the development symlinks still validates."""
+    root = tmp_path / "openblas"
+    (root / "lib").mkdir(parents=True)
+    (root / "include").mkdir(parents=True)
+    (root / "lib/libopenblas_zenp-r0.3.30.so").write_bytes(b"shared")
+    (root / "include/cblas.h").write_text("/* cblas */\n")
+
+    _, library, library_dir, _ = build_detect._openblas_installation(str(root))
+
+    assert library.endswith("libopenblas_zenp-r0.3.30.so")
+    assert library_dir == str(root / "lib")
+
+
+def test_openblas_root_rejects_versioned_soname_without_link_name(tmp_path):
+    root = tmp_path / "openblas"
+    (root / "lib").mkdir(parents=True)
+    (root / "include").mkdir(parents=True)
+    (root / "lib/libopenblas.so.0").write_bytes(b"shared")
+    (root / "include/cblas.h").write_text("/* cblas */\n")
+
+    with pytest.raises(BuildError, match="linkable"):
+        build_detect._openblas_installation(str(root))
+
+
+def test_openblas_uses_openmp_follows_the_library_not_the_directory_name(
+    tmp_path, monkeypatch
+):
+    """The configuration string decides; the directory name is only a hint."""
+    openmp_dir = tmp_path / "lib/x86_64-linux-gnu/openblas-openmp"
+    openmp_dir.mkdir(parents=True)
+    library = openmp_dir / "libopenblas.so"
+    library.write_bytes(b"shared")
+    monkeypatch.setattr(
+        build_detect, "_openblas_links_openmp_runtime", lambda path: False
+    )
+
+    monkeypatch.setattr(
+        build_detect, "_openblas_config_string", lambda path: "OpenBLAS 0.3.30 ZEN"
+    )
+    assert not build_detect._openblas_uses_openmp(str(library))
+
+    monkeypatch.setattr(
+        build_detect,
+        "_openblas_config_string",
+        lambda path: "OpenBLAS 0.3.30 USE_OPENMP ZEN",
+    )
+    assert build_detect._openblas_uses_openmp(str(library))
+
+    # Unreadable configuration falls back to the dynamic dependencies.
+    monkeypatch.setattr(build_detect, "_openblas_config_string", lambda path: None)
+    monkeypatch.setattr(
+        build_detect, "_openblas_links_openmp_runtime", lambda path: True
+    )
+    assert build_detect._openblas_uses_openmp(str(library))
+
+
+def test_damaged_library_under_a_scanned_prefix_does_not_kill_the_build(tmp_path):
+    """A truncated shared object must fail soft, not by signal.
+
+    Regression test for the blocking review finding: probing a damaged library
+    in process died with SIGBUS, taking every detect/build/install invocation
+    with it and printing nothing.
+    """
+    import glob
+
+    source = next(
+        (
+            Path(candidate)
+            for pattern in ("/lib/*/libm.so.6", "/usr/lib/*/libm.so.6")
+            for candidate in glob.glob(pattern)
+        ),
+        None,
+    )
+    if source is None:
+        pytest.skip("no system libm available to truncate")
+
+    root = tmp_path / "openblas"
+    (root / "lib").mkdir(parents=True)
+    (root / "include").mkdir(parents=True)
+    with source.open("rb") as handle:
+        (root / "lib/libopenblas.so").write_bytes(handle.read(200_000))
+    (root / "include/cblas.h").write_text("/* cblas */\n")
+
+    script = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(TOOLS_ROOT)!r})\n"
+        "from _symmetrix_build import detect\n"
+        "from _symmetrix_build.command import BuildError\n"
+        f"detect._OPENBLAS_CANDIDATE_ROOTS = ({str(root)!r},)\n"
+        "detect.ctypes.util.find_library = lambda name: None\n"
+        "try:\n"
+        "    print('policy', detect._cpu_blas_policy('auto'))\n"
+        "except BuildError as error:\n"
+        "    print('builderror', error)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, (completed.returncode, completed.stderr)
+    assert "policy" in completed.stdout or "builderror" in completed.stdout
+
+
+def test_build_environment_prepends_pinned_openblas_library_dir(tmp_path):
+    root = _openblas_prefix(tmp_path, ("openblas-openmp",))
+    manifest = replace(
+        _manifest("cpu", "x86-64-v3"),
+        blas_policy="openblas",
+        blas_root=str(root),
+    )
+
+    environment = build_python.build_environment(manifest)
+
+    library_dir = build_detect._openblas_installation(str(root))[2]
+    assert environment["LD_LIBRARY_PATH"].split(os.pathsep)[0] == library_dir
+
+
+def test_explicit_openblas_root_selects_shared_library(tmp_path):
+    root = tmp_path / "openblas"
+    (root / "lib/x86_64-linux-gnu/openblas-openmp").mkdir(parents=True)
+    (root / "include/x86_64-linux-gnu/openblas-openmp").mkdir(parents=True)
+    (root / "lib/x86_64-linux-gnu/openblas-openmp/libopenblas.so").write_bytes(
+        b"shared"
+    )
+    (root / "include/x86_64-linux-gnu/openblas-openmp/cblas.h").write_text(
+        "/* cblas */\n"
+    )
+
+    policy, selected_root = build_detect._cpu_blas_policy(
+        "openblas", openblas_root=str(root)
+    )
+
+    assert policy == "openblas"
+    assert selected_root == str(root.resolve())
+
+
+def test_python_cmake_definitions_select_explicit_openblas_root(tmp_path):
+    root = tmp_path / "openblas"
+    library_dir = root / "lib/openblas-openmp"
+    include_dir = root / "include/openblas-openmp"
+    library_dir.mkdir(parents=True)
+    include_dir.mkdir(parents=True)
+    (library_dir / "libopenblas.so").write_bytes(b"shared")
+    (include_dir / "cblas.h").write_text("/* cblas */\n")
+    manifest = replace(
+        _manifest("cpu", "x86-64-v3"),
+        blas_policy="openblas",
+        blas_root=str(root),
+    )
+
+    definitions = cmake_definitions(manifest)
+
+    assert definitions["SYMMETRIX_BLAS_LIBRARY"] == str(library_dir / "libopenblas.so")
+    assert definitions["SYMMETRIX_BLAS_INCLUDE_DIR"] == str(include_dir)
+    assert definitions["CMAKE_INSTALL_RPATH"] == str(library_dir)
 
 
 def test_accelerator_static_blas_root_is_validated(tmp_path):
@@ -655,6 +1052,32 @@ def test_lammps_cmake_definitions_select_mkl_sequential(tmp_path):
     assert definitions["CMAKE_Fortran_COMPILER"] == "/usr/bin/gfortran"
     assert definitions["MKLROOT"] == "/opt/intel/oneapi/mkl/latest"
     assert definitions["CMAKE_INSTALL_RPATH"] == ("/opt/intel/oneapi/mkl/latest/lib")
+
+
+def test_lammps_cmake_definitions_select_explicit_openblas(tmp_path):
+    root = tmp_path / "openblas"
+    library_dir = root / "lib/openblas-openmp"
+    include_dir = root / "include/openblas-openmp"
+    library_dir.mkdir(parents=True)
+    include_dir.mkdir(parents=True)
+    (library_dir / "libopenblas.so").write_bytes(b"shared")
+    (include_dir / "cblas.h").write_text("/* cblas */\n")
+    manifest = replace(
+        _manifest("cpu", "native"),
+        blas_policy="openblas",
+        blas_root=str(root),
+    )
+
+    definitions = lammps_cmake_definitions(
+        manifest,
+        prefix=tmp_path / "prefix",
+        mpi_enabled=False,
+        mpi_cxx="",
+        lammps_source=_lammps_source(tmp_path / "lammps"),
+    )
+
+    assert definitions["BLAS_openblas_LIBRARY"] == str(library_dir / "libopenblas.so")
+    assert definitions["CMAKE_INSTALL_RPATH"] == str(library_dir)
 
 
 @pytest.mark.parametrize(
