@@ -313,6 +313,16 @@ void bind_mace_cpu(py::module_ &m, const char* class_name)
             })
         .def("compute_H1", &Evaluator::compute_H1)
         .def("reverse_H1", &Evaluator::reverse_H1)
+        .def("compute_H1_linear_up", &Evaluator::compute_H1_linear_up)
+        .def("reverse_H1_linear_up", &Evaluator::reverse_H1_linear_up)
+        .def("add_H1_first_residual",
+            [](Evaluator& self, const int num_nodes,
+                           ContiguousIntArray node_types, bool fused) {
+                self.add_H1_first_residual(
+                    num_nodes,
+                    std::span<const int>(node_types.data(), node_types.size()),
+                    fused);
+            })
         .def("compute_field_H1",
             [](Evaluator& self, const int num_nodes, ContiguousDoubleArray electric_field) {
                 self.compute_field_H1(

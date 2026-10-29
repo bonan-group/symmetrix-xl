@@ -527,6 +527,8 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
   mace->compute_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
   mace->compute_M0(num_nodes, node_types);
   mace->compute_H1(num_nodes);
+  // First-interaction residual (b_z U), as in the whole-model evaluation.
+  mace->add_H1_first_residual(num_nodes, node_types, true);
 
   // sort local H1 contributions by i (rather than ii)
   H1.resize((atom->nlocal+atom->nghost)*mace->num_LM*mace->num_channels);
@@ -776,6 +778,8 @@ void PairSymmetrixMACE::compute_no_mpi_message_passing(int eflag, int vflag)
   mace->compute_A0_scaled(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
   mace->compute_M0(num_local_nodes+num_ghost_nodes, node_types);
   mace->compute_H1(num_local_nodes+num_ghost_nodes);
+  // First-interaction residual (b_z U), as in the whole-model evaluation.
+  mace->add_H1_first_residual(num_local_nodes+num_ghost_nodes, node_types, true);
 
   if (mace->streamed_edges == MACEStreamedEdgesMode::materialized) {
     mace->compute_R1(num_local_nodes, node_types, num_neigh, neigh_types, r);

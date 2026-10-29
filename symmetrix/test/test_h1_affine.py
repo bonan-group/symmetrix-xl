@@ -934,6 +934,7 @@ def _ghost_sequence(evaluator, graph, num_local):
     evaluator.compute_A0_scaled(num_all, *args, g["r"])
     evaluator.compute_M0(num_all, g["node_types"])
     evaluator.compute_H1(num_all)
+    evaluator.add_H1_first_residual(num_all, g["node_types"], True)
     evaluator.compute_R1(num_local, *args, g["r"])
     evaluator.compute_Phi1(num_local, g["num_neigh"], g["j"])
     evaluator.compute_A1(num_local)
@@ -967,14 +968,15 @@ def _local_energy(evaluator, atoms, cutoff, atomic_numbers, num_local):
 
 
 @pytest.mark.parametrize("use_kokkos", [False, True])
-@pytest.mark.parametrize("variant", ["synthetic_m0_composite", "pre_linear_up"])
+@pytest.mark.parametrize("variant", ["synthetic_m0_composite", "residual_pre_linear_up",
+                                     "residual_old_format"])
 def test_ghost_rows_receive_no_direct_adjoint(tmp_path, variant, use_kokkos):
-    """The H1 reverse covers ghost rows after the local ones; only the local
-    rows carry the readout_1 / skip adjoint.  The local energy and its exact
-    gradient (finite differences of the sum of local node energies) must
-    follow from the pair-style stage sequence.  The pre_linear_up model is the
-    residual export with the residual removed: the pair-style stage sequences
-    never call add_H1_first_residual (a separate, pre-existing gap)."""
+    """The pair-style stage sequence (as fixed: the first-interaction residual is
+    added after compute_H1): the H1 reverse covers ghost rows after the local
+    ones and only the local rows carry the readout_1 / skip adjoint.  The local
+    energy and its exact gradient (finite differences of the sum of local node
+    energies) must follow, for a residual-first model with its residual b in
+    v4 and in the old format."""
     nc = _native()
     if variant == "synthetic_m0_composite":
         _, data, _ = synthetic_model_pair(1e-3)
@@ -985,8 +987,9 @@ def test_ghost_rows_receive_no_direct_adjoint(tmp_path, variant, use_kokkos):
         data = _extract_single_head_data(_mace_model("residual", sigma_min=1e-3, seed=3),
                                          num_spline_points=500)
         assert data["h1_affine_mode"] == "pre_linear_up"
-        data["first_interaction_residual"] = False
-        data.pop("H1_first_residual_weights")
+        assert np.max(np.abs(data["H1_first_residual_weights"])) > 1e-3
+        if variant == "residual_old_format":
+            data = _to_old_basis(data)
         symbols = ("H", "C", "O")
     path = _write(tmp_path, "model.json", data)
     if use_kokkos:
@@ -1072,3 +1075,139 @@ def test_converted_split_files_match_native_exports(field_models, use_kokkos):
             for key, value in worst.items():
                 if key != "energy":
                     assert value <= 1e-8 * max(1.0, float(np.max(np.abs(a[key])))), key
+
+
+# --------------------------------------------------------------------------- review fixes (check 1)
+
+@pytest.mark.parametrize("mode", ["m0_composite", "pre_linear_up"])
+def test_reverse_H2_overwrites_M1_adjoint(tmp_path, mode):
+    """dE/dM1 = H2_adj W^T is assigned, not accumulated: M1_adj may alias M1 or
+    hold a previous adjoint (Kokkos MH0 adjoint reuse)."""
+    nc = _native()
+    import symmetrix as native
+
+    if not native._kokkos_is_initialized():
+        native._init_kokkos()
+    _, data, _ = synthetic_model_pair(0.5)
+    if mode == "pre_linear_up":
+        data["h1_affine_mode"] = mode
+        data["H1_product_weights"] = data["H1_weights"]
+        data["readout_1_weights_for_H1_pre_linear_up"] = data.pop("readout_1_weights_for_M0")
+        data["H2_weights_for_H1_pre_linear_up"] = data.pop("H2_weights_for_M0")
+    K, LM = data["num_channels"], (data["L_max"] + 1) ** 2
+    rng = np.random.default_rng(2207)
+    path = _write(tmp_path, "model.json", data)
+    weight = np.asarray(data["H2_weights_for_M1"], dtype=np.float64).reshape(K, K)
+    for cls, scalar in ((nc.MACE, np.float64), (nc.MACEFloat, np.float32),
+                        (native.MACEKokkos, np.float64), (native.MACEKokkosFloat, np.float32)):
+        evaluator = cls(str(path), "")
+        try:
+            n = 3
+            types = np.array([0, 1, 0], dtype=np.int32)
+            evaluator.M0 = np.asarray(rng.normal(size=n * LM * K), dtype=scalar)
+            evaluator.compute_H1(n)
+            evaluator.M1 = np.asarray(rng.normal(size=n * K), dtype=scalar)
+            evaluator.M1_adj = np.full(n * K, 17.0, dtype=scalar)
+            evaluator.H1_adj = np.zeros(n * LM * K, dtype=scalar)
+            adjoint = rng.normal(size=(n, K))
+            evaluator.H2_adj = np.asarray(adjoint.reshape(-1), dtype=np.float64
+                                          if "Kokkos" in cls.__name__ else scalar)
+            expected = adjoint @ weight.T
+            evaluator.reverse_H2(n, types, False)
+            first = np.asarray(evaluator.M1_adj, dtype=np.float64).reshape(n, K)
+            evaluator.reverse_H2(n, types, False)
+            second = np.asarray(evaluator.M1_adj, dtype=np.float64).reshape(n, K)
+            tolerance = 5e-6 if scalar is np.float32 else 1e-12
+            np.testing.assert_allclose(first, expected, rtol=tolerance, atol=tolerance)
+            np.testing.assert_array_equal(second, first)
+        finally:
+            del evaluator
+            gc.collect()
+
+
+@pytest.mark.parametrize("use_kokkos", [False, True])
+def test_field_rank_without_owned_readouts(field_models, use_kokkos):
+    """Field MPI split stages on a rank that owns no readout rows: reverse_H2(0)
+    then the linear_up reverse over the communicated features must not throw and
+    must add no direct readout / skip adjoint."""
+    nc = _native()
+    import symmetrix as native
+
+    if use_kokkos:
+        if not native._kokkos_is_initialized():
+            native._init_kokkos()
+        cls = native.MACEKokkos
+    else:
+        cls = nc.MACE
+    _, field_path = field_models
+    data = json.loads(Path(field_path).read_text())
+    K, LM = data["num_channels"], (data["L_max"] + 1) ** 2
+    rng = np.random.default_rng(31)
+    evaluator = cls(str(field_path), "")
+    try:
+        features = 3
+        evaluator.H1 = rng.normal(size=features * LM * K)
+        evaluator.compute_field_H1(features, np.array([0.03, -0.02, 0.07]))
+        evaluator.compute_H1_linear_up(features)
+        evaluator.H1_adj = np.zeros(features * LM * K)
+        evaluator.M1 = np.empty(0)
+        evaluator.H2_adj = np.empty(0)
+        evaluator.reverse_H2(0, np.empty(0, dtype=np.int32), False)
+        evaluator.reverse_H1_linear_up(features)
+        assert float(np.max(np.abs(np.asarray(evaluator.H1_adj)))) == 0.0
+    finally:
+        del evaluator
+        gc.collect()
+
+
+def _cli(*args):
+    import shutil
+    import subprocess
+    import sys
+
+    command = shutil.which("symmetrix_recompose_mace_json")
+    prefix = [command] if command else [sys.executable, "-m", "symmetrix.cli.recompose_mace_json"]
+    return subprocess.run(prefix + [str(arg) for arg in args], capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("case", ["zero_P", "exact_cancellation"])
+def test_converter_accepts_unbounded_diagnostics(tmp_path, case, capfd):
+    """A singular fused map (zero P: cond_C unbounded) or an exactly cancelling
+    readout / skip (unbounded cancellation estimate) is a valid old model; the
+    installed converter writes standard JSON (null for unbounded diagnostics)
+    and the v4 output loads and evaluates."""
+    nc = _native()
+    old, _, _ = synthetic_model_pair(0.5)
+    K = old["num_channels"]
+    C = np.asarray(old["H1_weights"]).reshape(-1, K, K)
+    if case == "zero_P":
+        C[:] = 0.0
+    else:
+        C[0] = 1.0
+        readout = np.zeros(K)
+        readout[:2] = [1.0, -1.0]
+        skip = np.zeros((K, K))
+        skip[:2, 0] = [1.0, -1.0]
+        old["readout_1_weights"] = readout.tolist()
+        old["H2_weights_for_H1"] = [skip.reshape(-1).tolist() for _ in old["atomic_numbers"]]
+    old["H1_weights"] = C.reshape(-1).tolist()
+    src = _write(tmp_path, "old.json", old)
+    dst = tmp_path / "v4.json"
+    result = _cli("--input", src, "--output", dst, "--receipt", tmp_path / "receipt.json")
+    assert result.returncode == 0, result.stderr
+    new = json.loads(dst.read_text())  # strict JSON (no Infinity / NaN tokens)
+    for text in (dst.read_text(), (tmp_path / "receipt.json").read_text()):
+        assert "Infinity" not in text and "NaN" not in text
+    diag = new["h1_affine_provenance"]["conditioning"]
+    if case == "zero_P":
+        assert diag["cond_C"] is None
+    else:
+        assert diag["legacy_cancellation"]["readout"] is None
+    validate_payload(new)
+    summary = _cli("--validate-only", src)
+    assert summary.returncode == 0 and "Infinity" not in summary.stdout
+    result = _evaluate(dst, "float64", False, _structure())
+    assert all(np.all(np.isfinite(value)) for value in result.values())
+    nc.MACE(str(src), "")
+    if case == "exact_cancellation":
+        assert "readout unbounded" in capfd.readouterr().err

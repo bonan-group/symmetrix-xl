@@ -10,6 +10,9 @@ All notable changes to Symmetrix-XL are documented in this file.
   load with the old arithmetic and print a warning with an fp32 cancellation
   estimate computed from the file; `symmetrix_recompose_mace_json` converts
   them.
+- Fixed the LAMMPS pair styles' `mpi_message_passing` and
+  `no_mpi_message_passing` modes, which omitted the first-interaction residual
+  of residual-first models.
 
 ## 0.1.1 - 2026-09-22
 

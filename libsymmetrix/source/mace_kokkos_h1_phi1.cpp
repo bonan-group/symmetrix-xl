@@ -295,15 +295,15 @@ template <typename Precision>
 void MACEKokkos<Precision>::add_h1_affine_direct_adjoint(const int num_nodes)
 {
     // The H1 reverse may cover ghost / feature rows after the receivers; only
-    // the first h1_affine_direct_rows rows (reverse_H2) carry a direct adjoint.
-    const int direct_rows = std::min(num_nodes, h1_affine_direct_rows);
-    if (h1_affine_M0_direct_adj.extent(0) < static_cast<std::size_t>(direct_rows)
-        || (num_nodes > 0 && direct_rows == 0))
+    // the first h1_affine_direct_rows rows (reverse_H2) carry a direct adjoint,
+    // and an MPI rank may own no readout rows at all (zero rows: no-op).
+    const int direct_rows = std::max(0, std::min(num_nodes, h1_affine_direct_rows));
+    if (h1_affine_M0_direct_adj.extent(0) < static_cast<std::size_t>(direct_rows))
         throw std::logic_error(
             "The format-4 direct adjoint requires reverse_H2 for the same nodes first.");
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
-    if (num_nodes <= 0)
+    if (direct_rows == 0)
         return;
     const int channels = num_channels;
     auto M0_adj = this->M0_adj;

@@ -1783,11 +1783,9 @@ void MACECPU<Precision>::add_h1_affine_direct_adjoint(
     if (!h1_affine_v4())
         return;
     // Only the rows whose readouts were evaluated (reverse_H2) carry a direct
-    // adjoint; the H1 reverse may also cover ghost / feature rows after them.
+    // adjoint; the H1 reverse may also cover ghost / feature rows after them,
+    // and an MPI rank may own no readout rows at all (zero rows: no-op).
     const int rows = std::min<int>(num_nodes, M0_direct_adj.size()/num_channels);
-    if (num_nodes > 0 && rows == 0)
-        throw std::logic_error(
-            "The format-4 direct adjoint requires reverse_H2 for the same nodes first.");
     for (int i=0; i<rows; ++i) {
         const auto direct_i = M0_direct_adj.data()+i*num_channels;
         if (has_field_coupling) {

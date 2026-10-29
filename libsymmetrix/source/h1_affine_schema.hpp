@@ -76,17 +76,21 @@ inline const char* skip_key(Mode mode)
 // those sums scales with the magnitude of their terms, |A| |r|, while the
 // result is A r = P r0 (or r0).  The estimate is the ratio of the largest term
 // sum to the largest result component (readout), and the same for the skip
-// over every element; 1 when the maps are zero (single-layer models).
+// over every element; 1 when the maps are zero (single-layer models).  An
+// exactly cancelling sum is unbounded, stored as -1 (the library is built with
+// -ffast-math, so no inf/nan values are used here).
 struct LegacyCancellation {
     double readout = 1.0;
     double skip = 1.0;
 };
 
+inline constexpr double unbounded_cancellation = -1.0;
+
 inline double cancellation_ratio(double terms, double result)
 {
     if (result > 0.0)
         return terms/result;
-    return terms > 0.0 ? INFINITY : 1.0;
+    return terms > 0.0 ? unbounded_cancellation : 1.0;
 }
 
 inline LegacyCancellation legacy_cancellation(
@@ -137,7 +141,12 @@ inline LegacyCancellation legacy_cancellation(
                 z_result = std::max(z_result, std::abs(q[c]));
             }
         }
-        worst = std::max(worst, cancellation_ratio(z_terms, z_result));
+        const double ratio = cancellation_ratio(z_terms, z_result);
+        if (ratio < 0.0) {
+            worst = unbounded_cancellation;
+            break;
+        }
+        worst = std::max(worst, ratio);
     }
     out.skip = worst;
     return out;
@@ -145,9 +154,15 @@ inline LegacyCancellation legacy_cancellation(
 
 inline std::string legacy_format_message(int version, const LegacyCancellation& estimate)
 {
-    char numbers[96];
-    std::snprintf(numbers, sizeof(numbers), "readout %.3g, skip %.3g",
-                  estimate.readout, estimate.skip);
+    const auto text = [](double value) {
+        if (value < 0.0)
+            return std::string("unbounded");
+        char buffer[32];
+        std::snprintf(buffer, sizeof(buffer), "%.3g", value);
+        return std::string(buffer);
+    };
+    const std::string numbers =
+        "readout " + text(estimate.readout) + ", skip " + text(estimate.skip);
     return "Symmetrix MACE JSON format version " + std::to_string(version)
         + " stores readout_1 and the H1->H2 skip multiplied by inv(linear_up) "
           "(fp32 cancellation estimate from this file: " + numbers

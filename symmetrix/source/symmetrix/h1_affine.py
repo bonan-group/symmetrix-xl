@@ -100,13 +100,23 @@ def legacy_cancellation(data: dict) -> dict:
     return {"readout": readout, "skip": skip}
 
 
+def _bounded(value):
+    """JSON-safe diagnostic: None for an unbounded (inf/nan) value."""
+    return float(value) if value is not None and math.isfinite(value) else None
+
+
+def _estimate_text(value) -> str:
+    return f"{value:.3g}" if value is not None and math.isfinite(value) else "unbounded"
+
+
 def legacy_format_message(version: int, cancellation: dict | None = None) -> str:
     """Warning of a format-1/2 load (same text as the native loaders)."""
     estimate = ""
     if cancellation is not None:
         estimate = (
             f" (fp32 cancellation estimate from this file: readout "
-            f"{cancellation['readout']:.3g}, skip {cancellation['skip']:.3g})"
+            f"{_estimate_text(cancellation['readout'])}, skip "
+            f"{_estimate_text(cancellation['skip'])})"
         )
     return (
         f"Symmetrix MACE JSON format version {version} stores readout_1 and the "
@@ -295,9 +305,11 @@ def validate_payload(data: dict) -> dict:
     if mode == H1_AFFINE_MODE_LEGACY:
         version = int(data.get("symmetrix_format_version", 1))
         cancellation = legacy_cancellation(data)
+        warning = legacy_format_message(version, cancellation)
+        cancellation = {key: _bounded(value) for key, value in cancellation.items()}
         return {"mode": mode, "format_version": version, "K": K, "L_max": L_max,
                 "num_elements": num_elements, "cancellation": cancellation,
-                "warning": legacy_format_message(version, cancellation)}
+                "warning": warning}
     readout, skip = affine_maps(data, mode)
     return {
         "mode": mode,
@@ -315,7 +327,7 @@ def conditioning(A: np.ndarray, name: str = "C") -> dict:
     return {
         f"sigma_min_{name}": smin,
         f"sigma_max_{name}": float(sv[0]),
-        f"cond_{name}": (float(sv[0] / smin) if smin > 0 else math.inf),
+        f"cond_{name}": (float(sv[0] / smin) if smin > 0 else None),  # None: unbounded
     }
 
 
@@ -410,7 +422,8 @@ def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: in
     checks = identity_check(A, r, S, q, T)
     checks["mode"] = mode
     diag = conditioning(scalar_h1_map(data))
-    diag["legacy_cancellation"] = legacy_cancellation(data)
+    diag["legacy_cancellation"] = {
+        key: _bounded(value) for key, value in legacy_cancellation(data).items()}
     diag.update({
         "legacy_readout_1_l2": float(np.linalg.norm(r)),
         "legacy_skip_fro": float(np.linalg.norm(S)),
