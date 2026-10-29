@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .command import BuildError, CommandRunner
+from .detect import _openblas_installation
 from .manifest import TargetManifest
 from .package_identity import PackageIdentity, package_identity
 from .source_provenance import symmetrix_source_provenance
@@ -75,7 +76,19 @@ def cmake_definitions(
         )
         if manifest.toolchain.fortran:
             definitions["CMAKE_Fortran_COMPILER"] = manifest.toolchain.fortran
-        if manifest.blas_root:
+        if manifest.blas_policy == "openblas" and manifest.blas_root:
+            _, library, runtime_path, include_dir = _openblas_installation(
+                manifest.blas_root
+            )
+            definitions.update(
+                {
+                    "SYMMETRIX_BLAS_LIBRARY": library,
+                    "SYMMETRIX_BLAS_INCLUDE_DIR": include_dir,
+                    "CMAKE_BUILD_RPATH": runtime_path,
+                    "CMAKE_INSTALL_RPATH": runtime_path,
+                }
+            )
+        elif manifest.blas_root:
             runtime_path = str(Path(manifest.blas_root) / "lib")
             definitions["MKLROOT"] = manifest.blas_root
             definitions["CMAKE_BUILD_RPATH"] = runtime_path
@@ -197,6 +210,16 @@ def build_environment(
         _prepend_path(environment, Path(manifest.toolchain.toolkit_root) / "bin")
         previous = environment.get("CMAKE_PREFIX_PATH", "")
         environment["CMAKE_PREFIX_PATH"] = manifest.toolchain.toolkit_root + (
+            os.pathsep + previous if previous else ""
+        )
+    elif (
+        manifest.backend == "cpu"
+        and manifest.blas_root
+        and manifest.blas_policy == "openblas"
+    ):
+        _, _, runtime_path, _ = _openblas_installation(manifest.blas_root)
+        previous = environment.get("LD_LIBRARY_PATH", "")
+        environment["LD_LIBRARY_PATH"] = runtime_path + (
             os.pathsep + previous if previous else ""
         )
     elif manifest.backend == "cpu" and manifest.blas_root:

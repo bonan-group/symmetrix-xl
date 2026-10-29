@@ -385,6 +385,18 @@ def _phi1_report(evaluator):
         "a1_blas_flatten_workspace_bytes": int(
             getattr(evaluator, "a1_blas_flatten_workspace_bytes", 0)
         ),
+        "a1_host_blocked_forward_launch_count": int(
+            getattr(evaluator, "a1_host_blocked_forward_launch_count", 0)
+        ),
+        "a1_host_blocked_reverse_launch_count": int(
+            getattr(evaluator, "a1_host_blocked_reverse_launch_count", 0)
+        ),
+        "a1_host_block_nodes_used": int(
+            getattr(evaluator, "a1_host_block_nodes_used", 0)
+        ),
+        "a1_host_blocked_scratch_bytes": int(
+            getattr(evaluator, "a1_host_blocked_scratch_bytes", 0)
+        ),
     }
 
 

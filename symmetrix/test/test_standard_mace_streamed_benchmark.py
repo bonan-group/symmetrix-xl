@@ -232,6 +232,10 @@ def test_phi1_report_tracks_policy_and_workspace(monkeypatch):
         "selected_policy": "receiver-local",
         "workspace_bytes": 0,
         "a1_blas_flatten_workspace_bytes": 0,
+        "a1_host_blocked_forward_launch_count": 0,
+        "a1_host_blocked_reverse_launch_count": 0,
+        "a1_host_block_nodes_used": 0,
+        "a1_host_blocked_scratch_bytes": 0,
     }
 
 

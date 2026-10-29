@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <limits>
@@ -60,6 +61,55 @@ using Kokkos::View;
 namespace {
 
 constexpr int host_h2_blas_max_channels = 1024;
+
+// Transient per-team workspace plan for the host owner-computes A1 path.  The
+// blocked form stages one node block for a single l into host scratch, issues
+// one larger GEMM against the shared weight matrix, and unpacks the result.
+// One node's Phi1 (and A1 / A1-adjoint) rows for a fixed l form a contiguous
+// span, so both directions reduce to per-node contiguous copies.
+struct HostA1BlockPlan {
+    int block_nodes = 0;
+    std::size_t input_offset_floats = 0;
+    std::size_t scratch_bytes = 0;
+    bool usable = false;
+};
+
+template <typename Precision>
+HostA1BlockPlan make_host_a1_block_plan(
+    const int num_nodes,
+    const int max_components,
+    const int max_input_columns,
+    const int output_columns)
+{
+    HostA1BlockPlan plan;
+    if (num_nodes < MACEKokkos<Precision>::a1_host_block_min_nodes
+        || max_components <= 0 || max_input_columns <= 0
+        || output_columns <= 0)
+        return plan;
+    const std::size_t limit = admitted_team_scratch_limit_bytes<>(1);
+    int block = std::min(MACEKokkos<Precision>::a1_host_block_nodes, num_nodes);
+    while (block >= MACEKokkos<Precision>::a1_host_block_min_block) {
+        const std::size_t input_floats = static_cast<std::size_t>(block)
+            *static_cast<std::size_t>(max_components)
+            *static_cast<std::size_t>(max_input_columns);
+        const std::size_t output_floats = static_cast<std::size_t>(block)
+            *static_cast<std::size_t>(max_components)
+            *static_cast<std::size_t>(output_columns);
+        // Keep the packed input 64-byte aligned for the BLAS kernels.
+        const std::size_t input_offset = (input_floats+15)/16*16;
+        const std::size_t bytes =
+            (input_offset+output_floats)*sizeof(Precision);
+        if (bytes <= limit) {
+            plan.block_nodes = block;
+            plan.input_offset_floats = input_offset;
+            plan.scratch_bytes = bytes;
+            plan.usable = true;
+            return plan;
+        }
+        block /= 2;
+    }
+    return plan;
+}
 
 }
 
@@ -132,6 +182,127 @@ void MACEKokkos<Precision>::compute_A1(
             Kokkos::HostSpace>) {
         if (symmetrix::host_worker_cblas_enabled()
                 && !symmetrix::host_dense_backend_overrides_cblas()) {
+            int max_block_components = 0;
+            int max_block_input_columns = 0;
+            for (int l=0; l<=l_max; ++l) {
+                int num_eta = 0;
+                for (int p=0; p<Phi1_l.size(); ++p)
+                    if (Phi1_l(p) == l)
+                        ++num_eta;
+                max_block_components = std::max(
+                    max_block_components, 2*l+1);
+                max_block_input_columns = std::max(
+                    max_block_input_columns, num_eta*num_channels);
+            }
+            const HostA1BlockPlan block_plan =
+                symmetrix::host_a1_blocked_enabled()
+                    ? make_host_a1_block_plan<Precision>(
+                        num_nodes, max_block_components,
+                        max_block_input_columns, num_channels)
+                    : HostA1BlockPlan{};
+            if (block_plan.usable) {
+                const int block_nodes = block_plan.block_nodes;
+                const std::size_t input_offset_floats =
+                    block_plan.input_offset_floats;
+                const std::size_t scratch_floats =
+                    input_offset_floats
+                    +static_cast<std::size_t>(block_nodes)
+                        *static_cast<std::size_t>(max_block_components)
+                        *static_cast<std::size_t>(num_channels);
+                const int block_count =
+                    (num_nodes+block_nodes-1)/block_nodes;
+                auto policy = Kokkos::TeamPolicy<>(
+                    factorized_execution_space,
+                    block_count*(l_max+1), 1);
+                const std::size_t admitted_scratch_bytes =
+                    admitted_team_scratch_bytes<>(
+                        "Compute A1 host blocked",
+                        scratch_floats, sizeof(Precision), 1);
+                policy.set_scratch_size(
+                    1, Kokkos::PerTeam(admitted_scratch_bytes));
+                Kokkos::parallel_for(
+                    "Compute A1 host blocked", policy,
+                    KOKKOS_LAMBDA (
+                        const Kokkos::TeamPolicy<>::member_type& member) {
+                        using ScratchView = Kokkos::View<
+                            Precision*,
+                            typename Kokkos::TeamPolicy<>::member_type
+                                ::scratch_memory_space,
+                            Kokkos::MemoryUnmanaged>;
+                        const int work = member.league_rank();
+                        const int l = work%(l_max+1);
+                        const int node_begin =
+                            (work/(l_max+1))*block_nodes;
+                        const int count = std::min(
+                            block_nodes, num_nodes-node_begin);
+                        int lme = 0;
+                        int num_eta = 0;
+                        for (int p=0; p<Phi1_l.size(); ++p) {
+                            const int ll = Phi1_l(p);
+                            if (ll < l)
+                                lme += 2*ll+1;
+                            if (ll == l)
+                                ++num_eta;
+                        }
+                        const int component_count = 2*l+1;
+                        const int input_count = num_eta*num_channels;
+                        ScratchView scratch(
+                            member.team_scratch(1), scratch_floats);
+                        Precision* const packed_output =
+                            scratch.data()+input_offset_floats;
+                        // One node's Phi1 rows for one l are contiguous, so
+                        // staging a block is one contiguous copy per node.
+                        for (int n=0; n<count; ++n) {
+                            const std::size_t node =
+                                static_cast<std::size_t>(node_begin)
+                                +static_cast<std::size_t>(n);
+                            std::memcpy(
+                                scratch.data()
+                                    +static_cast<std::size_t>(n)
+                                        *component_count*input_count,
+                                phi1_data + node*phi1_row_stride
+                                    +static_cast<std::size_t>(lme)
+                                        *phi1_channels,
+                                sizeof(Precision)
+                                    *static_cast<std::size_t>(
+                                        component_count)
+                                    *static_cast<std::size_t>(input_count));
+                        }
+                        const auto weights = A1_weights(l);
+                        symmetrix_blas_gemm<Precision>(
+                            CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            count*component_count, num_channels,
+                            input_count,
+                            Precision(1), scratch.data(), input_count,
+                            weights.data(), num_channels,
+                            Precision(0), packed_output, num_channels);
+                        for (int n=0; n<count; ++n) {
+                            const std::size_t node =
+                                static_cast<std::size_t>(node_begin)
+                                +static_cast<std::size_t>(n);
+                            std::memcpy(
+                                a1_data + node*a1_row_stride
+                                    +static_cast<std::size_t>(l*l)
+                                        *a1_channels,
+                                packed_output
+                                    +static_cast<std::size_t>(n)
+                                        *component_count*num_channels,
+                                sizeof(Precision)
+                                    *static_cast<std::size_t>(
+                                        component_count)
+                                    *static_cast<std::size_t>(num_channels));
+                        }
+                    });
+                a1_host_blocked_forward_launch_count += 1;
+                a1_host_block_nodes_used = block_nodes;
+                a1_host_blocked_scratch_bytes = std::max(
+                    a1_host_blocked_scratch_bytes,
+                    block_plan.scratch_bytes);
+                if (completion_fence)
+                    factorized_execution_space.fence(
+                        "Compute A1 completion");
+                return;
+            }
             Kokkos::parallel_for(
                 "Compute A1 host BLAS",
                 Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
@@ -644,6 +815,131 @@ void MACEKokkos<Precision>::reverse_A1_from(
             Kokkos::HostSpace>) {
         if (symmetrix::host_worker_cblas_enabled()
                 && !symmetrix::host_dense_backend_overrides_cblas()) {
+            int max_block_components = 0;
+            int max_block_output_columns = 0;
+            for (int l=0; l<=l_max; ++l) {
+                int num_eta = 0;
+                for (int p=0; p<Phi1_l.size(); ++p)
+                    if (Phi1_l(p) == l)
+                        ++num_eta;
+                max_block_components = std::max(
+                    max_block_components, 2*l+1);
+                max_block_output_columns = std::max(
+                    max_block_output_columns, num_eta*num_channels);
+            }
+            const HostA1BlockPlan block_plan =
+                symmetrix::host_a1_blocked_enabled()
+                    ? make_host_a1_block_plan<Precision>(
+                        num_nodes, max_block_components, num_channels,
+                        max_block_output_columns)
+                    : HostA1BlockPlan{};
+            if (block_plan.usable) {
+                const int block_nodes = block_plan.block_nodes;
+                const std::size_t input_offset_floats =
+                    block_plan.input_offset_floats;
+                const std::size_t scratch_floats =
+                    input_offset_floats
+                    +static_cast<std::size_t>(block_nodes)
+                        *static_cast<std::size_t>(max_block_components)
+                        *static_cast<std::size_t>(
+                            max_block_output_columns);
+                const int block_count =
+                    (num_nodes+block_nodes-1)/block_nodes;
+                auto policy = Kokkos::TeamPolicy<>(
+                    factorized_execution_space,
+                    block_count*(l_max+1), 1);
+                const std::size_t admitted_scratch_bytes =
+                    admitted_team_scratch_bytes<>(
+                        "Reverse A1 host blocked",
+                        scratch_floats, sizeof(Precision), 1);
+                policy.set_scratch_size(
+                    1, Kokkos::PerTeam(admitted_scratch_bytes));
+                Kokkos::parallel_for(
+                    "Reverse A1 host blocked", policy,
+                    KOKKOS_LAMBDA (
+                        const Kokkos::TeamPolicy<>::member_type& member) {
+                        using ScratchView = Kokkos::View<
+                            Precision*,
+                            typename Kokkos::TeamPolicy<>::member_type
+                                ::scratch_memory_space,
+                            Kokkos::MemoryUnmanaged>;
+                        const int work = member.league_rank();
+                        const int l = work%(l_max+1);
+                        const int node_begin =
+                            (work/(l_max+1))*block_nodes;
+                        const int count = std::min(
+                            block_nodes, num_nodes-node_begin);
+                        int lme = 0;
+                        int num_eta = 0;
+                        for (int p=0; p<Phi1_l.size(); ++p) {
+                            const int ll = Phi1_l(p);
+                            if (ll < l)
+                                lme += 2*ll+1;
+                            if (ll == l)
+                                ++num_eta;
+                        }
+                        const int component_count = 2*l+1;
+                        const int output_count = num_eta*num_channels;
+                        ScratchView scratch(
+                            member.team_scratch(1), scratch_floats);
+                        Precision* const packed_output =
+                            scratch.data()+input_offset_floats;
+                        // One node's A1-adjoint rows for one l are contiguous,
+                        // so staging a block is one contiguous copy per node.
+                        for (int n=0; n<count; ++n) {
+                            const std::size_t node =
+                                static_cast<std::size_t>(node_begin)
+                                +static_cast<std::size_t>(n);
+                            std::memcpy(
+                                scratch.data()
+                                    +static_cast<std::size_t>(n)
+                                        *component_count*num_channels,
+                                output_adjoint_data_base
+                                    +node*output_adjoint_row_stride
+                                    +static_cast<std::size_t>(l*l)
+                                        *output_adjoint_channels,
+                                sizeof(Precision)
+                                    *static_cast<std::size_t>(
+                                        component_count)
+                                    *static_cast<std::size_t>(
+                                        num_channels));
+                        }
+                        const auto weights = A1_weights_trans(l);
+                        symmetrix_blas_gemm<Precision>(
+                            CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            count*component_count, output_count,
+                            num_channels,
+                            Precision(1), scratch.data(), num_channels,
+                            weights.data(), output_count,
+                            Precision(0), packed_output, output_count);
+                        for (int n=0; n<count; ++n) {
+                            const std::size_t node =
+                                static_cast<std::size_t>(node_begin)
+                                +static_cast<std::size_t>(n);
+                            std::memcpy(
+                                dphi1_data_base + node*dphi1_row_stride
+                                    +static_cast<std::size_t>(lme)
+                                        *dphi1_channels,
+                                packed_output
+                                    +static_cast<std::size_t>(n)
+                                        *component_count*output_count,
+                                sizeof(Precision)
+                                    *static_cast<std::size_t>(
+                                        component_count)
+                                    *static_cast<std::size_t>(
+                                        output_count));
+                        }
+                    });
+                a1_host_blocked_reverse_launch_count += 1;
+                a1_host_block_nodes_used = block_nodes;
+                a1_host_blocked_scratch_bytes = std::max(
+                    a1_host_blocked_scratch_bytes,
+                    block_plan.scratch_bytes);
+                if (completion_fence)
+                    factorized_execution_space.fence(
+                        "Reverse A1 completion");
+                return;
+            }
             Kokkos::parallel_for(
                 "Reverse A1 host BLAS",
                 Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,

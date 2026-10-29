@@ -63,6 +63,30 @@ inline std::string_view host_dense_backend_selected_backend()
     return "cblas";
 }
 
+// Host owner-computes blocking for the A1 dense contractions.  The blocked
+// path is only reachable from the existing admitted-CBLAS branch, so a
+// pthread OpenBLAS deployment with multiple workers never executes a BLAS call
+// inside a worker.  Set SYMMETRIX_A1_HOST_BLOCKED=0, false, or off to select
+// the per-node form for A/B diagnosis.
+inline bool host_a1_blocked_enabled()
+{
+    static const bool enabled = [] {
+        const char* raw = std::getenv("SYMMETRIX_A1_HOST_BLOCKED");
+        const std::string_view value = raw == nullptr
+            ? std::string_view("automatic") : std::string_view(raw);
+        if (value.empty() || value == "automatic")
+            return true;
+        if (value == "1" || value == "true" || value == "on")
+            return true;
+        if (value == "0" || value == "false" || value == "off")
+            return false;
+        throw std::invalid_argument(
+            "SYMMETRIX_A1_HOST_BLOCKED must be 'automatic', '1', 'true', "
+            "'on', '0', 'false', or 'off'.");
+    }();
+    return enabled;
+}
+
 template <typename Precision>
 inline void host_dense_gemm_nn(
     const Precision* input,

@@ -78,6 +78,16 @@ arbitrary BLAS implementation supports concurrent callers.
 controlled A/B diagnosis. Strict runtime qualification rejects concurrent
 CBLAS when its threading backend cannot be verified.
 
+The host A1 dense contractions use owner-computes blocking inside that admitted
+branch: one Kokkos worker stages a contiguous node block into transient
+level-1 team scratch (level 0 is capped near 32 KiB), issues one larger CBLAS
+GEMM against the shared weight matrix, and unpacks the result. Staging buffers
+are per team, so no worker reads or writes another worker's data, and the
+blocked form stays inside the same `host_worker_cblas_enabled()` branch that
+guards the per-node GEMMs: the pthread-OpenBLAS multi-worker selection never
+enters it, so no gather, scratch reservation, or external call happens in a
+worker. Use `SYMMETRIX_A1_HOST_BLOCKED=0` to compare against the per-node form.
+
 Before changing this policy, run a standalone concurrent-call stress test with
 independent buffers and a scalar reference. Record the actual library path,
 the provider and threading layer, OpenMP runtime compatibility, and the maximum

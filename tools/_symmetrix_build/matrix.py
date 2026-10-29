@@ -108,6 +108,7 @@ def _child_arguments(
     build_root: Path | None,
     jobs: int | None,
     accelerator_blas_root: Path | None,
+    openblas_root: Path | None,
 ) -> list[str]:
     arguments = ["--backend", spec.backend]
     if spec.backend == "cpu":
@@ -124,6 +125,8 @@ def _child_arguments(
         arguments.extend(("--jobs", str(jobs)))
     if spec.backend in {"cuda", "hip"} and accelerator_blas_root is not None:
         arguments.extend(("--accelerator-blas-root", os.fspath(accelerator_blas_root)))
+    if spec.backend == "cpu" and openblas_root is not None:
+        arguments.extend(("--openblas-root", os.fspath(openblas_root)))
     return arguments
 
 
@@ -137,12 +140,25 @@ def child_commands(
     build_root: Path | None = None,
     jobs: int | None = None,
     accelerator_blas_root: Path | None = None,
+    openblas_root: Path | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     detect_arguments = _child_arguments(
-        spec, cuda_root, rocm_root, None, None, accelerator_blas_root
+        spec,
+        cuda_root,
+        rocm_root,
+        None,
+        None,
+        accelerator_blas_root,
+        openblas_root,
     )
     wheel_arguments = _child_arguments(
-        spec, cuda_root, rocm_root, build_root, jobs, accelerator_blas_root
+        spec,
+        cuda_root,
+        rocm_root,
+        build_root,
+        jobs,
+        accelerator_blas_root,
+        openblas_root,
     )
     detect_command = (
         sys.executable,
@@ -243,6 +259,7 @@ def run_wheel_matrix(
     rocm_root: Path | None = None,
     jobs: int | None = None,
     accelerator_blas_root: Path | None = None,
+    openblas_root: Path | None = None,
     dry_run: bool = False,
 ) -> int:
     specs = [parse_matrix_spec(value) for value in target_values]
@@ -263,6 +280,7 @@ def run_wheel_matrix(
                 build_root=build_root,
                 jobs=jobs,
                 accelerator_blas_root=accelerator_blas_root,
+                openblas_root=openblas_root,
             )
             plan.append(
                 {
@@ -292,6 +310,7 @@ def run_wheel_matrix(
             build_root=build_root,
             jobs=jobs,
             accelerator_blas_root=accelerator_blas_root,
+            openblas_root=openblas_root,
         )
         result = runner.run(detect_command)
         if result.returncode != 0:

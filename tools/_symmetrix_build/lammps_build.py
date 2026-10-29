@@ -16,6 +16,7 @@ from .command import (
     canonical_executable,
     validated_executable,
 )
+from .detect import _openblas_installation
 from .manifest import TargetManifest
 from .python_build import build_environment, prepare_build_directory
 from .source_provenance import (
@@ -225,7 +226,15 @@ def lammps_cmake_definitions(
         )
         if manifest.toolchain.fortran:
             definitions["CMAKE_Fortran_COMPILER"] = manifest.toolchain.fortran
-        if manifest.blas_root:
+        if manifest.blas_policy == "openblas" and manifest.blas_root:
+            _, library, runtime_path, _ = _openblas_installation(manifest.blas_root)
+            definitions["BLAS_openblas_LIBRARY"] = library
+            openblas_config = Path(runtime_path) / "cmake/openblas"
+            if openblas_config.is_dir():
+                definitions["OpenBLAS_DIR"] = str(openblas_config)
+            definitions["CMAKE_BUILD_RPATH"] = runtime_path
+            definitions["CMAKE_INSTALL_RPATH"] = runtime_path
+        elif manifest.blas_root:
             runtime_path = str(Path(manifest.blas_root) / "lib")
             definitions["MKLROOT"] = manifest.blas_root
             definitions["CMAKE_BUILD_RPATH"] = runtime_path
