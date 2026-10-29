@@ -329,7 +329,7 @@ void MACECPU<Precision>::compute_node_energies_forces_field(
     std::span<const double> r,
     std::span<const double> electric_field)
 {
-    if (h1_affine_m0_composite())
+    if (!h1_affine_legacy())
         throw std::invalid_argument(
             "The m0_composite H1 affine basis is not supported by the field-coupled MACE sequence.");
     node_energies.resize(num_nodes);
@@ -1696,7 +1696,7 @@ void MACECPU<Precision>::reverse_H1(
                 num_channels);  // const MKL_INT ldc
         }
     }
-    if (h1_affine_m0_composite()) {
+    if (!h1_affine_legacy()) {
         // Direct scalar adjoint q + T_z H2_adj (formed in reverse_H2); H1_adj held
         // only the message-passing adjoint, so nothing is counted twice.
         if (M0_direct_adj.size() < static_cast<std::size_t>(num_nodes)*num_channels)
@@ -2401,9 +2401,10 @@ void MACECPU<Precision>::compute_H2(
 {
     H2.resize(static_cast<std::size_t>(num_nodes)*num_channels);
     // legacy: H2 = S_z^T H1 (scalar block); m0_composite: H2 = T_z^T M0 (scalar block).
-    const bool m0_composite = h1_affine_m0_composite();
-    const auto& skip_weights = m0_composite ? H2_weights_for_M0 : H2_weights_for_H1;
-    const auto& skip_input = m0_composite ? M0 : H1;
+    const bool legacy_h1_affine = h1_affine_legacy();
+    const auto& skip_weights = legacy_h1_affine
+        ? H2_weights_for_H1 : H2_weights_for_M0;
+    const auto& skip_input = legacy_h1_affine ? H1 : M0;
     for (int i=0; i<num_nodes; ++i) {
         auto H2_i = H2.data()+i*num_channels;
         auto H1_i = skip_input.data()+i*num_LM*num_channels;
@@ -2447,7 +2448,7 @@ void MACECPU<Precision>::reverse_H2(
     M1_adj.resize(M1.size());
     if (zero_H1_adj)
         std::fill(H1_adj.begin(), H1_adj.end(), 0.0);
-    if (h1_affine_m0_composite()) {
+    if (!h1_affine_legacy()) {
         // Direct scalar M0 adjoint q + T_z H2_adj; H1_adj is not touched.
         M0_direct_adj.resize(static_cast<std::size_t>(num_nodes)*num_channels);
         for (int i=0; i<num_nodes; ++i) {
@@ -2511,12 +2512,12 @@ void MACECPU<Precision>::compute_readouts(
     //          There is probably a better way to manage this.
     std::fill(H1_adj.begin(), H1_adj.end(), 0.0);
     H2_adj.resize(H2.size());
-    const bool m0_composite = h1_affine_m0_composite();
+    const bool legacy_h1_affine = h1_affine_legacy();
     for (int i=0; i<num_nodes; ++i) {
         // atomic energies
         node_energies[i] += atomic_energies[node_types[i]];
         // first readout
-        if (m0_composite) {
+        if (!legacy_h1_affine) {
             // E1 = q . M0 (scalar block); its adjoint q enters M0_direct_adj in
             // reverse_H2, H1_adj stays zero for the message-passing reverse.
             for (int k=0; k<num_channels; ++k)
@@ -2794,7 +2795,7 @@ void MACECPU<Precision>::load_from_json(
     readout_1_weights.clear();
     readout_1_weights_for_M0.clear();
     M0_direct_adj.clear();
-    if (h1_affine_m0_composite()) {
+    if (!h1_affine_legacy()) {
         H2_weights_for_M0 = checked_precision_data<Precision>(
             file["H2_weights_for_M0"].get<std::vector<std::vector<double>>>());
     } else {
@@ -2805,7 +2806,7 @@ void MACECPU<Precision>::load_from_json(
         file["H2_weights_for_M1"].get<std::vector<double>>());
 
     // Readouts
-    if (h1_affine_m0_composite()) {
+    if (!h1_affine_legacy()) {
         readout_1_weights_for_M0 = checked_precision_data<Precision>(
             file["readout_1_weights_for_M0"].get<std::vector<double>>());
     } else {

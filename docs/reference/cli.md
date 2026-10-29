@@ -35,10 +35,15 @@ and `symmetrix_prepare_jit_device_artifact`. The converter is
 `symmetrix_extract_mace --model MODEL [--output PATH]`; it accepts species,
 head, compact/pair-spline format, and device-artifact preparation options and
 requires the optional `symmetrix-xl[mace]` dependencies. Omitting the species
-options creates the preferred universal compact export. Explicit species
-selection is limited to restricted format-v2 exports or the original Symmetrix
-pair-spline format (named v1 here); format-v3 nonlinear models always retain
-the complete checkpoint domain.
+options creates the preferred universal compact format-v4 export.
+`--h1-affine-mode m0_composite` is the default: supported standard MACE models
+use inverse-free H1 composites, while other model families retain their native
+payload inside the common v4 container. Use `--h1-affine-mode legacy` to write
+standard-MACE format v2 or together with `--radial-format pair-splines` for the
+original format. Nonlinear models always retain the complete checkpoint domain.
+`symmetrix_recompose_mace_json --input OLD.json --output NEW.json` remains an
+explicit checkpoint-free remedy for compatible v2 files and marks the output
+as converted from v2.
 `symmetrix_calibrate_kernel_launch` explicitly calibrates bounded GPU launch
 profiles for a model and structure; normal `kernel_launch_policy="automatic"`
 execution consumes a compatible calibration record but does not benchmark.

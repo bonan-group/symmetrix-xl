@@ -16,7 +16,7 @@ def main(argv=None):
         "-z",
         nargs="+",
         help=(
-            "Optional restricted format-v2 or original Symmetrix pair-spline "
+            "Optional restricted compact or original Symmetrix pair-spline "
             "element subset; omit for the preferred universal compact export."
         ),
         default=[],
@@ -26,7 +26,7 @@ def main(argv=None):
         "-s",
         nargs="+",
         help=(
-            "Optional restricted format-v2 or original Symmetrix pair-spline "
+            "Optional restricted compact or original Symmetrix pair-spline "
             "element subset; omit for the preferred universal compact export."
         ),
         default=[],
@@ -55,11 +55,11 @@ def main(argv=None):
     parser.add_argument(
         "--h1-affine-mode",
         choices=("legacy", "m0_composite"),
-        default="legacy",
+        default="m0_composite",
         help=(
-            "legacy: format v2, readout/skip in the post-linear_up basis (inverse of "
-            "linear_up). m0_composite: format v4, inverse-free composite readout/skip "
-            "maps on the scalar M0 block (single-head two-interaction compact MACE)."
+            "m0_composite (default): format v4, with inverse-free composite "
+            "readout/skip maps for supported standard MACE and the native graph for "
+            "other model families. legacy: explicitly write standard MACE format v2."
         ),
     )
     parser.add_argument("--output", "-o", help="Output filename.")

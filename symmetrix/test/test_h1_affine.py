@@ -23,6 +23,7 @@ from symmetrix.h1_affine import (
     H1AffineError,
     h1_affine_mode_of,
     identity_check,
+    legacy_v2_reexport_guidance,
     recompose_legacy_payload,
     validate_payload,
 )
@@ -31,6 +32,7 @@ RNG = np.random.default_rng(20261017)
 
 
 # --------------------------------------------------------------------------- helpers
+
 
 def _synthetic_legacy_payload(K=6, num_elements=6, L_max=1, sigma_min=1e-6, seed=3):
     rng = np.random.default_rng(seed)
@@ -42,14 +44,24 @@ def _synthetic_legacy_payload(K=6, num_elements=6, L_max=1, sigma_min=1e-6, seed
         U.append((u * s) @ vt)
     C = np.stack([P[l] @ U[l] for l in range(L_max + 1)])
     r0 = rng.standard_normal(K) / np.sqrt(K)
-    S0 = [rng.standard_normal((K, K)) / np.sqrt(K * num_elements) for _ in range(num_elements)]
+    S0 = [
+        rng.standard_normal((K, K)) / np.sqrt(K * num_elements)
+        for _ in range(num_elements)
+    ]
     r = np.linalg.solve(U[0], r0)
     S = [np.linalg.solve(U[0], s) for s in S0]
     payload = {
-        "num_channels": K, "L_max": L_max, "num_interactions": 2, "model_type": "MACE",
-        "has_field_coupling": False, "first_interaction_residual": False, "field_couplings": [],
-        "atomic_numbers": list(range(1, num_elements + 1)), "num_elements": num_elements,
-        "symmetrix_format_version": 2, "radial_representation": "compact",
+        "num_channels": K,
+        "L_max": L_max,
+        "num_interactions": 2,
+        "model_type": "MACE",
+        "has_field_coupling": False,
+        "first_interaction_residual": False,
+        "field_couplings": [],
+        "atomic_numbers": list(range(1, num_elements + 1)),
+        "num_elements": num_elements,
+        "symmetrix_format_version": 2,
+        "radial_representation": "compact",
         "H1_weights": C.reshape(-1).tolist(),
         "H2_weights_for_H1": [s.reshape(-1).tolist() for s in S],
         "H2_weights_for_M1": rng.standard_normal(K * K).tolist(),
@@ -66,9 +78,12 @@ def _assert_refused(payload, match=None):
 
 # --------------------------------------------------------------------------- schema / migration
 
+
 def test_recompose_identities_and_v4_layout():
     payload, native = _synthetic_legacy_payload(sigma_min=1e-4)
-    new, checks = recompose_legacy_payload(payload, source_sha256="a" * 64, source_bytes=10)
+    new, checks = recompose_legacy_payload(
+        payload, source_sha256="a" * 64, source_bytes=10
+    )
     assert new["symmetrix_format_version"] == 4
     assert new["h1_affine_mode"] == "m0_composite" and new["h1_affine_version"] == 1
     assert "readout_1_weights" not in new and "H2_weights_for_H1" not in new
@@ -79,11 +94,83 @@ def test_recompose_identities_and_v4_layout():
     T = np.asarray(new["H2_weights_for_M0"]).reshape(6, 6, 6)
     np.testing.assert_allclose(q, native["P0"] @ native["r0"], rtol=0, atol=1e-10)
     for z in range(6):
-        np.testing.assert_allclose(T[z], native["P0"] @ native["S0"][z], rtol=0, atol=1e-10)
+        np.testing.assert_allclose(
+            T[z], native["P0"] @ native["S0"][z], rtol=0, atol=1e-10
+        )
     assert checks["E1_max_abs_diff"] <= 1e-10 * max(1.0, checks["E1_scale"])
     prov = new["h1_affine_provenance"]
     assert prov["source"] == "json_migration" and prov["source_json_sha256"] == "a" * 64
+    assert prov["origin"] == "converted_from_v2"
+    assert prov["source_format_version"] == 2
     assert prov["conditioning"]["sigma_min_U0"] is None
+    assert new["symmetrix_format_provenance"] == {
+        "origin": "converted_from_v2",
+        "source_format_version": 2,
+        "source_json_sha256": "a" * 64,
+        "tool": "symmetrix.cli.recompose_mace_json",
+        "tool_version": "symmetrix-h1-affine-m0c-1",
+    }
+
+
+def test_v4_nonstandard_family_does_not_require_h1_affine_fields():
+    payload, _ = _synthetic_legacy_payload(sigma_min=1.0)
+    payload.update(
+        symmetrix_format_version=4,
+        model_type="MACEField",
+        has_field_coupling=True,
+    )
+
+    assert h1_affine_mode_of(payload) == "legacy"
+    assert validate_payload(payload)["mode"] == "legacy"
+
+
+def test_v4_single_layer_standard_model_does_not_require_h1_affine_fields():
+    assert (
+        h1_affine_mode_of(
+            {
+                "model_type": "MACE",
+                "symmetrix_format_version": 4,
+                "num_interactions": 1,
+                "single_layer_readout": True,
+            }
+        )
+        == "legacy"
+    )
+
+
+def test_legacy_v2_guidance_distinguishes_map_amplification_risk():
+    low_risk, _ = _synthetic_legacy_payload(K=2, num_elements=1, L_max=0, sigma_min=1.0)
+    low_risk["H1_weights"] = np.eye(2).reshape(-1).tolist()
+    low_risk["readout_1_weights"] = [1.0, 1.0]
+    low_risk["H2_weights_for_H1"] = [np.eye(2).reshape(-1).tolist()]
+
+    elevated = copy.deepcopy(low_risk)
+    elevated["H1_weights"] = np.diag([1.0, 1e-8]).reshape(-1).tolist()
+    elevated["readout_1_weights"] = [1.0, 1e8]
+
+    low = legacy_v2_reexport_guidance(low_risk)
+    high = legacy_v2_reexport_guidance(elevated)
+
+    assert low["risk"] == "low"
+    assert low["diagnostic_source"] == "exported_maps"
+    assert "Re-export to v4 is recommended but optional." in low["message"]
+    assert high["risk"] == "elevated"
+    assert high["readout_amplification"] > low["readout_amplification"]
+    assert "elevated float32 cancellation risk" in high["message"]
+
+
+def test_legacy_v2_guidance_prefers_checkpoint_conditioning():
+    payload, _ = _synthetic_legacy_payload(K=2, num_elements=1, L_max=0, sigma_min=1.0)
+    payload["h1_affine_provenance"] = {
+        "origin": "native_checkpoint",
+        "conditioning": {"cond_U0": 2e7},
+    }
+
+    guidance = legacy_v2_reexport_guidance(payload)
+
+    assert guidance["risk"] == "elevated"
+    assert guidance["diagnostic_source"] == "checkpoint_linear_up"
+    assert guidance["cond_U0"] == 2e7
 
 
 @pytest.mark.parametrize(
@@ -91,10 +178,19 @@ def test_recompose_identities_and_v4_layout():
     [
         (lambda d: d.update(prediction_heads={"names": ["a", "b"]}), "multi-head"),
         (lambda d: d.update(has_field_coupling=True), "field"),
-        (lambda d: d.update(first_interaction_residual=True), "first_interaction_residual"),
-        (lambda d: d.update(single_layer_readout=True, num_interactions=1), "single_layer"),
+        (
+            lambda d: d.update(first_interaction_residual=True),
+            "first_interaction_residual",
+        ),
+        (
+            lambda d: d.update(single_layer_readout=True, num_interactions=1),
+            "single_layer",
+        ),
         (lambda d: d.update(model_type="MACE_Nonlinear"), "model_type"),
-        (lambda d: d.update(symmetrix_format_version=1, radial_representation=None), "version-2"),
+        (
+            lambda d: d.update(symmetrix_format_version=1, radial_representation=None),
+            "version-2",
+        ),
         (lambda d: d.update(H2_weights_for_M0=[[0.0]]), "must not declare"),
         (lambda d: d.update(readout_1_weights=[1.0, 2.0]), "readout_1_weights"),
         (lambda d: d.update(readout_1_weights=[float("nan")] * 6), "non-finite"),
@@ -112,7 +208,10 @@ def test_validator_rejects_mixed_and_partial_v4():
     validate_payload(new)
     for mutate, match in (
         (lambda d: d.__setitem__("readout_1_weights", [0.0] * 6), "legacy keys"),
-        (lambda d: d.__setitem__("H2_weights_for_H1", d["H2_weights_for_M0"]), "legacy keys"),
+        (
+            lambda d: d.__setitem__("H2_weights_for_H1", d["H2_weights_for_M0"]),
+            "legacy keys",
+        ),
         (lambda d: d.pop("H2_weights_for_M0"), "missing"),
         (lambda d: d.__setitem__("h1_affine_mode", "pre_linear_up"), "m0_composite"),
         (lambda d: d.__setitem__("h1_affine_version", 2), "h1_affine_version"),
@@ -133,17 +232,23 @@ def test_migration_cli_never_overwrites(tmp_path):
     src = tmp_path / "old.json"
     src.write_text(json.dumps(payload))
     dst = tmp_path / "new" / "m0c.json"
-    assert main(["-i", str(src), "-o", str(dst), "--receipt", str(tmp_path / "r.json")]) == 0
+    assert (
+        main(["-i", str(src), "-o", str(dst), "--receipt", str(tmp_path / "r.json")])
+        == 0
+    )
     first = dst.read_bytes()
     assert main(["-i", str(src), "-o", str(dst)]) == 2
     assert dst.read_bytes() == first
     assert main(["-i", str(dst), "-o", str(tmp_path / "again.json")]) == 3
     assert main(["--validate-only", str(src), str(dst)]) == 0
     receipt = json.loads((tmp_path / "r.json").read_text())
+    assert receipt["origin"] == "converted_from_v2"
+    assert receipt["source_format_version"] == 2
     assert receipt["identity_fp64"]["detail"]["worst_rel_terms"] <= 1e-12
 
 
 # --------------------------------------------------------------------------- native algebra
+
 
 @pytest.mark.parametrize("sigma_min", [1e-2, 1e-6, 1e-10, 0.0])
 def test_native_composite_needs_no_inverse(sigma_min):
@@ -207,7 +312,7 @@ def test_reverse_algebra_matches_finite_differences():
     M1 = rng.standard_normal((N, K))
     Sz, Tz = S[types], T[types]
     h = m @ C
-    a = np.cos(h @ msg_w)[:, None] * msg_w[None, :]          # message (R1) adjoint only
+    a = np.cos(h @ msg_w)[:, None] * msg_w[None, :]  # message (R1) adjoint only
     h2 = np.einsum("nk,nkc->nc", m, Tz) + M1 @ W2
     g2 = 1.0 / (1.0 + np.exp(-h2))
     g_legacy = (a + r[None, :] + np.einsum("nkc,nc->nk", Sz, g2)) @ C.T
@@ -218,7 +323,7 @@ def test_reverse_algebra_matches_finite_differences():
     E_leg = lambda mm: _toy_energy(mm, C, msg_w, r=r, S=Sz, W2=W2, M1=M1)  # noqa: E731
     assert abs(E(m) - E_leg(m)) <= 1e-9 * max(abs(E(m)), 1.0)
     eps = 1e-6
-    for (i, k) in [(0, 0), (1, 3), (2, 5), (3, 1), (4, 2), (5, 4)]:
+    for i, k in [(0, 0), (1, 3), (2, 5), (3, 1), (4, 2), (5, 4)]:
         dm = np.zeros_like(m)
         dm[i, k] = eps
         fd = (E(m + dm) - E(m - dm)) / (2 * eps)
@@ -230,7 +335,9 @@ def test_reverse_algebra_matches_finite_differences():
 
 def test_identity_check_reports_per_element():
     payload, _ = _synthetic_legacy_payload()
-    new, checks = recompose_legacy_payload(payload, source_sha256="d" * 64, source_bytes=1)
+    new, checks = recompose_legacy_payload(
+        payload, source_sha256="d" * 64, source_bytes=1
+    )
     assert len(checks["per_element"]) == 6
     C = np.asarray(payload["H1_weights"]).reshape(2, 6, 6)[0]
     r = np.asarray(payload["readout_1_weights"])
@@ -241,8 +348,6 @@ def test_identity_check_reports_per_element():
     assert all(row["T_vs_CS_max_rel_terms"] <= 1e-12 for row in again["per_element"])
     assert all(row["H2_max_rel_terms"] <= 1e-12 for row in again["per_element"])
     assert again["E1_max_rel_terms"] <= 1e-12
-
-
 
 
 # --------------------------------------------------------------------------- native library (synthetic model)
@@ -346,7 +451,9 @@ def _efs(model_path, dtype, use_kokkos, displacement=None):
     from symmetrix import Symmetrix
 
     kwargs = {"streamed_edges": "generic"} if use_kokkos else {}
-    calculator = Symmetrix(str(model_path), use_kokkos=use_kokkos, dtype=dtype, **kwargs)
+    calculator = Symmetrix(
+        str(model_path), use_kokkos=use_kokkos, dtype=dtype, **kwargs
+    )
     atoms = _structure()
     if displacement is not None:
         atoms.positions = atoms.positions + displacement
@@ -367,17 +474,32 @@ def test_synthetic_dispatch_and_payload_agreement(tmp_path):
     nc = _native()
     legacy, v4 = synthetic_model_pair(1e-4)
     validate_payload(v4)
-    migrated, _ = recompose_legacy_payload(legacy, source_sha256="0" * 64, source_bytes=1)
+    migrated, _ = recompose_legacy_payload(
+        legacy, source_sha256="0" * 64, source_bytes=1
+    )
     # migration from the legacy JSON reproduces the inverse-free maps up to the
     # inverse rounding already present in the legacy payload
     np.testing.assert_allclose(
-        migrated["readout_1_weights_for_M0"], v4["readout_1_weights_for_M0"], rtol=0, atol=1e-9
+        migrated["readout_1_weights_for_M0"],
+        v4["readout_1_weights_for_M0"],
+        rtol=0,
+        atol=1e-9,
     )
     legacy_path = _write(tmp_path, "legacy.json", legacy)
     v4_path = _write(tmp_path, "v4.json", v4)
     for cls in (nc.MACE, nc.MACEFloat):
         assert cls(str(legacy_path), "").h1_affine_mode == "legacy"
         assert cls(str(v4_path), "").h1_affine_mode == "m0_composite"
+
+
+def test_native_v4_nonstandard_family_uses_its_existing_payload(tmp_path):
+    native = _native()
+    legacy, _ = synthetic_model_pair(0.5)
+    legacy["symmetrix_format_version"] = 4
+    legacy["model_type"] = "MACEField"
+    path = _write(tmp_path, "field-container-v4.json", legacy)
+
+    assert native.MACE(str(path), "").h1_affine_mode == "legacy"
 
 
 @pytest.mark.parametrize(
@@ -404,7 +526,9 @@ def test_synthetic_loader_refuses_malformed_v4(tmp_path, mutation):
 def test_synthetic_fp64_equivalence(tmp_path, use_kokkos):
     _native()
     legacy, v4 = synthetic_model_pair(1e-4)
-    E_old, F_old, S_old = _efs(_write(tmp_path, "legacy.json", legacy), "float64", use_kokkos)
+    E_old, F_old, S_old = _efs(
+        _write(tmp_path, "legacy.json", legacy), "float64", use_kokkos
+    )
     E_new, F_new, S_new = _efs(_write(tmp_path, "v4.json", v4), "float64", use_kokkos)
     assert np.isfinite(E_new) and np.all(np.isfinite(F_new))
     assert abs(E_new - E_old) <= 1e-9 * max(1.0, abs(E_old))
@@ -449,12 +573,18 @@ def test_synthetic_fp32_amplification_is_removed(tmp_path, use_kokkos):
 
         if not native._kokkos_is_initialized():
             native._init_kokkos()
-        path = "kokkos-cuda" if native._kokkos_default_execution_space() == "Cuda" else "kokkos-host"
+        path = (
+            "kokkos-cuda"
+            if native._kokkos_default_execution_space() == "Cuda"
+            else "kokkos-host"
+        )
     print(f"H1_AFFINE_FP32 path={path} {errors}")
     (legacy_well, v4_well), (legacy_ill, v4_ill) = errors["well"], errors["ill"]
     min_amplification, min_removal, max_floor = _FP32_RATIO_BOUNDS[path]
     if min_amplification is not None:
-        assert legacy_ill >= min_amplification * legacy_well  # amplification present (legacy basis)
+        assert (
+            legacy_ill >= min_amplification * legacy_well
+        )  # amplification present (legacy basis)
     assert legacy_ill >= min_removal * v4_ill  # removed in the m0_composite basis
     assert v4_ill <= max_floor * v4_well  # v4 stays at its own well-conditioned floor
 
@@ -478,6 +608,12 @@ def test_synthetic_v4_forces_match_finite_differences(tmp_path):
         for component in range(3):
             d = np.zeros((count, 3))
             d[atom, component] = 1.0
-            energies = [_efs(path, "float64", False, k * h * d)[0] for k in (2, 1, -1, -2)]
-            fd = (-energies[0] + 8 * energies[1] - 8 * energies[2] + energies[3]) / (12 * h)
-            assert abs(-fd - F[atom, component]) <= 1e-6 * max(1.0, abs(F[atom, component]))
+            energies = [
+                _efs(path, "float64", False, k * h * d)[0] for k in (2, 1, -1, -2)
+            ]
+            fd = (-energies[0] + 8 * energies[1] - 8 * energies[2] + energies[3]) / (
+                12 * h
+            )
+            assert abs(-fd - F[atom, component]) <= 1e-6 * max(
+                1.0, abs(F[atom, component])
+            )

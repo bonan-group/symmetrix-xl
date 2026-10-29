@@ -42,6 +42,11 @@ H1_AFFINE_MODES = (H1_AFFINE_MODE_LEGACY, H1_AFFINE_MODE_M0_COMPOSITE)
 H1_AFFINE_VERSION = 1
 M0_COMPOSITE_FORMAT_VERSION = 4
 H1_AFFINE_TOOL_VERSION = "symmetrix-h1-affine-m0c-1"
+# These conservative advisory thresholds correspond to losing at least five
+# fp32 bits in an exported composite (32x amplification), or nearly the full
+# 24-bit fp32 significand through the native linear_up solve (condition 1e6).
+LEGACY_V2_MAP_AMPLIFICATION_THRESHOLD = 32.0
+LEGACY_V2_LINEAR_UP_CONDITION_THRESHOLD = 1.0e6
 
 LEGACY_KEYS = ("readout_1_weights", "H2_weights_for_H1")
 M0_COMPOSITE_KEYS = ("readout_1_weights_for_M0", "H2_weights_for_M0")
@@ -123,7 +128,10 @@ def legacy_maps(data: dict) -> tuple[np.ndarray, np.ndarray]:
     if len(rows) != num_elements:
         raise H1AffineError("H2_weights_for_H1 must have one row per element")
     S = np.stack(
-        [_finite_array(row, f"H2_weights_for_H1[{z}]", K * K) for z, row in enumerate(rows)]
+        [
+            _finite_array(row, f"H2_weights_for_H1[{z}]", K * K)
+            for z, row in enumerate(rows)
+        ]
     ).reshape(num_elements, K, K)
     return r, S
 
@@ -136,7 +144,10 @@ def m0_composite_maps(data: dict) -> tuple[np.ndarray, np.ndarray]:
     if len(rows) != num_elements:
         raise H1AffineError("H2_weights_for_M0 must have one row per element")
     T = np.stack(
-        [_finite_array(row, f"H2_weights_for_M0[{z}]", K * K) for z, row in enumerate(rows)]
+        [
+            _finite_array(row, f"H2_weights_for_M0[{z}]", K * K)
+            for z, row in enumerate(rows)
+        ]
     ).reshape(num_elements, K, K)
     return q, T
 
@@ -144,9 +155,17 @@ def m0_composite_maps(data: dict) -> tuple[np.ndarray, np.ndarray]:
 def h1_affine_mode_of(data: dict) -> str:
     """Return the declared basis after a strict schema check (legacy or m0_composite)."""
     version = int(data.get("symmetrix_format_version", 1))
+    model_type = data.get("model_type", "MACE")
     mode = data.get("h1_affine_mode")
     present_new = [key for key in M0_COMPOSITE_KEYS if key in data]
     present_old = [key for key in LEGACY_KEYS if key in data]
+    if model_type != "MACE":
+        if mode is not None or "h1_affine_version" in data or present_new:
+            raise H1AffineError(
+                f"model_type {model_type!r} must not declare standard-MACE "
+                f"h1_affine fields (mode={mode!r}, keys={present_new})"
+            )
+        return H1_AFFINE_MODE_LEGACY
     if version in (1, 2):
         if mode is not None or "h1_affine_version" in data or present_new:
             raise H1AffineError(
@@ -156,15 +175,25 @@ def h1_affine_mode_of(data: dict) -> str:
         return H1_AFFINE_MODE_LEGACY
     if version != M0_COMPOSITE_FORMAT_VERSION:
         raise H1AffineError(f"unsupported symmetrix_format_version {version} for MACE")
+    if int(data.get("num_interactions", 2)) == 1:
+        if mode is not None or "h1_affine_version" in data or present_new:
+            raise H1AffineError(
+                "single-layer format version 4 must not declare h1_affine fields"
+            )
+        return H1_AFFINE_MODE_LEGACY
     if mode != H1_AFFINE_MODE_M0_COMPOSITE:
-        raise H1AffineError(f"format version 4 requires h1_affine_mode 'm0_composite', got {mode!r}")
+        raise H1AffineError(
+            f"format version 4 requires h1_affine_mode 'm0_composite', got {mode!r}"
+        )
     if data.get("h1_affine_version") != H1_AFFINE_VERSION:
         raise H1AffineError(
             f"unsupported h1_affine_version {data.get('h1_affine_version')!r} "
             f"(supported: {H1_AFFINE_VERSION})"
         )
     if present_old:
-        raise H1AffineError(f"m0_composite payload must not contain legacy keys {present_old}")
+        raise H1AffineError(
+            f"m0_composite payload must not contain legacy keys {present_old}"
+        )
     missing = [key for key in M0_COMPOSITE_KEYS if key not in data]
     if missing:
         raise H1AffineError(f"m0_composite payload is missing {missing}")
@@ -179,13 +208,24 @@ def validate_payload(data: dict) -> dict:
     C = scalar_h1_map(data)
     if mode == H1_AFFINE_MODE_LEGACY:
         r, S = legacy_maps(data)
-        return {"mode": mode, "K": K, "L_max": L_max, "num_elements": num_elements,
-                "readout_l2": float(np.linalg.norm(r)), "skip_fro": float(np.linalg.norm(S))}
+        return {
+            "mode": mode,
+            "K": K,
+            "L_max": L_max,
+            "num_elements": num_elements,
+            "readout_l2": float(np.linalg.norm(r)),
+            "skip_fro": float(np.linalg.norm(S)),
+        }
     q, T = m0_composite_maps(data)
-    return {"mode": mode, "K": K, "L_max": L_max, "num_elements": num_elements,
-            "readout_for_M0_l2": float(np.linalg.norm(q)),
-            "skip_for_M0_fro": float(np.linalg.norm(T)),
-            "C_shape": list(C.shape)}
+    return {
+        "mode": mode,
+        "K": K,
+        "L_max": L_max,
+        "num_elements": num_elements,
+        "readout_for_M0_l2": float(np.linalg.norm(q)),
+        "skip_for_M0_fro": float(np.linalg.norm(T)),
+        "C_shape": list(C.shape),
+    }
 
 
 def conditioning(C: np.ndarray) -> dict:
@@ -198,8 +238,99 @@ def conditioning(C: np.ndarray) -> dict:
     }
 
 
-def identity_check(C: np.ndarray, r: np.ndarray, S: np.ndarray, q: np.ndarray,
-                   T: np.ndarray, *, num_probe_rows: int = 64, seed: int = 20261017) -> dict:
+def _map_amplification(
+    C: np.ndarray, value: np.ndarray, *, operator_norm: float
+) -> float:
+    output = C @ value
+    numerator = float(operator_norm * np.linalg.norm(value))
+    denominator = float(np.linalg.norm(output))
+    if denominator == 0.0:
+        return math.inf if numerator > 0.0 else 1.0
+    return numerator / denominator
+
+
+def legacy_v2_reexport_guidance(data: dict) -> dict | None:
+    """Describe fp32 cancellation risk for a legacy standard-MACE v2 payload.
+
+    Native exports can carry the condition number of ``linear_up``. Older JSON
+    files cannot recover that matrix, so their fallback diagnostic measures the
+    amplification in the maps that are actually evaluated: ``C r`` and
+    ``C S_z``. The fallback is a risk proxy, not a reconstruction of ``U``.
+    """
+    if (
+        data.get("model_type", "MACE") != "MACE"
+        or int(data.get("symmetrix_format_version", 1)) != 2
+    ):
+        return None
+
+    C = scalar_h1_map(data)
+    r, S = legacy_maps(data)
+    operator_norm = float(np.linalg.norm(C, ord=2))
+    readout_amplification = _map_amplification(C, r, operator_norm=operator_norm)
+    skip_amplification = max(
+        _map_amplification(C, row, operator_norm=operator_norm) for row in S
+    )
+    map_amplification = max(readout_amplification, skip_amplification)
+
+    provenance = data.get("h1_affine_provenance", {})
+    checkpoint_conditioning = provenance.get("conditioning", {})
+    cond_U0 = checkpoint_conditioning.get("cond_U0")
+    if cond_U0 is None and checkpoint_conditioning.get("sigma_min_U0") is not None:
+        sigma_min_U0 = float(checkpoint_conditioning["sigma_min_U0"])
+        sigma_max_U0 = float(checkpoint_conditioning["sigma_max_U0"])
+        cond_U0 = sigma_max_U0 / sigma_min_U0 if sigma_min_U0 > 0.0 else math.inf
+    if cond_U0 is not None:
+        cond_U0 = float(cond_U0)
+        diagnostic_source = "checkpoint_linear_up"
+        elevated = (
+            not math.isfinite(cond_U0)
+            or cond_U0 >= LEGACY_V2_LINEAR_UP_CONDITION_THRESHOLD
+            or map_amplification >= LEGACY_V2_MAP_AMPLIFICATION_THRESHOLD
+        )
+    else:
+        diagnostic_source = "exported_maps"
+        elevated = (
+            not math.isfinite(map_amplification)
+            or map_amplification >= LEGACY_V2_MAP_AMPLIFICATION_THRESHOLD
+        )
+
+    message = (
+        "This is a legacy v2 standard-MACE model. "
+        "Re-export to v4 is recommended but optional."
+    )
+    if elevated:
+        message += (
+            " Diagnostics indicate elevated float32 cancellation risk; "
+            "re-export is especially advisable for float32 evaluation."
+        )
+    elif diagnostic_source == "exported_maps":
+        message += (
+            " The available JSON-only check found no elevated risk, but it "
+            "cannot recover the original linear_up matrix."
+        )
+
+    return {
+        "risk": "elevated" if elevated else "low",
+        "diagnostic_source": diagnostic_source,
+        "cond_U0": cond_U0,
+        "readout_amplification": readout_amplification,
+        "skip_amplification": skip_amplification,
+        "map_amplification_threshold": LEGACY_V2_MAP_AMPLIFICATION_THRESHOLD,
+        "linear_up_condition_threshold": LEGACY_V2_LINEAR_UP_CONDITION_THRESHOLD,
+        "message": message,
+    }
+
+
+def identity_check(
+    C: np.ndarray,
+    r: np.ndarray,
+    S: np.ndarray,
+    q: np.ndarray,
+    T: np.ndarray,
+    *,
+    num_probe_rows: int = 64,
+    seed: int = 20261017,
+) -> dict:
     """fp64 identities (m C) r == m q and (m C) S_z == m T_z for every element z.
 
     ``*_rel`` divides by the result scale (informative; grows with the legacy
@@ -218,11 +349,17 @@ def identity_check(C: np.ndarray, r: np.ndarray, S: np.ndarray, q: np.ndarray,
     out = {
         "probe_rows": num_probe_rows,
         "seed": seed,
-        "q_vs_Cr_max_rel": float(np.max(np.abs(q - C @ r)) / max(np.max(np.abs(q)), 1e-300)),
-        "q_vs_Cr_max_rel_terms": float(np.max(np.abs(q - C @ r) / np.maximum(q_terms, 1e-300))),
+        "q_vs_Cr_max_rel": float(
+            np.max(np.abs(q - C @ r)) / max(np.max(np.abs(q)), 1e-300)
+        ),
+        "q_vs_Cr_max_rel_terms": float(
+            np.max(np.abs(q - C @ r) / np.maximum(q_terms, 1e-300))
+        ),
         "E1_max_abs_diff": float(np.max(np.abs(e_old - e_new))),
         "E1_scale": float(np.max(np.abs(e_new))),
-        "E1_max_rel_terms": float(np.max(np.abs(e_old - e_new) / np.maximum(e_terms, 1e-300))),
+        "E1_max_rel_terms": float(
+            np.max(np.abs(e_old - e_new) / np.maximum(e_terms, 1e-300))
+        ),
         "per_element": [],
     }
     for z in range(S.shape[0]):
@@ -230,22 +367,28 @@ def identity_check(C: np.ndarray, r: np.ndarray, S: np.ndarray, q: np.ndarray,
         h2_new = m @ T[z]
         h2_terms = np.abs(H1) @ np.abs(S[z])
         t_terms = np.abs(C) @ np.abs(S[z])
-        out["per_element"].append({
-            "z_index": z,
-            "T_vs_CS_max_rel": float(
-                np.max(np.abs(T[z] - C @ S[z])) / max(np.max(np.abs(T[z])), 1e-300)),
-            "T_vs_CS_max_rel_terms": float(
-                np.max(np.abs(T[z] - C @ S[z]) / np.maximum(t_terms, 1e-300))),
-            "H2_max_abs_diff": float(np.max(np.abs(h2_old - h2_new))),
-            "H2_scale": float(np.max(np.abs(h2_new))),
-            "H2_max_rel_terms": float(
-                np.max(np.abs(h2_old - h2_new) / np.maximum(h2_terms, 1e-300))),
-        })
+        out["per_element"].append(
+            {
+                "z_index": z,
+                "T_vs_CS_max_rel": float(
+                    np.max(np.abs(T[z] - C @ S[z])) / max(np.max(np.abs(T[z])), 1e-300)
+                ),
+                "T_vs_CS_max_rel_terms": float(
+                    np.max(np.abs(T[z] - C @ S[z]) / np.maximum(t_terms, 1e-300))
+                ),
+                "H2_max_abs_diff": float(np.max(np.abs(h2_old - h2_new))),
+                "H2_scale": float(np.max(np.abs(h2_new))),
+                "H2_max_rel_terms": float(
+                    np.max(np.abs(h2_old - h2_new) / np.maximum(h2_terms, 1e-300))
+                ),
+            }
+        )
     return out
 
 
-def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: int,
-                             source_path: str | None = None) -> tuple[dict, dict]:
+def recompose_legacy_payload(
+    data: dict, *, source_sha256: str, source_bytes: int, source_path: str | None = None
+) -> tuple[dict, dict]:
     """Build a new v4 m0_composite payload from a validated legacy v2 payload.
 
     The recomposition q = C r and T_z = C S_z is exact up to the inverse already
@@ -268,14 +411,16 @@ def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: in
         raise H1AffineError("non-finite composite maps")
     checks = identity_check(C, r, S, q, T)
     diag = conditioning(C)
-    diag.update({
-        "sigma_min_U0": None,
-        "sigma_min_U0_status": "UNAVAILABLE_FROM_LEGACY_JSON",
-        "legacy_readout_1_l2": float(np.linalg.norm(r)),
-        "legacy_skip_fro": float(np.linalg.norm(S)),
-        "readout_1_for_M0_l2": float(np.linalg.norm(q)),
-        "skip_for_M0_fro": float(np.linalg.norm(T)),
-    })
+    diag.update(
+        {
+            "sigma_min_U0": None,
+            "sigma_min_U0_status": "UNAVAILABLE_FROM_LEGACY_JSON",
+            "legacy_readout_1_l2": float(np.linalg.norm(r)),
+            "legacy_skip_fro": float(np.linalg.norm(S)),
+            "readout_1_for_M0_l2": float(np.linalg.norm(q)),
+            "skip_for_M0_fro": float(np.linalg.norm(T)),
+        }
+    )
     out = {}
     for key, value in data.items():
         if key == "symmetrix_format_version":
@@ -285,10 +430,13 @@ def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: in
         elif key == "readout_1_weights":
             out["readout_1_weights_for_M0"] = q.tolist()
         elif key == "H2_weights_for_H1":
-            out["H2_weights_for_M0"] = [T[z].reshape(-1).tolist() for z in range(T.shape[0])]
+            out["H2_weights_for_M0"] = [
+                T[z].reshape(-1).tolist() for z in range(T.shape[0])
+            ]
         else:
             out[key] = value
     out["h1_affine_provenance"] = {
+        "origin": "converted_from_v2",
         "source": "json_migration",
         "source_json_sha256": source_sha256,
         "source_json_bytes": int(source_bytes),
@@ -299,12 +447,20 @@ def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: in
         "numpy_version": np.__version__,
         "conditioning": diag,
     }
+    out["symmetrix_format_provenance"] = {
+        "origin": "converted_from_v2",
+        "source_format_version": int(data.get("symmetrix_format_version", 1)),
+        "source_json_sha256": source_sha256,
+        "tool": "symmetrix.cli.recompose_mace_json",
+        "tool_version": H1_AFFINE_TOOL_VERSION,
+    }
     h1_affine_mode_of(out)
     return out, checks
 
 
-def native_composite_maps(P0: np.ndarray, r0_scaled: np.ndarray,
-                          S0: list[np.ndarray]) -> tuple[np.ndarray, list[np.ndarray]]:
+def native_composite_maps(
+    P0: np.ndarray, r0_scaled: np.ndarray, S0: list[np.ndarray]
+) -> tuple[np.ndarray, list[np.ndarray]]:
     """Fresh export from native weights: q = P0 r0*scale, T_z = P0 S0_z (no inverse)."""
     q = P0 @ r0_scaled
     T = [P0 @ S0_z for S0_z in S0]

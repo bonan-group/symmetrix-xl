@@ -27,7 +27,7 @@ and supported analytical field-response properties. Multi-head model files can
 retain every prediction head, and `SymmetrixEnsemble` can evaluate compatible
 models together and report member values, means, and population variances.
 
-Compatible format-version-2 MACE and MACEField JSON can be used from Python/ASE
+Compatible format-version-2 and format-version-4 MACE and MACEField JSON can be used from Python/ASE
 or from the `pair_symmetrix` LAMMPS integration. Two-interaction direct LAMMPS
 runs consume a prepared JIT artifact; LAMMPS does not invoke the runtime
 compiler during a simulation. Compiler-free and single-layer paths do not

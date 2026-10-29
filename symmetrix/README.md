@@ -196,13 +196,15 @@ symmetrix_extract_mace \
 ```
 
 Universal compact exports are preferred. By omitting `--chemical-symbols` and
-`--atomic-numbers`, format v2 retains the checkpoint's complete element domain
+`--atomic-numbers`, format v4 retains the checkpoint's complete element domain
 without generating the per-element-pair spline tables used by the original
-Symmetrix format (named v1 here). Format-v3 nonlinear MACE exports likewise
-retain the complete domain and do not support element subsets. Universal files
+Symmetrix format (named v1 here). Supported standard MACE models use the
+inverse-free H1 payload; nonlinear and field-aware models keep their native
+graph payload in the same v4 container. Nonlinear exports retain the complete
+domain and do not support element subsets. Universal files
 still contain the checkpoint's element-indexed learned parameters. Use a subset
-only for an intentionally restricted format-v2 deployment or an original-format
-`--radial-format pair-splines` file.
+only for an intentionally restricted deployment. Original-format
+`--radial-format pair-splines` files also require `--h1-affine-mode legacy`.
 
 The converter retains all compatible prediction heads. Use `--head` to select
 the default head without discarding the others:

@@ -806,7 +806,8 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
     if (!dual_layer_tiled_plan_active || single_layer_readout
         || phase < 1 || phase > 3)
         throw std::logic_error("Invalid dual-layer tiled evaluation phase.");
-    if (h1_affine_m0_composite()
+    const bool legacy_h1_affine = h1_affine_legacy();
+    if (!legacy_h1_affine
         && (h1_affine_graph_M0_scalar.extent_int(0) < execution_prepared_num_feature_nodes
             || h1_affine_graph_M0_direct_adj.extent_int(0)
                 < execution_prepared_num_feature_nodes
@@ -958,7 +959,7 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
                     graph_h1_adjoint(feature,LM,k) =
                         tile_h1_adjoint(receiver,LM,k);
                 });
-            if (h1_affine_m0_composite()) {
+            if (!legacy_h1_affine) {
                 // Keep the receiver's scalar M0 block for phase 2 (skip input).
                 const auto tile_m0 = h1_affine_M0_scalar;
                 const auto graph_m0 = h1_affine_graph_M0_scalar;
@@ -1007,7 +1008,7 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
                 receiver_count, batch_node_types, batch_num_neigh,
                 batch_neigh_types, batch_r);
             compute_M1(receiver_count, batch_node_types);
-            if (h1_affine_m0_composite()) {
+            if (!legacy_h1_affine) {
                 const auto tile_m0 = h1_affine_M0_scalar;
                 const auto graph_m0 = h1_affine_graph_M0_scalar;
                 Kokkos::parallel_for(
@@ -1027,7 +1028,7 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
             compute_H2(receiver_count, batch_node_types);
             compute_readout_2(receiver_count);
             reverse_H2(receiver_count, batch_node_types, false);
-            if (h1_affine_m0_composite()) {
+            if (!legacy_h1_affine) {
                 const auto tile_direct = h1_affine_M0_direct_adj;
                 const auto graph_direct = h1_affine_graph_M0_direct_adj;
                 Kokkos::parallel_for(
@@ -1097,7 +1098,7 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
             compute_A0_scaled(
                 receiver_count, batch_node_types, batch_num_neigh,
                 batch_neigh_types, batch_r);
-            if (h1_affine_m0_composite()) {
+            if (!legacy_h1_affine) {
                 const auto tile_direct = h1_affine_M0_direct_adj;
                 const auto graph_direct = h1_affine_graph_M0_direct_adj;
                 Kokkos::parallel_for(

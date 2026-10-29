@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import json
 import logging
 from types import SimpleNamespace
@@ -29,6 +30,27 @@ pytestmark = pytest.mark.skipif(
     extract_mace_data is None,
     reason=f"extract_mace_data is not available: {extract_mace_data_import_error}",
 )
+
+
+def test_standard_export_defaults_to_inverse_free_v4():
+    default = inspect.signature(extract_mace_data).parameters["h1_affine_mode"].default
+
+    assert default == "m0_composite"
+
+
+def test_extract_cli_defaults_to_inverse_free_v4(monkeypatch, tmp_path):
+    cli = importlib.import_module("symmetrix.cli.extract_mace")
+    requested = {}
+
+    def fake_extract(*args, **kwargs):
+        requested.update(kwargs)
+        return {"model_type": "MACE", "symmetrix_format_version": 4}
+
+    monkeypatch.setattr(cli, "extract_mace_data", fake_extract)
+    output = tmp_path / "model.json"
+
+    assert cli.main(["--model", "checkpoint.model", "--output", str(output)]) == 0
+    assert requested["h1_affine_mode"] == "m0_composite"
 
 
 def test_ordinary_checkpoint_does_not_import_macefield(monkeypatch):
@@ -314,7 +336,9 @@ def test_macefield_extractor_includes_field_schema(macefield_model_path, tmp_pat
     assert len(data["H1_product_weights"]) == 32768
     assert len(data["H1_linear_up_weights"]) == 32768
 
-    assert data["symmetrix_format_version"] == 2
+    assert data["symmetrix_format_version"] == 4
+    assert "h1_affine_mode" not in data
+    assert data["symmetrix_format_provenance"]["origin"] == "native_checkpoint"
     assert data["radial_representation"] == "compact"
     assert "radial_spline_values_0" not in data
     assert "radial_spline_values_1" not in data
@@ -397,6 +421,7 @@ def test_macefield_extractor_retains_legacy_pair_splines(
         head="mp-dielectric",
         num_spline_points=8,
         radial_format="pair-splines",
+        h1_affine_mode="legacy",
     )
 
     assert "symmetrix_format_version" not in data
@@ -424,6 +449,7 @@ def test_legacy_pair_splines_retain_low_node_count_support(macefield_model_path)
             head="mp-dielectric",
             num_spline_points=num_spline_points,
             radial_format="pair-splines",
+            h1_affine_mode="legacy",
         )
 
         assert len(data["radial_spline_values_0"][0][0]) == num_spline_points
@@ -473,6 +499,7 @@ def test_compact_radial_values_and_derivatives_match_pair_splines(
         head="mp-dielectric",
         num_spline_points=32,
         radial_format="pair-splines",
+        h1_affine_mode="legacy",
     )
     compact_path = tmp_path / "compact.json"
     legacy_path = tmp_path / "legacy.json"

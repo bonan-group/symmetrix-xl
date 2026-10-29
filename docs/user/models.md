@@ -23,18 +23,29 @@ symmetrix_extract_mace \
 ```
 
 Omitting `--chemical-symbols` and `--atomic-numbers` produces the preferred
-universal export and retains the checkpoint's complete element domain. Compact
-format v2 stores the shared radial model once with element-indexed parameters,
-and format v3 uses the same full-domain principle for nonlinear MACE models.
-Unlike the original Symmetrix pair-spline format (named v1 here), these formats
+universal export and retains the checkpoint's complete element domain. New
+compact exports use format v4 as a common container for every model family.
+Supported standard MACE models use the inverse-free `m0_composite` H1 payload;
+MACEField and MACE-MH-1 retain their native graph representation and do not
+declare standard-MACE H1-affine fields. Unlike the original Symmetrix
+pair-spline format (named v1 here), compact formats
 do not add a separate radial spline table for every element pair, avoiding
 quadratic pair-table growth. A
 universal file still contains the checkpoint's element-indexed learned
-parameters and can therefore be larger than a deliberately restricted v2
+parameters and can therefore be larger than a deliberately restricted compact
 subset, but it can be reused across compositions. Use an explicit element
-subset only for an intentionally restricted format-v2 deployment or when
+subset only for an intentionally restricted deployment or when
 producing the original Symmetrix format with `--radial-format pair-splines`;
-format-v3 models reject subsets.
+nonlinear models reject subsets.
+
+Format v2 standard-MACE files remain supported. On load, Symmetrix reports
+whether checkpoint conditioning metadata or a JSON-only exported-map proxy
+indicates elevated float32 cancellation risk. Re-export to v4 is recommended
+but optional. If the original checkpoint is unavailable,
+`symmetrix_recompose_mace_json` can explicitly convert a compatible v2 JSON;
+the result records `origin: converted_from_v2`, its source format, and source
+hash. A native export records `origin: native_checkpoint`. Conversion is never
+performed automatically while loading.
 
 The command retains all compatible prediction heads. It does not download a
 model; obtain a checkpoint from its model provider, then use the resulting JSON

@@ -154,6 +154,7 @@ def residual_first_macefield_artifacts(tmp_path_factory):
             head="test",
             num_spline_points=256,
             radial_format="pair-splines",
+            h1_affine_mode="legacy",
         )
     finally:
         torch.set_default_dtype(previous_dtype)

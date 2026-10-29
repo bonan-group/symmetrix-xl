@@ -1324,12 +1324,13 @@ def test_generalized_mh1_family_rejects_unsupported_semantics(
             native_symmetrix.MACENonlinearKokkosFloat(str(path))
 
 
-def test_mh1_rejects_malformed_nonlinear_json(tmp_path):
+@pytest.mark.parametrize("format_version", [3, 4])
+def test_mh1_rejects_malformed_nonlinear_json(tmp_path, format_version):
     path = tmp_path / "malformed-nonlinear.json"
     path.write_text(
         json.dumps(
             {
-                "symmetrix_format_version": 3,
+                "symmetrix_format_version": format_version,
                 "model_type": "MACE_Nonlinear",
             }
         )
@@ -1386,7 +1387,8 @@ def test_mh1_rejects_invalid_species_mapping_before_evaluation(tmp_path, use_kok
 
 def test_mh1_full_schema_preserves_dynamic_architecture(mh1_si_artifact):
     data, _ = mh1_si_artifact
-    assert data["symmetrix_format_version"] == 3
+    assert data["symmetrix_format_version"] == 4
+    assert data["symmetrix_format_provenance"]["origin"] == "native_checkpoint"
     assert data["model_type"] == "MACE_Nonlinear"
     assert data["head"] == "matpes_r2scan"
     assert data["atomic_numbers"] == data["model_atomic_numbers"]
@@ -2573,11 +2575,12 @@ def test_mh1_universal_kokkos_matches_serial(tmp_path):
 
 
 def test_mh1_rejects_legacy_pair_spline_extraction():
-    with pytest.raises(ValueError, match="format-version-3 compact schema"):
+    with pytest.raises(ValueError, match="format-version-4 compact schema"):
         extract_mace_data(
             _mh1_model_path(),
             head="matpes_r2scan",
             radial_format="pair-splines",
+            h1_affine_mode="legacy",
         )
 
 

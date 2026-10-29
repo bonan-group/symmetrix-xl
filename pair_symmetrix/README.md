@@ -35,13 +35,15 @@ types `1`, `2`, and `3`, respectively. A compact universal JSON can be reused by
 different input with another element mapping; active radial tables are built
 once during `pair_coeff` for that mapping.
 
-Compact universal files use Symmetrix-XL format version 2 and require an updated
-pair style. The original Symmetrix format (named v1 here), which was
+New compact universal files use the common Symmetrix-XL format version 4 and
+require an updated pair style. Legacy compact format v2 remains supported. The
+original Symmetrix format (named v1 here), which was
 unversioned, remains supported. When an artifact must also work with an older
 Symmetrix-XL/LAMMPS installation, generate it with `symmetrix_extract_mace
---radial-format pair-splines` and an explicit element subset.
+--radial-format pair-splines --h1-affine-mode legacy` and an explicit element
+subset.
 
-Format-version-3 `MACE_Nonlinear` models, including MACE-MH-1, are currently
+Format-version-3 and version-4 `MACE_Nonlinear` models, including MACE-MH-1, are currently
 supported by the Python ASE calculator and native library only. Both LAMMPS
 pair styles reject these models explicitly at `pair_coeff`.
 
@@ -59,13 +61,13 @@ yet supported.
 
 The Kokkos pair style recognizes
 `streamed_edges auto|materialized|non-compiled|direct` for compact
-format-version-2 MACE and MACEField models. `non-compiled` is the public name
+format-version-2 or version-4 MACE and MACEField models. `non-compiled` is the public name
 for the compiler-free fallback. The internal `generic` spelling remains a
 temporary compatibility alias, along with `all_interactions -> generic`,
 `factorized -> direct`, and `direct_streamed -> direct`.
 The default `auto` mode selects `direct` only when a `jit_host_artifact` or
 `jit_device_artifact` is provided; otherwise it selects `generic` for compact
-format-version-2 models and retains `materialized` for original Symmetrix
+format-version-2 or version-4 models and retains `materialized` for original Symmetrix
 pair-spline models (named v1 here). Loading this format prints a migration
 notice; explicit mode selections override `auto`. The serial pair style applies
 the same format-aware default automatically.

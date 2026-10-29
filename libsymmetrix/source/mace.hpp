@@ -260,9 +260,10 @@ void reverse_M1(const int num_nodes, std::span<const int> node_types);
 // on the scalar M0 block with q = C r and T_z = C S_z; the scalar M0 adjoint
 // receives q + T_z H2_adj directly (M0_direct_adj, added after reverse_H1) and
 // H1_adj carries only the message-passing (R1) adjoint.
-symmetrix::h1_affine::Mode h1_affine_mode = symmetrix::h1_affine::Mode::legacy;
-bool h1_affine_m0_composite() const {
-    return h1_affine_mode == symmetrix::h1_affine::Mode::m0_composite;
+symmetrix::h1_affine::Mode h1_affine_mode =
+    symmetrix::h1_affine::Mode::m0_composite;
+bool h1_affine_legacy() const {
+    return h1_affine_mode == symmetrix::h1_affine::Mode::legacy;
 }
 std::string h1_affine_mode_name() const {
     return symmetrix::h1_affine::mode_name(h1_affine_mode);

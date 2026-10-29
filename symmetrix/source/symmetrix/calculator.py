@@ -32,6 +32,7 @@ from ase.calculators.calculator import (
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from . import symmetrix
+from .h1_affine import H1AffineError, legacy_v2_reexport_guidance
 
 _LOGGER = logging.getLogger(__name__)
 _FIELD_ADDITIVE_PROPERTIES = ["energy", "free_energy", "energies", "forces", "stress"]
@@ -83,6 +84,37 @@ _NEIGHBOR_BACKENDS = frozenset(("automatic", "host", "kokkos"))
 _AUTOMATIC_KOKKOS_NEIGHBOR_MIN_ATOMS = 512
 _AUTOMATIC_KOKKOS_NEIGHBOR_EXECUTION_SPACES = frozenset(("Cuda", "HIP"))
 _INT32_MAX = int(np.iinfo(np.int32).max)
+
+
+def _legacy_v2_guidance(model_data):
+    if (
+        not isinstance(model_data, dict)
+        or model_data.get("model_type", "MACE") != "MACE"
+        or int(model_data.get("symmetrix_format_version", 1)) != 2
+    ):
+        return None
+    try:
+        return legacy_v2_reexport_guidance(model_data)
+    except (H1AffineError, KeyError, TypeError, ValueError):
+        return {
+            "risk": "unknown",
+            "diagnostic_source": "unavailable",
+            "message": (
+                "This is a legacy v2 standard-MACE model. "
+                "Re-export to v4 is recommended but optional. "
+                "Numerical risk could not be assessed from this JSON."
+            ),
+        }
+
+
+def _warn_for_legacy_v2(model_data_or_metadata):
+    guidance = None
+    if isinstance(model_data_or_metadata, dict):
+        guidance = model_data_or_metadata.get("legacy_v2_guidance")
+        if guidance is None:
+            guidance = _legacy_v2_guidance(model_data_or_metadata)
+    if guidance is not None:
+        warnings.warn(guidance["message"], RuntimeWarning, stacklevel=3)
 
 
 def _validate_int32_graph_cardinality(num_atoms, num_edges):
@@ -968,6 +1000,7 @@ class Symmetrix(Calculator):
         self._macefield_response_graph_generation = 0
         self._electric_field = kwargs.get("electric_field", None)
         json_metadata = self._json_metadata(model_file)
+        _warn_for_legacy_v2(json_metadata)
         self._model_has_field_coupling = (
             bool(json_metadata.get("has_field_coupling", False))
             if json_metadata is not None
@@ -2662,10 +2695,19 @@ class Symmetrix(Calculator):
     def _json_metadata(model_file):
         try:
             model_type, has_field_coupling = symmetrix._model_metadata(str(model_file))
-            return {
+            metadata = {
                 "model_type": model_type,
                 "has_field_coupling": has_field_coupling,
             }
+            try:
+                model_data = json.loads(Path(model_file).read_text())
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+                return metadata
+            metadata["symmetrix_format_version"] = int(
+                model_data.get("symmetrix_format_version", 1)
+            )
+            metadata["legacy_v2_guidance"] = _legacy_v2_guidance(model_data)
+            return metadata
         except RuntimeError as error:
             if Symmetrix._is_native_json_schema_error(error):
                 raise

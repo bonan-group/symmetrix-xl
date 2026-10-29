@@ -199,10 +199,11 @@ void MACEKokkos<Precision>::load_from_json(
 
     A0_scaled = file["A0_scaled"].get<bool>();
     const int format_version = file.value("symmetrix_format_version", 1);
-    // H1 affine basis: v1/v2 -> legacy (unchanged arithmetic); v4 -> m0_composite.
+    // H1 affine basis: standard two-layer v4 uses m0_composite; legacy and
+    // family-specific v4 payloads retain their existing arithmetic.
     h1_affine_mode = symmetrix::h1_affine::validate(file, num_elements, num_channels);
 #ifdef SYMMETRIX_ENABLE_METAL
-    if (h1_affine_m0_composite())
+    if (!h1_affine_legacy())
         throw std::invalid_argument(
             "The m0_composite H1 affine basis is not supported by Metal builds "
             "(fused Metal H1 path); use a legacy format-v2 export.");
@@ -1187,20 +1188,21 @@ void MACEKokkos<Precision>::load_from_json(
     // H2 skip maps: legacy S_z (H2_weights_for_H1) or m0_composite T_z
     // (H2_weights_for_M0); the views of the other basis stay empty.  Values are
     // converted from the JSON doubles directly into H2WeightPrecision.
-    const bool m0_composite = h1_affine_m0_composite();
+    const bool legacy_h1_affine = h1_affine_legacy();
     auto H2_weights_for_H1_vec = file[
-        m0_composite ? "H2_weights_for_M0" : "H2_weights_for_H1"]
+        legacy_h1_affine ? "H2_weights_for_H1" : "H2_weights_for_M0"]
         .get<std::vector<std::vector<double>>>();
     H2_weights_for_H1 = {};
     H2_weights_for_H1_reverse = {};
     H2_weights_for_M0 = {};
     H2_weights_for_M0_reverse = {};
-    auto& skip_weights = m0_composite ? H2_weights_for_M0 : H2_weights_for_H1;
-    auto& skip_weights_reverse = m0_composite
-        ? H2_weights_for_M0_reverse : H2_weights_for_H1_reverse;
+    auto& skip_weights = legacy_h1_affine
+        ? H2_weights_for_H1 : H2_weights_for_M0;
+    auto& skip_weights_reverse = legacy_h1_affine
+        ? H2_weights_for_H1_reverse : H2_weights_for_M0_reverse;
     skip_weights = Kokkos::View<
         H2WeightPrecision**,Kokkos::LayoutRight>(
-        std::string(m0_composite ? "H2_weights_for_M0" : "H2_weights_for_H2"),
+        std::string(legacy_h1_affine ? "H2_weights_for_H1" : "H2_weights_for_M0"),
         num_elements, num_channels*num_channels);
     auto h_H2_weights_for_H1 = Kokkos::create_mirror_view(skip_weights);
     for (int i=0; i<num_elements; ++i) {
@@ -1215,7 +1217,8 @@ void MACEKokkos<Precision>::load_from_json(
             Kokkos::HostSpace>) {
         skip_weights_reverse = Kokkos::View<
             H2WeightPrecision**,Kokkos::LayoutRight>(
-            std::string(m0_composite ? "H2_weights_for_M0_reverse" : "H2_weights_for_H1_reverse"),
+            std::string(legacy_h1_affine
+                ? "H2_weights_for_H1_reverse" : "H2_weights_for_M0_reverse"),
             num_elements, num_channels*num_channels);
         auto h_H2_weights_for_H1_reverse =
             Kokkos::create_mirror_view(skip_weights_reverse);
@@ -1262,12 +1265,12 @@ void MACEKokkos<Precision>::load_from_json(
     // Readouts
     readout_1_weights = {};
     readout_1_weights_for_M0 = {};
-    if (m0_composite)
+    if (legacy_h1_affine)
+        readout_1_weights = toKokkosView("readout_1_weights", file["readout_1_weights"].get<std::vector<double>>());
+    else
         readout_1_weights_for_M0 = toKokkosView(
             "readout_1_weights_for_M0",
             file["readout_1_weights_for_M0"].get<std::vector<double>>());
-    else
-        readout_1_weights = toKokkosView("readout_1_weights", file["readout_1_weights"].get<std::vector<double>>());
     auto readout_2_weights_1 = file["readout_2_weights_1"].get<std::vector<double>>();
     auto readout_2_weights_2 = file["readout_2_weights_2"].get<std::vector<double>>();
     const int readout_2_hidden_size = file.value("readout_2_hidden_size", 16);

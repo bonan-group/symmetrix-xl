@@ -1,6 +1,6 @@
 #pragma once
 
-// H1 affine basis of a MACE JSON (format version 4).
+// H1 affine basis within the common format-version-4 model container.
 //
 // legacy        (format 1/2, no h1_affine fields): readout_1_weights and
 //               H2_weights_for_H1 act on the fused H1 = M0 C (C = P U), i.e.
@@ -10,6 +10,9 @@
 //               (T_z = C S_z, same row-major [input][output] layout) act on the
 //               scalar M0 block; H1_weights still feeds the second message
 //               interaction only.  The legacy keys must be absent.
+//
+// Nonstandard families and single-layer MACE keep their existing payload in
+// the v4 container and do not declare h1_affine fields.
 //
 // Scope of m0_composite: single-head two-interaction compact MACE without
 // field coupling, first-interaction residual or single-layer readout.  Every
@@ -23,7 +26,9 @@
 
 namespace symmetrix::h1_affine {
 
-enum class Mode { legacy, m0_composite };
+// New evaluators start in the v4 representation. Loading a v1/v2 standard-MACE
+// payload explicitly selects the legacy representation during schema validation.
+enum class Mode { m0_composite, legacy };
 
 inline constexpr int m0_composite_format_version = 4;
 inline constexpr int m0_composite_affine_version = 1;
@@ -39,16 +44,29 @@ inline const char* mode_name(Mode mode)
 inline Mode validate(const nlohmann::json& file, int num_elements, int num_channels)
 {
     const int format_version = file.value("symmetrix_format_version", 1);
+    const std::string model_type = file.value("model_type", std::string("MACE"));
     const bool declares_mode = file.contains("h1_affine_mode")
         || file.contains("h1_affine_version");
     const bool has_composite_keys = file.contains("readout_1_weights_for_M0")
         || file.contains("H2_weights_for_M0");
+    if (model_type != "MACE") {
+        if (declares_mode || has_composite_keys)
+            throw std::invalid_argument(
+                "Only standard MACE JSON may declare h1_affine fields.");
+        return Mode::legacy;
+    }
     if (format_version != m0_composite_format_version) {
         if (declares_mode || has_composite_keys)
             throw std::invalid_argument(
                 "Symmetrix MACE format version " + std::to_string(format_version)
                 + " must not declare h1_affine fields; the m0_composite basis "
                   "requires format version 4.");
+        return Mode::legacy;
+    }
+    if (file.value("num_interactions", 2) == 1) {
+        if (declares_mode || has_composite_keys)
+            throw std::invalid_argument(
+                "Single-layer MACE format version 4 must not declare h1_affine fields.");
         return Mode::legacy;
     }
     if (file.value("h1_affine_mode", std::string()) != "m0_composite")

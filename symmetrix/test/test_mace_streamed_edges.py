@@ -124,6 +124,7 @@ def legacy_standard_model_path(tmp_path_factory, macefield_model_path):
         head="mp-dielectric",
         num_spline_points=16,
         radial_format="pair-splines",
+        h1_affine_mode="legacy",
     )
     legacy_data["model_type"] = "MACE"
     legacy_data["has_field_coupling"] = False

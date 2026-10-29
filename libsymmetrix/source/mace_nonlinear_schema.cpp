@@ -210,11 +210,14 @@ MaceMH1FamilyDescriptor analyze_mh1_family_architecture(
 
 void validate_mace_nonlinear_schema(const nlohmann::json& data)
 {
-    if (!data.is_object()
-        || data.value("model_type", std::string()) != "MACE_Nonlinear"
-        || data.at("symmetrix_format_version").get<int>() != 3)
+    if (!data.is_object())
         throw std::invalid_argument(
-            "MACE_Nonlinear evaluator requires format-version-3 nonlinear JSON.");
+            "MACE_Nonlinear evaluator requires format-version-3 or format-version-4 nonlinear JSON.");
+    const int format_version = data.value("symmetrix_format_version", 0);
+    if (data.value("model_type", std::string()) != "MACE_Nonlinear"
+        || (format_version != 3 && format_version != 4))
+        throw std::invalid_argument(
+            "MACE_Nonlinear evaluator requires format-version-3 or format-version-4 nonlinear JSON.");
 
     const auto atomic_numbers = data.at("atomic_numbers").get<std::vector<int>>();
     const auto model_atomic_numbers =

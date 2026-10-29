@@ -3,6 +3,7 @@
 
 import json
 import os
+import warnings
 
 import numpy as np
 import pytest
@@ -42,6 +43,34 @@ else:
     mace_field_available = _MACEField is not None
 
 from model_downloads import test_model_cache_dir
+
+
+def test_legacy_v2_load_warning_is_optional_and_risk_aware():
+    model = {
+        "model_type": "MACE",
+        "symmetrix_format_version": 2,
+        "num_channels": 1,
+        "L_max": 0,
+        "num_elements": 1,
+        "atomic_numbers": [1],
+        "H1_weights": [1.0],
+        "readout_1_weights": [1.0],
+        "H2_weights_for_H1": [[1.0]],
+    }
+
+    with pytest.warns(RuntimeWarning, match="recommended but optional") as caught:
+        calculator_module._warn_for_legacy_v2(model)
+
+    assert len(caught) == 1
+    assert "Diagnostics indicate elevated" not in str(caught[0].message)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        calculator_module._warn_for_legacy_v2(
+            {"model_type": "MACE_Nonlinear", "symmetrix_format_version": 4}
+        )
+
+    assert caught == []
 
 
 @pytest.mark.parametrize(

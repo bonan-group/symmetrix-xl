@@ -338,7 +338,8 @@ def extract_mace_nonlinear_data(
             )
 
     output = {
-        "symmetrix_format_version": 3,
+        "symmetrix_format_version": 4,
+        "symmetrix_format_provenance": {"origin": "native_checkpoint"},
         "model_type": "MACE_Nonlinear",
         "head": model.heads[0]
         if hasattr(model, "heads") and len(model.heads) == 1

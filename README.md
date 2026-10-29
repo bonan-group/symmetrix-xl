@@ -222,14 +222,15 @@ symmetrix_extract_mace \
 ```
 
 The default is the preferred universal compact export, retaining every element
-supported by the checkpoint. Compact format v2 stores the shared radial model
-once instead of generating pair-specific spline tables, while format v3 also
-retains the complete checkpoint domain. Universal compact files therefore
+supported by the checkpoint. New exports use common format v4: supported
+standard MACE models use inverse-free H1 composites, while other model families
+keep their native graph payload. The compact radial model is stored once instead
+of generating pair-specific spline tables. Universal compact files therefore
 avoid quadratic pair-table growth and can be reused across compositions; they
 still include the checkpoint's element-indexed learned parameters. Element
-selectors are intended only for deliberately restricted format-v2 deployments
-or exports in the original Symmetrix pair-spline format (named v1 here);
-format-v3 models reject subsets.
+selectors are intended only for deliberately restricted deployments or exports
+in the original Symmetrix pair-spline format (named v1 here); nonlinear models
+reject subsets.
 
 CUDA and HIP backends are installed separately for a matching GPU architecture;
 see the [installation guide](docs/user/installation.md) and [Symmetrix-XL

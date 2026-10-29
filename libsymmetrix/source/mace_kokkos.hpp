@@ -921,9 +921,10 @@ void reverse_H1_fused(const int num_nodes);
 // after the fused H1 reverse, so H1_adj carries only the message-passing (R1)
 // adjoint.  The tiled dual-layer plan keeps both per receiver feature in the
 // graph-level views between its phases.  Legacy JSONs never touch these views.
-symmetrix::h1_affine::Mode h1_affine_mode = symmetrix::h1_affine::Mode::legacy;
-bool h1_affine_m0_composite() const {
-    return h1_affine_mode == symmetrix::h1_affine::Mode::m0_composite;
+symmetrix::h1_affine::Mode h1_affine_mode =
+    symmetrix::h1_affine::Mode::m0_composite;
+bool h1_affine_legacy() const {
+    return h1_affine_mode == symmetrix::h1_affine::Mode::legacy;
 }
 std::string h1_affine_mode_name() const {
     return symmetrix::h1_affine::mode_name(h1_affine_mode);

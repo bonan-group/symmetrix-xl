@@ -208,7 +208,7 @@ template <typename Precision>
 void MACEKokkos<Precision>::ensure_h1_affine_capacity(
     const int local_rows, const int graph_rows)
 {
-    if (!h1_affine_m0_composite())
+    if (h1_affine_legacy())
         return;
     const auto channels = static_cast<std::size_t>(num_channels);
     const auto local = static_cast<std::size_t>(std::max(local_rows, 0));
@@ -309,7 +309,7 @@ void MACEKokkos<Precision>::compute_H1(
     if (H1.extent(0) < M0.extent(0))
         Kokkos::realloc(H1, M0.extent(0), M0.extent(1), M0.extent(2));
     // m0_composite: retain the scalar M0 block before any adjoint reuses M0.
-    if (h1_affine_m0_composite())
+    if (!h1_affine_legacy())
         capture_h1_affine_M0_scalar(num_nodes);
 #ifdef SYMMETRIX_ENABLE_METAL
     if constexpr (std::is_same_v<Precision, float>) {
@@ -548,8 +548,9 @@ void MACEKokkos<Precision>::reverse_H1(
     const int num_nodes)
 {
     reverse_H1_fused(num_nodes);
-    if (h1_affine_m0_composite())
-        add_h1_affine_direct_adjoint(num_nodes);
+    if (h1_affine_legacy())
+        return;
+    add_h1_affine_direct_adjoint(num_nodes);
 }
 
 template <typename Precision>
