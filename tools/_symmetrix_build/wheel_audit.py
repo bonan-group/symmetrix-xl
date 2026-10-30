@@ -370,7 +370,7 @@ def _audit_release_metadata(archive: zipfile.ZipFile) -> tuple[dict, str]:
     return descriptor, version
 
 
-def audit_wheel(path: Path) -> None:
+def audit_wheel(path: Path, *, require_cpu_runtime: bool = False) -> None:
     findings: list[str] = []
     try:
         archive = zipfile.ZipFile(path)
@@ -378,6 +378,15 @@ def audit_wheel(path: Path) -> None:
         raise BuildError(f"cannot inspect wheel {path}: {error}") from error
 
     with archive:
+        if require_cpu_runtime or any(
+            name.endswith(".dist-info/cpu-runtime.json") for name in archive.namelist()
+        ):
+            from .cpu_wheel_runtime import audit_cpu_wheel_runtime
+
+            try:
+                audit_cpu_wheel_runtime(path)
+            except (BuildError, OSError, ValueError, KeyError) as error:
+                findings.append(str(error))
         cpu_operators: list[zipfile.ZipInfo] = []
         cpu_package_roots: set[PurePosixPath] = set()
         descriptor = None
@@ -511,10 +520,15 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wheel", nargs="+", type=Path)
+    parser.add_argument(
+        "--require-cpu-runtime",
+        action="store_true",
+        help="require original GNU runtime hash and canonical private CPU closure",
+    )
     args = parser.parse_args(argv)
     for wheel in args.wheel:
         try:
-            audit_wheel(wheel)
+            audit_wheel(wheel, require_cpu_runtime=args.require_cpu_runtime)
         except BuildError as error:
             parser.exit(1, f"error: {error}\n")
         print(f"wheel content audit passed: {wheel.name}")

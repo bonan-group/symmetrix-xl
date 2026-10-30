@@ -111,13 +111,23 @@ jobs:
             --target cpu:avx512 \
             --prebuilt-operator-artifacts r0 \
             --prebuilt-oam-artifacts known \
+            --build-root /tmp/symmetrix-cpu-addon-build \
             --wheel-dir dist
 
       - name: Repair the wheel to manylinux
         run: |
           /opt/python/${{ matrix.python }}/bin/python -m pip install auditwheel
           auditwheel show dist/*.whl
-          auditwheel repair dist/*.whl -w dist-repaired --plat manylinux_2_28_x86_64
+          auditwheel repair dist/*.whl -w dist-grafted --plat manylinux_2_28_x86_64
+          grafted_wheels=(dist-grafted/*.whl)
+          if [ "${#grafted_wheels[@]}" -ne 1 ] || [ ! -f "${grafted_wheels[0]}" ]; then
+            echo "expected exactly one auditwheel-repaired wheel" >&2
+            exit 1
+          fi
+          /opt/python/${{ matrix.python }}/bin/python tools/repair_cpu_wheel_runtime.py \
+            --wheel "${grafted_wheels[0]}" \
+            --build-root /tmp/symmetrix-cpu-addon-build \
+            --output-dir dist-repaired
           ls -lh dist-repaired
 
       - name: Audit repaired wheel
@@ -129,7 +139,7 @@ jobs:
             exit 1
           fi
           /opt/python/${{ matrix.python }}/bin/python \
-            tools/check_wheel_contents.py "${repaired_wheels[0]}"
+            tools/check_wheel_contents.py "${repaired_wheels[0]}" --require-cpu-runtime
           /opt/python/${{ matrix.python }}/bin/python \
             -m auditwheel show "${repaired_wheels[0]}"
 

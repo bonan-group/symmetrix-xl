@@ -33,8 +33,9 @@ trap 'rm -rf "$work_root"' EXIT
 "${PYTHON_ROOT}/bin/python" -m venv "$work_root/venv"
 build_python="$work_root/venv/bin/python"
 raw_dir="$work_root/raw"
+grafted_dir="$work_root/grafted"
 repaired_dir="$work_root/repaired"
-mkdir -p "$raw_dir" "$repaired_dir"
+mkdir -p "$raw_dir" "$grafted_dir" "$repaired_dir"
 
 "$build_python" -m pip install auditwheel twine
 "$build_python" tools/symmetrix_build.py wheel \
@@ -54,9 +55,20 @@ fi
 
 "$build_python" -m auditwheel show "${raw_wheels[0]}"
 "$build_python" -m auditwheel repair "${raw_wheels[0]}" \
-  --wheel-dir "$repaired_dir" \
+  --wheel-dir "$grafted_dir" \
   --only-plat \
   --plat manylinux_2_28_x86_64
+
+grafted_wheels=("$grafted_dir"/*.whl)
+if [ "${#grafted_wheels[@]}" -ne 1 ] || [ ! -f "${grafted_wheels[0]}" ]; then
+  echo "error: expected exactly one auditwheel-repaired wheel" >&2
+  exit 1
+fi
+# Read the actual generated metadata, never guess a host/runtime path or digest.
+"$build_python" tools/repair_cpu_wheel_runtime.py \
+  --wheel "${grafted_wheels[0]}" \
+  --build-root /tmp/build \
+  --output-dir "$repaired_dir"
 
 repaired_wheels=("$repaired_dir"/*.whl)
 if [ "${#repaired_wheels[@]}" -ne 1 ] || [ ! -f "${repaired_wheels[0]}" ]; then
@@ -102,7 +114,7 @@ print("CPU wheel layout and x86-64-v3 gates passed:", wheel.name)
 PY
 
 "$build_python" -m twine check --strict "${repaired_wheels[0]}"
-"$build_python" tools/check_wheel_contents.py "${repaired_wheels[0]}"
+"$build_python" tools/check_wheel_contents.py "${repaired_wheels[0]}" --require-cpu-runtime
 "$build_python" -m auditwheel show "${repaired_wheels[0]}"
 cp "${repaired_wheels[0]}" "$OUTPUT_DIR/"
 (
