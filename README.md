@@ -59,6 +59,14 @@ It does not select by model path or learned-weight hash. A custom architecture
 that has no exact catalog match is generated at runtime when the matching
 compiler is available.
 
+The 0.2.0 preparation branch adds native MACE-POLAR-1 and MACELES evaluation,
+DFT-D2/D3 corrections, and reciprocal-space FourierD3. See the
+[model guide](docs/user/models.md),
+[dispersion guide](docs/user/dispersion_corrections.md), and
+[execution support matrix](docs/reference/execution_support_matrix.md) for
+model, property, and backend boundaries. The [changelog](CHANGELOG.md) records
+implemented changes and pending release qualification.
+
 ### Demonstrated scale
 
 The paper's FP32 single-GPU LAMMPS capacity benchmark uses the MACE-OMAT-0

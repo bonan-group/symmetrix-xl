@@ -2,7 +2,7 @@
 
 All notable changes to Symmetrix-XL are documented in this file.
 
-## 0.2.0 - 2026-10-25
+## 0.2.0 (unreleased)
 
 ### Execution and JIT
 
@@ -51,8 +51,53 @@ All notable changes to Symmetrix-XL are documented in this file.
   derivatives, and ZBL. Live upstream-reference FP64 parity, HIP, multi-GPU,
   and LAMMPS/MPI remain outside the current qualified boundary.
 
+### Dispersion corrections
+
+- Added native DFT-D2 and two-body DFT-D3 through `D2Correction` and
+  `D3Correction`, including energy, per-atom energies, forces, and stress.
+  D3 supports zero, Becke-Johnson, modified-zero, and modified-Becke-Johnson
+  damping. Corrections own independent reusable neighbor graphs and do not
+  require PyTorch or torch-dftd at runtime; three-body ATM is not implemented.
+- Added reciprocal-space `FourierD3Correction` for fully periodic systems,
+  with a short coordination graph, low-rank particle-mesh evaluation,
+  analytic forces and stress, and reusable FFT plans and workspaces. FourierD3
+  is a modified two-body BJ-damped model, not a numerically interchangeable
+  replacement for finite-cutoff D3, and never falls back to real-space D3.
+- Added shared particle-mesh infrastructure with backend-selected FFTW on
+  CPU, cuFFT on CUDA, and hipFFT on HIP. FourierD3 requires the matching FFT
+  provider; implementation availability does not replace architecture-specific
+  runtime qualification.
+
 ### Models, properties, and backends
 
+- Added native MACE-POLAR-1 evaluation for polarizable MACE models, including
+  energy, forces, stress, and total dipole, with total charge, total spin,
+  Fermi level, and external electric field as graph inputs. Generated `direct`
+  and artifact-free `reference` backbones compose with the native Polar
+  forward and reverse program. Nonperiodic systems use exact real-space
+  electrostatics; periodic systems support direct reciprocal electrostatics.
+  PME implementation and automatic selection exist but remain outside the
+  qualified public release contract. Distributed Polar LAMMPS is unsupported;
+  the Polar pair style
+  currently requires one MPI rank owning the complete system.
+- Added specialized Polar-S `direct` execution for the one-interaction,
+  retained scalar-only backbone with a linear energy readout, alongside the
+  artifact-free `reference` route. Generated forward and seeded reverse use
+  the validated layer contract; unsupported layouts fail explicitly. Focused
+  CPU and CUDA sm120 FP32/FP64 checks passed before final integration; final
+  combined-source release qualification remains pending. HIP and released
+  Polar-L runtime qualification are outside this record.
+- Corrected the generated retained-state bias-readout reverse and Polar-S
+  reference retained-feature/skin-graph handling. Strict frozen Polar oracle
+  comparisons explicitly use 4096 radial spline points; the public 256-point
+  default and frozen numerical tolerances are unchanged.
+- Added native MACELES evaluation and checkpoint export for two-interaction
+  MACE models with learned scalar charges and intrinsic LES electrostatics.
+  Both execution routings evaluate the complete fitted model, including charge
+  derivatives in forces and stress, and expose `les_energy`,
+  `mace_les_energy`, and `latent_charges`. Fully periodic and nonperiodic
+  systems are supported; mixed periodicity, fixed-workspace plans, alchemical
+  mixing, distributed evaluation, and LAMMPS are outside the supported boundary.
 - Added frozen-weight alchemical message mixing for standard two-interaction
   compact MACE models, including Agnesi radial functions, A0/A1 density
   conditioning, ZBL, energy, forces, stress, and reusable coefficient updates.
@@ -64,6 +109,18 @@ All notable changes to Symmetrix-XL are documented in this file.
   exact frontend-version dependencies and source/native provenance. HIP support
   for ordinary MACE remains available, but NequIP-OAM HIP execution is not part
   of this release.
+
+### CUDA packaging
+
+- Added lazy external cuFFT loading in place of a direct cuFFT link or
+  bundled vendor payload. Normal installs still require the matching NVIDIA
+  cuFFT package; this reduces the Symmetrix wheel itself, not the total
+  dependency download. FFT requests and explicit runtime probes load cuFFT;
+  non-FFT execution can proceed when cuFFT is unavailable.
+- A CUDA 13/sm120 development wheel passed FP32/FP64 FFT/particle-mesh checks
+  and the cuFFT dependency/content audit. Final integrated release wheels,
+  CUDA 12 execution, and portable manylinux repair remain unqualified; the
+  development wheel is not a publication artifact.
 
 ### Migration
 

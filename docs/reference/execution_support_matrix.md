@@ -78,9 +78,13 @@ editing this block.
 For MACE Polar, `direct` and `reference` select the generated or portable
 backbone implementation. They do not select electrostatic boundary conditions.
 The independent runtime request `polar_electrostatics` defaults to `auto`,
-which chooses real space for an all-FFF single system and direct reciprocal
-space when any PBC axis is true. Neither choice is serialized in the model
-JSON. PME/PPPM and distributed Polar LAMMPS remain deferred.
+which chooses real space for an all-FFF single system. Periodic inputs use
+direct reciprocal space unless the backend, FFT provider, multipole order,
+and fully periodic system size admit automatic PME selection. This runtime
+choice is not serialized in the model JSON. PME implementation and automatic
+selection exist, but PME remains outside the qualified public release contract;
+the strict periodic frozen-oracle configuration explicitly selects
+`direct_reciprocal`. Distributed Polar LAMMPS remains unsupported.
 
 ### Native additive corrections
 
@@ -118,10 +122,15 @@ selects the native `reference` spelling explicitly; artifact-free `direct`
 remains unavailable and fails closed rather than reporting a portable
 implementation.
 
-MACE_Nonlinear device plugins currently carry exactly two interaction slots.
-Models with another interaction count use the count-agnostic composed ABI-v7
-host plugin and are qualified only on host backends; CUDA and HIP qualification
-covers the standard two-interaction topology.
+MACE_Nonlinear device plugins retain capacity for two interaction slots.
+The generated Polar-S specialization admits one active interaction for its
+validated scalar-only retained product and linear energy readout. Focused
+CPU and CUDA sm120 FP32/FP64 checks passed before final integration; final
+combined-source release qualification remains pending, and the generated
+table above retains the earlier released-M qualification boundary. The
+count-agnostic composed ABI-v7 host plugin does not imply support for arbitrary
+interaction counts on devices. HIP runtime and released Polar-L remain
+unqualified.
 
 OAM v2 `direct` execution separately supports the architecture-bound,
 full-message-only host ABI-v7 plugin and CUDA ABI-v3 cubin/shared-library

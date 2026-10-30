@@ -26,23 +26,52 @@ inputs and receives compact public outputs only.
 
 One solver-neutral JSON serves both boundary conditions. With
 `polar_electrostatics="auto"`, a fully non-periodic system uses exact
-real-space electrostatics and a system with any periodic axis uses the
-direct-reciprocal solver. PME is not implemented. FP32 and FP64 are
+real-space electrostatics. Periodic inputs use direct-reciprocal electrostatics
+unless the backend, FFT provider, multipole order, and fully periodic system
+size admit automatic PME selection. PME implementation and automatic selection
+exist, but PME remains outside the qualified public release contract. Select
+`polar_electrostatics="direct_reciprocal"` explicitly to reproduce the strict
+periodic frozen-oracle configuration. FP32 and FP64 are
 qualified on CPU and CUDA for the released M checkpoint, including E, EF,
 EFS, and dipole; isolated public stress is exactly zero. HIP is not currently
-runtime-qualified. CUDA real-space
-reverse automatically uses the bounded-memory `pair_atomic` strategy.
+runtime-qualified. CUDA real-space reverse automatically uses the bounded-memory
+`pair_atomic` strategy.
 `materialized_forward` is only a forced internal experiment.
+
+Strict frozen-oracle comparisons use `num_spline_points=4096` when loading a
+checkpoint, or `--num-spline-points 4096` when exporting JSON. This controls the
+backbone's radial approximation, not the electrostatic solver. The ordinary
+256-point default is unchanged; converge this resolution against the accuracy
+required by the calculation rather than assuming it meets the oracle tests'
+tight force and stress tolerances.
+
+In recorded CPU FP64 singlet checks for the S/M checkpoints (molecule, slab,
+and bulk, with direct-reciprocal electrostatics), the default 256 points gave
+force errors up to `7.4e-4 eV/Angstrom` and an M bulk dipole error of
+`2.3e-6 e Angstrom`. Both reference and direct exceeded the corresponding
+strict frozen bounds (`5e-6 eV/Angstrom` and `1e-6 e Angstrom`). Explicit
+4096-point sampling met those bounds for the measured cases; this is not a
+universal convergence guarantee for other models or configurations. Selecting
+FP64 alone does not remove radial interpolation error.
 
 The `reference` routing uses the artifact-free backbone. The `direct`
 routing loads a matching generated backbone artifact while the Polar program
-remains native. The generated keep-last specialization currently recognizes
-the canonical `512x0e+512x1o` final product with a scalar-only energy readout;
-unsupported keep-last layouts fail explicitly. Checkpoint extraction may use
+remains native. Generated keep-last execution recognizes the single-layer
+scalar-only S topology with a linear energy readout, and the canonical
+`512x0e+512x1o` final product with a scalar-only nonlinear energy readout.
+Unsupported keep-last layouts fail explicitly. Checkpoint extraction may use
 Python and PyTorch; JSON evaluation does not require Python. LAMMPS uses the
 same native evaluator through `symmetrix/mace/polar/kk`, currently only with
 exactly one MPI rank owning the complete system. Distributed Polar LAMMPS is
 a separate future delivery.
+
+The scalar-only, one-interaction S backbone supports both native `reference`
+execution and specialized generated `direct` execution, including its linear
+energy readout, retained features, and the Polar chain's seeded reverse.
+Focused CPU and CUDA sm120 checks cover FP32/FP64, released-S frozen
+comparisons, and synthetic force/stress derivatives. These checks precede
+final combined-source release qualification, which remains pending. They do
+not qualify HIP, released Polar-L, multi-GPU execution, or distributed LAMMPS.
 
 ## MACE model contracts and usage
 
@@ -50,9 +79,10 @@ For MH-1-style backbones, channel equality is required only within one
 interaction's tied UVU paths. Different interactions may use different edge
 channel counts; admission reports the failing layer and invariant when a layer
 is internally inconsistent. Ordinary MH-1 still requires its scalar-final
-layout. Polar keep-last models are admitted only when the final hidden,
-product, retained-feature, and readout layouts match the supported scalar-plus-
-vector policy. `reference` never compiles or loads a model-specific artifact.
+layout. Polar generated keep-last admission requires consistent hidden,
+product, retained-feature, and readout layouts under the scalar-only S policy
+or the supported scalar-plus-vector policy. `reference` never compiles or
+loads a model-specific artifact.
 `direct` requires a contract-matched artifact and refuses a missing, stale, or
 unrecognized keep-last schedule instead of falling back to `reference`.
 
