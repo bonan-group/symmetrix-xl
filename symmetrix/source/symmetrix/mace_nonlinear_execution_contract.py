@@ -1135,7 +1135,9 @@ def _product_structure_payload(descriptor: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _readout_descriptor(index: int, definition: Any, *, last: bool) -> dict[str, Any]:
+def _readout_descriptor(
+    index: int, definition: Any, *, last: bool, allow_linear_final: bool = False
+) -> dict[str, Any]:
     if not isinstance(definition, Mapping):
         raise ValueError(f"readouts[{index}] must be an object")
     # Every layer but the last reads out through a linear block; the last layer
@@ -1144,7 +1146,7 @@ def _readout_descriptor(index: int, definition: Any, *, last: bool) -> dict[str,
     # block with one more dense layer, and the generated node readout serves
     # either.
     readout_class = definition.get("class")
-    if not last:
+    if not last or (allow_linear_final and readout_class == "LinearReadoutBlock"):
         if readout_class != "LinearReadoutBlock":
             raise ValueError(
                 "MH-1 node generation requires a linear readout for every layer "
@@ -1511,7 +1513,18 @@ def _node_program_descriptor(
         for index, product in enumerate(products)
     ]
     readout_descriptors = [
-        _readout_descriptor(index, readout, last=index == len(readouts) - 1)
+        _readout_descriptor(
+            index,
+            readout,
+            last=index == len(readouts) - 1,
+            # The retained scalar-only, one-layer Polar-S backbone uses a
+            # linear energy readout on its sole (and therefore final) layer.
+            allow_linear_final=(
+                retain_last_product_irreps
+                and len(readouts) == 1
+                and len(product_descriptors[0]["blocks"]["output"]) == 1
+            ),
+        )
         for index, readout in enumerate(readouts)
     ]
     layers = []

@@ -2381,6 +2381,7 @@ void MaceBackboneKokkosT<Precision>::load_jit_mh1_cuda_plugin_v5(
             Traits::device_ordinal(execution_space));
         const auto device=execution_device_execution_environment();
         symmetrix::execution::MH1CudaPluginV4Expectation expectation;
+        expectation.interaction_count=interactions.size();
         expectation.artifact_id=artifact_id;
         expectation.generation_fingerprint=
             execution_mh1_model_generation_fingerprint_v4;
@@ -3152,7 +3153,7 @@ std::uint64_t MaceBackboneKokkosT<Precision>::prepare_factorized_graph(
     const std::span<const int> neigh_indices,
     const std::span<const int> neigh_types)
 {
-    if(!uses_prepared_execution(streamed_edges))
+    if(!uses_prepared_graph())
         throw std::invalid_argument(
             "Prepared Execution R1 graphs require streamed_edges='factorized'.");
     if(num_nodes<0
@@ -3277,7 +3278,7 @@ MaceBackboneKokkosT<Precision>::prepare_periodic_factorized_graph(
     const std::span<const double> inverse_cell,
     const double neighbor_cutoff)
 {
-    if(!uses_prepared_execution(streamed_edges))
+    if(!uses_prepared_graph())
         throw std::invalid_argument(
             "Native periodic MH-1 graph construction requires "
             "streamed_edges='direct'.");
@@ -3773,7 +3774,7 @@ void MaceBackboneKokkosT<Precision>::compute_prepared_factorized(
     const std::uint64_t graph_generation,const std::span<const double> xyz,
     const std::span<const double> distances)
 {
-    if(!uses_prepared_execution(streamed_edges))
+    if(!uses_prepared_graph())
         throw std::invalid_argument(
             "An execution graph token requires streamed_edges='direct'.");
     if(graph_generation==0
@@ -3825,7 +3826,7 @@ void MaceBackboneKokkosT<Precision>::compute_prepared_factorized_positions(
     const std::uint64_t graph_generation,
     const std::span<const double> positions)
 {
-    if(!uses_prepared_execution(streamed_edges))
+    if(!uses_prepared_graph())
         throw std::invalid_argument(
             "Prepared MH-1 Execution positions require streamed_edges='factorized'.");
     if(graph_generation==0
@@ -3976,10 +3977,11 @@ MaceBackboneKokkosT<Precision>::make_layer_retained_feature_layout(
             throw std::runtime_error(
                 "MH-1 retained-feature blocks must use the family node "
                 "channel count.");
-        if(block.l==0&&layout.scalar_offset<0) {
+        if(block.l==0&&block.parity==1&&layout.scalar_offset<0&&offset==0) {
             layout.scalar_offset=offset;
             layout.scalar_multiplicity=block.multiplicity;
-        } else if(block.l==1&&layout.vector_offset<0) {
+        } else if(block.l==1&&block.parity==-1
+            &&layout.scalar_offset==0&&layout.vector_offset<0) {
             layout.vector_offset=offset;
             layout.vector_multiplicity=block.multiplicity;
             layout.vector_components=3;
@@ -5095,6 +5097,9 @@ MaceBackboneKokkosT<Precision>::MaceBackboneKokkosT(
     :node_embedding(data.at("node_embedding"))
 {
     validate_mace_backbone_schema(data,schema);
+    if(schema==MaceBackboneSchema::polar)
+        for(const auto& product:data.at("products"))
+            validate_mace_retained_product_connectivity(product);
     mh1_pair_spline_nodes_=data.at("radial_embedding").value(
         "num_spline_points",256);
     selected_head=data.value("selected_head",std::string());available_heads=data.value("available_heads",std::vector<std::string>());
@@ -5159,12 +5164,18 @@ MaceBackboneKokkosT<Precision>::MaceBackboneKokkosT(
     stage_description=symmetrix::mace_nonlinear::StageDescription::canonical(
         interactions.size());
     mh1_family=analyze_mh1_family_architecture(data,schema);
-    if(mh1_family.compatible) {
+    // Polar reference execution also retains product outputs and transposes
+    // chain seeds for topologies outside the generated MH-1 support matrix
+    // (notably the scalar-only, one-interaction S checkpoint). The layout
+    // builder still validates every block and output width independently.
+    if(mh1_family.compatible||schema==MaceBackboneSchema::polar) {
         layer_retained_feature_layouts.reserve(mh1_family.layer_count());
         for(std::size_t layer=0;layer<mh1_family.layer_count();++layer)
             layer_retained_feature_layouts.push_back(
                 make_layer_retained_feature_layout(layer));
     }
+    materialized_reference_ready_=schema==MaceBackboneSchema::polar
+        &&layer_retained_feature_layouts.size()==interactions.size();
     // The Python routing layer validates the contract against the complete
     // model before setting this identity. Do not trust embedded hashes here:
     // same-sized tensor-product programs can have different semantics.
@@ -5422,7 +5433,8 @@ MaceBackboneKokkosT<Precision>::family_capabilities() const
     // the generated tier is the JIT/RTC artifact of one of the MH-1 ABIs.
     capabilities.reference_ready=host_build&&supports_factorized();
     capabilities.portable_ready=
-        supports_factorized()||mh1_pair_spline_ready();
+        supports_factorized()||mh1_pair_spline_ready()
+        ||materialized_reference_ready_;
     capabilities.generated_ready=jit_mh1_host_plugin_v7_ready()
         ||jit_mh1_cuda_plugin_v5_ready();
     // The prepared path owns a real stress reduction, and the field coupling
@@ -5675,7 +5687,8 @@ MaceBackboneKokkosT<Precision>::family_implementation_registry() const
         std::is_same_v<Precision,float> ? "float32" : "float64";
     const PrecisionPolicy policy{precision_name,"float64"};
     const bool portable_ready=
-        supports_factorized()||mh1_pair_spline_ready();
+        supports_factorized()||mh1_pair_spline_ready()
+        ||materialized_reference_ready_;
     const bool generated_ready=family_artifact_ready();
     ImplementationRegistry registry;
     const auto declare=[this,&registry,target,policy](const std::string& id,
@@ -5713,7 +5726,9 @@ MaceBackboneKokkosT<Precision>::family_implementation_registry() const
         ImplementationTier::generated,
         [generated_ready] {return generated_ready;});
     declare("generic_kokkos_node_program",OperatorKind::node_program,"node_program",
-        ImplementationTier::portable,[this] {return supports_factorized();});
+        ImplementationTier::portable,[this] {
+            return supports_factorized()||materialized_reference_ready_;
+        });
     declare("generated_node_program",OperatorKind::node_program,"node_program",
         ImplementationTier::generated,
         [generated_ready] {return generated_ready;});
@@ -5968,7 +5983,7 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
             "direct execution does not fall back to another algorithm.");
     if(execution_graph_generation!=0) {
         factorized_completed_evaluation_graph_generation=0;
-        if(!uses_prepared_execution(streamed_edges))
+        if(!uses_prepared_graph())
             throw std::invalid_argument(
                 "An execution graph token requires streamed_edges='direct'.");
         if(execution_graph_generation!=factorized_prepared_graph_generation
@@ -6021,7 +6036,7 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
             spline_type_count=mh1_spline_type_count_;
         }
     }
-    compute_Y(xyz,uses_prepared_execution(streamed_edges));
+    compute_Y(xyz,uses_prepared_graph());
 
     if(execution_graph_generation!=0) {
         offsets=execution_prepared_offsets;
@@ -7839,6 +7854,9 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
         if(!generated_wide_final)
             retain_layer_output(
                 layer,num_nodes,state.output,generated_node_program);
+        if(execution_graph_generation!=0
+            &&streamed_edges==ExecutionMode::materialized)
+            ++factorized_forward_evaluations;
     }
 
     for(int layer=0;!generated_node_program
@@ -9737,6 +9755,9 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
             interaction.linear_up.reverse(state.up_adj,previous,false);
             interaction.skip.reverse(state.skip_adj,previous,false);
         }
+        if(execution_graph_generation!=0
+            &&streamed_edges==ExecutionMode::materialized)
+            ++factorized_reverse_evaluations;
     }
 
     ensure_view(node_forces,node_forces_storage,xyz.size());
@@ -9818,7 +9839,7 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
             forces(index)+=energy_scale*zbl_f(index);
         });
     }
-    if(uses_prepared_execution(streamed_edges)) {
+    if(uses_prepared_graph()) {
         factorized_execution_space.fence(
             "MH-1 Execution energy and force evaluation");
         ++factorized_evaluation_fences;

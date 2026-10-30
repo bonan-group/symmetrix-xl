@@ -3018,18 +3018,15 @@ class Symmetrix(Calculator):
                 mh1_product_descriptors = tuple(
                     layer["product"] for layer in contract["node_program"]["layers"]
                 )
-                retain_last_product_irreps = bool(
-                    model_data.get("polar", {}).get("keep_last_layer_irreps", False)
-                )
                 projected_products = tuple(
                     project_execution_mh1_product_contract(
                         product,
-                        final=(
-                            index == len(mh1_product_descriptors) - 1
-                            and not retain_last_product_irreps
-                        ),
+                        # The contraction ABI follows the validated output
+                        # basis. Polar-S retains a scalar-only final product;
+                        # keeping it does not turn that product into M0.
+                        final=len(product["blocks"]["output"]) == 1,
                     )
-                    for index, product in enumerate(mh1_product_descriptors)
+                    for product in mh1_product_descriptors
                 )
                 product_requests = _mh1_product_artifact_requests(projected_products)
                 parallel_operator_backend = jit_backend

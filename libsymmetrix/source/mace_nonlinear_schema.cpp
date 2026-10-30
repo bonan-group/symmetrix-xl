@@ -130,6 +130,15 @@ bool has_scalar_only_energy_readout(
     const nlohmann::json& readout,
     const std::vector<std::tuple<int, int, int>>& product_output)
 {
+    if (readout.at("class").get<std::string>() == "LinearReadoutBlock") {
+        const auto& linear = readout.at("linear");
+        return blocks_equal(
+                Irreps(linear.at("irreps_in").get<std::string>()), product_output)
+            && blocks_equal(
+                Irreps(linear.at("irreps_out").get<std::string>()),
+                std::vector<std::tuple<int, int, int>>{{1, 0, 1}})
+            && has_scalar_only_linear_paths(linear);
+    }
     const auto& linear_1 = readout.at("linear_1");
     const auto& linear_2 = readout.at("linear_2");
     const Irreps linear_1_output(
@@ -401,6 +410,21 @@ void validate_mace_nonlinear_schema(const nlohmann::json& data)
     validate_mace_backbone_schema(data, MaceBackboneSchema::mh1);
 }
 
+void validate_mace_retained_product_connectivity(const nlohmann::json& product)
+{
+    const Irreps output(product.at("symmetric_contractions")
+        .at("irreps_out").get<std::string>());
+    for(const char* field:{"node_feats_irreps","target_irreps"})
+        if(!blocks_equal(Irreps(product.at(field).get<std::string>()),output))
+            throw std::invalid_argument(
+                "MH-1 retained-feature product connectivity is inconsistent.");
+    for(const char* field:{"irreps_in","irreps_out"})
+        if(!blocks_equal(Irreps(product.at("linear").at(field)
+                .get<std::string>()),output))
+            throw std::invalid_argument(
+                "MH-1 retained-feature product connectivity is inconsistent.");
+}
+
 MaceMH1FamilyDescriptor analyze_mh1_family_architecture(
     const nlohmann::json& data, const MaceBackboneSchema schema)
 {
@@ -472,6 +496,15 @@ MaceMH1FamilyDescriptor analyze_mh1_family_architecture(
         {result.node_channels, 0, 1}, {result.node_channels, 1, -1}};
     const std::vector<std::tuple<int, int, int>> scalar_hidden = {
         {result.node_channels, 0, 1}};
+    // Polar-S retains its single scalar product and reads its energy through
+    // a linear block. This is a family-owned generated topology; ordinary
+    // MH-1 models keep their existing layer-zero and final-readout rules.
+    const bool scalar_polar = keep_last && interaction_count == 1
+        && data.at("readouts").at(0).at("class").get<std::string>()
+            == "LinearReadoutBlock"
+        && blocks_equal(
+            Irreps(data.at("products").at(0).at("symmetric_contractions")
+                .at("irreps_out").get<std::string>()), scalar_hidden);
     // Every layer but the last carries the node representation its successor
     // consumes; the last layer carries the scalar representation its readout
     // consumes.  The rule is stated against the layer's position, so a model
@@ -507,10 +540,10 @@ MaceMH1FamilyDescriptor analyze_mh1_family_architecture(
                 expected_edges))
             return reject_layer(layer, "edge representation");
 
-        // Preserve the original one-interaction support matrix: layer zero
-        // always carries the node-hidden representation, even when it is also
-        // the final layer.
-        const auto& expected_hidden = layer != 0 && layer == last && !keep_last
+        // Outside Polar-S, preserve the original one-interaction support
+        // matrix: layer zero carries node-hidden even when it is also final.
+        const auto& expected_hidden = scalar_polar
+            || (layer != 0 && layer == last && !keep_last)
             ? scalar_hidden : node_hidden;
         if (!blocks_equal(
                 Irreps(interaction.at("hidden_irreps").get<std::string>()),
@@ -539,7 +572,8 @@ MaceMH1FamilyDescriptor analyze_mh1_family_architecture(
     for (std::size_t layer = 0;
          layer < data.at("products").size(); ++layer) {
         const std::vector<std::tuple<int, int, int>> product_output =
-            layer == last && !keep_last ? scalar_hidden : node_hidden;
+            scalar_polar || (layer == last && !keep_last)
+                ? scalar_hidden : node_hidden;
         const auto& product = data.at("products").at(layer);
         const auto& contractions =
             product.at("symmetric_contractions").at("contractions");
@@ -589,11 +623,12 @@ MaceMH1FamilyDescriptor analyze_mh1_family_architecture(
         // produced; the plain nonlinear form and the bias variant (a second
         // hidden layer between its two linears) are both admitted, and the
         // node program's generated readout serves either.
-        if (readout_class != "NonLinearReadoutBlock"
+        if (!(scalar_polar && readout_class == "LinearReadoutBlock")
+            && readout_class != "NonLinearReadoutBlock"
             && readout_class != "NonLinearBiasReadoutBlock")
             return reject_layer(layer, "readout class");
         const std::vector<std::tuple<int, int, int>> product_output =
-            keep_last ? node_hidden : scalar_hidden;
+            keep_last && !scalar_polar ? node_hidden : scalar_hidden;
         if (!has_scalar_only_energy_readout(readout, product_output))
             return reject_layer(layer, "readout connectivity");
     }

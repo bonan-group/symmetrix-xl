@@ -425,6 +425,11 @@ def test_the_adaptations_the_runner_applies_are_the_documented_ones():
 #: fp32 realization and for a different reduction order on this side.
 BACKBONE_TOLERANCE = {"float64": 1.0e-9, "float32": 1.0e-6}
 
+# These strict gates compare against an analytic upstream radial model, not
+# the default 256-point approximation. Convergence at 4096 points closes the
+# force and stress-relation bounds without changing the public speed default.
+ORACLE_NUM_SPLINE_POINTS = 4096
+
 _ORACLE_MACE_CHECKOUT = optional_checkout("SYMMETRIX_POLAR_ORACLE_MACE")
 _ORACLE_GRAPH_ELECTROSTATICS_CHECKOUT = optional_checkout(
     "SYMMETRIX_POLAR_ORACLE_GRAPH_LONGRANGE"
@@ -632,6 +637,7 @@ def test_the_retained_layer_features_are_the_chains_frozen_input(geometry):
     calculator = symmetrix.Symmetrix(
         str(checkpoint),
         dtype="float64",
+        num_spline_points=ORACLE_NUM_SPLINE_POINTS,
         polar_electrostatics=FROZEN_ELECTROSTATICS,
     )
     evaluator = calculator.evaluator
@@ -699,6 +705,7 @@ def test_the_layer_product_seed_is_the_backbones_reverse_tap():
     calculator = symmetrix.Symmetrix(
         str(checkpoint),
         dtype="float64",
+        num_spline_points=ORACLE_NUM_SPLINE_POINTS,
         polar_electrostatics=FROZEN_ELECTROSTATICS,
     )
     evaluator = calculator.evaluator
@@ -976,6 +983,7 @@ def test_the_family_evaluates_the_total_energy_force_and_dipole(
         calculator = symmetrix.Symmetrix(
             str(checkpoint),
             dtype=dtype,
+            num_spline_points=ORACLE_NUM_SPLINE_POINTS,
             total_charge=charge,
             total_spin=spin,
             fermi_level=fermi,
@@ -1060,6 +1068,7 @@ def test_the_family_stress_is_its_own_energy_derivative():
         atoms.calc = symmetrix.Symmetrix(
             str(checkpoint),
             dtype="float64",
+            num_spline_points=ORACLE_NUM_SPLINE_POINTS,
             polar_electrostatics=FROZEN_ELECTROSTATICS,
         )
         return atoms
@@ -1121,7 +1130,9 @@ def test_the_backbone_half_is_parity_clean_against_the_oracle_reference(tmp_path
     manifest = _load_manifest()
     path = _checkpoint_path(size)
     model = _torch.load(path, map_location=_torch.device("cpu"), weights_only=False)
-    data = extract_mace_polar_data(model.to(_torch.float64))
+    data = extract_mace_polar_data(
+        model.to(_torch.float64), num_spline_points=ORACLE_NUM_SPLINE_POINTS
+    )
     model_path = tmp_path / f"MACE-POLAR-1-{size}.json"
     model_path.write_text(_json.dumps(data))
 

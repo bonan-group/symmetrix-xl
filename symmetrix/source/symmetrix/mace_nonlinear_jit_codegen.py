@@ -9296,6 +9296,7 @@ float* interaction = arena;
     )
     specialized_readout_reverse_launches: tuple[MH1KernelLaunch, ...] = ()
     specialized_readout_middle_body = "(void)args; (void)node;"
+    specialized_readout_activation_phases = ()
     if index == 1 and readout["class"] != "LinearReadoutBlock":
         readout_recompute_launches = grouped_forward(
             readout["linear_1"],
@@ -9307,10 +9308,102 @@ float* interaction = arena;
             stem=f"node_grouped_l{index}_reverse_readout1_recompute",
             args_type=reverse_args,
         )
+        bias_readout = readout["class"] == "NonLinearBiasReadoutBlock"
+        readout_prepare_launches = ()
+        readout_finish_launches = ()
+        if bias_readout:
+            # Reuse the existing two hidden buffers. The middle forward leaves
+            # z2 in the second half; its reverse overwrites that half with da1.
+            # Recompute z1 in the first half only after da2 is no longer live.
+            activation1_forward_body = f"""float* hidden = args.node_arena
+    + node * {arena_dimension};
+{
+                _cuda_block_silu(
+                    activation_blocks,
+                    activation_constants,
+                    values_pointer="hidden",
+                    stem=f"l{index}_readout_activation1_forward_specialized",
+                )
+            }"""
+            activation1_reverse_body = f"""float* hidden = args.node_arena
+    + node * {arena_dimension};
+float* hidden_adjoint = hidden + {hidden_dimension};
+{
+                _cuda_block_silu(
+                    activation_blocks,
+                    activation_constants,
+                    values_pointer="hidden",
+                    adjoint_pointer="hidden_adjoint",
+                    stem=f"l{index}_readout_activation1_reverse_specialized",
+                    reverse=True,
+                )
+            }"""
+            specialized_readout_activation_phases = (
+                (
+                    "specialized_readout_activation1_forward",
+                    reverse_args,
+                    2,
+                    activation1_forward_body,
+                    "specialized_readout_activation1_forward_launches",
+                ),
+                (
+                    "specialized_readout_activation1_reverse",
+                    reverse_args,
+                    2,
+                    activation1_reverse_body,
+                    "specialized_readout_activation1_reverse_launches",
+                ),
+            )
+            readout_prepare_launches = (
+                MH1KernelLaunch(
+                    f"{symbol_prefix}specialized_readout_activation1_forward_kernel_{index}",
+                    "persistent_nodes",
+                    128,
+                ),
+            ) + grouped_forward(
+                readout["linear_mid"],
+                input_pointer="args.node_arena",
+                input_stride=arena_dimension,
+                parameter_pointer=f"args.readout_parameters + {readout_mid_offset}",
+                output_pointer=f"args.node_arena + {hidden_dimension}",
+                output_stride=arena_dimension,
+                stem=f"node_grouped_l{index}_reverse_readoutmid_recompute",
+                args_type=reverse_args,
+            )
+            readout_finish_launches = (
+                grouped_reverse(
+                    readout["linear_mid"],
+                    output_adjoint_pointer="args.node_arena",
+                    output_stride=arena_dimension,
+                    parameter_pointer=(
+                        f"args.readout_parameters + {readout_mid_offset}"
+                    ),
+                    input_adjoint_pointer=f"args.node_arena + {hidden_dimension}",
+                    input_stride=arena_dimension,
+                    stem=f"node_grouped_l{index}_reverse_readoutmid",
+                )
+                + grouped_forward(
+                    readout["linear_1"],
+                    input_pointer="args.layer_output",
+                    input_stride=output_dimension,
+                    parameter_pointer=f"args.readout_parameters + {readout_1_offset}",
+                    output_pointer="args.node_arena",
+                    output_stride=arena_dimension,
+                    stem=f"node_grouped_l{index}_reverse_readout1_recompute2",
+                    args_type=reverse_args,
+                )
+                + (
+                    MH1KernelLaunch(
+                        f"{symbol_prefix}specialized_readout_activation1_reverse_kernel_{index}",
+                        "persistent_nodes",
+                        128,
+                    ),
+                )
+            )
         specialized_readout_middle_body = f"""float* arena = args.node_arena
     + node * {arena_dimension};
-float* hidden = arena;
-float* hidden_adjoint = arena + {hidden_dimension};
+float* hidden = arena + {hidden_dimension if bias_readout else 0};
+float* hidden_adjoint = arena + {0 if bias_readout else hidden_dimension};
 const float energy_scale = static_cast<float>(args.energy_scale);
 {
             _cuda_block_linear_reverse(
@@ -9327,7 +9420,11 @@ const float energy_scale = static_cast<float>(args.energy_scale);
                 activation_constants,
                 values_pointer="hidden",
                 adjoint_pointer="hidden_adjoint",
-                stem=f"l{index}_readout_activation_reverse_middle",
+                stem=(
+                    f"l{index}_readout_activation2_reverse_middle"
+                    if bias_readout
+                    else f"l{index}_readout_activation_reverse_middle"
+                ),
                 reverse=True,
             )
         }"""
@@ -9352,6 +9449,7 @@ const float energy_scale = static_cast<float>(args.energy_scale);
         )
         specialized_readout_reverse_launches = (
             readout_recompute_launches
+            + readout_prepare_launches
             + (
                 MH1KernelLaunch(
                     f"{symbol_prefix}specialized_readout_middle_kernel_{index}",
@@ -9359,6 +9457,7 @@ const float energy_scale = static_cast<float>(args.energy_scale);
                     128,
                 ),
             )
+            + readout_finish_launches
             + readout_reverse_launches
             + skip_reverse_launches
         )
@@ -9521,6 +9620,7 @@ __syncthreads();"""
             "post_finalize_launches",
         ),
         ("post_readout", reverse_args, 2, post_readout_body, "post_readout_launches"),
+        *specialized_readout_activation_phases,
         (
             "specialized_readout_middle",
             reverse_args,

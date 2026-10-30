@@ -752,6 +752,12 @@ private:
     MaceMH1FamilyDescriptor mh1_family;
     std::string mh1_fast_path_rejection;
     ExecutionMode streamed_edges=ExecutionMode::materialized;
+    bool materialized_reference_ready_=false;
+    bool uses_prepared_graph() const {
+        return uses_prepared_execution(streamed_edges)
+            ||(materialized_reference_ready_
+                &&streamed_edges==ExecutionMode::materialized);
+    }
     Kokkos::DefaultExecutionSpace factorized_execution_space;
     std::size_t factorized_forward_evaluations=0;
     std::size_t factorized_reverse_evaluations=0;

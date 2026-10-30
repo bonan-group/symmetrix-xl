@@ -196,12 +196,18 @@ class MacePolarFrontendAdapter:
         )
         calculator._sync_low_memory_policy_state()
         cache = calculator._materialize_neighbor_cache_geometry()
+        # A materialized reference graph contains only active edges, whereas
+        # the Verlet cache also owns its skin shell. Bind the active vectors
+        # to their current positions rather than mixing the two topologies.
+        materialized = calculator.evaluator.streamed_edges_mode == "materialized"
+        reference_positions = (
+            atoms.get_positions() if materialized else cache.reference_positions
+        )
+        reference_xyz = mace_inputs[5] if materialized else cache.reference_xyz
         prepare_geometry(
             generation,
-            np.ascontiguousarray(cache.reference_positions, dtype=np.float64).reshape(
-                -1
-            ),
-            np.ascontiguousarray(cache.reference_xyz, dtype=np.float64).reshape(-1),
+            np.ascontiguousarray(reference_positions, dtype=np.float64).reshape(-1),
+            np.ascontiguousarray(reference_xyz, dtype=np.float64).reshape(-1),
             np.ascontiguousarray(cache.cell, dtype=np.float64).reshape(-1),
             np.ascontiguousarray(cache.inverse_cell, dtype=np.float64).reshape(-1),
             np.ascontiguousarray(cache.pbc, dtype=np.int32).reshape(-1),

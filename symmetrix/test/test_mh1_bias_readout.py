@@ -187,13 +187,24 @@ def _generated_jit_target_is_executable():
 
 
 @pytest.mark.parametrize("dtype", ("float64", "float32"))
-def test_the_generated_readout_matches_the_reference_routing(bias_model_path, dtype):
+@pytest.mark.parametrize(
+    "policy",
+    (
+        "full-retention-v1",
+        "reuse-adjoints-v1",
+        "retain-interaction-v1",
+        "recompute-v1",
+    ),
+)
+def test_the_generated_readout_matches_the_reference_routing(
+    bias_model_path, dtype, policy
+):
     """The direct routing's generated execution matches the artifact-free tier.
 
-    The host's generated node program is the float32 one, so the float64 case
-    qualifies the artifact's published node-program identity (the plugin is
-    prepared and loaded, and its declared readout pack has to match the native
-    runtime's) while the float32 case exercises the generated readout itself.
+    On host, the generated node program is float32: the float64 case qualifies
+    the loaded artifact's node-program identity, while float32 executes its
+    generated readout. CUDA/HIP execute the generated device reverse in both
+    precisions.
     """
 
     if not _generated_jit_target_is_executable():
@@ -201,11 +212,23 @@ def test_the_generated_readout_matches_the_reference_routing(bias_model_path, dt
             "the direct routing requires a JIT artifact this build cannot "
             "prepare (no Kokkos execution space reported)"
         )
+    if (
+        policy == "reuse-adjoints-v1"
+        and symmetrix._kokkos_default_execution_space() not in ("Cuda", "HIP")
+    ):
+        pytest.skip("reuse-adjoints-v1 requires a generated CUDA or HIP module")
     path, _ = bias_model_path
     atoms = _atoms()
     results = {}
     for mode in ("reference", "direct"):
-        calculator = symmetrix.Symmetrix(str(path), dtype=dtype, streamed_edges=mode)
+        calculator = symmetrix.Symmetrix(
+            str(path),
+            dtype=dtype,
+            streamed_edges=mode,
+            execution_profile="speed",
+            execution_mh1_node_state_policy=policy,
+        )
+        assert calculator.execution_mh1_node_state_policy == policy
         assert calculator.streamed_edges == mode
         atoms.calc = calculator
         calculator.calculate(atoms, properties=["energy", "forces"])
@@ -224,6 +247,88 @@ def test_the_generated_readout_matches_the_reference_routing(bias_model_path, dt
         rtol=0.0,
         atol=tolerance,
     )
+
+
+def test_retained_bias_readout_forces_are_the_energy_derivative(bias_model_path):
+    """Catch an incomplete reverse even if the reference shares its mistake."""
+
+    path, _ = bias_model_path
+    atoms = _atoms()
+    calculator = symmetrix.Symmetrix(
+        str(path),
+        dtype="float64",
+        streamed_edges="direct",
+        execution_profile="speed",
+        execution_mh1_node_state_policy="full-retention-v1",
+    )
+    calculator.calculate(atoms, properties=["energy", "forces"])
+    forces = np.array(calculator.results["forces"], copy=True)
+    finite_difference = np.zeros_like(forces)
+    step = 1e-4
+    for atom in range(len(atoms)):
+        for axis in range(3):
+            energies = []
+            for displacement in (step, -step):
+                displaced = atoms.copy()
+                displaced.positions[atom, axis] += displacement
+                calculator.calculate(displaced, properties=["energy"])
+                energies.append(float(calculator.results["energy"]))
+            finite_difference[atom, axis] = -(energies[0] - energies[1]) / (2 * step)
+    fallbacks = calculator.evaluator.factorized_fallback_evaluation_count
+    del calculator
+    np.testing.assert_allclose(forces, finite_difference, atol=1e-8, rtol=0.0)
+    assert fallbacks == 0
+
+
+@pytest.mark.parametrize(
+    "backend",
+    (pytest.param("cuda", id="cuda-plan"), pytest.param("hip", id="hip-plan")),
+)
+def test_retained_bias_launch_plan_specializes_the_complete_reverse(
+    bias_model_path, backend
+):
+    """The active optimized schedule must apply the middle linear's adjoint."""
+
+    from symmetrix import mace_nonlinear_jit_codegen as codegen
+
+    _, data = bias_model_path
+    contract = make_execution_mh1_v4_contract(data)
+    if backend == "cuda":
+        plan = codegen.execution_mh1_cuda_module_v4_launch_plan(contract, 90)
+    else:
+        plan = codegen.execution_mh1_hip_module_v4_launch_plan(
+            contract,
+            {
+                "architecture": "gfx1151",
+                "target_features": ["sramecc-", "xnack-"],
+                "compiler_offload_target": "gfx1151",
+                "native_subgroup_width": 32,
+                "compute_unit_count": 40,
+            },
+        )
+    reverse = plan["nodes"][1]["split_post_reverse"]
+    kernels = [launch["kernel"] for launch in reverse]
+    # Dense hidden linears use the same grouped contractions as the plain
+    # readout, with two activation stages and bounded recomputation between.
+    stages = (
+        "reverse_readout1_recompute_grouped",
+        "specialized_readout_activation1_forward_kernel",
+        "reverse_readoutmid_recompute_grouped",
+        "specialized_readout_middle_kernel",
+        "reverse_readoutmid_grouped",
+        "reverse_readout1_recompute2_grouped",
+        "specialized_readout_activation1_reverse_kernel",
+        "reverse_readout1_grouped",
+        "reverse_skip_grouped",
+        "reverse_product_linear",
+    )
+    previous = -1
+    for stage in stages:
+        matching = [i for i, kernel in enumerate(kernels) if stage in kernel]
+        assert matching, (stage, kernels)
+        assert min(matching) > previous
+        previous = max(matching)
+    assert not any("post_readout_kernel" in kernel for kernel in kernels)
 
 
 def test_the_device_node_program_renders_the_bias_readout(bias_model_path):

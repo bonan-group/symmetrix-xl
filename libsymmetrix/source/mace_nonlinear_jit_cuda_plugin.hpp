@@ -3,6 +3,7 @@
 #include "mace_nonlinear_jit_cuda_plugin_abi.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -66,6 +67,7 @@ struct MH1CudaPluginV4Expectation {
         SYMMETRIX_JIT_MH1_CUDA_PLUGIN_INTERACTIONS> interactions;
     std::array<MH1CudaNodeProgramExpectation,
         SYMMETRIX_JIT_MH1_CUDA_PLUGIN_INTERACTIONS> node_programs;
+    std::size_t interaction_count = SYMMETRIX_JIT_MH1_CUDA_PLUGIN_INTERACTIONS;
     std::string_view target_backend = "cuda";
     std::string_view target_architecture;
     std::int32_t target_compute_capability = -1;

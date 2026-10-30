@@ -426,6 +426,123 @@ def test_the_program_scales_its_backbone_with_the_interaction_count(
     )
 
 
+@pytest.mark.parametrize("dtype", ("float64", "float32"))
+@pytest.mark.parametrize("skin_shell", (False, True))
+def test_scalar_single_layer_reference_retains_features_without_generated_artifacts(
+    tmp_path, dtype, skin_shell
+):
+    """Admitting Polar-S to generation must keep reference artifact-free."""
+
+    data = extract_mace_polar_data(
+        _build_polar_shaped_model(num_interactions=1, hidden_irreps="4x0e")
+    )
+    path = _write_model(tmp_path / "scalar-single-layer.json", data)
+    calculator = _polar_calculator(path, dtype=dtype)
+    evaluator = calculator.evaluator
+    assert evaluator.uses_mh1_fast_path
+    assert evaluator.family_capabilities["portable"]
+    assert not evaluator.family_capabilities["generated"]
+    assert evaluator.layer_feature_components(4) == 1
+    layout = evaluator.mh1_layer_retained_feature_layout(0)
+    assert layout["width"] == layout["scalar_multiplicity"] == 4
+    assert layout["scalar_offset"] == 0
+    assert layout["vector_offset"] == -1
+    assert layout["vector_components"] == 0
+    atoms = _molecule()
+    if skin_shell:
+        from ase import Atom
+
+        atoms.append(Atom("H", position=(4.2, 0.0, 0.0)))
+    calculator.calculate(atoms, properties=["energy", "forces", "stress", "dipole"])
+    forces = np.array(calculator.results["forces"], copy=True)
+    assert np.isfinite(forces).all()
+    assert np.isfinite(calculator.results["energy"])
+    assert np.isfinite(calculator.results["stress"]).all()
+    assert np.isfinite(calculator.results["dipole"]).all()
+    features = evaluator.layer_features()
+    assert len(features) == 1
+    assert np.asarray(features[0]).shape == (len(atoms), 4)
+    assert np.isfinite(features[0]).all()
+    assert calculator.jit_status == "not_applicable"
+    assert not evaluator.jit_mh1_host_plugin_ready
+    assert not evaluator.jit_mh1_cuda_plugin_ready
+    assert evaluator.factorized_fallback_evaluation_count == 0
+    assert evaluator.factorized_forward_evaluation_count == 2
+    assert evaluator.factorized_reverse_evaluation_count == 2
+
+    graph_builds = evaluator.factorized_prepared_graph_count
+    calculator.calculate(atoms.copy(), properties=["energy", "forces"])
+    assert evaluator.factorized_prepared_graph_count == graph_builds
+    np.testing.assert_allclose(
+        calculator.results["forces"],
+        forces,
+        rtol=0.0,
+        atol=1e-12 if dtype == "float64" else 1e-6,
+    )
+
+    # The complete Polar derivative includes the chain's transpose seed back
+    # through this scalar-only retained tap, not only the backbone readout.
+    if dtype == "float64":
+        step = 1e-4
+        for atom, axis in ((0, 0), (1, 2)):
+            energies = []
+            for displacement in (step, -step):
+                displaced = atoms.copy()
+                displaced.positions[atom, axis] += displacement
+                calculator.calculate(displaced, properties=["energy"])
+                energies.append(float(calculator.results["energy"]))
+            numerical_force = -(energies[0] - energies[1]) / (2 * step)
+            assert forces[atom, axis] == pytest.approx(numerical_force, abs=1e-7)
+
+    from ase import Atom
+
+    old_generation = evaluator.factorized_graph_generation
+    enlarged = atoms.copy()
+    enlarged.append(Atom("H", position=(1.1, 0.7, 0.4)))
+    calculator.calculate(enlarged, properties=["energy", "forces"])
+    assert evaluator.factorized_graph_generation != old_generation
+    with pytest.raises(ValueError, match="current graph and geometry tokens"):
+        evaluator._compute_prepared_factorized_positions(
+            old_generation, np.ascontiguousarray(enlarged.positions).reshape(-1)
+        )
+
+
+def test_polar_reference_retained_layout_rejects_odd_scalar_parity(tmp_path):
+    """Independent retained-layout admission must still enforce its basis."""
+
+    data = extract_mace_polar_data(
+        _build_polar_shaped_model(num_interactions=1, hidden_irreps="4x0e")
+    )
+    product = data["products"][0]
+    product["symmetric_contractions"]["irreps_out"] = "4x0o"
+    for field in ("node_feats_irreps", "target_irreps"):
+        product[field] = "4x0o"
+    for field in ("irreps_in", "irreps_out"):
+        product["linear"][field] = "4x0o"
+    path = _write_model(tmp_path / "odd-scalar-retained-layout.json", data)
+    with pytest.raises(RuntimeError, match="retained features support"):
+        _native_module().MACEPolarKokkos(str(path))
+
+
+@pytest.mark.parametrize(
+    "field", ("node_feats_irreps", "target_irreps", "irreps_in", "irreps_out")
+)
+def test_polar_reference_retained_layout_checks_product_connectivity(tmp_path, field):
+    """Equal widths cannot hide a product linear's incompatible representation."""
+
+    data = extract_mace_polar_data(
+        _build_polar_shaped_model(num_interactions=1, hidden_irreps="4x0e")
+    )
+    product = data["products"][0]
+    target = product["linear"] if field in ("irreps_in", "irreps_out") else product
+    target[field] = "4x0o"
+    path = _write_model(tmp_path / "mismatched-product-layout.json", data)
+    with pytest.raises(
+        (ValueError, RuntimeError), match="retained-feature product connectivity"
+    ):
+        _native_module().MACEPolarKokkos(str(path))
+
+
 def test_the_shared_extractor_routes_a_polar_checkpoint_to_the_family_extractor(
     tmp_path,
 ):
@@ -701,7 +818,12 @@ def test_direct_loads_generated_backbone_and_default_resolves_to_reference(
             atol=value_atol,
             err_msg=f"generated and portable polar {name} disagree",
         )
-    assert "shared_products" in direct.evaluator.execution_mh1_execution_backend
+    expected_backend = (
+        "pair_spline_v1_staged_device_v5"
+        if _native_module()._kokkos_default_execution_space() in ("Cuda", "HIP")
+        else "pair_spline_v1_staged_host_v7_shared_products"
+    )
+    assert direct.evaluator.execution_mh1_execution_backend == expected_backend
     assert all(
         direct.evaluator._execution_mh1_product_module_forward_launch_count(layer) > 0
         for layer in range(2)

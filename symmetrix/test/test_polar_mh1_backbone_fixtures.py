@@ -852,7 +852,12 @@ def test_polar_generated_backbone_matches_portable_retention_and_seed(
     )
 
     evaluator = direct.evaluator
-    assert "shared_products" in evaluator.execution_mh1_execution_backend
+    expected_backend = (
+        "pair_spline_v1_staged_device_v5"
+        if native._kokkos_default_execution_space() in ("Cuda", "HIP")
+        else "pair_spline_v1_staged_host_v7_shared_products"
+    )
+    assert evaluator.execution_mh1_execution_backend == expected_backend
     assert all(
         evaluator._execution_mh1_product_module_forward_launch_count(layer) > 0
         for layer in range(2)

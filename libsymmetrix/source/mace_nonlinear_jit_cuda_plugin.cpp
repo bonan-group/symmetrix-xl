@@ -114,6 +114,7 @@ struct MH1CudaModuleState {
     int device = -1;
     std::array<MH1CudaModuleInteraction,2> interactions;
     std::array<MH1CudaModuleNode,2> nodes;
+    std::size_t interaction_count=0;
     std::string abi_tag;
     std::string artifact_id;
     std::string generation_fingerprint;
@@ -574,6 +575,10 @@ void validate_node_expectation(
 
 void validate_expectation(const MH1CudaPluginV4Expectation& expectation)
 {
+    if(expectation.interaction_count==0
+        ||expectation.interaction_count>expectation.interactions.size())
+        throw std::invalid_argument(
+            "Execution MH-1 device module interaction count is unsupported.");
     if(expectation.artifact_id.empty())
         throw std::invalid_argument(
             "Execution MH-1 CUDA ABI-v4 expectation requires an artifact id.");
@@ -593,10 +598,9 @@ void validate_expectation(const MH1CudaPluginV4Expectation& expectation)
         throw std::invalid_argument(
             "Execution MH-1 device ABI-v4 expectation requires exact backend, "
             "architecture, and device extents.");
-    for(const auto& interaction:expectation.interactions)
-        validate_interaction_expectation(interaction);
     for(std::size_t interaction=0;
-        interaction<expectation.node_programs.size();++interaction) {
+        interaction<expectation.interaction_count;++interaction) {
+        validate_interaction_expectation(expectation.interactions[interaction]);
         const auto& node=expectation.node_programs[interaction];
         validate_node_expectation(node,expectation.max_threads_per_block);
         if(node.requires_tp_source_state_adjoint!=(interaction!=0))
@@ -1026,9 +1030,8 @@ void validate_descriptor(
         throw plugin_error(path,"pointer width does not match this process");
     if(descriptor.byte_order!=SYMMETRIX_JIT_MH1_CUDA_PLUGIN_BYTE_ORDER)
         throw plugin_error(path,"byte order does not match this process");
-    if(descriptor.interaction_count
-        !=SYMMETRIX_JIT_MH1_CUDA_PLUGIN_INTERACTIONS)
-        throw plugin_error(path,"descriptor must contain exactly two interactions");
+    if(descriptor.interaction_count!=expectation.interaction_count)
+        throw plugin_error(path,"descriptor interaction count does not match");
     if(descriptor.scalar_size!=expectation.scalar_size)
         throw plugin_error(path,"scalar width does not match model execution");
     if(descriptor.scalar_size!=sizeof(float)
@@ -1072,7 +1075,7 @@ void validate_descriptor(
         throw plugin_error(path,"target compute capability does not match");
 
     for(std::size_t interaction=0;
-        interaction<SYMMETRIX_JIT_MH1_CUDA_PLUGIN_INTERACTIONS;
+        interaction<expectation.interaction_count;
         ++interaction) {
         validate_interaction(path,descriptor.interactions[interaction],
             expectation.interactions[interaction],
@@ -1284,11 +1287,14 @@ MH1CudaPluginV4 MH1CudaPluginV4::load_module(
         const bool reuse_message_adjoint=
             node_state_policy=="reuse-adjoints-v1"
             ||node_state_policy=="retain-interaction-v1";
-        if(!interaction_plans.is_array()||interaction_plans.size()!=2
-            ||!node_plans.is_array()||node_plans.size()!=2)
-            throw plugin_error(path,"launch plan must contain two interactions");
+        const auto interaction_count=expectation.interaction_count;
+        if(!interaction_plans.is_array()
+            ||interaction_plans.size()!=interaction_count
+            ||!node_plans.is_array()||node_plans.size()!=interaction_count)
+            throw plugin_error(path,"launch-plan interaction count does not match");
 
         auto state=std::make_unique<MH1CudaModuleState>();
+        state->interaction_count=interaction_count;
         state->module=reinterpret_cast<void*>(module);
 #if defined(KOKKOS_ENABLE_CUDA)
         state->context=reinterpret_cast<void*>(context);
@@ -1312,7 +1318,7 @@ MH1CudaPluginV4 MH1CudaPluginV4::load_module(
                 path,
                 "generation-19 MH-1 modules require canonical common products");
         state->split_phase=split_phase;
-        for(std::size_t index=0;index<2;++index) {
+        for(std::size_t index=0;index<interaction_count;++index) {
             const auto& value=interaction_plans.at(index);
             if(value.at("index")!=index)
                 throw plugin_error(path,"interaction launch-plan index does not match");
@@ -1446,7 +1452,7 @@ MH1CudaPluginV4 MH1CudaPluginV4::load_module(
         descriptor.pointer_size=sizeof(void*);
         descriptor.byte_order=SYMMETRIX_JIT_MH1_CUDA_PLUGIN_BYTE_ORDER;
         descriptor.capabilities=expectation.required_capabilities;
-        descriptor.interaction_count=2;
+        descriptor.interaction_count=static_cast<std::uint32_t>(interaction_count);
         descriptor.scalar_size=expectation.scalar_size;
         descriptor.abi_tag=state->abi_tag.c_str();
         descriptor.artifact_id=state->artifact_id.c_str();
@@ -1458,7 +1464,7 @@ MH1CudaPluginV4 MH1CudaPluginV4::load_module(
         descriptor.target_backend=state->target_backend.c_str();
         descriptor.target_architecture=state->target_architecture.c_str();
         descriptor.node_programs=state->node_descriptors.data();
-        for(std::size_t index=0;index<2;++index) {
+        for(std::size_t index=0;index<interaction_count;++index) {
             const auto& expected_node=expectation.node_programs[index];
             auto& node=state->node_descriptors[index];
             node.struct_size=sizeof(node);
@@ -1488,7 +1494,8 @@ MH1CudaPluginV4 MH1CudaPluginV4::load_module(
         const MH1SplitPhaseExpectation split_expectation{
             expectation.artifact_id,expectation.generation_fingerprint,
             expectation.semantic_fingerprint,expectation.structure_fingerprint,
-            expectation.runtime_layout_fingerprint,2u,expectation.scalar_size,
+            expectation.runtime_layout_fingerprint,
+            static_cast<std::uint32_t>(interaction_count),expectation.scalar_size,
             expectation.target_backend,expectation.target_architecture};
         validate_mh1_split_phase_cuda_descriptor(
             descriptor,split_expectation);
@@ -1557,7 +1564,7 @@ const SymmetrixJitMH1CudaPluginV5& MH1CudaPluginV4::descriptor() const
 std::int32_t MH1CudaPluginV4::edge_launch_count(
     const std::size_t interaction) const
 {
-    if(module_state_==nullptr||interaction>=module_state_->interactions.size())
+    if(module_state_==nullptr||interaction>=module_state_->interaction_count)
         throw std::logic_error("Execution MH-1 device module handle is empty.");
     return module_state_->interactions[interaction].edge_count;
 }
@@ -1576,7 +1583,8 @@ std::int32_t MH1CudaPluginV4::launch_forward(
         |SYMMETRIX_JIT_MH1_CUDA_HAS_FIXED_CONTRIBUTION_V4;
     if(args==nullptr
         ||args->struct_size<sizeof(SymmetrixJitMH1CudaForwardArgsV4)
-        ||args->interaction>=2||(args->flags&~known_flags)!=0u
+        ||args->interaction>=module_state_->interaction_count
+        ||(args->flags&~known_flags)!=0u
         ||args->num_nodes<0||args->num_nodes>INT32_MAX
         ||args->num_edges<0||args->num_edges>INT32_MAX
         ||args->first_edge!=0||args->samples<0
@@ -1632,7 +1640,8 @@ std::int32_t MH1CudaPluginV4::launch_reverse(
         |SYMMETRIX_JIT_MH1_CUDA_HAS_FIXED_CONTRIBUTION_V4;
     if(args==nullptr
         ||args->struct_size<sizeof(SymmetrixJitMH1CudaReverseArgsV4)
-        ||args->interaction>=2||(args->flags&~known_flags)!=0u
+        ||args->interaction>=module_state_->interaction_count
+        ||(args->flags&~known_flags)!=0u
         ||args->reserved!=0u||args->num_nodes<0||args->num_nodes>INT32_MAX
         ||args->num_edges<0||args->num_edges>INT32_MAX
         ||args->first_edge!=0||args->samples<0
@@ -1696,11 +1705,12 @@ std::int32_t MH1CudaPluginV4::launch_reverse(
 
 bool MH1CudaPluginV4::has_spline_r_program() const noexcept
 {
-    return module_state_!=nullptr
-        &&module_state_->interactions[0].spline_forward!=nullptr
-        &&module_state_->interactions[0].spline_reverse!=nullptr
-        &&module_state_->interactions[1].spline_forward!=nullptr
-        &&module_state_->interactions[1].spline_reverse!=nullptr;
+    if(module_state_==nullptr||module_state_->interaction_count==0) return false;
+    for(std::size_t index=0;index<module_state_->interaction_count;++index)
+        if(module_state_->interactions[index].spline_forward==nullptr
+            ||module_state_->interactions[index].spline_reverse==nullptr)
+            return false;
+    return true;
 }
 
 std::int32_t MH1CudaPluginV4::launch_spline_r_forward(
@@ -1708,7 +1718,8 @@ std::int32_t MH1CudaPluginV4::launch_spline_r_forward(
     std::int32_t persistent_blocks) const
 {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
-    if(module_state_==nullptr||args==nullptr||args->interaction>=2
+    if(module_state_==nullptr||args==nullptr
+        ||args->interaction>=module_state_->interaction_count
         ||args->struct_size<sizeof(*args)||args->reserved!=0u
         ||args->num_nodes<0||args->num_nodes>INT32_MAX
         ||args->num_edges<0||args->num_edges>INT32_MAX
@@ -1755,7 +1766,7 @@ std::int32_t MH1CudaPluginV4::launch_spline_r_reverse(
 {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     if(module_state_==nullptr||source_args==nullptr||edge_args==nullptr
-        ||source_args->interaction>=2
+        ||source_args->interaction>=module_state_->interaction_count
         ||edge_args->interaction!=source_args->interaction
         ||source_args->struct_size<sizeof(*source_args)
         ||edge_args->struct_size<sizeof(*edge_args)
@@ -1837,7 +1848,8 @@ std::int32_t MH1CudaPluginV4::launch_conditioning_forward(
     if(args==nullptr
         ||args->struct_size
             <sizeof(SymmetrixJitMH1CudaConditioningForwardArgsV4)
-        ||args->interaction>=2||(args->flags&~known_flags)!=0u
+        ||args->interaction>=module_state_->interaction_count
+        ||(args->flags&~known_flags)!=0u
         ||args->num_nodes<0||args->num_nodes>INT32_MAX
         ||args->num_edges<0||args->num_edges>INT32_MAX
         ||args->active_receiver_count>args->num_nodes
@@ -1882,7 +1894,8 @@ std::int32_t MH1CudaPluginV4::launch_conditioning_reverse(
     if(args==nullptr
         ||args->struct_size
             <sizeof(SymmetrixJitMH1CudaConditioningReverseArgsV4)
-        ||args->interaction>=2||(args->flags&~known_flags)!=0u
+        ||args->interaction>=module_state_->interaction_count
+        ||(args->flags&~known_flags)!=0u
         ||args->reserved!=0u||args->num_nodes<0||args->num_nodes>INT32_MAX
         ||args->num_edges<0||args->num_edges>INT32_MAX
         ||(args->num_edges>0&&args->num_nodes==0)||persistent_blocks<=0)
@@ -1916,7 +1929,8 @@ std::int32_t MH1CudaPluginV4::launch_node_forward(
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     if(args==nullptr
         ||args->struct_size<sizeof(SymmetrixJitMH1CudaNodeForwardArgsV5)
-        ||args->interaction>=2||args->phase>1
+        ||module_state_==nullptr
+        ||args->interaction>=module_state_->interaction_count||args->phase>1
         ||args->num_nodes<0||args->num_nodes>INT32_MAX
         ||persistent_blocks<=0)
         throw std::invalid_argument("Execution MH1 node-forward packet is invalid");
@@ -1958,7 +1972,9 @@ std::int32_t MH1CudaPluginV4::launch_node_reverse(
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     if(args==nullptr
         ||args->struct_size<sizeof(SymmetrixJitMH1CudaNodeReverseArgsV5)
-        ||args->interaction>=2||args->phase<2||args->phase>3
+        ||module_state_==nullptr
+        ||args->interaction>=module_state_->interaction_count
+        ||args->phase<2||args->phase>3
         ||args->num_nodes<0||args->num_nodes>INT32_MAX
         ||persistent_blocks<=0)
         throw std::invalid_argument("Execution MH1 node-reverse packet is invalid");
@@ -2010,7 +2026,8 @@ std::int32_t MH1CudaPluginV4::launch_split_forward(
     if(!split_phase_ready())
         throw std::logic_error(
             "Execution MH1 split forward phase is unavailable");
-    if(args==nullptr||args->struct_size<sizeof(*args)||args->interaction>=2
+    if(args==nullptr||args->struct_size<sizeof(*args)
+        ||args->interaction>=module_state_->interaction_count
         ||args->phase>1||args->num_nodes<0||args->num_nodes>INT32_MAX
         ||persistent_blocks<=0)
         throw std::invalid_argument(
@@ -2040,7 +2057,8 @@ std::int32_t MH1CudaPluginV4::launch_split_reverse(
     if(!split_phase_ready())
         throw std::logic_error(
             "Execution MH1 split reverse phase is unavailable");
-    if(args==nullptr||args->struct_size<sizeof(*args)||args->interaction>=2
+    if(args==nullptr||args->struct_size<sizeof(*args)
+        ||args->interaction>=module_state_->interaction_count
         ||args->phase<2||args->phase>3||args->num_nodes<0
         ||args->num_nodes>INT32_MAX||persistent_blocks<=0)
         throw std::invalid_argument(

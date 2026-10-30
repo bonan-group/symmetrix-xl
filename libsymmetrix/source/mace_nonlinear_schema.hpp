@@ -28,6 +28,10 @@ void validate_mace_backbone_schema(
 //: rules, unchanged from the single-family form.
 void validate_mace_nonlinear_schema(const nlohmann::json& data);
 
+// Retention follows the product linear; equal widths alone do not establish
+// that its basis matches the contraction and the declared feature consumers.
+void validate_mace_retained_product_connectivity(const nlohmann::json& product);
+
 struct MaceMH1IrrepBlockPattern {
     int multiplicity = 0;
     int l = 0;
