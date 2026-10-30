@@ -49,8 +49,9 @@ def main(argv=None):
     parser.add_argument(
         "--num-spline-points",
         type=int,
-        default=256,
-        help="Number of radial spline grid points.",
+        default=None,
+        help="Number of radial spline grid points (default 256). For MACE_Nonlinear "
+        "models this sets the runtime pair-spline table size.",
     )
     parser.add_argument("--output", "-o", help="Output filename.")
     parser.add_argument(

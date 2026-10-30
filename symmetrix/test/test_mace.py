@@ -16,7 +16,7 @@ def _cached_json_model(filename):
 
 JSON_MODELS = {
     filename: _cached_json_model(filename)
-    for filename in ("MACE-OFF23_small-1-8.json", "mace-mp-0b3-medium-1-8.json")
+    for filename in ("MACE-OFF23_small-1-8.json",)
 }
 
 model = "mace-off-small"
@@ -26,7 +26,6 @@ model = "mace-off-small"
 # model = "mace-mp-medium"
 # model = "mace-mp-large"
 # model = "mace-mpa-medium"
-# model = "mace-mp-0b3-medium"
 # model = "mace-omat-0-medium"
 
 kokkos = False
@@ -52,8 +51,6 @@ elif model == "mace-mp-large":
     evaluator = MACE("mace-large-density-agnesi-stress.json")
 elif model == "mace-mpa-medium":
     evaluator = MACE("mace-mpa-0-medium-1-8.json")
-elif model == "mace-mp-0b3-medium":
-    evaluator = MACE(str(JSON_MODELS["mace-mp-0b3-medium-1-8.json"]))
 elif model == "mace-omat-0-medium":
     evaluator = MACE("mace-omat-0-medium-1-8.json")
 
@@ -753,8 +750,8 @@ def test_compute_node_energies_forces():
     assert np.allclose(f, f_num, rtol=1e-4, atol=1e-6)
 
 
-def test_zbl():
-    evaluator = MACE(str(JSON_MODELS["mace-mp-0b3-medium-1-8.json"]))
+def test_zbl(generated_standard_mace_zbl_model):
+    evaluator = MACE(str(generated_standard_mace_zbl_model))
     atoms = ase.Atoms(
         "OHH", positions=[[0.0, -0.5, 0.0], [0.5, 0.0, 0.0], [0.0, 0.5, 0.0]]
     )
@@ -775,8 +772,18 @@ def test_zbl():
     )
     e = sum(evaluator.node_energies)
     f = evaluator.node_forces
-    exact_e = -5.003106904473648
-    assert e == pytest.approx(exact_e, abs=1e-3)
+    zbl = symmetrix.ZBL(
+        0.3,
+        0.4543,
+        [0.1818, 0.5099, 0.2802, 0.02817],
+        [1.0] * 119,
+        6,
+    )
+    exact_e = sum(
+        zbl.compute(ase_atomic_numbers[i], ase_atomic_numbers[j], distance)
+        for i, j, distance in zip(i_list, j_list, r, strict=True)
+    )
+    assert e == pytest.approx(exact_e)
 
     ### REVERSE
     # test partial forces

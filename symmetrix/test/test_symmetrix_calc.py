@@ -1049,14 +1049,14 @@ def mace_foundation_model():
 
 
 @pytest.mark.parametrize("use_kokkos", [True, False])
-def test_calc_caching(monkeypatch, model_cache, use_kokkos):
+def test_calc_caching(monkeypatch, generated_standard_mace_zbl_model, use_kokkos):
     atoms = Atoms("O", cell=[2] * 3, pbc=[True] * 3)
     atoms *= 4
     rng = np.random.default_rng(5)
     atoms.rattle(rng=rng)
 
     calc = Symmetrix(
-        model_cache["mace-mp-0b3-medium-1-8.json"],
+        generated_standard_mace_zbl_model,
         use_kokkos=use_kokkos,
         streamed_edges="materialized",
     )
@@ -1198,7 +1198,7 @@ def test_ase_npt_reuses_stress_and_factorized_skin_topology():
 
 
 @pytest.mark.parametrize("use_kokkos", [True, False])
-def test_symmetrix_calc_finite_diff(model_cache, use_kokkos):
+def test_symmetrix_calc_finite_diff(generated_standard_mace_zbl_model, use_kokkos):
     atoms = Atoms("O", cell=[2] * 3, pbc=[True] * 3)
     atoms *= 2
     rng = np.random.default_rng(5)
@@ -1209,7 +1209,7 @@ def test_symmetrix_calc_finite_diff(model_cache, use_kokkos):
 
     print("pre-converted")
     calc = Symmetrix(
-        model_cache["mace-mp-0b3-medium-1-8.json"],
+        generated_standard_mace_zbl_model,
         dtype="float64",
         use_kokkos=use_kokkos,
         streamed_edges="materialized",

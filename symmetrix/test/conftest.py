@@ -4,10 +4,7 @@ import os
 from pathlib import Path
 
 import pytest
-from model_downloads import (
-    MODEL_URLS,
-    cached_model_path,
-)
+from compact_r1_model import foundation_r1_test_model
 from model_downloads import (
     macefield_model_path as cached_macefield_model_path,
 )
@@ -167,16 +164,33 @@ def finalize_kokkos_after_tests():
 
 
 @pytest.fixture(scope="session")
-def model_cache():
-    models = {}
-    for filename, url in MODEL_URLS.items():
-        if not filename.endswith(".json"):
-            continue
-        try:
-            models[filename] = cached_model_path(filename, url)
-        except RuntimeError as exc:
-            pytest.skip(str(exc))
-    return models
+def generated_standard_mace_zbl_model(tmp_path_factory):
+    contract_path = (
+        Path(__file__).resolve().parent
+        / "data"
+        / "execution_contracts"
+        / "jit_r1_fixture_c4_e3_l0_contract.json"
+    )
+    model = foundation_r1_test_model(
+        json.loads(contract_path.read_text()), atomic_numbers=(1, 8)
+    )
+    model.update(
+        {
+            "has_zbl": True,
+            "zbl_a_exp": 0.3,
+            "zbl_a_prefactor": 0.4543,
+            "zbl_c": [0.1818, 0.5099, 0.2802, 0.02817],
+            "zbl_covalent_radii": [1.0] * 119,
+            "zbl_p": 6,
+        }
+    )
+    # Keep the integration fixture's energy purely ZBL so its expected value
+    # is independent of the generated MACE weights.
+    model["readout_2_weights_1"] = [0.0] * len(model["readout_2_weights_1"])
+    model["readout_2_weights_2"] = [0.0] * len(model["readout_2_weights_2"])
+    output = tmp_path_factory.mktemp("standard-mace-zbl") / "model.json"
+    output.write_text(json.dumps(model, separators=(",", ":")))
+    return output
 
 
 @pytest.fixture(scope="session")

@@ -18,9 +18,6 @@ import textwrap
 import numpy as np
 import pytest
 
-from model_downloads import MODEL_URLS, cached_model_path
-
-_MODEL_NAME = "mace-mp-0b3-medium-1-8.json"
 _COUNTERS = (
     "a1_host_blocked_forward_launch_count",
     "a1_host_blocked_reverse_launch_count",
@@ -41,7 +38,12 @@ _EVALUATION = textwrap.dedent(
     atoms.pbc = True
     atoms = atoms.repeat((2, 1, 2))
     atoms.cell = [14.0, 14.0, 14.0]
-    calculator = Symmetrix(sys.argv[1], use_kokkos=True, dtype="float64")
+    calculator = Symmetrix(
+        sys.argv[1],
+        use_kokkos=True,
+        dtype="float64",
+        streamed_edges="materialized",
+    )
     atoms.calc = calculator
     report = {
         "energy": float(atoms.get_potential_energy()),
@@ -62,11 +64,8 @@ _EVALUATION = textwrap.dedent(
 
 
 @pytest.fixture(scope="module")
-def a1_model_path():
-    try:
-        return cached_model_path(_MODEL_NAME, MODEL_URLS[_MODEL_NAME])
-    except RuntimeError as exc:
-        pytest.skip(str(exc))
+def a1_model_path(generated_standard_mace_zbl_model):
+    return generated_standard_mace_zbl_model
 
 
 def _run_evaluation(model_path, overrides):

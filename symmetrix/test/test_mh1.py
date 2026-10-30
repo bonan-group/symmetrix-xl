@@ -2581,6 +2581,42 @@ def test_mh1_rejects_legacy_pair_spline_extraction():
         )
 
 
+def test_mh1_extraction_forwards_num_spline_points(tmp_path):
+    from symmetrix.cli.extract_mace import main as extract_mace_main
+
+    model, _ = _make_generalized_mh1((8, 4, 8, 2, [7, 9]))
+    checkpoint = tmp_path / "model.model"
+    torch.save(model, checkpoint)
+    paths = {}
+    for nodes in (None, 1024):
+        paths[nodes] = tmp_path / f"model-{nodes}.json"
+        argv = ["--model", str(checkpoint), "--output", str(paths[nodes])]
+        if nodes is not None:
+            argv += ["--num-spline-points", str(nodes)]
+        assert extract_mace_main(argv) == 0
+
+    default = json.loads(paths[None].read_text())
+    fine = json.loads(paths[1024].read_text())
+    assert "num_spline_points" not in default["radial_embedding"]
+    assert fine["radial_embedding"].pop("num_spline_points") == 1024
+    assert fine == default
+
+    atoms = _generalized_mh1_atoms()
+    forces = {}
+    for nodes, path in paths.items():
+        calculator = Symmetrix(
+            path, use_kokkos=True, dtype="float64", streamed_edges="generic"
+        )
+        assert calculator.evaluator.mh1_pair_spline_nodes == (nodes or 256)
+        calculator.calculate(atoms.copy(), properties=["forces"])
+        forces[nodes] = np.array(calculator.results["forces"], copy=True)
+    calculator.evaluator.set_mh1_edge_executor("mlp_reference")
+    calculator.calculate(atoms.copy(), properties=["forces"])
+    reference = calculator.results["forces"]
+    error = {nodes: np.abs(value - reference).max() for nodes, value in forces.items()}
+    assert error[1024] < 0.1 * error[None]
+
+
 def test_mh1_raw_checkpoint_dispatches_to_native_kokkos():
     calculator = Symmetrix(
         _mh1_model_path(),
