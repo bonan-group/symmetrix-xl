@@ -2909,6 +2909,7 @@ def test_m1_recompute_matches_retained_and_releases_polynomial_storage(
             == expected_m1_binding
         )
         return {
+            "expected_m1_binding": expected_m1_binding,
             "energy": results["energy"],
             "energies": np.array(results["energies"], copy=True),
             "forces": np.array(results["forces"], copy=True),
@@ -2950,7 +2951,7 @@ def test_m1_recompute_matches_retained_and_releases_polynomial_storage(
         assert result["adjoints_active_bytes"] == 0
         assert result["adjoints_capacity_bytes"] == 0
         if (
-            evaluator.standard_m1_module_ready
+            result["expected_m1_binding"] == "builtin_m1"
             and evaluator.m1_recompute_backend == "host"
         ):
             assert result["scratch_bytes"] == 0
