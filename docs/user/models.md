@@ -23,18 +23,30 @@ symmetrix_extract_mace \
 ```
 
 Omitting `--chemical-symbols` and `--atomic-numbers` produces the preferred
-universal export and retains the checkpoint's complete element domain. Compact
-format v2 stores the shared radial model once with element-indexed parameters,
-and format v3 uses the same full-domain principle for nonlinear MACE models.
-Unlike the original Symmetrix pair-spline format (named v1 here), these formats
-do not add a separate radial spline table for every element pair, avoiding
+universal export and retains the checkpoint's complete element domain. The
+compact radial representation stores the shared radial model once with
+element-indexed parameters, and nonlinear MACE models use the same full-domain
+principle. Unlike pair-spline radial tables (`--radial-format pair-splines`),
+it does not add a separate radial spline table for every element pair, avoiding
 quadratic pair-table growth. A
 universal file still contains the checkpoint's element-indexed learned
-parameters and can therefore be larger than a deliberately restricted v2
+parameters and can therefore be larger than a deliberately restricted
 subset, but it can be reused across compositions. Use an explicit element
-subset only for an intentionally restricted format-v2 deployment or when
-producing the original Symmetrix format with `--radial-format pair-splines`;
-format-v3 models reject subsets.
+subset only for an intentionally restricted deployment or with
+`--radial-format pair-splines`; nonlinear MACE models reject subsets.
+
+Every export is written in format version 4: the first readout and the
+H1->H2 skip are stored without the inverse of `interactions[1].linear_up`
+(`h1_affine_mode` `m0_composite`, or `pre_linear_up` for first-interaction
+residual and MACEField models). Format-1/2 files carry that inverse; they still
+load with the old arithmetic and print a warning with an fp32 cancellation
+estimate computed from the file. Re-export to v4 is recommended but optional.
+Convert them without the checkpoint, or re-export:
+
+```bash
+symmetrix_recompose_mace_json --input old.json --output new.json
+```
+
 
 The command retains all compatible prediction heads. It does not download a
 model; obtain a checkpoint from its model provider, then use the resulting JSON

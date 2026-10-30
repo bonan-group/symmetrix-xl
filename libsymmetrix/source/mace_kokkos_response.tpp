@@ -308,6 +308,13 @@ void MACEKokkos<Precision>::compute_electric_field_response(
     Kokkos::View<Precision***,Kokkos::LayoutRight> dPhi1_local;
     Kokkos::View<Precision***,Kokkos::LayoutRight> dPhi1_dot;
     Kokkos::View<Precision***,Kokkos::LayoutRight> H1_product_adj_dot;
+    // Format 4 (pre_linear_up): field tangent of the pre-linear_up scalar block
+    // and the direct readout_1 + skip adjoint (and its tangent) on that block.
+    // Format 1/2 keeps the old maps on the post-linear_up H1 (views stay empty).
+    const bool v4 = h1_affine_v4();
+    Kokkos::View<Precision**,Kokkos::LayoutRight> h1_affine_scalar_dot;
+    Kokkos::View<Precision**,Kokkos::LayoutRight> h1_affine_direct;
+    Kokkos::View<Precision**,Kokkos::LayoutRight> h1_affine_direct_dot;
     Kokkos::View<Precision***,Kokkos::LayoutRight> M0_adj_dot(
         "MACEField M0 adjoint tangent",
         include_force_derivative ? num_nodes : 0, LM_count, channels);
@@ -405,6 +412,33 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                     }
                 }
                 H1_dot(i,lm,output) = value;
+            });
+        const auto field_matrix = field_path_matrix;
+        h1_affine_scalar_dot = decltype(h1_affine_scalar_dot)(
+            "MACEField pre-linear_up scalar tangent", v4 ? num_nodes : 0, channels);
+        const auto scalar_dot = h1_affine_scalar_dot;
+        if (v4) Kokkos::parallel_for(
+            "MACEField analytic pre-linear_up scalar tangent",
+            Kokkos::MDRangePolicy<
+                Kokkos::Rank<2,Kokkos::Iterate::Right>,
+                Kokkos::IndexType<std::size_t>>(
+                {0,0}, {num_nodes,channels}),
+            KOKKOS_LAMBDA (
+                const std::size_t i,
+                const std::size_t output) {
+                Precision value = 0.0;
+                for (int entry=0; entry<field_entry_count; ++entry) {
+                    if (field_output_lm(entry) != 0
+                        || field_component(entry) != seed)
+                        continue;
+                    const int path = field_path(entry);
+                    for (int input=0; input<channels; ++input) {
+                        value += field_coefficient(entry)
+                            * field_matrix(path,input,output)
+                            * H1_before_field(i,field_input_lm(entry),input);
+                    }
+                }
+                scalar_dot(i,output) = value;
             });
 
         Kokkos::deep_copy(Phi1_dot, 0.0);
@@ -858,7 +892,7 @@ void MACEKokkos<Precision>::compute_electric_field_response(
             M1_value_dot = decltype(M1_value_dot)();
         }
 
-        const auto H2_from_H1 = H2_weights_for_H1;
+        const auto H2_from_H1 = v4 ? H2_weights_for_M0 : H2_weights_for_H1;
         const auto H2_from_M1 = H2_weights_for_M1;
         H2_dot = decltype(H2_dot)("MACEField H2_dot", num_nodes, channels);
         Kokkos::parallel_for(
@@ -873,7 +907,8 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                 double value = 0.0;
                 for (int input=0; input<channels; ++input) {
                     value += H2_from_H1(node_types(i),input*channels+output)
-                        *static_cast<double>(H1_dot(i,0,input));
+                        *static_cast<double>(
+                            v4 ? scalar_dot(i,input) : H1_dot(i,0,input));
                     value += H2_from_M1(input*channels+output)
                         *static_cast<double>(M1_dot(i,input));
                 }
@@ -909,7 +944,13 @@ void MACEKokkos<Precision>::compute_electric_field_response(
             "MACEField M1_adj_dot", num_nodes, channels);
         Kokkos::deep_copy(H1_adj_local, 0.0);
         Kokkos::deep_copy(H1_adj_dot, 0.0);
-        const auto readout1 = readout_1_weights;
+        h1_affine_direct = decltype(h1_affine_direct)(
+            "MACEField direct adjoint", v4 ? num_nodes : 0, channels);
+        h1_affine_direct_dot = decltype(h1_affine_direct_dot)(
+            "MACEField direct adjoint tangent", v4 ? num_nodes : 0, channels);
+        const auto direct = h1_affine_direct;
+        const auto direct_dot = h1_affine_direct_dot;
+        const auto readout1 = v4 ? readout_1_weights_for_M0 : readout_1_weights;
         Kokkos::parallel_for(
             "MACEField analytic H2 reverse tangent",
             Kokkos::MDRangePolicy<
@@ -936,8 +977,14 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                     m1_adjoint_dot += static_cast<Precision>(
                         m1_weight*H2_adj_dot(i,output));
                 }
-                H1_adj_local(i,0,input) = h1_adjoint;
-                H1_adj_dot(i,0,input) = h1_adjoint_dot;
+                if (v4) {
+                    // On the pre-linear_up scalar block, added in the field reverse.
+                    direct(i,input) = h1_adjoint;
+                    direct_dot(i,input) = h1_adjoint_dot;
+                } else {
+                    H1_adj_local(i,0,input) = h1_adjoint;
+                    H1_adj_dot(i,0,input) = h1_adjoint_dot;
+                }
                 M1_adj_local(i,input) = m1_adjoint;
                 M1_adj_dot(i,input) = m1_adjoint_dot;
             });
@@ -1721,6 +1768,7 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         A1_adj_dot = decltype(A1_adj_dot)();
         }
         H1_dot = decltype(H1_dot)();
+        h1_affine_scalar_dot = decltype(h1_affine_scalar_dot)();
 
         H1_product_adj_dot = decltype(H1_product_adj_dot)(
             "MACEField product adjoint tangent", num_nodes, LM_count, channels);
@@ -1744,6 +1792,9 @@ void MACEKokkos<Precision>::compute_electric_field_response(
                 field_path,
                 field_coefficient,
                 field_up_matrix,
+                field_path_matrix,
+                h1_affine_direct,
+                h1_affine_direct_dot,
                 electric_field,
                 response_hessian
             });
@@ -1751,6 +1802,8 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         Kokkos::fence();
         H1_adj_local = decltype(H1_adj_local)();
         H1_adj_dot = decltype(H1_adj_dot)();
+        h1_affine_direct = decltype(h1_affine_direct)();
+        h1_affine_direct_dot = decltype(h1_affine_direct_dot)();
         if (!include_force_derivative) {
             H1_product_adj_dot = decltype(H1_product_adj_dot)();
             continue;

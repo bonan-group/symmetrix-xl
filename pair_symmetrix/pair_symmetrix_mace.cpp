@@ -165,6 +165,9 @@ void PairSymmetrixMACE::coeff(int narg, char **arg)
 
   utils::logmesg(lmp, "Loading MACE model from \'{}\' ... ", arg[2]);
   mace = std::make_unique<MACE>(arg[2], prediction_head);
+  if (mace->has_field_coupling)
+    error->all(FLERR, "MACEField models require pair_style symmetrix/mace/kk electric_field Ex Ey Ez");
+  utils::logmesg(lmp, "(h1_affine_mode {}) ", mace->h1_affine_mode_name());
   utils::logmesg(lmp, "success\n");
   execution_pair_seconds = 0.0;
   execution_pair_evaluation_count = 0.0;
@@ -526,6 +529,8 @@ void PairSymmetrixMACE::compute_mpi_message_passing(int eflag, int vflag)
   mace->compute_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
   mace->compute_M0(num_nodes, node_types);
   mace->compute_H1(num_nodes);
+  // First-interaction residual (b_z U), as in the whole-model evaluation.
+  mace->add_H1_first_residual(num_nodes, node_types, true);
 
   // sort local H1 contributions by i (rather than ii)
   H1.resize((atom->nlocal+atom->nghost)*mace->num_LM*mace->num_channels);
@@ -775,6 +780,8 @@ void PairSymmetrixMACE::compute_no_mpi_message_passing(int eflag, int vflag)
   mace->compute_A0_scaled(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
   mace->compute_M0(num_local_nodes+num_ghost_nodes, node_types);
   mace->compute_H1(num_local_nodes+num_ghost_nodes);
+  // First-interaction residual (b_z U), as in the whole-model evaluation.
+  mace->add_H1_first_residual(num_local_nodes+num_ghost_nodes, node_types, true);
 
   if (mace->streamed_edges == MACEStreamedEdgesMode::materialized) {
     mace->compute_R1(num_local_nodes, node_types, num_neigh, neigh_types, r);

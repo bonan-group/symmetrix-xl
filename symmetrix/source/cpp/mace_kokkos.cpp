@@ -2082,6 +2082,8 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
         .def_readonly("L_max", &MACEKokkos<Precision>::L_max)
         .def_readonly(
             "single_layer_readout", &MACEKokkos<Precision>::single_layer_readout)
+        .def_property_readonly(
+            "h1_affine_mode", &MACEKokkos<Precision>::h1_affine_mode_name)
         // node energies
         .def_property("node_energies",
             [] (MACEKokkos<Precision>& self) {
@@ -2537,6 +2539,16 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             })
         .def("compute_H1", &MACEKokkos<Precision>::compute_H1)
         .def("reverse_H1", &MACEKokkos<Precision>::reverse_H1)
+        .def("add_H1_first_residual",
+            [] (MACEKokkos<Precision>& self,
+                    int num_nodes,
+                    ContiguousIntArray node_types,
+                    bool fused) {
+                self.add_H1_first_residual(
+                    num_nodes,
+                    create_kokkos_view("node_types", node_types),
+                    fused);
+            })
         .def("compute_H1_product", &MACEKokkos<Precision>::compute_H1_product)
         .def("compute_H1_linear_up", &MACEKokkos<Precision>::compute_H1_linear_up)
         .def("reverse_H1_linear_up", &MACEKokkos<Precision>::reverse_H1_linear_up)

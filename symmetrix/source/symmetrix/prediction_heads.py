@@ -11,9 +11,17 @@ PREDICTION_HEADS_SCHEMA_VERSION = 1
 def _prediction_head_fields(model_data: Mapping[str, Any]) -> set[str]:
     if model_data.get("model_type") == "MACE_Nonlinear":
         return {"atomic_energies", "scale_shift", "readouts"}
+    readout_1 = "readout_1_weights"
+    if model_data.get("symmetrix_format_version") == 4:
+        # Format 4 names the first readout after its basis (see h1_affine.py).
+        readout_1 = (
+            "readout_1_weights_for_H1_pre_linear_up"
+            if model_data.get("h1_affine_mode") == "pre_linear_up"
+            else "readout_1_weights_for_M0"
+        )
     fields = {
         "atomic_energies",
-        "readout_1_weights",
+        readout_1,
         "readout_2_weights_1",
         "readout_2_weights_2",
     }

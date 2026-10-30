@@ -513,7 +513,7 @@ def randomize(values, scale):
     values = np.asarray(values, dtype=float)
     return (scale * rng.standard_normal(values.shape)).tolist()
 for key in ("H0_weights", "A0_weights", "H1_weights", "A1_weights",
-            "H2_weights_for_H1", "H2_weights_for_M1", "readout_1_weights"):
+            "H2_weights_for_M0", "H2_weights_for_M1", "readout_1_weights_for_M0"):
     model[key] = randomize(model[key], 1.0 / np.sqrt(channels))
 for key in ("M0_weights", "M1_weights"):
     model[key] = randomize(model[key], 0.5)
