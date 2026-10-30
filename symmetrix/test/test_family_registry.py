@@ -743,13 +743,24 @@ def _oam_calculator():
     """Build the OAM family's Kokkos calculator for the checked-in fixture."""
 
     _native_class("NequIPOAMKokkos")
+    query = getattr(_native(), "_execution_device_execution_environment", None)
+    environment = query() if callable(query) else {}
+    if isinstance(environment, dict) and (
+        str(environment.get("backend", "")).lower() == "hip"
+        or "hip" in str(environment.get("execution_space", "")).lower()
+    ):
+        pytest.skip(
+            "OAM native capability/dispatch positives require host or CUDA; "
+            "HIP execution is intentionally unsupported"
+        )
     if shutil.which("c++") is None:
         pytest.skip("a C++ compiler is required for the OAM host artifact")
     return NequIPCalculator(OAM_FIXTURE, dtype="float64")
 
 
+@pytest.mark.parametrize("family_key", ("MACE", "MACE_Nonlinear", "OAM"))
 def test_the_native_capability_key_set_equals_the_declared_key_set(
-    tmp_path, compact_mace_model
+    tmp_path, request, family_key
 ):
     """Every family's native capability query publishes exactly the declared keys.
 
@@ -759,17 +770,17 @@ def test_the_native_capability_key_set_equals_the_declared_key_set(
     matrix's capability rows incomplete.
     """
 
-    calculators = (
-        ("MACE", _mace_calculator(compact_mace_model)),
-        ("MACE_Nonlinear", _mh1_calculator(tmp_path)),
-        ("OAM", _oam_calculator()),
-    )
+    if family_key == "MACE":
+        calculator = _mace_calculator(request.getfixturevalue("compact_mace_model"))
+    elif family_key == "MACE_Nonlinear":
+        calculator = _mh1_calculator(tmp_path)
+    else:
+        calculator = _oam_calculator()
 
-    for key, calculator in calculators:
-        entry = registry_module.declared_registry().by_key(key)
-        reported = registry_module.capabilities_of(entry, calculator.evaluator)
-        assert reported is not None, key
-        assert set(reported) == set(registry_module.CAPABILITY_KEYS), key
+    entry = registry_module.declared_registry().by_key(family_key)
+    reported = registry_module.capabilities_of(entry, calculator.evaluator)
+    assert reported is not None, family_key
+    assert set(reported) == set(registry_module.CAPABILITY_KEYS), family_key
 
 
 def test_mace_calculator_constructs_the_class_its_family_declares(

@@ -1776,7 +1776,8 @@ def test_jit_reverse_and_standard_r0_v2_match_forced_fallbacks(
     assert evaluator.factorized_selected_direct_reverse_executor == "jit"
     assert evaluator.standard_r0_selected_executor == "v2_receiver"
     assert evaluator.factorized_jit_forward_launch_count - generated_launches[0] == 1
-    expected_reverse_launches = 1 if _kokkos_execution_space() == "Cuda" else 2
+    # Device R1 reverse fuses source/edge work; the host launches them separately.
+    expected_reverse_launches = 1 if _kokkos_execution_space() in ("Cuda", "HIP") else 2
     assert (
         evaluator.factorized_jit_reverse_launch_count - generated_launches[1]
         == expected_reverse_launches

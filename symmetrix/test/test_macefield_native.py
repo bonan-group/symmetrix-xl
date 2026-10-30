@@ -2413,22 +2413,18 @@ def test_kokkos_current_execution_response_reuses_completed_primal(
         rtol=0.0,
         atol=2e-6,
     )
+    # Each of the two response calls drives three seeds per 64-channel phase.
+    grid = json.loads(macefield_full_json_path.read_text())
+    tile_phases = max(1, -(-int(grid["num_channels"]) // 64))
     execution_space = native_symmetrix._kokkos_default_execution_space()
     if execution_space == "Cuda":
-        # The Phi1 response reverse launches once per 64-channel phase.
-        grid = json.loads(macefield_full_json_path.read_text())
-        tile_phases = max(1, -(-int(grid["num_channels"]) // 64))
         assert current.macefield_response_phi1_fused_launch_count == 6 * tile_phases
         assert current.macefield_response_phi1_generic_launch_count == 0
         assert current.macefield_response_a0_fused_launch_count == 3
         assert current.macefield_response_a0_generic_launch_count == 0
     else:
         assert current.macefield_response_phi1_fused_launch_count == 0
-        expected_generic_launches = 12 if execution_space in ("OpenMP", "Serial") else 6
-        assert (
-            current.macefield_response_phi1_generic_launch_count
-            == expected_generic_launches
-        )
+        assert current.macefield_response_phi1_generic_launch_count == 6 * tile_phases
         assert current.macefield_response_a0_fused_launch_count == 0
         assert current.macefield_response_a0_generic_launch_count == 3
 
