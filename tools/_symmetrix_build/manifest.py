@@ -45,9 +45,12 @@ class TargetManifest:
     particle_mesh_policy: str = "auto"
     prebuilt_operator_artifacts: str = "r0"
     prebuilt_oam_artifacts: str = "off"
+    cufft_linkage: str = "runtime"
     schema_version: int = SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        if self.cufft_linkage not in {"runtime", "direct"}:
+            raise BuildError("cufft_linkage must be runtime or direct")
         if self.prebuilt_operator_artifacts not in {"off", "r0", "full"}:
             raise BuildError("prebuilt_operator_artifacts must be off, r0, or full")
         if self.prebuilt_oam_artifacts not in {"off", "known"}:
@@ -113,6 +116,7 @@ class TargetManifest:
                     "prebuilt_operator_artifacts", "r0"
                 ),
                 prebuilt_oam_artifacts=value.get("prebuilt_oam_artifacts", "off"),
+                cufft_linkage=value.get("cufft_linkage", "direct"),
                 schema_version=value["schema_version"],
             )
         except (KeyError, TypeError) as error:

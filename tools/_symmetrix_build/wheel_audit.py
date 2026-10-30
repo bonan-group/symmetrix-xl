@@ -82,6 +82,42 @@ _ALLOWED_CPU_DEPENDENCY = re.compile(
 _OPENMP_RUNTIME = re.compile(
     r"^lib(gomp|omp|iomp5)(?:-[0-9a-f]{8,})?[.]so(?:[.]|$)", re.IGNORECASE
 )
+_CUFFT_LIBRARY = re.compile(r"(?:^|/)(?:lib)?cufft(?:w)?(?:[-.]|$)", re.I)
+_CUFFT_SYMBOL = re.compile(r"^(?:cufft[A-Z]|cufftw)")
+
+
+def audit_external_cufft_boundary(path: Path) -> None:
+    """Reject vendor implementations and direct imports, even after renaming."""
+
+    readelf = shutil.which("readelf")
+    if readelf is None:
+        raise BuildError("cuFFT dependency audit requires readelf")
+    result = subprocess.run(
+        [readelf, "-d", "--dyn-syms", "--wide", os.fspath(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise BuildError(
+            f"cannot inspect cuFFT boundary of {path.name}: {result.stderr.strip()}"
+        )
+    for line in result.stdout.splitlines():
+        if "(NEEDED)" in line or "(SONAME)" in line:
+            match = re.search(r"\[([^]]+)\]", line)
+            if match and _CUFFT_LIBRARY.search(match.group(1)):
+                raise BuildError(
+                    f"cuFFT runtime dependency/payload is forbidden: {match.group(1)}"
+                )
+        fields = line.split()
+        if len(fields) >= 8 and fields[0].rstrip(":").isdigit():
+            name = fields[7].split("@", 1)[0]
+            # FFTW is a supported CPU provider; only vendor cuFFT exports and
+            # imports belong to this boundary.
+            if _CUFFT_SYMBOL.match(name):
+                raise BuildError(
+                    f"cuFFT direct import or vendor implementation is forbidden: {name}"
+                )
 
 
 def _dynamic_dependencies(path: Path) -> tuple[str, ...]:
@@ -304,6 +340,28 @@ def _audit_release_metadata(archive: zipfile.ZipFile) -> tuple[dict, str]:
     is_addon = descriptor_members[0].filename != "symmetrix/_backend_cpu.json"
     if is_addon and not any(exact_frontend.match(value) for value in requirements):
         raise BuildError(f"backend wheel must require symmetrix-xl=={version} exactly")
+    if descriptor.get("backend") == "cuda":
+        if descriptor.get("cufft_linkage") != "runtime":
+            raise BuildError("CUDA release wheels require runtime cuFFT linkage")
+        providers = {"cuda12": "nvidia-cufft-cu12", "cuda13": "nvidia-cufft"}
+        vendor = providers.get(descriptor.get("toolkit"))
+        if vendor is None:
+            raise BuildError("cuFFT policy has an unsupported CUDA toolkit")
+        vendor_requirements = []
+        for requirement in requirements:
+            match = re.match(r"^([A-Za-z0-9_.-]+)(.*)$", requirement)
+            if match and _normalized_distribution(match[1]) in providers.values():
+                if _normalized_distribution(match[1]) != vendor:
+                    raise BuildError(
+                        "cuFFT requirement belongs to the wrong CUDA major"
+                    )
+                vendor_requirements.append(match[2])
+        if len(vendor_requirements) != 1:
+            raise BuildError(f"CUDA wheel must require external {vendor} exactly once")
+        if ";" in vendor_requirements[0] or "[" in vendor_requirements[0]:
+            raise BuildError(
+                "external cuFFT must be an unconditional runtime requirement"
+            )
     if not is_addon and any(
         _normalized_distribution(value.split()[0].split("=", 1)[0]) == "symmetrix-xl"
         for value in requirements
@@ -341,6 +399,22 @@ def audit_wheel(path: Path) -> None:
             if info.is_dir() or forbidden or forbidden_name:
                 continue
             content = archive.read(info)
+            if _CUFFT_LIBRARY.search(info.filename):
+                findings.append(f"{info.filename}: bundled cuFFT runtime is forbidden")
+            if content.startswith(b"!<arch>\n"):
+                findings.append(
+                    f"{info.filename}: static archive is forbidden in a release wheel"
+                )
+            if content.startswith(b"\x7fELF"):
+                with tempfile.TemporaryDirectory(
+                    prefix=".symmetrix-elf-audit-", dir=path.parent
+                ) as directory:
+                    library = Path(directory) / "member.so"
+                    library.write_bytes(content)
+                    try:
+                        audit_external_cufft_boundary(library)
+                    except BuildError as error:
+                        findings.append(f"{info.filename}: {error}")
             for label, marker, pattern in _SENSITIVE_CONTENT:
                 if marker in content and pattern.search(content):
                     findings.append(f"{info.filename}: contains {label}")

@@ -113,6 +113,8 @@ def _child_arguments(
     openblas_root: Path | None,
 ) -> list[str]:
     arguments = ["--backend", spec.backend]
+    if spec.backend == "cuda":
+        arguments.extend(("--cufft-linkage", "runtime"))
     if spec.backend == "cpu":
         arguments.extend(("--cpu-target", spec.target))
     else:
@@ -375,6 +377,9 @@ def run_wheel_matrix(
                 "architecture": identity.architecture,
                 "toolkit": identity.toolkit,
                 "kokkos_trait": manifest.architecture.kokkos_trait,
+                "cufft_linkage": manifest.cufft_linkage
+                if spec.backend == "cuda"
+                else "",
                 "python_abi": manifest.python_abi,
                 "wheel": {
                     "filename": wheel_path.name,

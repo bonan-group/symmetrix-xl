@@ -40,6 +40,7 @@ class DetectionRequest:
     openblas_root: str = ""
     accelerator_blas_root: str = ""
     particle_mesh: str = "auto"
+    cufft_linkage: str = "runtime"
 
 
 @dataclass(frozen=True)
@@ -691,6 +692,7 @@ def detect_target(
         device_probe=device_probe,
         visible_devices=visible,
         particle_mesh_policy=particle_mesh_policy,
+        cufft_linkage=request.cufft_linkage,
     )
 
 

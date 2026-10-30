@@ -532,6 +532,10 @@ def load_backend(frontend_version: str, request: str | None = None):
                     f"loaded module {module_name} reports source_dirty "
                     f"{built_dirty!r}, expected {descriptor.source_dirty!r}"
                 )
+    if descriptor.backend == "cuda":
+        from .cufft_library import configure_cufft_library
+
+        configure_cufft_library(native, descriptor.toolkit)
     _selected = descriptor
     _native_module = native
     sys.modules["symmetrix.symmetrix"] = native

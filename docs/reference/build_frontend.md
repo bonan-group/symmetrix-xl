@@ -46,6 +46,21 @@ configuration remains a diagnostic path; the supported installation workflow
 is described in {doc}`/user/installation`, with backend-specific requirements
 in {doc}`/user/backends`.
 
+CUDA targets default to `--cufft-linkage runtime`: a staged, fingerprinted patch
+of the pinned KokkosFFT provider dispatches cuFFT calls through a private lazy
+loader. The source submodule is not modified. The build still requires CUDA
+development headers. `--cufft-linkage direct` retains upstream linking for
+source-build comparisons; it is not allowed in CUDA release wheels. The policy
+is recorded in the manifest and selects a distinct build fingerprint. Legacy
+manifests without this field retain direct linking when replayed. Use separate
+build roots for the two policies.
+
+The CUDA release matrix pins runtime linkage. Raw and repaired wheel audits
+reject cuFFT/cuFFTW payloads, direct ELF dependencies, and direct vendor symbol
+imports. The repair exclusion is a safeguard, not a replacement for removing
+the link dependency. cuFFT remains a required external NVIDIA dependency with
+an ABI-specific version range.
+
 Within one fixed backend/toolchain configuration, repeated `install` commands
 are incremental and should reuse the same build root. The command installs
 `scikit-build-core`, `pybind11`, and `ninja` into the target environment once,

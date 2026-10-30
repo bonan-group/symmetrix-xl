@@ -48,6 +48,28 @@ On CPU-only hosts, automatic mode explains that the bundled CPU backend needs no
 download. If no pre-compiled wheel resolves, it reports the attempted selectors
 and a source-build command.
 
+## External CUDA FFT runtime
+
+CUDA builds load cuFFT on the first particle-mesh FFT request, not when importing
+the backend. Symmetrix CUDA wheels do not contain NVIDIA's cuFFT or cuFFTW
+libraries. Normal dependency installation supplies `nvidia-cufft-cu12` (cuFFT
+ABI 11) for CUDA 12 or `nvidia-cufft` (cuFFT ABI 12) for CUDA 13. These are
+required dependencies, not an optional FFT extra.
+
+The selected backend registers the corresponding package's absolute library
+path without loading it. `symmetrix doctor --json` explicitly probes the runtime
+and reports its path, version, and load failure. The static particle-mesh and
+FourierD3 capability reports describe the build; they do not prove that an
+external runtime is installed. A missing runtime blocks FFT operations but not
+unrelated calculations; no CPU or alternative FFT fallback is substituted.
+
+For a source/C++ deployment, the matching system SONAME can be used instead.
+Set `SYMMETRIX_CUFFT_LIBRARY=/absolute/path/to/libcufft.so.12` (ABI 11 for CUDA
+12) before starting the process to override discovery. An invalid override is
+an error, not a request to search other toolkits. Once cuFFT loads successfully,
+its provider remains fixed for the process lifetime. Do not mix CUDA majors
+through `LD_LIBRARY_PATH`.
+
 An OpenMP-enabled OpenBLAS build using the same OpenMP runtime as Kokkos is
 preferred for CPU Kokkos deployments. Symmetrix-XL selects compatible builds
 automatically for host GEMMs and prints a runtime warning when the loaded

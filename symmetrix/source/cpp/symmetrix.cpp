@@ -7,6 +7,9 @@
 #include "model_metadata.hpp"
 #include "jit_generation_version.hpp"
 #include "prebuilt_operator_build_info.hpp"
+#ifdef SYMMETRIX_CUFFT_RUNTIME_LOAD
+#include "cufft_runtime.hpp"
+#endif
 
 namespace py = pybind11;
 
@@ -108,6 +111,19 @@ py::dict fourier_d3_capability()
 PYBIND11_MODULE(SYMMETRIX_PYTHON_MODULE, m)
 {
     m.doc() = "symmetrix";
+#ifdef SYMMETRIX_CUFFT_RUNTIME_LOAD
+    m.def("_configure_cufft_library", &symmetrix::cufft_runtime::configure_library);
+    m.def("_cufft_runtime_information", [](bool probe) {
+        const auto report = symmetrix::cufft_runtime::information(probe);
+        py::dict value;
+        value["available"] = report.available;
+        value["state"] = report.state;
+        value["library"] = report.library;
+        value["version"] = report.version;
+        value["reason"] = report.reason;
+        return value;
+    }, py::arg("probe") = false);
+#endif
     m.def("_model_metadata", &symmetrix_model_metadata);
     m.def("_required_jit_generation_version", [] {
         return symmetrix::execution::required_jit_generation_version;
@@ -128,6 +144,11 @@ PYBIND11_MODULE(SYMMETRIX_PYTHON_MODULE, m)
         result["device_compiler_id"] = SYMMETRIX_BUILD_DEVICE_COMPILER_ID;
         result["device_compiler_version"] = SYMMETRIX_BUILD_DEVICE_COMPILER_VERSION;
         result["particle_mesh"] = particle_mesh_capability();
+#ifdef SYMMETRIX_CUFFT_RUNTIME_LOAD
+        result["cufft_linkage"] = "runtime";
+#else
+        result["cufft_linkage"] = "direct";
+#endif
         result["fast_math"] = bool(SYMMETRIX_BUILD_FAST_MATH);
         py::dict prebuilt;
         prebuilt["mode"] = symmetrix::build::prebuilt_operator_mode;

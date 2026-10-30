@@ -738,6 +738,22 @@ def main(argv=None):
             )
     report["native"]["installed_operator_artifacts"] = installed_validation
     report["fourier_d3"] = fourier_d3_capability(native).to_dict()
+    cufft_query = getattr(native, "_cufft_runtime_information", None)
+    if callable(cufft_query):
+        cufft = dict(cufft_query(True))
+        report["native"]["cufft_runtime"] = cufft
+        report["checks"].append(
+            {
+                "name": "cufft_runtime",
+                "status": "ok" if cufft["available"] else "error",
+                "message": cufft.get("library")
+                if cufft["available"]
+                else cufft.get("reason"),
+            }
+        )
+        if not cufft["available"]:
+            report["ok"] = False
+            report["status"] = "error"
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:

@@ -7,6 +7,9 @@
 #include "particle_mesh_storage.hpp"
 
 #include <KokkosFFT.hpp>
+#ifdef SYMMETRIX_CUFFT_RUNTIME_LOAD
+#include "cufft_runtime.hpp"
+#endif
 
 #include <array>
 #include <cmath>
@@ -563,6 +566,10 @@ std::unique_ptr<FftPlanHandle<Float>> build_fft_plan(
             "Particle-mesh FFT plans require a committed mesh allocation; the storage "
             "holds none.");
     }
+#ifdef SYMMETRIX_CUFFT_RUNTIME_LOAD
+    // Fail before upstream plan construction (including its noexcept cleanup).
+    (void)symmetrix::cufft_runtime::api();
+#endif
     if (key.role() == FftPlanRole::forward_r2c) {
         return HostRfftPlan<Float, FftPlanRole::forward_r2c>::create(
             execution_space, key, std::move(allocation));

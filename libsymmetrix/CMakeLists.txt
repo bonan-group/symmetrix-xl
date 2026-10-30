@@ -394,6 +394,12 @@ unset(_symmetrix_legacy_fourier_d3_defined)
 set(SYMMETRIX_KOKKOSFFT_SOURCE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/external/kokkos-fft")
 set(SYMMETRIX_PARTICLE_MESH_AVAILABLE 0)
+set(SYMMETRIX_CUFFT_LINKAGE "runtime" CACHE STRING
+    "CUDA cuFFT linkage: runtime loads the external vendor library on demand; direct is for source builds.")
+set_property(CACHE SYMMETRIX_CUFFT_LINKAGE PROPERTY STRINGS runtime direct)
+if(NOT SYMMETRIX_CUFFT_LINKAGE MATCHES "^(runtime|direct)$")
+    message(FATAL_ERROR "SYMMETRIX_CUFFT_LINKAGE must be runtime or direct")
+endif()
 set(SYMMETRIX_PARTICLE_MESH_PROVIDER "")
 set(SYMMETRIX_PARTICLE_MESH_PROVIDER_VARIANT "")
 set(SYMMETRIX_PARTICLE_MESH_KOKKOSFFT_VERSION "")
@@ -613,12 +619,20 @@ if(SYMMETRIX_PARTICLE_MESH_AVAILABLE)
         set(KokkosFFT_ENABLE_FFTW ON)
     elseif(SYMMETRIX_PARTICLE_MESH_PROVIDER STREQUAL "cufft")
         set(KokkosFFT_ENABLE_CUFFT ON)
+        if(SYMMETRIX_CUFFT_LINKAGE STREQUAL "runtime")
+            include(cmake/cufft_runtime.cmake)
+            symmetrix_prepare_cufft_runtime()
+            set(KokkosFFT_CUFFT_RUNTIME_DISPATCH ON)
+        endif()
     elseif(SYMMETRIX_PARTICLE_MESH_PROVIDER STREQUAL "hipfft")
         set(KokkosFFT_ENABLE_HIPFFT ON)
     endif()
     add_subdirectory("${SYMMETRIX_KOKKOSFFT_SOURCE_DIR}"
         "${CMAKE_CURRENT_BINARY_DIR}/external/kokkos-fft-build"
         EXCLUDE_FROM_ALL)
+    if(KokkosFFT_CUFFT_RUNTIME_DISPATCH)
+        target_include_directories(fft INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/source")
+    endif()
 else()
     message(STATUS
         "Symmetrix: particle-mesh algorithms are unavailable "
@@ -811,6 +825,17 @@ if(SYMMETRIX_KOKKOS AND SYMMETRIX_PARTICLE_MESH_AVAILABLE)
 endif()
 
 add_library(symmetrix ${SYMMETRIX_SOURCE_FILES})
+if(KokkosFFT_CUFFT_RUNTIME_DISPATCH)
+    target_sources(symmetrix PRIVATE source/cufft_runtime.cpp)
+    if(CUDAToolkit_VERSION_MAJOR GREATER_EQUAL 13)
+        set(_symmetrix_cufft_abi 12)
+    else()
+        set(_symmetrix_cufft_abi 11)
+    endif()
+    target_compile_definitions(symmetrix PUBLIC
+        SYMMETRIX_CUFFT_RUNTIME_LOAD=1
+        SYMMETRIX_CUFFT_ABI_MAJOR=${_symmetrix_cufft_abi})
+endif()
 
 include(cmake/prebuilt_operator_artifacts.cmake)
 symmetrix_add_prebuilt_operator_artifacts()

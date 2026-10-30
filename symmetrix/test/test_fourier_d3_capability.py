@@ -234,6 +234,49 @@ def test_doctor_reports_an_unsupported_provider(monkeypatch, capsys):
     assert report["fourier_d3"]["reason"] == "fftw3-provider-missing"
 
 
+@pytest.mark.parametrize("available", [False, True])
+def test_cufft_runtime_is_probed_only_when_required(available):
+    native = _native({**_AVAILABLE_PAYLOAD, "provider": "cufft"})
+    probes = []
+
+    def query(probe=False):
+        probes.append(probe)
+        return {"available": available, "reason": "missing test cuFFT library"}
+
+    native._cufft_runtime_information = query
+    assert fourier_d3_capability(native).available
+    assert probes == []
+    if available:
+        assert require_fourier_d3_capability(native).available
+    else:
+        with pytest.raises(RuntimeError, match="missing test cuFFT library"):
+            require_fourier_d3_capability(native)
+    assert probes == [True]
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_doctor_reports_cufft_runtime_failure(monkeypatch, capsys, available):
+    native = _native({**_AVAILABLE_PAYLOAD, "provider": "cufft"})
+    native._cufft_runtime_information = lambda probe: {
+        "available": available,
+        "state": "loaded" if available else "probe-failed",
+        "library": "/vendor/libcufft.so.12",
+        "reason": "" if available else "missing test cuFFT library",
+    }
+    monkeypatch.setattr(symmetrix, "load_backend", lambda *_args: native)
+    monkeypatch.setattr(symmetrix, "selected_backend", lambda: {"backend": "cpu"})
+    monkeypatch.setattr(
+        cli,
+        "openmp_runtime_diagnostics",
+        lambda strict: {"status": "ok", "ok": True, "strict": strict, "checks": []},
+    )
+    assert cli.main(["doctor", "--json"]) == (0 if available else 1)
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is available
+    assert report["status"] == ("ok" if available else "error")
+    assert report["native"]["cufft_runtime"]["available"] is available
+
+
 def test_version_probe_reports_fourier_d3_capability(monkeypatch, capsys):
     native = _native(_AVAILABLE_PAYLOAD, build_info={"fourier_d3": _AVAILABLE_PAYLOAD})
     monkeypatch.setattr(cli.importlib.metadata, "version", lambda _: "0.1.1")

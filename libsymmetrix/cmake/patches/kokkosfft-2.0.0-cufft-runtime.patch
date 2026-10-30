@@ -1,0 +1,202 @@
+--- a/fft/src/KokkosFFT_Cuda_types.hpp
++++ b/fft/src/KokkosFFT_Cuda_types.hpp
+@@ -6,6 +6,7 @@
+ #define KOKKOSFFT_CUDA_TYPES_HPP
+
+ #include <cufft.h>
++#include "cufft_runtime.hpp"
+ #include <Kokkos_Abort.hpp>
+ #include <Kokkos_Profiling_ScopedRegion.hpp>
+ #include "KokkosFFT_Asserts.hpp"
+@@ -34,21 +35,21 @@
+
+  public:
+   ScopedCufftPlan(int nx, cufftType type, int batch) {
+-    KOKKOSFFT_CHECK_CUFFT_CALL(cufftPlan1d(&m_plan, nx, type, batch));
++    KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftPlan1d(&m_plan, nx, type, batch));
+   }
+
+   ScopedCufftPlan(int nx, int ny, cufftType type) {
+-    KOKKOSFFT_CHECK_CUFFT_CALL(cufftPlan2d(&m_plan, nx, ny, type));
++    KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftPlan2d(&m_plan, nx, ny, type));
+   }
+
+   ScopedCufftPlan(int nx, int ny, int nz, cufftType type) {
+-    KOKKOSFFT_CHECK_CUFFT_CALL(cufftPlan3d(&m_plan, nx, ny, nz, type));
++    KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftPlan3d(&m_plan, nx, ny, nz, type));
+   }
+
+   ScopedCufftPlan(int rank, int *n, int *inembed, int istride, int idist,
+                   int *onembed, int ostride, int odist, cufftType type,
+                   int batch) {
+-    KOKKOSFFT_CHECK_CUFFT_CALL(cufftPlanMany(&m_plan, rank, n, inembed, istride,
++    KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftPlanMany(&m_plan, rank, n, inembed, istride,
+                                              idist, onembed, ostride, odist,
+                                              type, batch));
+   }
+@@ -56,7 +57,7 @@
+   ~ScopedCufftPlan() noexcept {
+     Kokkos::Profiling::ScopedRegion region(
+         "KokkosFFT::cleanup_plan[TPL_cufft]");
+-    cufftResult cufft_rt = cufftDestroy(m_plan);
++    cufftResult cufft_rt = symmetrix::cufft_runtime::api().cufftDestroy(m_plan);
+     if (cufft_rt != CUFFT_SUCCESS) Kokkos::abort("cufftDestroy failed");
+   }
+
+@@ -69,7 +70,7 @@
+   cufftHandle plan() const noexcept { return m_plan; }
+   void commit(const Kokkos::Cuda &exec_space) const {
+     KOKKOSFFT_CHECK_CUFFT_CALL(
+-        cufftSetStream(m_plan, exec_space.cuda_stream()));
++        symmetrix::cufft_runtime::api().cufftSetStream(m_plan, exec_space.cuda_stream()));
+   }
+ };
+
+@@ -81,25 +82,25 @@
+
+  public:
+   ScopedCufftDynPlan(int nx, cufftType type, int batch) {
+-    KOKKOSFFT_CHECK_CUFFT_CALL(cufftCreate(&m_plan));
+-    KOKKOSFFT_CHECK_CUFFT_CALL(cufftSetAutoAllocation(m_plan, 0));
++    KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftCreate(&m_plan));
++    KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftSetAutoAllocation(m_plan, 0));
+     KOKKOSFFT_CHECK_CUFFT_CALL(
+-        cufftMakePlan1d(m_plan, nx, type, batch, &m_workspace_size));
++        symmetrix::cufft_runtime::api().cufftMakePlan1d(m_plan, nx, type, batch, &m_workspace_size));
+   }
+
+   ScopedCufftDynPlan(const std::vector<int> &fft_extents, cufftType type) {
+-    KOKKOSFFT_CHECK_CUFFT_CALL(cufftCreate(&m_plan));
+-    KOKKOSFFT_CHECK_CUFFT_CALL(cufftSetAutoAllocation(m_plan, 0));
++    KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftCreate(&m_plan));
++    KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftSetAutoAllocation(m_plan, 0));
+
+     if (fft_extents.size() == 2) {
+       auto nx = fft_extents.at(0), ny = fft_extents.at(1);
+       KOKKOSFFT_CHECK_CUFFT_CALL(
+-          cufftMakePlan2d(m_plan, nx, ny, type, &m_workspace_size));
++          symmetrix::cufft_runtime::api().cufftMakePlan2d(m_plan, nx, ny, type, &m_workspace_size));
+     } else if (fft_extents.size() == 3) {
+       auto nx = fft_extents.at(0), ny = fft_extents.at(1),
+            nz = fft_extents.at(2);
+       KOKKOSFFT_CHECK_CUFFT_CALL(
+-          cufftMakePlan3d(m_plan, nx, ny, nz, type, &m_workspace_size));
++          symmetrix::cufft_runtime::api().cufftMakePlan3d(m_plan, nx, ny, nz, type, &m_workspace_size));
+     } else {
+       KOKKOSFFT_THROW_IF(true, "FFT dimension can be 2D or 3D only");
+     }
+@@ -108,17 +109,17 @@
+   ScopedCufftDynPlan(int rank, int *n, int *inembed, int istride, int idist,
+                      int *onembed, int ostride, int odist, cufftType type,
+                      int batch) {
+-    KOKKOSFFT_CHECK_CUFFT_CALL(cufftCreate(&m_plan));
+-    KOKKOSFFT_CHECK_CUFFT_CALL(cufftSetAutoAllocation(m_plan, 0));
++    KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftCreate(&m_plan));
++    KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftSetAutoAllocation(m_plan, 0));
+     KOKKOSFFT_CHECK_CUFFT_CALL(
+-        cufftMakePlanMany(m_plan, rank, n, inembed, istride, idist, onembed,
++        symmetrix::cufft_runtime::api().cufftMakePlanMany(m_plan, rank, n, inembed, istride, idist, onembed,
+                           ostride, odist, type, batch, &m_workspace_size));
+   }
+
+   ~ScopedCufftDynPlan() noexcept {
+     Kokkos::Profiling::ScopedRegion region(
+         "KokkosFFT::cleanup_plan[TPL_cufft]");
+-    cufftResult cufft_rt = cufftDestroy(m_plan);
++    cufftResult cufft_rt = symmetrix::cufft_runtime::api().cufftDestroy(m_plan);
+     if (cufft_rt != CUFFT_SUCCESS) Kokkos::abort("cufftDestroy failed");
+   }
+
+@@ -145,12 +146,12 @@
+             ", required size: " + std::to_string(m_workspace_size));
+     void *work_area = static_cast<void *>(work.data());
+
+-    KOKKOSFFT_CHECK_CUFFT_CALL(cufftSetWorkArea(m_plan, work_area));
++    KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftSetWorkArea(m_plan, work_area));
+   }
+
+   void commit(const Kokkos::Cuda &exec_space) {
+     KOKKOSFFT_CHECK_CUFFT_CALL(
+-        cufftSetStream(m_plan, exec_space.cuda_stream()));
++        symmetrix::cufft_runtime::api().cufftSetStream(m_plan, exec_space.cuda_stream()));
+   }
+ };
+
+--- a/fft/src/KokkosFFT_Cuda_transform.hpp
++++ b/fft/src/KokkosFFT_Cuda_transform.hpp
+@@ -6,6 +6,7 @@
+ #define KOKKOSFFT_CUDA_TRANSFORM_HPP
+
+ #include <cufft.h>
++#include "cufft_runtime.hpp"
+ #include <Kokkos_Profiling_ScopedRegion.hpp>
+ #include "KokkosFFT_Asserts.hpp"
+ #include "KokkosFFT_Cuda_types.hpp"
+@@ -19,7 +20,7 @@
+                       cufftComplex* odata, int /*direction*/) {
+   Kokkos::Profiling::ScopedRegion region(
+       "KokkosFFT::exec_plan[TPL_cufftExecR2C]");
+-  KOKKOSFFT_CHECK_CUFFT_CALL(cufftExecR2C(scoped_plan.plan(), idata, odata));
++  KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftExecR2C(scoped_plan.plan(), idata, odata));
+ }
+
+ template <typename PlanType>
+@@ -27,7 +28,7 @@
+                       cufftDoubleComplex* odata, int /*direction*/) {
+   Kokkos::Profiling::ScopedRegion region(
+       "KokkosFFT::exec_plan[TPL_cufftExecD2Z]");
+-  KOKKOSFFT_CHECK_CUFFT_CALL(cufftExecD2Z(scoped_plan.plan(), idata, odata));
++  KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftExecD2Z(scoped_plan.plan(), idata, odata));
+ }
+
+ template <typename PlanType>
+@@ -35,7 +36,7 @@
+                       cufftReal* odata, int /*direction*/) {
+   Kokkos::Profiling::ScopedRegion region(
+       "KokkosFFT::exec_plan[TPL_cufftExecC2R]");
+-  KOKKOSFFT_CHECK_CUFFT_CALL(cufftExecC2R(scoped_plan.plan(), idata, odata));
++  KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftExecC2R(scoped_plan.plan(), idata, odata));
+ }
+
+ template <typename PlanType>
+@@ -43,7 +44,7 @@
+                       cufftDoubleReal* odata, int /*direction*/) {
+   Kokkos::Profiling::ScopedRegion region(
+       "KokkosFFT::exec_plan[TPL_cufftExecZ2D]");
+-  KOKKOSFFT_CHECK_CUFFT_CALL(cufftExecZ2D(scoped_plan.plan(), idata, odata));
++  KOKKOSFFT_CHECK_CUFFT_CALL(symmetrix::cufft_runtime::api().cufftExecZ2D(scoped_plan.plan(), idata, odata));
+ }
+
+ template <typename PlanType>
+@@ -52,7 +53,7 @@
+   Kokkos::Profiling::ScopedRegion region(
+       "KokkosFFT::exec_plan[TPL_cufftExecC2C]");
+   KOKKOSFFT_CHECK_CUFFT_CALL(
+-      cufftExecC2C(scoped_plan.plan(), idata, odata, direction));
++      symmetrix::cufft_runtime::api().cufftExecC2C(scoped_plan.plan(), idata, odata, direction));
+ }
+
+ template <typename PlanType>
+@@ -61,7 +62,7 @@
+   Kokkos::Profiling::ScopedRegion region(
+       "KokkosFFT::exec_plan[TPL_cufftExecZ2Z]");
+   KOKKOSFFT_CHECK_CUFFT_CALL(
+-      cufftExecZ2Z(scoped_plan.plan(), idata, odata, direction));
++      symmetrix::cufft_runtime::api().cufftExecZ2Z(scoped_plan.plan(), idata, odata, direction));
+ }
+ }  // namespace Impl
+ }  // namespace KokkosFFT
+--- a/fft/src/CMakeLists.txt
++++ b/fft/src/CMakeLists.txt
+@@ -13,6 +13,10 @@
+     target_link_libraries(fft INTERFACE cuFFTMp::cuFFTMp)
+   else()
+     find_package(CUDAToolkit REQUIRED COMPONENTS cufft)
+-    target_link_libraries(fft INTERFACE CUDA::cufft)
++    if(KokkosFFT_CUFFT_RUNTIME_DISPATCH)
++      target_include_directories(fft INTERFACE ${CUDAToolkit_INCLUDE_DIRS})
++    else()
++      target_link_libraries(fft INTERFACE CUDA::cufft)
++    endif()
+   endif()
+ endif()

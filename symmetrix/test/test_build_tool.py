@@ -1141,6 +1141,7 @@ def test_gpu_wheel_project_owns_no_frontend_files(tmp_path):
         "nvidia-cuda-runtime>=13,<14",
         "nvidia-cuda-nvrtc>=13,<14",
         "nvidia-cublas>=13,<14",
+        "nvidia-cufft>=12,<13",
     ]
     assert metadata["tool"]["scikit-build"]["wheel"]["packages"] == [
         "source/symmetrix_backend_cuda13_sm120"
@@ -1156,6 +1157,28 @@ def test_gpu_wheel_project_owns_no_frontend_files(tmp_path):
     assert descriptor["selector"] == "cuda13-sm120"
     assert "target_manifest" not in descriptor
     assert not (project / "source/symmetrix").exists()
+
+
+def test_cufft_linkage_is_fingerprinted_and_forwarded():
+    runtime = _manifest("cuda", "sm120")
+    direct = replace(runtime, cufft_linkage="direct")
+    assert runtime.fingerprint != direct.fingerprint
+    assert cmake_definitions(runtime)["SYMMETRIX_CUFFT_LINKAGE"] == "runtime"
+    assert cmake_definitions(direct)["SYMMETRIX_CUFFT_LINKAGE"] == "direct"
+    legacy = runtime.to_dict()
+    legacy.pop("cufft_linkage")
+    assert TargetManifest.from_dict(legacy).cufft_linkage == "direct"
+
+
+def test_cuda12_external_cufft_uses_library_abi_not_toolkit_major():
+    manifest = _manifest("cuda", "sm80")
+    manifest = replace(
+        manifest, toolchain=replace(manifest.toolchain, toolkit_version="12.9")
+    )
+    requirements = build_python._backend_dependencies(
+        package_identity(manifest), "0.2.0"
+    )
+    assert "nvidia-cufft-cu12>=11.4,<12" in requirements
 
 
 def test_wheel_build_redacts_private_build_paths(tmp_path):
@@ -1645,6 +1668,7 @@ def test_cuda12_wheel_declares_split_nvidia_dependencies(tmp_path):
         "nvidia-cuda-runtime-cu12>=12,<13",
         "nvidia-cuda-nvrtc-cu12>=12,<13",
         "nvidia-cublas-cu12>=12,<13",
+        "nvidia-cufft-cu12>=11.4,<12",
     ]
 
 
@@ -2771,6 +2795,7 @@ def test_matrix_child_commands_forward_target_selection(tmp_path):
             command[1:3] == (str(tmp_path / "symmetrix_build.py"), "wheel")
         )
         assert command[command.index("--backend") + 1] == "cuda"
+        assert command[command.index("--cufft-linkage") + 1] == "runtime"
         assert command[command.index("--arch") + 1] == "sm86"
         assert command[command.index("--cuda-root") + 1] == "/opt/cuda-12"
         assert command[command.index("--accelerator-blas-root") + 1] == (

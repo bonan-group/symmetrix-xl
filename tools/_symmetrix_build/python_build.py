@@ -42,6 +42,7 @@ def cmake_definitions(
         "SYMMETRIX_BACKEND_SELECTOR": identity.backend,
         "SYMMETRIX_BACKEND_ARCHITECTURE": identity.architecture,
         "SYMMETRIX_PARTICLE_MESH": manifest.particle_mesh_policy.upper(),
+        "SYMMETRIX_CUFFT_LINKAGE": manifest.cufft_linkage,
         "SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS": (manifest.prebuilt_operator_artifacts),
         "SYMMETRIX_PREBUILT_OAM_ARTIFACTS": manifest.prebuilt_oam_artifacts,
         # Reset a development configure that reused this fingerprinted cache;
@@ -312,6 +313,7 @@ def _backend_dependencies(identity: PackageIdentity, version: str) -> list[str]:
                 "nvidia-cuda-runtime-cu12>=12,<13",
                 "nvidia-cuda-nvrtc-cu12>=12,<13",
                 "nvidia-cublas-cu12>=12,<13",
+                "nvidia-cufft-cu12>=11.4,<12",
             )
         )
     elif identity.toolkit == "cuda13":
@@ -320,6 +322,7 @@ def _backend_dependencies(identity: PackageIdentity, version: str) -> list[str]:
                 "nvidia-cuda-runtime>=13,<14",
                 "nvidia-cuda-nvrtc>=13,<14",
                 "nvidia-cublas>=13,<14",
+                "nvidia-cufft>=12,<13",
             )
         )
     return dependencies
@@ -353,6 +356,7 @@ def prepare_backend_project(
         "toolkit": identity.toolkit,
         "compiler": manifest.toolchain.cxx_version,
         "target_manifest_fingerprint": manifest.fingerprint,
+        "cufft_linkage": manifest.cufft_linkage if manifest.backend == "cuda" else "",
     }
     if source_provenance is not None:
         descriptor["source_commit"] = str(source_provenance.get("revision", ""))

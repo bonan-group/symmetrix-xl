@@ -89,6 +89,11 @@ def _add_target_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--target-manifest", type=Path)
     parser.add_argument(
+        "--cufft-linkage",
+        choices=("runtime", "direct"),
+        help="CUDA cuFFT loading policy (default: runtime; direct for source builds).",
+    )
+    parser.add_argument(
         "--prebuilt-operator-artifacts",
         choices=("off", "r0", "full"),
         help="Package no, R0-only, or complete verified operator artifacts.",
@@ -148,6 +153,7 @@ def _base_request(
                     else ""
                 ),
                 particle_mesh=_particle_mesh_argument(args, "auto"),
+                cufft_linkage=getattr(args, "cufft_linkage", None) or "runtime",
             ),
             None,
         )
@@ -222,6 +228,7 @@ def _base_request(
             )
         ),
         particle_mesh=_particle_mesh_argument(args, base.particle_mesh_policy),
+        cufft_linkage=getattr(args, "cufft_linkage", None) or base.cufft_linkage,
     )
     if not same_backend:
         devices = None
@@ -298,6 +305,8 @@ def _human_manifest(manifest: TargetManifest) -> str:
         if manifest.blas_root:
             lines.append(f"Host BLAS root: {manifest.blas_root}")
     lines.append(f"Particle-mesh policy: {manifest.particle_mesh_policy}")
+    if manifest.backend == "cuda":
+        lines.append(f"cuFFT linkage: {manifest.cufft_linkage}")
     lines.append(f"Prebuilt operator artifacts: {manifest.prebuilt_operator_artifacts}")
     lines.append(f"Prebuilt OAM artifacts: {manifest.prebuilt_oam_artifacts}")
     return "\n".join(lines)

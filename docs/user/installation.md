@@ -14,6 +14,14 @@ source .venv/bin/activate
 python tools/symmetrix_build.py install --backend cpu --cpu-target native
 ```
 
+CUDA backend installations also install NVIDIA's matching cuFFT package as a
+separate dependency; cuFFT is not copied into the Symmetrix wheel. Keep default
+dependency resolution enabled for a complete installation. If installing with
+`--no-deps`, supply the matching runtime yourself before using particle-mesh
+features. See {doc}`backends` for runtime discovery, overrides, and diagnostics.
+Removing a Symmetrix backend does not automatically remove its NVIDIA
+dependencies, which may be shared with other packages.
+
 ## CPU BLAS selection
 
 The CPU build looks for an OpenBLAS installation under `/usr/local`, `/usr`,

@@ -16,12 +16,14 @@ case "$CUDA_MAJOR" in
     cuda_blas_soname=libcublas.so.12
     cuda_blas_lt_soname=libcublasLt.so.12
     cuda_nvjitlink_soname=libnvJitLink.so.12
+    cuda_cufft_soname=libcufft.so.11
     ;;
   13)
     cuda_runtime_soname=libcudart.so.13
     cuda_blas_soname=libcublas.so.13
     cuda_blas_lt_soname=libcublasLt.so.13
     cuda_nvjitlink_soname=libnvJitLink.so.13
+    cuda_cufft_soname=libcufft.so.12
     ;;
   *)
     echo "error: CUDA_MAJOR must be 12 or 13, not $CUDA_MAJOR" >&2
@@ -106,6 +108,7 @@ with tempfile.TemporaryDirectory() as directory:
     assert "libgomp" not in dynamic, dynamic
     assert "libcusparse" not in dynamic, dynamic
     assert "libcusolver" not in dynamic, dynamic
+    assert "libcufft" not in dynamic, "cuFFT must be loaded explicitly"
     if cuda_major == "13":
         expected_rpaths = ("$ORIGIN/../nvidia/cu13/lib",)
     else:
@@ -133,7 +136,8 @@ PY
   --exclude "$cuda_runtime_soname" \
   --exclude "$cuda_blas_soname" \
   --exclude "$cuda_blas_lt_soname" \
-  --exclude "$cuda_nvjitlink_soname"
+  --exclude "$cuda_nvjitlink_soname" \
+  --exclude "$cuda_cufft_soname"
 
 repaired_wheels=("$repaired_dir"/*.whl)
 if [ "${#repaired_wheels[@]}" -ne 1 ] || [ ! -f "${repaired_wheels[0]}" ]; then

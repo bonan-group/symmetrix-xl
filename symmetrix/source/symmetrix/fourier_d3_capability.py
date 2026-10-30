@@ -148,4 +148,16 @@ def require_fourier_d3_capability(native_module: Any = None) -> FourierD3Capabil
             f"{capability.describe()}. Rebuild with a discovered FFTW3, cuFFT, "
             f"or hipFFT provider; {NO_FALLBACK_STATEMENT}."
         )
+    if native_module is None:
+        from . import load_backend
+
+        native_module = load_backend()
+    runtime_query = getattr(native_module, "_cufft_runtime_information", None)
+    if callable(runtime_query):
+        runtime = runtime_query(True)
+        if not runtime.get("available"):
+            raise RuntimeError(
+                "FourierD3 cuFFT runtime is unavailable: "
+                + str(runtime.get("reason", ""))
+            )
     return capability
