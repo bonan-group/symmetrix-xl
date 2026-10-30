@@ -18,6 +18,9 @@
     "test/test_dispersion_device.py::test_hip_dispersion_device_graph_reuse[d2]",
     "test/test_dispersion_device.py::test_hip_dispersion_device_graph_reuse[d3]",
     "test/test_dispersion_device.py::test_hip_dispersion_precision_parity[d2]",
-    "test/test_dispersion_device.py::test_hip_dispersion_precision_parity[d3]"
+    "test/test_dispersion_device.py::test_hip_dispersion_precision_parity[d3]",
+    "test/test_mh1.py::test_generated_retention_and_reverse_tap_match_portable[c4-e2-b4-l2-linear]",
+    "test/test_mh1.py::test_generated_retention_and_reverse_tap_match_portable[c8-e4-b8-l2]",
+    "test/test_mh1.py::test_generated_retention_and_reverse_tap_match_portable[c12-e6-b16-l3]"
   ]
 }

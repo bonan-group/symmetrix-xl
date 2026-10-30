@@ -6121,13 +6121,7 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
             "selected route; fallback is forbidden.");
     Kokkos::View<int*> execution_mh1_spline_intervals;
     Kokkos::View<Precision*> execution_mh1_spline_coordinates;
-    bool needs_device_spline_points=generated_device_spline_node_adapter;
-#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
-    if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>)
-        needs_device_spline_points=needs_device_spline_points
-            ||(use_pair_spline&&uses_direct_execution(streamed_edges)
-                &&edges>0&&!generated_device_spline_r_program);
-#endif
+    const bool needs_device_spline_points=generated_device_spline_node_adapter;
     if(needs_device_spline_points) {
         if(execution_mh1_spline_intervals_storage.extent(0)
             <static_cast<std::size_t>(edges))

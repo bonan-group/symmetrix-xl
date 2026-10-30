@@ -12,7 +12,7 @@ from ase.build import bulk
 from ase.stress import full_3x3_to_voigt_6_stress
 from symmetrix import Symmetrix
 from symmetrix import symmetrix as native_symmetrix
-from symmetrix.jit import jit_nvrtc_information
+from symmetrix.jit import jit_hiprtc_information, jit_nvrtc_information
 
 try:
     import torch
@@ -1100,11 +1100,22 @@ def test_generated_retention_and_reverse_tap_match_portable(
     execution_space = native_symmetrix._kokkos_default_execution_space()
     if execution_space == "Cuda":
         _require_cuda_nvrtc(monkeypatch)
+    elif execution_space == "HIP":
+        try:
+            information = jit_hiprtc_information()
+        except Exception as exc:
+            pytest.skip(f"generated HIP Execution requires hipRTC: {exc}")
+        if not information.get("available", False):
+            pytest.skip(
+                "generated HIP Execution requires hipRTC: "
+                f"{information.get('reason', 'runtime compiler unavailable')}"
+            )
+        monkeypatch.setenv("SYMMETRIX_JIT_HIP_JIT_BACKEND", "hiprtc")
     elif execution_space in ("Serial", "OpenMP"):
         if shutil.which("c++") is None:
             pytest.skip("generated host Execution requires a C++20 compiler")
     else:
-        pytest.skip("generated retention requires a host or CUDA Kokkos build")
+        pytest.skip("generated retention requires a host, CUDA or HIP Kokkos build")
 
     _, _, model_path = generalized_mh1_artifact
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
@@ -1145,10 +1156,14 @@ def test_generated_retention_and_reverse_tap_match_portable(
         atol=5e-4,
     )
     evaluator = calculators["generated"].evaluator
-    if execution_space == "Cuda":
+    if execution_space in ("Cuda", "HIP"):
         assert evaluator.jit_mh1_cuda_plugin_v5_ready
     else:
         assert evaluator.jit_mh1_host_plugin_v7_ready
+    if execution_space == "HIP":
+        assert calculators["generated"].jit_compiler_backend == "hiprtc"
+        assert calculators["generated"].jit_artifact_path.endswith(".hsaco")
+        assert evaluator.execution_mh1_execution_backend == "generated_hip_v4"
 
 
 def test_generalized_mh1_bad_v7_replacement_preserves_loaded_composition(
@@ -3107,6 +3122,12 @@ def test_mh1_kokkos_mode_switch_releases_edge_workspaces(mh1_si_artifact):
         dtype=dtype,
         streamed_edges="generic",
     )
+    # A native mode switch does not install an RTC artifact.  The compiler-free
+    # route must keep chunked edge storage throughout this round trip.
+    assert calculator.jit_status == "not_applicable"
+    assert calculator.jit_artifact_path is None
+    assert not calculator.evaluator.jit_mh1_cuda_plugin_v5_ready
+    assert not calculator.evaluator.jit_mh1_host_plugin_v7_ready
     properties = ["energy", "forces"]
     calculator.calculate(atoms, properties=properties)
     streamed_results = {
@@ -3123,11 +3144,16 @@ def test_mh1_kokkos_mode_switch_releases_edge_workspaces(mh1_si_artifact):
 
     calculator.evaluator.set_streamed_edges("direct")
     calculator.calculate(atoms, properties=properties)
+    assert not calculator.evaluator.jit_mh1_cuda_plugin_v5_ready
+    assert not calculator.evaluator.jit_mh1_host_plugin_v7_ready
     assert calculator.evaluator.edge_workspace_rows <= min(
         edge_count, _mh1_streamed_edge_block_size()
     )
     calculator.evaluator.set_streamed_edges("generic")
     calculator.calculate(atoms, properties=properties)
+    assert calculator.evaluator.edge_workspace_rows <= min(
+        edge_count, _mh1_streamed_edge_block_size()
+    )
     # Executor-internal storages can retain capacity across a mode cycle, so
     # the byte footprint need not return exactly to the generic-mode value;
     # retaining BOTH modes' workspaces at once would, however, double it.
