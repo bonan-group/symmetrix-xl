@@ -21,9 +21,9 @@ the paper SI.  The shipped checkpoints pin S = 1, M = 2, L = 3 — S carries a
 single interaction, per the checkpoint extraction itself (the sole evidence,
 with each checkpoint's identity pinned by SHA-256 digest in the fixture).
 The fixture records checkpoint-extracted counts, never assumed ones, so S is
-pinned at one interaction and its MH1_UVU absence shares the same
-interaction-count admission dependency as L (the v6 interaction-count lift),
-rather than the full validation the plan expected for it.
+pinned at one interaction, including its admitted scalar-only linear-readout
+node program. Contract construction is distinct from generated evaluator
+admission: L's three-layer contract does not qualify composed L execution.
 """
 
 from __future__ import annotations
@@ -205,12 +205,9 @@ def test_execution_admission_outcomes_are_pinned(model_facts):
     # carries the unrolled chain for the model's own recursion depth.
     #
     # The v4 node program is a separate admission from the interaction count,
-    # and the released sizes split on it: the bias readout the M and L
-    # checkpoints read out through is a node-generation form the program
-    # admits, so both build their node program (two and three layers, one per
-    # interaction); S's single layer reads out through the plain linear block,
-    # which the last-layer rule does not admit, and the refusal is recorded
-    # with its own cause.  Whether the *evaluator* admits the backbone is a
+    # and all released sizes build that contract. S's scalar-only one-layer
+    # linear readout is admitted separately from the ordinary final bias
+    # readouts used by M/L. Whether the *evaluator* admits the backbone is a
     # third, separate rule (the node-program support matrix over the model's
     # irreps), and it is not a contract outcome.
     for size in MODEL_SIZES:
@@ -228,19 +225,11 @@ def test_execution_admission_outcomes_are_pinned(model_facts):
         ):
             assert _FINGERPRINT_PATTERN.match(contracts["mh1_uvu"][key]) is not None
         v4 = contracts["mh1_uvu_v4"]
-        if size == "S":
-            assert v4["status"] == "rejected"
-            assert v4["reason"] == (
-                "MH-1 node generation requires a linear readout for every "
-                "layer but the last, and a nonlinear or bias readout for the "
-                "last"
-            )
-        else:
-            assert v4["status"] == "built"
-            assert v4["tag"] == "symmetrix.execution.mh1_uvu/4"
-            assert v4["version"] == 4
-            assert v4["interaction_count"] == interaction_count
-            assert v4["node_program_layer_count"] == interaction_count
+        assert v4["status"] == "built"
+        assert v4["tag"] == "symmetrix.execution.mh1_uvu/4"
+        assert v4["version"] == 4
+        assert v4["interaction_count"] == interaction_count
+        assert v4["node_program_layer_count"] == interaction_count
         assert "graph_preparation_rejection" not in contracts
 
 
@@ -289,6 +278,7 @@ def _checkpoint_path(size: str) -> Path:
 @pytest.mark.parametrize("size", MODEL_SIZES)
 def test_real_checkpoint_extraction_matches_pinned_facts(model_facts, size):
     import hashlib
+    import importlib.util
 
     import numpy as np
 
@@ -306,6 +296,18 @@ def test_real_checkpoint_extraction_matches_pinned_facts(model_facts, size):
     ), f"{path.name} does not match the pinned MACE-POLAR-1-{size} digest"
     model = torch.load(path, map_location=torch.device("cpu"), weights_only=False)
     model = model.to(torch.float64)
+    runner_path = (
+        Path(__file__).resolve().parents[2]
+        / "benchmarks"
+        / "polar_checkpoint_facts_runner.py"
+    )
+    spec = importlib.util.spec_from_file_location("polar_facts_runner", runner_path)
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    captured = runner._extract_model_facts(model, path, size)
+    assert captured["execution_contracts"] == entry["execution_contracts"]
+    assert captured["constant_matrices"] == entry["constant_matrices"]
+    assert captured["file"] == entry["file"]
     data = extract_mace_polar_data(model)
     contracts = data["execution_contracts"]
     polar_contract = validate_execution_polar_backbone_contract_for_model(

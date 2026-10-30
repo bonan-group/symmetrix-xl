@@ -147,8 +147,11 @@
           "generation_fingerprint": "sha256:4da60eaaa6300ec25483a56533be909c388417c02b1bab94be256644f32fbf18"
         },
         "mh1_uvu_v4": {
-          "status": "rejected",
-          "reason": "MH-1 node generation requires a linear readout for every layer but the last, and a nonlinear or bias readout for the last"
+          "status": "built",
+          "tag": "symmetrix.execution.mh1_uvu/4",
+          "version": 4,
+          "interaction_count": 1,
+          "node_program_layer_count": 1
         }
       }
     },

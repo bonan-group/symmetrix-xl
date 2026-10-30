@@ -97,16 +97,18 @@ def _linear_io(descriptor) -> dict[str, Any]:
 
 
 def _extract_model_facts(model, checkpoint_path: Path, size: str) -> dict[str, Any]:
-    from symmetrix.extract_mace_nonlinear import extract_mace_nonlinear_data
+    from symmetrix.extract_mace_polar import extract_mace_polar_data
     from symmetrix.mace_nonlinear_execution_contract import (
         MH1_CONTRACT_KEY,
-        POLAR_CONTRACT_KEY,
-        make_execution_mh1_v4_contract,
         validate_execution_mh1_contract_for_model,
+    )
+    from symmetrix.mace_polar_execution_contract import (
+        POLAR_CONTRACT_KEY,
+        make_execution_polar_mh1_v4_contract,
         validate_execution_polar_backbone_contract_for_model,
     )
 
-    data = extract_mace_nonlinear_data(model)
+    data = extract_mace_polar_data(model)
     polar = data["polar"]
     contracts = data.get("execution_contracts", {})
 
@@ -138,12 +140,10 @@ def _extract_model_facts(model, checkpoint_path: Path, size: str) -> dict[str, A
     # The v4 node program's own support matrix is what calculator JIT
     # validation builds next, so its outcome (built, or the ValueError a real
     # calculator setup observes) is recorded beside the v3 identity.  It is a
-    # node-generation rule, not the interaction-count admission: the bias
-    # readout the M and L checkpoints read out through is admitted, so those
-    # two build their node program, while S's single layer reads out through
-    # the plain linear block, which the last-layer rule does not admit.
+    # node-generation rule, not evaluator admission. Polar's scalar-only,
+    # one-layer S program admits a linear final readout; M/L use bias readouts.
     try:
-        v4 = make_execution_mh1_v4_contract(data)
+        v4 = make_execution_polar_mh1_v4_contract(data)
         mh1_v4_status: dict[str, Any] = {
             "status": "built",
             "tag": v4["tag"],
@@ -337,7 +337,7 @@ def main() -> int:
             "url_template": RELEASE_URL_TEMPLATE,
         },
         "extraction": {
-            "extractor": "symmetrix.extract_mace_nonlinear.extract_mace_nonlinear_data",
+            "extractor": "symmetrix.extract_mace_polar.extract_mace_polar_data",
             "oracle_mace_sha": ORACLE_MACE_SHA,
             "oracle_mace_ref": ORACLE_MACE_REF,
             "oracle_graph_electrostatics_sha": ORACLE_GRAPH_ELECTROSTATICS_SHA,

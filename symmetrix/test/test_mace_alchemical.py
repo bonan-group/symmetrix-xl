@@ -270,11 +270,133 @@ def upstream_alchemical_model_path(tmp_path_factory):
     return path
 
 
+def _omat0_oracle_model_json(data, expected_sha256):
+    import hashlib
+    import json
+    from symmetrix.mace_execution_contract import make_generated_m1_contract
+
+    contracts = data["execution_contracts"]
+    expected_m1 = make_generated_m1_contract(
+        channels=data["num_channels"],
+        type_count=len(data["atomic_numbers"]),
+        input_l_max=data["l_max"],
+        correlation=contracts["M0"]["correlation"],
+        monomials=data["M1_monomials"],
+    )
+    assert json.dumps(
+        contracts.get("M1"), sort_keys=True, separators=(",", ":")
+    ) == json.dumps(
+        expected_m1, sort_keys=True, separators=(",", ":")
+    ), "OMAT-0 M1 contract is not canonical"
+    # The frozen identity predates derived M1 metadata; runtime keeps that
+    # metadata, while every original payload byte remains hash-checked.
+    identity = {
+        **data,
+        "execution_contracts": {
+            name: contract for name, contract in contracts.items() if name != "M1"
+        },
+    }
+    canonical_identity = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    assert (
+        hashlib.sha256(canonical_identity.encode()).hexdigest() == expected_sha256
+    ), "OMAT-0 frozen model identity mismatch"
+    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+
+
+@pytest.fixture
+def omat0_oracle_identity_case():
+    import hashlib
+    import json
+    from symmetrix.mace_execution_contract import make_generated_m1_contract
+
+    data = {
+        "num_channels": 4,
+        "atomic_numbers": [8, 22, 38, 56],
+        "l_max": 3,
+        "M1_monomials": [[0], [0, 0], [0, 0, 0]],
+        "M0_weights": [0.25],
+        "M1_weights": [0.5],
+        "atomic_energies": [-2040.0, -1580.0, -800.0, -750.0],
+        "execution_contracts": {"M0": {"correlation": 3}},
+    }
+    expected_sha256 = hashlib.sha256(
+        json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    data["execution_contracts"]["M1"] = make_generated_m1_contract(
+        channels=4,
+        type_count=4,
+        input_l_max=3,
+        correlation=3,
+        monomials=data["M1_monomials"],
+    )
+    return data, expected_sha256
+
+
+def test_omat0_oracle_identity_retains_the_validated_runtime_m1(
+    omat0_oracle_identity_case,
+):
+    import copy
+    import json
+
+    data, expected_sha256 = omat0_oracle_identity_case
+    original = copy.deepcopy(data)
+    runtime = json.loads(_omat0_oracle_model_json(data, expected_sha256))
+    assert runtime == original
+    assert data == original
+
+
+@pytest.mark.parametrize("field", ["M0_weights", "M1_weights", "atomic_energies"])
+def test_omat0_oracle_identity_rejects_changed_weights(
+    omat0_oracle_identity_case, field
+):
+    data, expected_sha256 = omat0_oracle_identity_case
+    data[field][0] += 0.125
+    with pytest.raises(AssertionError, match="frozen model identity mismatch"):
+        _omat0_oracle_model_json(data, expected_sha256)
+
+
+def test_omat0_oracle_identity_rejects_added_payload(omat0_oracle_identity_case):
+    data, expected_sha256 = omat0_oracle_identity_case
+    data["unexpected_payload"] = {"value": 1.0}
+    with pytest.raises(AssertionError, match="frozen model identity mismatch"):
+        _omat0_oracle_model_json(data, expected_sha256)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["fingerprint", "other-model", "extra-field", "missing", "noncanonical-type"],
+)
+def test_omat0_oracle_identity_rejects_noncanonical_m1(
+    omat0_oracle_identity_case, mutation
+):
+    from symmetrix.mace_execution_contract import make_generated_m1_contract
+
+    data, expected_sha256 = omat0_oracle_identity_case
+    contract = data["execution_contracts"]["M1"]
+    if mutation == "fingerprint":
+        contract["semantic_fingerprint"] = "sha256:" + "0" * 64
+    elif mutation == "other-model":
+        data["execution_contracts"]["M1"] = make_generated_m1_contract(
+            channels=8,
+            type_count=4,
+            input_l_max=3,
+            correlation=3,
+            monomials=data["M1_monomials"],
+        )
+    elif mutation == "extra-field":
+        contract["unexpected_payload"] = 1.0
+    elif mutation == "missing":
+        del data["execution_contracts"]["M1"]
+    else:
+        contract["channels"] = 4.0
+    with pytest.raises(AssertionError, match="M1 contract"):
+        _omat0_oracle_model_json(data, expected_sha256)
+
+
 @pytest.fixture(scope="module")
 def omat0_alchemical_model_path(tmp_path_factory):
     """Rebuild the deterministic OMAT-style model used by the frozen oracle."""
 
-    import hashlib
     import json
     from pathlib import Path
     import torch
@@ -325,13 +447,7 @@ def omat0_alchemical_model_path(tmp_path_factory):
     finally:
         torch.set_default_dtype(previous_dtype)
 
-    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
-    model_sha256 = hashlib.sha256(canonical.encode()).hexdigest()
-    if model_sha256 != oracle["model_sha256"]:
-        pytest.skip(
-            "the frozen OMAT-0 oracle requires upstream MACE commit "
-            f"{oracle['upstream_commit']}; generated model SHA-256 is {model_sha256}"
-        )
+    canonical = _omat0_oracle_model_json(data, oracle["model_sha256"])
     path = tmp_path_factory.mktemp("alchemical-omat0-model") / "model.json"
     path.write_text(canonical)
     return path

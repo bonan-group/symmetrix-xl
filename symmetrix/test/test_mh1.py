@@ -602,14 +602,16 @@ def test_generalized_mh1_low_memory_retained_interaction_matches_upstream(
     )
     assert evaluator.execution_mh1_retained_interaction_output_bytes > 0
     assert evaluator.execution_mh1_product_tile_scratch_bytes > 0
-    # Three nodes at tile_rows=2 produce two tiles.  CUDA reconstructs any
+    # Three nodes at tile_rows=2 produce two tiles. Device execution reconstructs
     # reverse prerequisites inside the composed device reverse launch, so the
     # public common module records one forward per tile.  The host split phase
     # reconstructs them with another common forward before reverse and records
     # two forwards per tile.  Reverse records once per tile on both paths and
     # the same public-counter scope applies to retained and recomputed policy.
     expected_common_forward_launches = (
-        2 if native_symmetrix._kokkos_default_execution_space() == "Cuda" else 4
+        2
+        if native_symmetrix._kokkos_default_execution_space() in ("Cuda", "HIP")
+        else 4
     )
     assert [
         evaluator._execution_mh1_product_module_forward_launch_count(layer)
@@ -652,10 +654,12 @@ def test_generalized_mh1_low_memory_retained_interaction_matches_upstream(
     assert recomputed_evaluator.execution_mh1_retained_interaction_output_bytes == 0
     assert recomputed_evaluator.execution_mh1_layer_up_adjoint_storage_bytes == 0
     assert recomputed_evaluator.execution_mh1_up_adjoint_scratch_bytes > 0
-    # CUDA's composed module owns its per-layer adjoint workspace; the host
+    # The composed device module owns its per-layer adjoint workspace; the host
     # route reuses the evaluator's one scratch slot across the two layers.
     expected_up_adjoint_reuses = (
-        0 if native_symmetrix._kokkos_default_execution_space() == "Cuda" else 2
+        0
+        if native_symmetrix._kokkos_default_execution_space() in ("Cuda", "HIP")
+        else 2
     )
     assert (
         recomputed_evaluator.execution_mh1_up_adjoint_scratch_reuse_count
@@ -2496,21 +2500,18 @@ def test_mh1_kokkos_direct_matches_generic_and_reports_execution(
     atoms = bulk("Si", "diamond", a=5.43, cubic=True).repeat((2, 1, 1))
     properties = ["energy", "energies", "forces", "stress"]
     results = {}
-    calculator = Symmetrix(
-        model_path,
-        dtype=dtype,
-        streamed_edges="direct",
-    )
-    evaluator = calculator.evaluator
-    assert evaluator.supports_factorized
-    assert evaluator.factorized_forward_evaluation_count == 0
-    assert evaluator.factorized_reverse_evaluation_count == 0
-    assert evaluator.factorized_fallback_evaluation_count == 0
-    assert evaluator.factorized_schedule_build_count == 0
-    assert not evaluator.factorized_source_owned_reverse
-
     for mode in ("generic", "direct"):
-        evaluator.set_streamed_edges(mode)
+        # The calculator owns a route-bound prepared plan. Changing only its
+        # native evaluator leaves that plan inconsistent with the requested
+        # route; construct each public route with its own admitted composition.
+        calculator = Symmetrix(model_path, dtype=dtype, streamed_edges=mode)
+        evaluator = calculator.evaluator
+        assert evaluator.supports_factorized
+        assert evaluator.factorized_forward_evaluation_count == 0
+        assert evaluator.factorized_reverse_evaluation_count == 0
+        assert evaluator.factorized_fallback_evaluation_count == 0
+        assert evaluator.factorized_schedule_build_count == 0
+        assert not evaluator.factorized_source_owned_reverse
         assert evaluator.streamed_edges_mode == mode
         counters_before = (
             evaluator.factorized_forward_evaluation_count,
@@ -5075,7 +5076,7 @@ def test_mh1_native_rejects_neighbor_source_type_mismatch(
 def test_mh1_kokkos_float32_supported_modes_match_float64(mh1_si_artifact):
     if not hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
         pytest.skip("Symmetrix was built without Float32 Kokkos nonlinear support")
-    _, model_path = mh1_si_artifact
+    data, model_path = mh1_si_artifact
     atoms = bulk("Si", "diamond", a=5.43, cubic=True).repeat((2, 1, 1))
     properties = ["energy", "energies", "forces", "stress"]
 
@@ -5091,6 +5092,7 @@ def test_mh1_kokkos_float32_supported_modes_match_float64(mh1_si_artifact):
     reference_workspace_bytes = reference.evaluator.edge_workspace_bytes
     float_results = {}
     float_workspace_bytes = {}
+    prepared_context_bytes = 0
     for mode in ("generic", "direct"):
         calculator = Symmetrix(
             model_path,
@@ -5107,6 +5109,44 @@ def test_mh1_kokkos_float32_supported_modes_match_float64(mh1_si_artifact):
             name: np.array(calculator.results[name], copy=True) for name in properties
         }
         float_workspace_bytes[mode] = calculator.evaluator.edge_workspace_bytes
+        if mode == "direct" and native_symmetrix._kokkos_default_execution_space() in (
+            "Serial",
+            "OpenMP",
+        ):
+            # The host generated node adapter retains the same spline chunks
+            # as reference, plus ir-mul conversion/adjoint buffers and compact
+            # ownership metadata. Bound that extra context from model/graph
+            # dimensions; it is not another edge-message allocation.
+            evaluator = calculator.evaluator
+            assert evaluator.mh1_edge_executor == "pair_spline_v1"
+            assert evaluator.execution_mh1_execution_backend == (
+                "pair_spline_v1_staged_host_v7_shared_products"
+            )
+            graph = calculator._mace_inputs(atoms)
+            sources = graph[3]
+            edge_count = len(sources)
+            block_size = _mh1_streamed_edge_block_size()
+            schedule_bytes = np.dtype(np.int32).itemsize * (
+                (edge_count + block_size - 1) // block_size
+                + _mh1_expected_active_sources(sources, block_size)
+                + len(np.unique(sources))
+                + np.count_nonzero(graph[2])
+                + 3 * edge_count
+                + 3
+            )
+            assert evaluator.factorized_schedule_bytes == schedule_bytes
+            dimensions = [
+                interaction["dimensions"]
+                for interaction in data["execution_contracts"]["MH1_UVU"][
+                    "interactions"
+                ]
+            ]
+            prepared_context_bytes = schedule_bytes + np.dtype(
+                np.float32
+            ).itemsize * len(atoms) * (
+                sum(width["input_1"] + width["output"] for width in dimensions)
+                + max(width["input_1"] for width in dimensions)
+            )
 
     for mode in ("generic", "direct"):
         for name in properties:
@@ -5127,7 +5167,9 @@ def test_mh1_kokkos_float32_supported_modes_match_float64(mh1_si_artifact):
             atol=2e-5,
         )
     assert float_workspace_bytes["generic"] <= reference_workspace_bytes * 0.51
-    assert float_workspace_bytes["direct"] <= float_workspace_bytes["generic"]
+    assert float_workspace_bytes["direct"] <= (
+        float_workspace_bytes["generic"] + prepared_context_bytes
+    )
 
     automatic = Symmetrix(model_path, dtype="float32")
     assert automatic.streamed_edges == "direct"
