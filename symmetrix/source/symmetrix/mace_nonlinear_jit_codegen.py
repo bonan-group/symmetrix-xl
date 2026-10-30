@@ -8332,6 +8332,7 @@ def _cuda_block_gate_forward(
     input_pointer: str,
     output_pointer: str,
     stem: str,
+    scalar_gate_division: bool = False,
 ) -> str:
     input_pointer = f"({input_pointer})"
     output_pointer = f"({output_pointer})"
@@ -8353,10 +8354,19 @@ def _cuda_block_gate_forward(
                 f"     {stem}_scalar_{block_index} += blockDim.x) {{",
                 f"    const int column = {scalar_offset} + {stem}_scalar_{block_index};",
                 f"    const float value = {input_pointer}[column];",
-                "    const float denominator = 1.0f + expf(-value);",
-                # Preserve native scalar SiLU ordering: reciprocal multiplication
-                # adds a rounding step that can perturb retained Polar features.
-                f"    {output_pointer}[column] = {scale} * value / denominator;",
+                # Preserve each device's qualified scalar ordering: the one-ULP
+                # difference can be amplified by the retained Polar chain.
+                *(
+                    (
+                        "    const float denominator = 1.0f + expf(-value);",
+                        f"    {output_pointer}[column] = {scale} * value / denominator;",
+                    )
+                    if scalar_gate_division
+                    else (
+                        "    const float sigmoid = 1.0f / (1.0f + expf(-value));",
+                        f"    {output_pointer}[column] = {scale} * value * sigmoid;",
+                    )
+                ),
                 "}",
             ]
         )
@@ -8618,6 +8628,7 @@ def _render_cuda_node_program(
     return_program: bool = False,
     symbol_prefix: str = "",
     node_reverse_schedule: str = _MH1_NODE_REVERSE_SCHEDULE,
+    scalar_gate_division: bool = False,
 ) -> str | MH1NodeCudaProgram:
     """Render only the MH-1 phases surrounding canonical common products."""
 
@@ -8966,6 +8977,7 @@ float* interaction = arena;
                 input_pointer="pre_gate",
                 output_pointer="gated",
                 stem=f"l{index}_reverse_recompute_gate",
+                scalar_gate_division=scalar_gate_division,
             )
         }
 {
@@ -9476,6 +9488,7 @@ float* gated = arena + {residual_dimension};
             input_pointer="pre_gate",
             output_pointer="gated",
             stem=f"l{index}_gate",
+            scalar_gate_division=scalar_gate_division,
         )
     }"""
     pre_retain_body = f"""float* arena = args.node_arena + node * {arena_dimension};
@@ -9998,6 +10011,7 @@ def _render_execution_mh1_gpu_module_v4(
             return_program=True,
             symbol_prefix="symmetrix_execution_mh1_split_",
             node_reverse_schedule=node_reverse_schedule,
+            scalar_gate_division=dialect.backend == "hip",
         )
         split_programs.append(
             _convert_gpu_module_precision(split_program.device_source, precision)
