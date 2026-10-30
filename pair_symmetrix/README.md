@@ -40,7 +40,8 @@ radial data. Format-1/2 files (including the unversioned original Symmetrix
 format) store readout and skip weights multiplied by the inverse of
 `linear_up`; they still load and print a warning with an fp32 cancellation
 estimate. Convert them with
-`symmetrix_recompose_mace_json --input old.json --output new.json` or re-export.
+`symmetrix_recompose_mace_json --input old.json --output new.json` or re-export;
+re-export to v4 is recommended but optional.
 
 `MACE_Nonlinear` models, including MACE-MH-1, are currently
 supported by the Python ASE calculator and native library only. Both LAMMPS

@@ -40,8 +40,8 @@ H1->H2 skip are stored without the inverse of `interactions[1].linear_up`
 (`h1_affine_mode` `m0_composite`, or `pre_linear_up` for first-interaction
 residual and MACEField models). Format-1/2 files carry that inverse; they still
 load with the old arithmetic and print a warning with an fp32 cancellation
-estimate computed from the file. Convert them without the checkpoint, or
-re-export:
+estimate computed from the file. Re-export to v4 is recommended but optional.
+Convert them without the checkpoint, or re-export:
 
 ```bash
 symmetrix_recompose_mace_json --input old.json --output new.json

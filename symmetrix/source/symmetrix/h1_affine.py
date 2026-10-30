@@ -123,7 +123,8 @@ def legacy_format_message(version: int, cancellation: dict | None = None) -> str
         f"H1->H2 skip multiplied by inv(linear_up){estimate}; it is evaluated with "
         "the old arithmetic. Re-export the checkpoint with `symmetrix_extract_mace` "
         "or convert the file with `symmetrix_recompose_mace_json --input OLD.json "
-        "--output NEW.json` (format version 4)."
+        "--output NEW.json` (format version 4). Re-export to v4 is recommended "
+        "but optional."
     )
 
 

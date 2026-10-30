@@ -481,6 +481,7 @@ def test_loaders_warn_and_evaluate_old_formats(tmp_path, capfd):
         assert cls(str(path), "").h1_affine_mode == "legacy"
         err = capfd.readouterr().err
         assert "Warning:" in err and CONVERTER in err and expected in err, err
+        assert "Re-export to v4 is recommended but optional." in err, err
     atoms = _structure()
     for use_kokkos in (False, True):
         a = _evaluate(path, "float64", use_kokkos, atoms)

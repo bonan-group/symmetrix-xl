@@ -53,7 +53,8 @@ selection is limited to restricted exports or pair-spline radial data;
 nonlinear models always retain the complete checkpoint domain. Exports use
 format version 4. `symmetrix_recompose_mace_json --input OLD --output NEW`
 converts a format-1/2 JSON (which carries the inverse of `linear_up`; such
-files still load, with a warning) to format 4 without the checkpoint;
+files still load, with a warning; re-export to v4 is recommended but optional)
+to format 4 without the checkpoint;
 `--validate-only FILE...` checks files and prints the warning and cancellation
 estimate of old ones.
 `symmetrix_calibrate_kernel_launch` explicitly calibrates bounded GPU launch

@@ -169,7 +169,7 @@ inline std::string legacy_format_message(int version, const LegacyCancellation& 
         + "); it is evaluated with the old arithmetic. Re-export the checkpoint "
           "with `symmetrix_extract_mace` or convert the file with "
           "`symmetrix_recompose_mace_json --input OLD.json --output NEW.json` "
-          "(format version 4).";
+          "(format version 4). Re-export to v4 is recommended but optional.";
 }
 
 // Validates the H1 affine contract of a head-selected MACE JSON and returns its

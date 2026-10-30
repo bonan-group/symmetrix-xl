@@ -232,6 +232,7 @@ restricted deployments or `--radial-format pair-splines` exports; nonlinear
 MACE models reject subsets. Exports use format version 4 (no inverse of
 `linear_up`); older format-1/2 JSON still loads, with a warning, and is
 converted with `symmetrix_recompose_mace_json --input old.json --output new.json`.
+Re-export to v4 is recommended but optional.
 
 CUDA and HIP backends are installed separately for a matching GPU architecture;
 see the [installation guide](docs/user/installation.md) and [Symmetrix-XL
