@@ -76,6 +76,7 @@ def _oam_direct_artifact_arguments(native, path, precision, cache):
             precision,
             native._execution_device_execution_environment(),
             cache_root=cache,
+            native_module=native,
         )
         return {
             "cuda_plugin_path": str(artifact.artifact_path),
@@ -84,7 +85,7 @@ def _oam_direct_artifact_arguments(native, path, precision, cache):
     if shutil.which("c++") is None:
         raise Unqualified("the OAM receiver-owned host artifact", CXX_RUNNER)
     artifact = oam_jit_artifact.prepare_nequip_oam_receiver_host_artifact(
-        path, precision, cache_dir=cache
+        path, precision, cache_dir=cache, native_module=native
     )
     return {
         "host_plugin_path": str(artifact.artifact_path),
@@ -659,7 +660,7 @@ def test_oam_full_message_direct_matches_reference_with_truthful_reports(
 
     tmp_path.chmod(0o700)
     artifact = prepare_nequip_oam_receiver_host_artifact(
-        OAM_MINIMAL, precision, cache_dir=tmp_path
+        OAM_MINIMAL, precision, cache_dir=tmp_path, native_module=native
     )
     class_name = "NequIPOAMKokkosFloat" if precision == "float32" else "NequIPOAMKokkos"
     evaluator_class = getattr(native, class_name)

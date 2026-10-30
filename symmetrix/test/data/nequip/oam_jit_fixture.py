@@ -17,6 +17,7 @@ def prepare_oam_jit_fixture(
     cache_dir: str | Path,
     precision: str = "float64",
     *,
+    native_module,
     contract_path: str | Path = FIXTURE_CONTRACT,
 ) -> tuple[Path, dict]:
     """Compile the generated fixture plugin and return ``(path, metadata)``."""
@@ -25,6 +26,7 @@ def prepare_oam_jit_fixture(
         contract_path,
         precision=precision,
         cache_dir=cache_dir,
+        native_module=native_module,
     )
     return result.artifact_path, dict(result.metadata)
 

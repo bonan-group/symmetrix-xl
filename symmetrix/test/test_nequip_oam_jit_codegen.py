@@ -24,6 +24,14 @@ prepare_oam_jit_fixture = _FIXTURE_HELPER.prepare_oam_jit_fixture
 FIXTURE = Path(__file__).parent / "data/nequip/oam_s_v2_minimal.json"
 
 
+class _CodegenNativeContext:
+    """Fixed unit-only identity; never used for native numerical qualification."""
+
+    @staticmethod
+    def _backend_build_info():
+        return {"source_content_sha256": "a" * 64}
+
+
 def _require_cxx():
     if shutil.which(os.environ.get("CXX", "c++")) is None:
         pytest.skip("a C++ compiler is required for the generated OAM host plugin")
@@ -67,21 +75,33 @@ def test_invalid_precision_is_rejected():
 
 def test_artifact_preparation_reports_cache_hit(tmp_path):
     _require_cxx()
-    first = prepare_nequip_oam_host_artifact(FIXTURE, "float64", cache_dir=tmp_path)
-    second = prepare_nequip_oam_host_artifact(FIXTURE, "float64", cache_dir=tmp_path)
+    first = prepare_nequip_oam_host_artifact(
+        FIXTURE, "float64", cache_dir=tmp_path, native_module=_CodegenNativeContext
+    )
+    second = prepare_nequip_oam_host_artifact(
+        FIXTURE, "float64", cache_dir=tmp_path, native_module=_CodegenNativeContext
+    )
     assert first.artifact_path == second.artifact_path
     assert first.cache_hit is False
     assert second.cache_hit is True
     assert second.compiler_command
+    manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["key_inputs"]["source_content_sha256"] == "a" * 64
 
 
 def test_fixture_helper_returns_compiled_plugin_and_metadata(tmp_path):
     _require_cxx()
-    artifact_path, metadata = prepare_oam_jit_fixture(tmp_path)
+    artifact_path, metadata = prepare_oam_jit_fixture(
+        tmp_path, native_module=_CodegenNativeContext
+    )
     assert artifact_path.is_file()
     assert metadata["artifact_id"].startswith("oam-host-v1-")
     assert metadata["layer_count"] == len(_contract()["layers"])
     assert (artifact_path.parent / "manifest.json").is_file()
+    manifest = json.loads(
+        (artifact_path.parent / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["key_inputs"]["source_content_sha256"] == "a" * 64
 
 
 def test_v1_reverse_advances_the_weight_offset_only_for_weighted_instructions():

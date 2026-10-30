@@ -60,6 +60,23 @@ PyTorch, NequIP, and e3nn are used by the optional
 exporter/reference workflow and are not runtime imports for JSON-only
 evaluation. See {doc}`publications` for citation guidance.
 
+For runtime artifact preparation, `prepare_nequip_oam_cuda_artifact`,
+`prepare_nequip_oam_host_artifact`, and
+`prepare_nequip_oam_receiver_host_artifact` require an explicit
+`native_module` carrying the backend's verified full source fingerprint.
+Pass the native module already owned by the caller; normal frontend calls
+already do this. Preparation does not autoload a backend or accept an
+environment variable or arbitrary hash as a substitute. The cache key and
+`_src<fullhash>` artifact basename bind this full fingerprint, preventing reuse
+across packages with different full source hashes. Learned weights still
+share an architecture-compatible artifact within the same package identity.
+
+Strict installed-prebuilt catalog returns and required-artifact failure
+paths are unchanged. This requirement applies to these OAM runtime
+preparation adapters; generic low-level JIT compiler APIs may still accept
+raw inputs with optional `None` context. Kernels, model layout, generation
+architecture, ABI, arithmetic and numerical tolerances are unchanged.
+
 `Symmetrix` is an ASE calculator. `dtype` defaults to `"float32"` and also
 accepts `"float64"`. Select float64 explicitly for high-precision calculations.
 `streamed_edges` accepts the routing `direct` (default) or `reference`, plus

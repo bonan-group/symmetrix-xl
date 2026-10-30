@@ -62,7 +62,7 @@ def _generated(native, path):
     from symmetrix.oam_jit_artifact import prepare_nequip_oam_receiver_host_artifact
 
     artifact = prepare_nequip_oam_receiver_host_artifact(
-        path, "float64", cache_dir=path.parent / "cache"
+        path, "float64", cache_dir=path.parent / "cache", native_module=native
     )
     evaluator = native.NequIPOAMKokkos(
         str(path),
@@ -185,7 +185,9 @@ def test_reference_mode_uses_the_portable_path_with_a_legacy_edge_owned_artifact
         native._kokkos_default_execution_space(),
         "the edge-owned OAM host artifact",
     )
-    artifact = prepare_nequip_oam_host_artifact(portable_contract, precision="float64")
+    artifact = prepare_nequip_oam_host_artifact(
+        portable_contract, precision="float64", native_module=native
+    )
     evaluator = native.NequIPOAMKokkos(
         str(portable_contract), str(artifact.artifact_path)
     )
@@ -241,7 +243,9 @@ def test_legacy_edge_owned_artifact_reports_the_tier_it_dispatches(portable_cont
         native._kokkos_default_execution_space(),
         "the edge-owned OAM host artifact",
     )
-    artifact = prepare_nequip_oam_host_artifact(portable_contract, precision="float64")
+    artifact = prepare_nequip_oam_host_artifact(
+        portable_contract, precision="float64", native_module=native
+    )
     evaluator = native.NequIPOAMKokkos(
         str(portable_contract), str(artifact.artifact_path)
     )
@@ -279,7 +283,9 @@ def test_legacy_edge_owned_artifact_reports_generated_where_it_dispatches(
         native._kokkos_default_execution_space(),
         "the edge-owned OAM host artifact",
     )
-    artifact = prepare_nequip_oam_host_artifact(portable_contract, precision="float64")
+    artifact = prepare_nequip_oam_host_artifact(
+        portable_contract, precision="float64", native_module=native
+    )
     evaluator = native.NequIPOAMKokkos(
         str(portable_contract), str(artifact.artifact_path)
     )

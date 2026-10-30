@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 import oam_host_oracle
+from symmetrix.jit import native_source_content_sha256
 from symmetrix.oam_jit_artifact import (
     OAMHostArtifactError,
     prepare_nequip_oam_host_artifact,
@@ -98,14 +99,22 @@ def _require_cxx() -> None:
         pytest.skip("a C++ compiler is required for the generated OAM host plugins")
 
 
+def _assert_runtime_source_identity(native, artifact):
+    if artifact.artifact_origin != "prebuilt":
+        manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+        assert manifest["key_inputs"]["source_content_sha256"] == (
+            native_source_content_sha256(native)
+        )
+
+
 @lru_cache(maxsize=None)
-def _host_plugin(path: str):
+def _host_plugin(native, path: str):
     """Receiver-owned ABI v2 artifact used by the production direct path."""
 
     _require_cxx()
     try:
         result = prepare_nequip_oam_receiver_host_artifact(
-            Path(path), "float64", cache_dir=_ARTIFACT_CACHE
+            Path(path), "float64", cache_dir=_ARTIFACT_CACHE, native_module=native
         )
     except OAMHostArtifactError as error:
         # A compiler is present, so this is a codegen/ABI defect rather than an
@@ -113,22 +122,24 @@ def _host_plugin(path: str):
         raise AssertionError(
             f"generated OAM receiver host plugin failed: {error}"
         ) from error
+    _assert_runtime_source_identity(native, result)
     return result
 
 
 @lru_cache(maxsize=None)
-def _debug_v1_host_plugin(path: str) -> str:
+def _debug_v1_host_plugin(native, path: str) -> str:
     """Edge-owned ABI v1 artifact used only by explicit debug_v1 execution."""
 
     _require_cxx()
     try:
         result = prepare_nequip_oam_host_artifact(
-            Path(path), "float64", cache_dir=_ARTIFACT_CACHE
+            Path(path), "float64", cache_dir=_ARTIFACT_CACHE, native_module=native
         )
     except OAMHostArtifactError as error:
         raise AssertionError(
             f"generated OAM debug host plugin failed: {error}"
         ) from error
+    _assert_runtime_source_identity(native, result)
     return str(result.artifact_path)
 
 
@@ -137,7 +148,7 @@ def _kokkos(native, path=FIXTURE):
         native._kokkos_default_execution_space(),
         "the receiver-owned OAM host artifact",
     )
-    artifact = _host_plugin(str(Path(path).resolve()))
+    artifact = _host_plugin(native, str(Path(path).resolve()))
     return native.NequIPOAMKokkos(
         str(path),
         str(artifact.artifact_path),
@@ -152,7 +163,7 @@ def _kokkos_debug_v1(native, path=FIXTURE):
         "the edge-owned OAM debug_v1 host artifact",
     )
     evaluator = native.NequIPOAMKokkos(
-        str(path), _debug_v1_host_plugin(str(Path(path).resolve()))
+        str(path), _debug_v1_host_plugin(native, str(Path(path).resolve()))
     )
     evaluator.set_streamed_edges("debug_v1")
     return evaluator
@@ -374,7 +385,7 @@ def test_oam_generated_reverse_callback_matches_the_generic_adjoint():
     native = _native()
     contract = json.loads(FIXTURE.read_text())
     layer = contract["layers"][0]
-    metadata = _debug_v1_host_plugin(str(FIXTURE))
+    metadata = _debug_v1_host_plugin(native, str(FIXTURE))
 
     class ReverseArgs(ctypes.Structure):
         _fields_ = [
@@ -620,7 +631,9 @@ def test_channel_tiled_host_artifact_routes_full_message_without_fallback():
         "float64",
         cache_dir=_ARTIFACT_CACHE,
         generation_policy=policy,
+        native_module=native,
     )
+    _assert_runtime_source_identity(native, artifact)
     candidate = native.NequIPOAMKokkos(
         str(FIXTURE),
         str(artifact.artifact_path),

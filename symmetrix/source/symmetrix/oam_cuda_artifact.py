@@ -30,8 +30,10 @@ from .jit import (
     JIT_DISABLED_POLICY,
     JIT_GENERATION_VERSION,
     JIT_POLICY_ENVIRONMENT_VARIABLE,
+    JitError,
     artifact_cache_inputs,
     direct_artifact_diagnostic,
+    native_source_content_sha256,
     prepare_execution_cuda_jit_artifact,
     prepare_nvrtc_jit_artifact,
     resolve_jit_policy,
@@ -415,6 +417,20 @@ def prepare_nequip_oam_cuda_artifact(
                 cache_key=None,
             )
 
+    if native_module is None:
+        raise OAMCudaArtifactError(
+            "runtime OAM CUDA artifacts require an explicit native module "
+            "with a source content fingerprint",
+            artifact_id=artifact_id,
+        )
+    try:
+        source_content_sha256 = native_source_content_sha256(native_module)
+    except JitError as error:
+        raise OAMCudaArtifactError(
+            f"runtime OAM CUDA artifact source identity is unavailable: {error}",
+            artifact_id=artifact_id,
+        ) from error
+
     try:
         selected = _selected_compiler(compiler)
     except ValueError:
@@ -478,6 +494,7 @@ def prepare_nequip_oam_cuda_artifact(
         "oam": expected,
     }
     arguments: dict[str, Any] = {
+        "source_content_sha256": source_content_sha256,
         "abi": abi,
         "build": build,
         "compute_capability": target,

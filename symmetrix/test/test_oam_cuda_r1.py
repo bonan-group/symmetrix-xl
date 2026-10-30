@@ -11,6 +11,7 @@ from oam_host_oracle import (
     reference_evaluator_results as host_reference_evaluator_results,
 )
 from oam_host_oracle import reference_routing as host_reference_routing
+from symmetrix.jit import native_source_content_sha256
 from symmetrix.oam_cuda_artifact import prepare_nequip_oam_cuda_artifact
 
 pytestmark = pytest.mark.cuda
@@ -32,12 +33,17 @@ def runtime(tmp_path_factory):
 
 
 def artifact_for(runtime, precision, compiler):
-    _native, target, cache, contract = runtime
+    native, target, cache, contract = runtime
     if compiler == "nvcc" and not shutil.which("nvcc"):
         pytest.skip("nvcc is required for the shared-library loader variant")
     # Compiler, loader and execution failures must fail qualification, not skip.
     return prepare_nequip_oam_cuda_artifact(
-        contract, precision, target, compiler=compiler, cache_root=cache
+        contract,
+        precision,
+        target,
+        compiler=compiler,
+        cache_root=cache,
+        native_module=native,
     )
 
 
@@ -78,6 +84,11 @@ def evaluate(evaluator, generation, xyz):
 
 def evaluator_for(runtime, artifact, precision, path=None):
     native = runtime[0]
+    if artifact.artifact_origin != "prebuilt":
+        manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+        assert manifest["key_inputs"]["source_content_sha256"] == (
+            native_source_content_sha256(native)
+        )
     cls = (
         native.NequIPOAMKokkosFloat
         if precision == "float32"
@@ -330,7 +341,12 @@ def test_generated_zbl_mixed_neighbors_cutoff_and_reuse(runtime, tmp_path, preci
     path = tmp_path / "zbl-mixed.json"
     path.write_text(json.dumps(contract))
     artifact = prepare_nequip_oam_cuda_artifact(
-        path, precision, runtime[1], compiler="nvrtc", cache_root=runtime[2]
+        path,
+        precision,
+        runtime[1],
+        compiler="nvrtc",
+        cache_root=runtime[2],
+        native_module=runtime[0],
     )
     evaluator = evaluator_for(runtime, artifact, precision, path)
     evaluator.set_streamed_edges("direct")
@@ -458,7 +474,12 @@ def test_binary_identity_cannot_be_replaced_by_another_manifest(
     other = tmp_path / "other-oam.json"
     other.write_text(json.dumps(contract))
     published = prepare_nequip_oam_cuda_artifact(
-        other, "float64", runtime[1], compiler=compiler, cache_root=runtime[2]
+        other,
+        "float64",
+        runtime[1],
+        compiler=compiler,
+        cache_root=runtime[2],
+        native_module=runtime[0],
     )
     assert artifact.artifact_id != published.artifact_id
     native = runtime[0]
@@ -501,7 +522,7 @@ def test_later_self_connection_preserves_expanded_node_features(runtime, tmp_pat
     path = tmp_path / "expanded-self-input.json"
     path.write_text(json.dumps(contract))
     artifact = prepare_nequip_oam_cuda_artifact(
-        path, "float64", runtime[1], cache_root=runtime[2]
+        path, "float64", runtime[1], cache_root=runtime[2], native_module=runtime[0]
     )
     evaluator = evaluator_for(runtime, artifact, "float64", path)
     evaluator.set_streamed_edges("direct")
@@ -592,7 +613,12 @@ def test_cooperative_reverse_shared_receivers_and_partial_channels(
     path = tmp_path / f"channels-{mode}.json"
     path.write_text(json.dumps(_channel_contract(mode)))
     artifact = prepare_nequip_oam_cuda_artifact(
-        path, precision, runtime[1], compiler=compiler, cache_root=runtime[2]
+        path,
+        precision,
+        runtime[1],
+        compiler=compiler,
+        cache_root=runtime[2],
+        native_module=runtime[0],
     )
     evaluator = evaluator_for(runtime, artifact, precision, path)
     evaluator.set_streamed_edges("direct")
@@ -695,7 +721,12 @@ def test_generated_wide_angular_masked_outputs(runtime, tmp_path, precision, com
     path = tmp_path / "wide-angular.json"
     path.write_text(json.dumps(_wide_angular_channel_contract()))
     artifact = prepare_nequip_oam_cuda_artifact(
-        path, precision, runtime[1], compiler=compiler, cache_root=runtime[2]
+        path,
+        precision,
+        runtime[1],
+        compiler=compiler,
+        cache_root=runtime[2],
+        native_module=runtime[0],
     )
     evaluator = evaluator_for(runtime, artifact, precision, path)
     evaluator.set_streamed_edges("direct")
@@ -806,7 +837,12 @@ def test_degree_three_harmonics_match_the_reference_routing_and_energy_gradient(
     path = tmp_path / "degree-three.json"
     path.write_text(json.dumps(_degree_three_contract()))
     artifact = prepare_nequip_oam_cuda_artifact(
-        path, precision, runtime[1], compiler=compiler, cache_root=runtime[2]
+        path,
+        precision,
+        runtime[1],
+        compiler=compiler,
+        cache_root=runtime[2],
+        native_module=runtime[0],
     )
     evaluator = evaluator_for(runtime, artifact, precision, path)
     evaluator.set_streamed_edges("direct")
@@ -854,7 +890,12 @@ def test_degree_four_harmonics_match_the_reference_routing(runtime, tmp_path, co
     path = tmp_path / "degree-four.json"
     path.write_text(json.dumps(_degree_contract(4)))
     artifact = prepare_nequip_oam_cuda_artifact(
-        path, "float32", runtime[1], compiler=compiler, cache_root=runtime[2]
+        path,
+        "float32",
+        runtime[1],
+        compiler=compiler,
+        cache_root=runtime[2],
+        native_module=runtime[0],
     )
     evaluator = evaluator_for(runtime, artifact, "float32", path)
     evaluator.set_streamed_edges("direct")
@@ -922,7 +963,7 @@ def test_conditioned_self_masked_split_blocks_and_type_mapping(
     path = tmp_path / "conditioned-angular.json"
     path.write_text(json.dumps(_conditioned_angular_contract(scalar_attributes)))
     artifact = prepare_nequip_oam_cuda_artifact(
-        path, precision, runtime[1], cache_root=runtime[2]
+        path, precision, runtime[1], cache_root=runtime[2], native_module=runtime[0]
     )
     evaluator = evaluator_for(runtime, artifact, precision, path)
     evaluator.set_streamed_edges("direct")
@@ -966,7 +1007,12 @@ def test_cooperative_reverse_reuses_large_small_and_replaced_topology(
     path = tmp_path / "conditioned-reuse.json"
     path.write_text(json.dumps(_conditioned_angular_contract()))
     artifact = prepare_nequip_oam_cuda_artifact(
-        path, "float64", runtime[1], compiler="nvrtc", cache_root=runtime[2]
+        path,
+        "float64",
+        runtime[1],
+        compiler="nvrtc",
+        cache_root=runtime[2],
+        native_module=runtime[0],
     )
     evaluator = evaluator_for(runtime, artifact, "float64", path)
     evaluator.set_streamed_edges("direct")

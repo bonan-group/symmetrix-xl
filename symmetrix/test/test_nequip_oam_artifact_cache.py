@@ -15,6 +15,7 @@ import copy
 import json
 import os
 import shutil
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -51,7 +52,130 @@ def _write(path: Path, contract: dict) -> Path:
 
 @pytest.fixture(params=sorted(PREPARERS), ids=sorted(PREPARERS))
 def prepare(request):
-    return PREPARERS[request.param]
+    # Cache-unit callers use a declared fake context, never a selected backend.
+    return partial(PREPARERS[request.param], native_module=_native_context())
+
+
+def _native_context(digest="a" * 64):
+    return SimpleNamespace(
+        _backend_build_info=lambda: {"source_content_sha256": digest}
+    )
+
+
+def test_runtime_native_fingerprint_isolates_host_cache(prepare, monkeypatch, tmp_path):
+    for name in ("render_oam_host_plugin", "render_oam_receiver_host_plugin"):
+        monkeypatch.setattr(
+            artifact_module,
+            name,
+            lambda *a, **k: 'extern "C" int stub() { return 1; }\n',
+        )
+    raw_results = []
+
+    def compile_cached(source, **arguments):
+        if not raw_results:
+            raw_results.append(
+                jit.prepare_jit_artifact(
+                    source, **{**arguments, "source_content_sha256": None}
+                )
+            )
+        return jit.prepare_jit_artifact(source, **arguments)
+
+    monkeypatch.setattr(artifact_module, "prepare_jit_artifact", compile_cached)
+
+    def request(digest):
+        return prepare(
+            FIXTURE,
+            "float64",
+            cache_dir=tmp_path,
+            native_module=_native_context(digest),
+        )
+
+    first = request("a" * 64)
+    raw = raw_results[0]
+    assert (
+        json.loads(first.manifest_path.read_text())["key_inputs"][
+            "source_content_sha256"
+        ]
+        == "a" * 64
+    )
+    assert "_src" + "a" * 64 in first.artifact_path.name
+    assert first.cache_key != raw.cache_key and not first.cache_hit
+    original = first.manifest_path.read_bytes()
+    old_raw = raw.manifest_path.read_bytes()
+    repeated = request("a" * 64)
+    other = request("b" * 64)
+    assert repeated.cache_hit and repeated.artifact_path == first.artifact_path
+    assert not other.cache_hit and other.artifact_path != first.artifact_path
+    assert other.artifact_id == first.artifact_id
+    assert (
+        json.loads(other.manifest_path.read_text())["key_inputs"][
+            "source_content_sha256"
+        ]
+        == "b" * 64
+    )
+    assert first.manifest_path.read_bytes() == original
+    assert raw.manifest_path.read_bytes() == old_raw
+
+
+@pytest.mark.parametrize(
+    "native",
+    (
+        None,
+        object(),
+        SimpleNamespace(_backend_build_info=lambda: {}),
+        _native_context("unknown"),
+        _native_context("x" * 64),
+        SimpleNamespace(_backend_build_info=lambda: []),
+    ),
+)
+def test_runtime_native_context_rejected_before_host_probe(
+    prepare, monkeypatch, tmp_path, native
+):
+    from symmetrix import backend_loader
+
+    monkeypatch.setattr(backend_loader, "selected_backend", lambda: None)
+    monkeypatch.setattr(
+        artifact_module,
+        "probe_compiler_identity",
+        lambda: pytest.fail("context rejection must precede compiler probe"),
+    )
+    monkeypatch.setattr(
+        artifact_module,
+        "render_oam_host_plugin",
+        lambda *a, **k: pytest.fail("context rejection must precede rendering"),
+    )
+    monkeypatch.setattr(
+        artifact_module,
+        "render_oam_receiver_host_plugin",
+        lambda *a, **k: pytest.fail("context rejection must precede rendering"),
+    )
+    with pytest.raises(OAMHostArtifactError, match="native|fingerprint|source"):
+        prepare(FIXTURE, cache_dir=tmp_path, native_module=native)
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_runtime_native_fingerprint_tamper_rebuilds_host_cache(
+    prepare, monkeypatch, tmp_path
+):
+    for name in ("render_oam_host_plugin", "render_oam_receiver_host_plugin"):
+        monkeypatch.setattr(
+            artifact_module,
+            name,
+            lambda *a, **k: 'extern "C" int stub() { return 1; }\n',
+        )
+    first = prepare(FIXTURE, cache_dir=tmp_path)
+    manifest = json.loads(first.manifest_path.read_text())
+    manifest["key_inputs"]["source_content_sha256"] = "b" * 64
+    first.manifest_path.write_text(json.dumps(manifest))
+    rebuilt = prepare(FIXTURE, cache_dir=tmp_path)
+    assert not rebuilt.cache_hit and rebuilt.cache_key == first.cache_key
+    assert any("quarantined" in line for line in rebuilt.diagnostics)
+    assert (
+        json.loads(rebuilt.manifest_path.read_text())["key_inputs"][
+            "source_content_sha256"
+        ]
+        == "a" * 64
+    )
 
 
 def test_changed_contract_invalidates_the_cached_artifact(prepare, tmp_path):
@@ -366,6 +490,7 @@ def test_runtime_generation_policy_follows_effective_compile_flags(
         contract,
         cache_dir=tmp_path / expected_policy,
         host_flags=host_flags,
+        native_module=_native_context(),
     )
 
     assert artifact.floating_point_policy == expected_policy
@@ -389,6 +514,7 @@ def test_runtime_generation_rejects_partial_floating_point_flags(tmp_path, host_
             contract,
             cache_dir=tmp_path / "rejected",
             host_flags=("-O3", host_flag, "-march=x86-64-v3"),
+            native_module=_native_context(),
         )
 
 
@@ -478,7 +604,7 @@ def test_loader_rejects_an_artifact_with_another_architecture_identity(tmp_path)
 
     contract = _write(tmp_path / "baseline.json", _contract())
     artifact = prepare_nequip_oam_receiver_host_artifact(
-        contract, "float64", cache_dir=tmp_path / "cache"
+        contract, "float64", cache_dir=tmp_path / "cache", native_module=native
     )
     manifest = Path(artifact.artifact_path).parent / "manifest.json"
     recorded = json.loads(manifest.read_text(encoding="utf-8"))
@@ -516,7 +642,7 @@ def test_loader_reuses_full_message_artifact_across_post_linear_values(tmp_path)
 
     baseline = _write(tmp_path / "baseline.json", _contract())
     artifact = prepare_nequip_oam_receiver_host_artifact(
-        baseline, "float64", cache_dir=tmp_path / "cache"
+        baseline, "float64", cache_dir=tmp_path / "cache", native_module=native
     )
     changed_data = _contract()
     mask = changed_data["layers"][0]["post_linear"]["output_mask"]["values"]
@@ -554,7 +680,7 @@ def test_full_message_v7_loader_rejects_missing_mandatory_metadata(tmp_path, fie
         native._init_kokkos()
     contract = _write(tmp_path / "model.json", _contract())
     artifact = prepare_nequip_oam_receiver_host_artifact(
-        contract, "float64", cache_dir=tmp_path / "cache"
+        contract, "float64", cache_dir=tmp_path / "cache", native_module=native
     )
     manifest = artifact.manifest_path
     data = json.loads(manifest.read_text(encoding="utf-8"))
@@ -576,7 +702,7 @@ def test_full_message_v7_loader_rejects_incompatible_active_host_target(tmp_path
         native._init_kokkos()
     contract = _write(tmp_path / "model.json", _contract())
     artifact = prepare_nequip_oam_receiver_host_artifact(
-        contract, "float64", cache_dir=tmp_path / "cache"
+        contract, "float64", cache_dir=tmp_path / "cache", native_module=native
     )
 
     with pytest.raises(ValueError, match="incompatible with the active runtime"):
@@ -594,10 +720,10 @@ def test_cached_host_artifact_reports_cache_origin(tmp_path):
         native._init_kokkos()
     contract = _write(tmp_path / "model.json", _contract())
     prepare_nequip_oam_receiver_host_artifact(
-        contract, "float64", cache_dir=tmp_path / "cache"
+        contract, "float64", cache_dir=tmp_path / "cache", native_module=native
     )
     cached = prepare_nequip_oam_receiver_host_artifact(
-        contract, "float64", cache_dir=tmp_path / "cache"
+        contract, "float64", cache_dir=tmp_path / "cache", native_module=native
     )
     evaluator = native.NequIPOAMKokkos(
         str(contract),

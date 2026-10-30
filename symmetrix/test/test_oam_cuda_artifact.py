@@ -51,6 +51,11 @@ def _stub_renderer(monkeypatch, rendered=None):
 def _real_nvrtc_cache(monkeypatch):
     """Route NVRTC preparation through the real cache with a stubbed compiler."""
 
+    # Diagnostics must observe the same declared stub compiler as the cache.
+    monkeypatch.setattr(
+        jit_module, "jit_nvrtc_information", lambda: dict(NVRTC_INFORMATION)
+    )
+
     def prepare(source, **arguments):
         arguments.setdefault("nvrtc_information", dict(NVRTC_INFORMATION))
         arguments.setdefault(
@@ -79,6 +84,172 @@ def required_policy(monkeypatch):
     monkeypatch.setenv("SYMMETRIX_JIT_POLICY", "required")
 
 
+def _native_context(digest="a" * 64):
+    return SimpleNamespace(
+        _backend_build_info=lambda: {"source_content_sha256": digest}
+    )
+
+
+def test_runtime_native_fingerprint_isolates_cuda_cache(monkeypatch, tmp_path):
+    _stub_renderer(monkeypatch)
+    raw_results = []
+
+    def prepare(source, **arguments):
+        arguments.update(
+            nvrtc_information=NVRTC_INFORMATION,
+            compile_source=lambda source, options: (b"\x7fELF-stub", ""),
+        )
+        if not raw_results:
+            raw = {**arguments, "source_content_sha256": None}
+            raw_results.append(jit_module.prepare_nvrtc_jit_artifact(source, **raw))
+        return jit_module.prepare_nvrtc_jit_artifact(source, **arguments)
+
+    monkeypatch.setattr(artifact_module, "prepare_nvrtc_jit_artifact", prepare)
+
+    def request(digest):
+        return prepare_nequip_oam_cuda_artifact(
+            FIXTURE,
+            "float32",
+            "sm_90",
+            "nvrtc",
+            cache_root=tmp_path,
+            native_module=_native_context(digest),
+        )
+
+    first = request("a" * 64)
+    raw = raw_results[0]
+    manifest = json.loads(first.manifest_path.read_text())
+    assert manifest["key_inputs"]["source_content_sha256"] == "a" * 64
+    assert "_src" + "a" * 64 in first.artifact_path.name
+    assert first.cache_key != raw.cache_key and not first.cache_hit
+    original = first.manifest_path.read_bytes()
+    old_raw = raw.manifest_path.read_bytes()
+    repeated = request("a" * 64)
+    other = request("b" * 64)
+    assert repeated.cache_hit and repeated.artifact_path == first.artifact_path
+    assert not other.cache_hit and other.artifact_path != first.artifact_path
+    assert other.artifact_id == first.artifact_id
+    assert (
+        json.loads(other.manifest_path.read_text())["key_inputs"][
+            "source_content_sha256"
+        ]
+        == "b" * 64
+    )
+    assert first.manifest_path.read_bytes() == original
+    assert raw.manifest_path.read_bytes() == old_raw
+
+
+@pytest.mark.parametrize("compiler", ("nvrtc", "nvcc"))
+def test_runtime_native_fingerprint_reaches_each_cuda_compiler(monkeypatch, compiler):
+    _stub_renderer(monkeypatch)
+    monkeypatch.setattr(artifact_module, "_selected_compiler", lambda value: value)
+
+    class ReachedCompiler(Exception):
+        pass
+
+    def prepare(source, **arguments):
+        assert arguments["source_content_sha256"] == "a" * 64
+        raise ReachedCompiler
+
+    attribute = (
+        "prepare_nvrtc_jit_artifact"
+        if compiler == "nvrtc"
+        else "prepare_execution_cuda_jit_artifact"
+    )
+    monkeypatch.setattr(artifact_module, attribute, prepare)
+    with pytest.raises(ReachedCompiler):
+        prepare_nequip_oam_cuda_artifact(
+            FIXTURE,
+            "float32",
+            "sm_90",
+            compiler=compiler,
+            native_module=_native_context(),
+        )
+
+
+@pytest.mark.parametrize(
+    "native",
+    (
+        None,
+        object(),
+        SimpleNamespace(_backend_build_info=lambda: {}),
+        _native_context("unknown"),
+        _native_context("x" * 64),
+        SimpleNamespace(_backend_build_info=lambda: []),
+    ),
+)
+def test_runtime_native_context_rejected_before_cuda_probe(
+    monkeypatch, tmp_path, native
+):
+    from symmetrix import backend_loader
+
+    monkeypatch.setattr(backend_loader, "selected_backend", lambda: None)
+    monkeypatch.setattr(
+        artifact_module,
+        "_selected_compiler",
+        lambda value: pytest.fail("context rejection must precede compiler probe"),
+    )
+    monkeypatch.setattr(
+        artifact_module,
+        "render_oam_cuda_plugin",
+        lambda *a, **k: pytest.fail("context rejection must precede rendering"),
+    )
+    with pytest.raises(OAMCudaArtifactError, match="native|fingerprint|source"):
+        prepare_nequip_oam_cuda_artifact(
+            FIXTURE, "float32", "sm_90", cache_root=tmp_path, native_module=native
+        )
+    assert not (tmp_path / "artifacts").exists()
+
+
+def test_runtime_native_fingerprint_tamper_rebuilds_cuda_cache(monkeypatch, tmp_path):
+    _stub_renderer(monkeypatch)
+    _real_nvrtc_cache(monkeypatch)
+    arguments = dict(cache_root=tmp_path, native_module=_native_context())
+    first = prepare_nequip_oam_cuda_artifact(
+        FIXTURE, "float32", "sm_90", "nvrtc", **arguments
+    )
+    manifest = json.loads(first.manifest_path.read_text())
+    manifest["key_inputs"]["source_content_sha256"] = "b" * 64
+    first.manifest_path.write_text(json.dumps(manifest))
+    rebuilt = prepare_nequip_oam_cuda_artifact(
+        FIXTURE, "float32", "sm_90", "nvrtc", **arguments
+    )
+    assert not rebuilt.cache_hit and rebuilt.cache_key == first.cache_key
+    assert any("quarantined" in line for line in rebuilt.diagnostics)
+    assert (
+        json.loads(rebuilt.manifest_path.read_text())["key_inputs"][
+            "source_content_sha256"
+        ]
+        == "a" * 64
+    )
+
+
+def test_runtime_native_fingerprint_preserves_descriptor_fallback(monkeypatch):
+    from symmetrix import backend_loader
+
+    monkeypatch.setattr(
+        backend_loader, "selected_backend", lambda: {"source_content_sha256": "a" * 64}
+    )
+    _stub_renderer(monkeypatch)
+
+    class ReachedCompiler(Exception):
+        pass
+
+    def prepare(source, **arguments):
+        assert arguments["source_content_sha256"] == "a" * 64
+        raise ReachedCompiler
+
+    monkeypatch.setattr(artifact_module, "prepare_nvrtc_jit_artifact", prepare)
+    with pytest.raises(ReachedCompiler):
+        prepare_nequip_oam_cuda_artifact(
+            FIXTURE,
+            "float32",
+            "sm_90",
+            "nvrtc",
+            native_module=SimpleNamespace(_backend_build_info=lambda: {}),
+        )
+
+
 def test_prepare_builds_then_hits_the_content_addressed_cache(
     monkeypatch, tmp_path, required_policy
 ):
@@ -86,7 +257,12 @@ def test_prepare_builds_then_hits_the_content_addressed_cache(
     _real_nvrtc_cache(monkeypatch)
 
     first = prepare_nequip_oam_cuda_artifact(
-        FIXTURE, "float32", "sm_90", "nvrtc", cache_root=tmp_path
+        FIXTURE,
+        "float32",
+        "sm_90",
+        "nvrtc",
+        cache_root=tmp_path,
+        native_module=_native_context(),
     )
 
     assert first.status == "built"
@@ -120,7 +296,12 @@ def test_prepare_builds_then_hits_the_content_addressed_cache(
         assert field in bound
 
     second = prepare_nequip_oam_cuda_artifact(
-        FIXTURE, "float32", "sm_90", "nvrtc", cache_root=tmp_path
+        FIXTURE,
+        "float32",
+        "sm_90",
+        "nvrtc",
+        cache_root=tmp_path,
+        native_module=_native_context(),
     )
 
     assert second.status == "cached"
@@ -384,7 +565,12 @@ def test_contract_mismatch_is_quarantined_and_rebuilt(
     _real_nvrtc_cache(monkeypatch)
 
     first = prepare_nequip_oam_cuda_artifact(
-        FIXTURE, "float32", "sm_90", "nvrtc", cache_root=tmp_path
+        FIXTURE,
+        "float32",
+        "sm_90",
+        "nvrtc",
+        cache_root=tmp_path,
+        native_module=_native_context(),
     )
     manifest_path = first.manifest_path
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -393,7 +579,12 @@ def test_contract_mismatch_is_quarantined_and_rebuilt(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     rebuilt = prepare_nequip_oam_cuda_artifact(
-        FIXTURE, "float32", "sm_90", "nvrtc", cache_root=tmp_path
+        FIXTURE,
+        "float32",
+        "sm_90",
+        "nvrtc",
+        cache_root=tmp_path,
+        native_module=_native_context(),
     )
 
     assert rebuilt.status == "built"
@@ -410,10 +601,20 @@ def test_retrained_weights_reuse_the_same_architecture_artifact(
     other = _variant_contract(tmp_path, _bump_first_tensor_product_weight)
 
     baseline = prepare_nequip_oam_cuda_artifact(
-        FIXTURE, "float32", "sm_90", "nvrtc", cache_root=tmp_path
+        FIXTURE,
+        "float32",
+        "sm_90",
+        "nvrtc",
+        cache_root=tmp_path,
+        native_module=_native_context(),
     )
     changed = prepare_nequip_oam_cuda_artifact(
-        other, "float32", "sm_90", "nvrtc", cache_root=tmp_path
+        other,
+        "float32",
+        "sm_90",
+        "nvrtc",
+        cache_root=tmp_path,
+        native_module=_native_context(),
     )
 
     assert changed.status == "cached"
@@ -428,7 +629,12 @@ def test_generation_policy_uses_a_distinct_cache_identity(
     _real_nvrtc_cache(monkeypatch)
 
     baseline = prepare_nequip_oam_cuda_artifact(
-        FIXTURE, "float32", "sm_120", "nvrtc", cache_root=tmp_path
+        FIXTURE,
+        "float32",
+        "sm_120",
+        "nvrtc",
+        cache_root=tmp_path,
+        native_module=_native_context(),
     )
     policy = OAMCudaGenerationPolicy(forward_live_output_budget=16)
     grouped = prepare_nequip_oam_cuda_artifact(
@@ -438,6 +644,7 @@ def test_generation_policy_uses_a_distinct_cache_identity(
         "nvrtc",
         cache_root=tmp_path,
         generation_policy=policy,
+        native_module=_native_context(),
     )
 
     assert grouped.artifact_id != baseline.artifact_id
@@ -460,7 +667,12 @@ def test_prepare_uses_qualified_sm120_fp32_policy_by_default(
     _real_nvrtc_cache(monkeypatch)
 
     result = prepare_nequip_oam_cuda_artifact(
-        FIXTURE, "float32", "sm_120", "nvrtc", cache_root=tmp_path
+        FIXTURE,
+        "float32",
+        "sm_120",
+        "nvrtc",
+        cache_root=tmp_path,
+        native_module=_native_context(),
     )
 
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
@@ -476,7 +688,12 @@ def test_target_and_precision_change_the_cache_identity(
 
     def prepare(target, precision):
         return prepare_nequip_oam_cuda_artifact(
-            FIXTURE, precision, target, "nvrtc", cache_root=tmp_path
+            FIXTURE,
+            precision,
+            target,
+            "nvrtc",
+            cache_root=tmp_path,
+            native_module=_native_context(),
         )
 
     sm90 = prepare("sm_90", "float32")
@@ -507,7 +724,12 @@ def test_disabled_policy_raises_because_no_fallback_exists(
     )
     with pytest.raises(OAMCudaArtifactError, match=expected):
         prepare_nequip_oam_cuda_artifact(
-            FIXTURE, "float32", "sm_90", "nvrtc", cache_root=tmp_path
+            FIXTURE,
+            "float32",
+            "sm_90",
+            "nvrtc",
+            cache_root=tmp_path,
+            native_module=_native_context(),
         )
 
 
@@ -532,7 +754,14 @@ def test_backend_selection_failure_raises(monkeypatch, tmp_path, required_policy
     monkeypatch.setattr(
         artifact_module, "select_execution_cuda_jit_backend", unavailable
     )
+    monkeypatch.setattr(
+        jit_module, "jit_nvrtc_information", lambda: {"available": False}
+    )
     with pytest.raises(OAMCudaArtifactError, match="backend is unavailable"):
         prepare_nequip_oam_cuda_artifact(
-            FIXTURE, "float32", "sm_90", cache_root=tmp_path
+            FIXTURE,
+            "float32",
+            "sm_90",
+            cache_root=tmp_path,
+            native_module=_native_context(),
         )

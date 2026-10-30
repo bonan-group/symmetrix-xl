@@ -108,7 +108,9 @@ def test_debug_v1_is_rejected_at_admission_on_a_device_build(tmp_path, monkeypat
         pytest.skip("debug_v1 device admission requires a device Kokkos build")
 
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "cache"))
-    artifact = prepare_nequip_oam_host_artifact(FIXTURE, precision="float64")
+    artifact = prepare_nequip_oam_host_artifact(
+        FIXTURE, precision="float64", native_module=native
+    )
     evaluator = native.NequIPOAMKokkos(str(FIXTURE), str(artifact.artifact_path))
 
     error = None

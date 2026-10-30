@@ -359,7 +359,9 @@ def _worker_main(argv: list[str]) -> int:
         native._init_kokkos()
 
     graph = _scaling_graph()
-    artifact = prepare_nequip_oam_receiver_host_artifact(FIXTURE, "float64")
+    artifact = prepare_nequip_oam_receiver_host_artifact(
+        FIXTURE, "float64", native_module=native
+    )
     evaluator = native.NequIPOAMKokkos(
         str(FIXTURE),
         str(artifact.artifact_path),

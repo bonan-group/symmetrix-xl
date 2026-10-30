@@ -54,6 +54,7 @@ def _direct(native, path, cache):
             "float64",
             native._execution_device_execution_environment(),
             cache_root=cache,
+            native_module=native,
         )
         evaluator = native.NequIPOAMKokkos(
             str(path),
@@ -64,7 +65,7 @@ def _direct(native, path, cache):
         from symmetrix.oam_jit_artifact import prepare_nequip_oam_receiver_host_artifact
 
         artifact = prepare_nequip_oam_receiver_host_artifact(
-            path, "float64", cache_dir=cache
+            path, "float64", cache_dir=cache, native_module=native
         )
         evaluator = native.NequIPOAMKokkos(
             str(path),
@@ -743,7 +744,7 @@ def test_artifact_is_shared_by_models_with_the_same_architecture(native, tmp_pat
     other_path = tmp_path / "oam-artifact-foreign.json"
     other_path.write_text(json.dumps(other))
     artifact = prepare_nequip_oam_receiver_host_artifact(
-        path, "float64", cache_dir=tmp_path / "cache"
+        path, "float64", cache_dir=tmp_path / "cache", native_module=native
     )
     assert nequip_contract_fingerprint(contract) != nequip_contract_fingerprint(other)
     assert oam_architecture_fingerprint(

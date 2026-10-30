@@ -15,6 +15,7 @@ from .jit import (
     artifact_cache_inputs,
     canonical_host_artifact_target,
     direct_artifact_diagnostic,
+    native_source_content_sha256,
     prepare_jit_artifact,
     probe_compiler_identity,
     resolve_host_floating_point_policy,
@@ -351,6 +352,17 @@ def _prepare(
                     f"(status={installed.status}); {detail}; regenerate or install "
                     "the exact approved prebuilt"
                 )
+    if native_module is None:
+        raise OAMHostArtifactError(
+            "runtime OAM host artifacts require an explicit native module "
+            "with a source content fingerprint"
+        )
+    try:
+        source_content_sha256 = native_source_content_sha256(native_module)
+    except JitError as error:
+        raise OAMHostArtifactError(
+            f"runtime OAM host artifact source identity is unavailable: {error}"
+        ) from error
     try:
         compiler_command, _ = probe_compiler_identity()
         host_policy = resolve_host_jit_policy(
@@ -395,6 +407,7 @@ def _prepare(
     )
     result = prepare_jit_artifact(
         source,
+        source_content_sha256=source_content_sha256,
         abi=artifact_cache_inputs(metadata, envelope),
         build={
             "generator": metadata.get("generator", "symmetrix.jit.oam-host-v1"),

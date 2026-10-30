@@ -406,7 +406,7 @@ def test_oam_l2_contract_direct_matches_the_reference_routing(native, tmp_path):
     path = tmp_path / "oam-l2.json"
     path.write_text(json.dumps(contract))
     artifact = prepare_nequip_oam_receiver_host_artifact(
-        path, "float64", cache_dir=tmp_path / "cache"
+        path, "float64", cache_dir=tmp_path / "cache", native_module=native
     )
     reference = _reference(native, path)
     kokkos = native.NequIPOAMKokkos(

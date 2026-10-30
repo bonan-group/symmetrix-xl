@@ -32,6 +32,13 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ### NequIP-OAM support
 
+- Bound runtime OAM artifact preparation to the backend's verified full source
+  fingerprint in cache keys and `_src<fullhash>` artifact basenames. The three
+  `prepare_nequip_oam_{cuda,host,receiver_host}_artifact` adapters require the
+  caller's explicit `native_module`; normal frontend calls already provide
+  it. Strict installed-prebuilt behavior is unchanged, and compatible learned
+  weights still share artifacts within one package identity. Kernels, model
+  architecture, ABI and numerical tolerances are unchanged.
 - Added the OAM v2 JSON contract, `NequIPCalculator`, and
   `symmetrix_extract_nequip`. JSON-only evaluation depends on ASE and the native
   Symmetrix backend; PyTorch, NequIP, and e3nn are optional exporter/reference

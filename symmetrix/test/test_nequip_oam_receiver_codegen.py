@@ -33,6 +33,14 @@ FIXTURE = Path(__file__).parent / "data/nequip/oam_s_v2_minimal.json"
 HOST_TARGET = "host-isa-x86-64-v3"
 
 
+class _CodegenNativeContext:
+    """Fixed unit-only identity; never used for native numerical qualification."""
+
+    @staticmethod
+    def _backend_build_info():
+        return {"source_content_sha256": "a" * 64}
+
+
 def oam_receiver_jit_metadata(*args, **kwargs):
     kwargs.setdefault("host_target", HOST_TARGET)
     return _oam_receiver_jit_metadata(*args, **kwargs)
@@ -301,15 +309,17 @@ def test_generated_receiver_source_compiles(precision, tmp_path):
 def test_receiver_artifact_preparation_reports_cache_hit(tmp_path):
     _require_cxx()
     first = prepare_nequip_oam_receiver_host_artifact(
-        FIXTURE, "float64", cache_dir=tmp_path
+        FIXTURE, "float64", cache_dir=tmp_path, native_module=_CodegenNativeContext
     )
     second = prepare_nequip_oam_receiver_host_artifact(
-        FIXTURE, "float64", cache_dir=tmp_path
+        FIXTURE, "float64", cache_dir=tmp_path, native_module=_CodegenNativeContext
     )
     assert first.artifact_path == second.artifact_path
     assert first.cache_hit is False
     assert second.cache_hit is True
     assert first.metadata["abi_version"] == 7
+    manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["key_inputs"]["source_content_sha256"] == "a" * 64
 
 
 def test_channel_tiled_receiver_artifact_preparation_is_cache_separated(tmp_path):
@@ -322,9 +332,10 @@ def test_channel_tiled_receiver_artifact_preparation_is_cache_separated(tmp_path
         "float64",
         cache_dir=tmp_path,
         generation_policy=policy,
+        native_module=_CodegenNativeContext,
     )
     conservative = prepare_nequip_oam_receiver_host_artifact(
-        FIXTURE, "float64", cache_dir=tmp_path
+        FIXTURE, "float64", cache_dir=tmp_path, native_module=_CodegenNativeContext
     )
 
     assert tiled.artifact_path.is_file()
@@ -339,7 +350,7 @@ def test_receiver_cached_artifact_is_bound_to_the_current_contract(tmp_path):
     _require_cxx()
     contract = _contract()
     first = prepare_nequip_oam_receiver_host_artifact(
-        FIXTURE, "float64", cache_dir=tmp_path
+        FIXTURE, "float64", cache_dir=tmp_path, native_module=_CodegenNativeContext
     )
     assert first.metadata[
         "contract_fingerprint"
@@ -354,7 +365,7 @@ def test_receiver_cached_artifact_is_bound_to_the_current_contract(tmp_path):
         (first.manifest_path.parent / "manifest.json").read_text(encoding="utf-8")
     )
     second = prepare_nequip_oam_receiver_host_artifact(
-        FIXTURE, "float64", cache_dir=tmp_path
+        FIXTURE, "float64", cache_dir=tmp_path, native_module=_CodegenNativeContext
     )
     assert second.cache_hit is True
     assert second.semantic_fingerprint == first.semantic_fingerprint
