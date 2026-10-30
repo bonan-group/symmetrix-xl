@@ -6809,7 +6809,9 @@ def _render_mh1_spline_r_gpu_programs(
         spline_helpers = render_gpu_spline_helpers(
             "SymmetrixJitMH1CudaSplineV5",
             qualifier,
-            precision_matched_coordinates=dialect.backend == "hip",
+            # Geometry remains double even when learned spline storage is FP32,
+            # matching the native radial evaluator and the packet's radius ABI.
+            precision_matched_coordinates=False,
             include_active_edge_helper=False,
         )
         harmonic_helpers = _render_direct_harmonic_gradient_helper(
@@ -8351,8 +8353,10 @@ def _cuda_block_gate_forward(
                 f"     {stem}_scalar_{block_index} += blockDim.x) {{",
                 f"    const int column = {scalar_offset} + {stem}_scalar_{block_index};",
                 f"    const float value = {input_pointer}[column];",
-                "    const float sigmoid = 1.0f / (1.0f + expf(-value));",
-                f"    {output_pointer}[column] = {scale} * value * sigmoid;",
+                "    const float denominator = 1.0f + expf(-value);",
+                # Preserve native scalar SiLU ordering: reciprocal multiplication
+                # adds a rounding step that can perturb retained Polar features.
+                f"    {output_pointer}[column] = {scale} * value / denominator;",
                 "}",
             ]
         )

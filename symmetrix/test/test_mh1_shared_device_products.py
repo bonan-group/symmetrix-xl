@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import math
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,6 +18,148 @@ from test_execution_mh1_contract import (
 def _contract():
     definition = mh1_node_definition.__wrapped__(mh1_definition.__wrapped__())
     return make_execution_mh1_v4_contract(definition)
+
+
+def _device_module(contract, backend, precision):
+    if backend == "cuda":
+        return mh1_codegen.render_execution_mh1_cuda_module_v4(
+            contract, 80, precision=precision, node_state_policy="full-retention-v1"
+        )
+    return mh1_codegen.render_execution_mh1_hip_module_v4(
+        contract,
+        {
+            "architecture": "gfx1151",
+            "compiler_offload_target": "gfx1151",
+            "native_subgroup_width": 32,
+            "compute_unit_count": 40,
+        },
+        precision=precision,
+        node_state_policy="full-retention-v1",
+    )
+
+
+def _compile_precision_probe(tmp_path, source):
+    compiler = shutil.which("c++") or shutil.which("g++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for emitted arithmetic coverage")
+    source_path = tmp_path / "precision.cpp"
+    library_path = tmp_path / "precision.so"
+    source_path.write_text(source)
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++20",
+            "-O0",
+            "-fno-fast-math",
+            "-ffp-contract=off",
+            "-shared",
+            "-fPIC",
+            str(source_path),
+            "-o",
+            str(library_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return ctypes.CDLL(str(library_path))
+
+
+@pytest.mark.parametrize("backend", ["cuda", "hip"])
+@pytest.mark.parametrize("precision", ["float32", "float64"])
+def test_emitted_spline_coordinates_preserve_geometry_precision(
+    tmp_path, backend, precision
+):
+    """FP32 learned storage must not round a double edge radius before lookup."""
+    source = _device_module(_contract(), backend, precision)
+    start = source.index("struct EvaluationPoint {")
+    function = source.index("EvaluationPoint evaluation_point(", start)
+    end = source.index("\n}\n", function) + 2
+    helper = source[start:end].replace("__device__", "")
+    scalar = "float" if precision == "float32" else "double"
+    library = _compile_precision_probe(
+        tmp_path,
+        f"""#include <cmath>
+#include <cstdint>
+using Scalar = {scalar};
+struct SymmetrixJitMH1CudaSplineV5 {{
+    double h, x0;
+    std::uint32_t intervals;
+}};
+{helper}
+extern "C" int coordinates(double radius, double* powers) {{
+    const SymmetrixJitMH1CudaSplineV5 radial{{4.0/255.0, 0.0, 255}};
+    const auto point = evaluation_point(radial, radius);
+    powers[0] = point.x;
+    powers[1] = point.xx;
+    powers[2] = point.xxx;
+    return point.interval;
+}}
+""",
+    )
+    probe = library.coordinates
+    probe.argtypes = [ctypes.c_double, ctypes.POINTER(ctypes.c_double)]
+    probe.restype = ctypes.c_int
+    h = 4.0 / 255.0
+    # Include a point just below a knot: an early FP32 cast changes its interval.
+    for radius in (1.7146428199482244, 1.8681541692269406, math.nextafter(h, 0.0)):
+        interval = math.floor(radius / h)
+        x = radius - h * interval
+        powers = (ctypes.c_double * 3)()
+        assert probe(radius, powers) == interval
+        assert list(powers) == [x, x * x, x * x * x]
+
+
+@pytest.mark.parametrize("backend", ["cuda", "hip"])
+@pytest.mark.parametrize("precision", ["float32", "float64"])
+def test_emitted_scalar_gate_matches_native_division_order(
+    tmp_path, backend, precision
+):
+    """Reciprocal multiplication adds an observable ULP at this SiLU input."""
+    source = _device_module(_contract(), backend, precision)
+    name = "symmetrix_execution_mh1_split_pre_gate_kernel_0"
+    start = source.index(f"void {name}(")
+    end = source.index("{", start) + 1
+    depth = 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    kernel = source[start:end]
+    scalar = "float" if precision == "float32" else "double"
+    # This fixture's pre-gate width is 4 scalar + 3 vector + 5 quadrupole +
+    # 7 octupole components. The emitted arena's gated output starts at 19.
+    library = _compile_precision_probe(
+        tmp_path,
+        f"""#include <cmath>
+#include <cstdint>
+struct Index {{ int x; }};
+constexpr Index threadIdx{{0}}, blockIdx{{0}}, blockDim{{1}}, gridDim{{1}};
+inline void __syncthreads() {{}}
+struct SymmetrixJitMH1CudaNodeForwardArgsV5 {{
+    std::int64_t num_nodes;
+    {scalar}* node_arena;
+    {scalar}* retained_pre_gate;
+}};
+{kernel}
+extern "C" double gate() {{
+    {scalar} arena[1024] = {{}};
+    {scalar} retained[1024] = {{}};
+    arena[0] = static_cast<{scalar}>(0.6840022206306458);
+    {name}({{1, arena, retained}});
+    return arena[19];
+}}
+""",
+    )
+    library.gate.restype = ctypes.c_double
+    if precision == "float32":
+        # Captured native FP32 value; reciprocal multiplication yields the
+        # distinct float 0.7633695006370544 for the identical input.
+        assert library.gate() == 0.7633694410324097
+    else:
+        x = 0.6840022206306458
+        assert library.gate() == pytest.approx(
+            1.6791767923989418 * x / (1.0 + math.exp(-x)), abs=1.0e-15, rel=0
+        )
 
 
 def test_device_module_publishes_product_free_split_phases():
