@@ -129,6 +129,8 @@ def main(argv=None) -> int:
         "output": str(dst.resolve()), "output_sha256": out_sha,
         "output_bytes": len(text.encode()),
         "h1_affine_mode": mode,
+        "origin": new["h1_affine_provenance"]["origin"],
+        "source_format_version": new["h1_affine_provenance"]["source_format_version"],
         "identity_fp64": {"E1_max_rel": worst_e, "H2_max_rel": worst_h2, "detail": checks},
         "conditioning": new["h1_affine_provenance"]["conditioning"],
     }

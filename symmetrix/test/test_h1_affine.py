@@ -109,6 +109,7 @@ def test_plain_v2_converts_to_m0_composite():
         np.testing.assert_allclose(T[z], f["P"][0] @ f["S0"][z], rtol=0, atol=1e-10)
     assert checks["mode"] == "m0_composite"
     assert h1_affine_mode_of(new) == "m0_composite"
+    assert new["h1_affine_provenance"]["origin"] == "converted_from_v2"
 
 
 @pytest.mark.parametrize("field", [False, True])
@@ -161,6 +162,8 @@ def test_v1_pair_splines_converts_and_keeps_tables():
     assert new["symmetrix_format_version"] == 4
     assert new["radial_representation"] == "pair-splines"
     assert new["radial_spline_values_0"] == old["radial_spline_values_0"]
+    assert new["h1_affine_provenance"]["origin"] == "converted_from_v1"
+    assert new["h1_affine_provenance"]["source_format_version"] == 1
     validate_payload(new)
 
 
@@ -271,6 +274,7 @@ def test_conversion_cli_never_overwrites(tmp_path):
     assert main(["--validate-only", str(src)]) == 0  # old file: valid, with the warning
     receipt = json.loads((tmp_path / "r.json").read_text())
     assert receipt["h1_affine_mode"] == "pre_linear_up"
+    assert receipt["origin"] == "converted_from_v2" and receipt["source_format_version"] == 2
     assert receipt["identity_fp64"]["detail"]["worst_rel_terms"] <= 1e-12
 
 
@@ -623,7 +627,10 @@ def _ill_condition_linear_up(torch, model, sigma_min, seed):
     rng = np.random.default_rng(seed)
     K = model.node_embedding.linear.irreps_out.count("0e")
     q1, _, q2 = np.linalg.svd(rng.standard_normal((K, K)))
-    block = (q1 * np.geomspace(1.0, sigma_min, K)) @ q2 * np.sqrt(K)
+    if sigma_min == 0.0:
+        block = np.zeros((K, K))  # exactly singular (sigma_min_U0 = 0)
+    else:
+        block = (q1 * np.geomspace(1.0, sigma_min, K)) @ q2 * np.sqrt(K)
     with torch.no_grad():
         weight = linear_up.weight_view_for_instruction(0)
         weight.copy_(torch.as_tensor(block, dtype=weight.dtype).reshape(weight.shape))
@@ -701,6 +708,11 @@ def test_mace_variants_match_torch_fp64(tmp_path, variant, radial_format):
     assert data["symmetrix_format_version"] == 4 and data["h1_affine_mode"] == expected
     assert data["radial_representation"] == radial_format
     assert "readout_1_weights" not in data and "H2_weights_for_H1" not in data
+    provenance = data["h1_affine_provenance"]
+    assert provenance["origin"] == "native_checkpoint"
+    cond = provenance["conditioning"]
+    assert cond["cond_U0"] == pytest.approx(cond["sigma_max_U0"] / cond["sigma_min_U0"])
+    assert cond["cond_U0"] == pytest.approx(1e3, rel=1e-6)
     validate_payload(data)
     path = _write(tmp_path, f"{variant}.json", data)
     atoms = _variant_atoms()
@@ -711,6 +723,27 @@ def test_mace_variants_match_torch_fp64(tmp_path, variant, radial_format):
         else:
             result = _evaluate(path, "float64", use_kokkos, atoms)
         _assert_matches_torch(result, reference, f"{variant}/{radial_format}/kokkos={use_kokkos}")
+
+
+@pytest.mark.parametrize("variant", ["plain", "residual"])
+def test_mace_singular_linear_up_exports_and_matches_torch(tmp_path, variant):
+    """A singular scalar block of linear_up has no inverse; the v4 export needs
+    none (cond_U0 is recorded as null) and still evaluates the model."""
+    _native()
+    from symmetrix.extract_mace_data import _extract_single_head_data
+
+    model = _mace_model(variant, sigma_min=0.0)
+    data = _extract_single_head_data(model, num_spline_points=1000)
+    cond = data["h1_affine_provenance"]["conditioning"]
+    assert cond["sigma_min_U0"] == 0.0 and cond["cond_U0"] is None
+    json.dumps(data, allow_nan=False)
+    validate_payload(data)
+    path = _write(tmp_path, f"{variant}_singular.json", data)
+    atoms = _variant_atoms()
+    reference = _torch_reference(model, atoms)
+    for use_kokkos in (False, True):
+        result = _evaluate(path, "float64", use_kokkos, atoms)
+        _assert_matches_torch(result, reference, f"{variant}/singular/kokkos={use_kokkos}")
 
 
 def test_mace_multihead_matches_torch_fp64(tmp_path):

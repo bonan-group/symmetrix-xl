@@ -316,6 +316,11 @@ def test_macefield_extractor_includes_field_schema(macefield_model_path, tmp_pat
 
     assert data["symmetrix_format_version"] == 4
     assert data["h1_affine_mode"] == "pre_linear_up"
+    assert data["h1_affine_provenance"]["origin"] == "native_checkpoint"
+    conditioning = data["h1_affine_provenance"]["conditioning"]
+    assert conditioning["cond_U0"] == pytest.approx(
+        conditioning["sigma_max_U0"] / conditioning["sigma_min_U0"]
+    )
     assert data["radial_representation"] == "compact"
     assert "radial_spline_values_0" not in data
     assert "radial_spline_values_1" not in data

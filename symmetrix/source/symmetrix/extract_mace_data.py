@@ -1617,6 +1617,7 @@ def _extract_single_head_data(
     singular_C0 = np.linalg.svd(H1_weights[0], compute_uv=False)
     output["h1_affine_provenance"] = {
         "source": "native_checkpoint",
+        "origin": "native_checkpoint",
         "exporter": "symmetrix.extract_mace_data",
         "exporter_version": H1_AFFINE_TOOL_VERSION,
         "torch_version": torch.__version__,
@@ -1626,6 +1627,10 @@ def _extract_single_head_data(
             "sigma_max_C": float(singular_C0[0]),
             "sigma_min_U0": float(singular_U0[-1]),
             "sigma_max_U0": float(singular_U0[0]),
+            "cond_U0": (
+                float(singular_U0[0] / singular_U0[-1])
+                if singular_U0[-1] > 0 else None  # None: singular U0
+            ),
             "sigma_min_P0": float(singular_P0[-1]),
             "sigma_max_P0": float(singular_P0[0]),
             "readout_1_l2": float(np.linalg.norm(readout_1)),

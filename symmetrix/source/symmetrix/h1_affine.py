@@ -459,6 +459,7 @@ def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: in
         out["prediction_heads"] = dict(section, parameters=parameters)
     out["h1_affine_provenance"] = {
         "source": "json_migration",
+        "origin": f"converted_from_v{version}",
         "source_json_sha256": source_sha256,
         "source_json_bytes": int(source_bytes),
         "source_json_path": source_path,
