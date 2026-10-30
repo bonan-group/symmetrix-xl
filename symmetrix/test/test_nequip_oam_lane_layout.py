@@ -37,13 +37,51 @@ def _reference(native, path):
     """The artifact-free reference routing: the portable Kokkos implementation.
 
     ``NequIPOAMKokkos(path)`` with no artifact argument uses the selected
-    execution space, and ``direct`` is the native mode the reference routing
-    hands it.
+    execution space through the explicit reference mode.
     """
 
     evaluator = native.NequIPOAMKokkos(str(path))
     evaluator.set_streamed_edges("reference")
     return evaluator
+
+
+def _direct(native, path, cache):
+    if native._kokkos_default_execution_space() == "Cuda":
+        from symmetrix.oam_cuda_artifact import prepare_nequip_oam_cuda_artifact
+
+        artifact = prepare_nequip_oam_cuda_artifact(
+            path,
+            "float64",
+            native._execution_device_execution_environment(),
+            cache_root=cache,
+        )
+        evaluator = native.NequIPOAMKokkos(
+            str(path),
+            cuda_plugin_path=str(artifact.artifact_path),
+            cuda_artifact_identity={"manifest_path": str(artifact.manifest_path)},
+        )
+    else:
+        from symmetrix.oam_jit_artifact import prepare_nequip_oam_receiver_host_artifact
+
+        artifact = prepare_nequip_oam_receiver_host_artifact(
+            path, "float64", cache_dir=cache
+        )
+        evaluator = native.NequIPOAMKokkos(
+            str(path),
+            str(artifact.artifact_path),
+            host_active_target=artifact.active_host_target,
+            host_artifact_origin=artifact.artifact_origin,
+        )
+    evaluator.set_streamed_edges("direct")
+    return evaluator
+
+
+def _assert_direct_execution(native, evaluator):
+    assert evaluator.family_artifact_ready
+    if native._kokkos_default_execution_space() == "Cuda":
+        assert evaluator.cuda_r1_ready
+        assert evaluator.cuda_r1_launch_count > 0
+        assert evaluator.cuda_r1_fallback_count == 0
 
 
 def _dimension(irreps):
@@ -344,22 +382,13 @@ def _build_contract():
 @pytest.mark.oam_runtime
 def test_merged_linear_irreps_keeps_lane_parity(native, tmp_path):
     from symmetrix.nequip_schema import validate_nequip_oam_data
-    from symmetrix.oam_jit_artifact import prepare_nequip_oam_receiver_host_artifact
 
     contract = _build_contract()
     validate_nequip_oam_data(contract)
     path = tmp_path / "oam-merged-irreps.json"
     path.write_text(json.dumps(contract))
-    artifact = prepare_nequip_oam_receiver_host_artifact(
-        path, "float64", cache_dir=tmp_path / "cache"
-    )
     reference = _reference(native, path)
-    kokkos = native.NequIPOAMKokkos(
-        str(path),
-        str(artifact.artifact_path),
-        host_active_target=artifact.active_host_target,
-        host_artifact_origin=artifact.artifact_origin,
-    )
+    kokkos = _direct(native, path, tmp_path / "cache")
 
     # A deliberately asymmetric cluster so the odd-angular (l=1) content is
     # non-zero: a symmetric cell would hide any l>0 defect.
@@ -372,6 +401,7 @@ def test_merged_linear_irreps_keeps_lane_parity(native, tmp_path):
     args = (3, node_types, num_neigh, indices, neigh_types, xyz, radii)
     reference.compute_node_energies_forces(*args)
     kokkos.compute_node_energies_forces(*args)
+    _assert_direct_execution(native, kokkos)
 
     reference_energy = np.asarray(reference.node_energies, dtype=float)
     kokkos_energy = np.asarray(kokkos.node_energies, dtype=float)
@@ -535,23 +565,14 @@ def _asymmetric_args():
 
 
 def _self_connection_parity(native, tmp_path, contract, tag):
-    from symmetrix.oam_jit_artifact import prepare_nequip_oam_receiver_host_artifact
-
     path = tmp_path / f"oam-self-{tag}.json"
     path.write_text(json.dumps(contract))
-    artifact = prepare_nequip_oam_receiver_host_artifact(
-        path, "float64", cache_dir=tmp_path / "cache"
-    )
     reference = _reference(native, path)
-    kokkos = native.NequIPOAMKokkos(
-        str(path),
-        str(artifact.artifact_path),
-        host_active_target=artifact.active_host_target,
-        host_artifact_origin=artifact.artifact_origin,
-    )
+    kokkos = _direct(native, path, tmp_path / "cache")
     args = _asymmetric_args()
     reference.compute_node_energies_forces(*args)
     kokkos.compute_node_energies_forces(*args)
+    _assert_direct_execution(native, kokkos)
     reference_energy = np.asarray(reference.node_energies, dtype=float)
     assert np.abs(reference_energy).max() > 1e-6
     np.testing.assert_allclose(
@@ -580,20 +601,11 @@ def test_self_tensor_product_lane_kernels_are_used_when_plans_match(native, tmp_
 
 @pytest.mark.oam_runtime
 def test_self_tensor_product_lane_workspace_is_arena_owned(native, tmp_path):
-    from symmetrix.oam_jit_artifact import prepare_nequip_oam_receiver_host_artifact
-
     path = tmp_path / "oam-self-arena.json"
     path.write_text(json.dumps(_self_connection_contract(_uvw_split_self_connection())))
-    artifact = prepare_nequip_oam_receiver_host_artifact(
-        path, "float64", cache_dir=tmp_path / "cache"
-    )
-    evaluator = native.NequIPOAMKokkos(
-        str(path),
-        str(artifact.artifact_path),
-        host_active_target=artifact.active_host_target,
-        host_artifact_origin=artifact.artifact_origin,
-    )
+    evaluator = _direct(native, path, tmp_path / "cache")
     evaluator.compute_node_energies_forces(*_asymmetric_args())
+    _assert_direct_execution(native, evaluator)
 
     memory = evaluator.execution_memory_report
     assert memory["arena_bilinear_workspace_bytes"] > 0

@@ -481,17 +481,32 @@ def test_benchmark_driver_builds_exact_layered_cells(
 
 
 def test_fourier_benchmark_record_pins_accuracy_and_reuse_state(tmp_path):
-    import symmetrix
-
-    native = symmetrix.load_backend("cpu")
-    if not hasattr(native, "FourierD3Kokkos"):
+    environment = os.environ.copy()
+    environment["SYMMETRIX_BACKEND"] = "cpu"
+    capability = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import symmetrix; "
+                "print(int(hasattr(symmetrix.load_backend(), 'FourierD3Kokkos')))"
+            ),
+        ],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if capability.stdout.strip() == "0":
         pytest.skip("the active CPU build has no FourierD3 FFT provider")
+    assert capability.stdout.strip() == "1", capability.stdout
     output = tmp_path / "fourier-record.json"
     completed = subprocess.run(
         _fourier_benchmark_driver_command(output),
         check=True,
         capture_output=True,
         text=True,
+        env=environment,
     )
     record = json.loads(completed.stdout)
 

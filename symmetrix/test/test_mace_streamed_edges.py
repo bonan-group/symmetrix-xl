@@ -2352,6 +2352,7 @@ def test_device_h2_stages_matches_the_reference_routing(
 @pytest.mark.cuda
 def test_r0_reverse_persistent_grid_is_a_whole_resident_wave(
     scalar_standard_model_path,
+    monkeypatch,
 ):
     """The coordinate reverse launches one whole resident wave per declaration.
 
@@ -2365,6 +2366,29 @@ def test_r0_reverse_persistent_grid_is_a_whole_resident_wave(
     """
 
     _require_execution_fixed_weight_backend()
+    from symmetrix import mace_jit_operator_artifact
+    from symmetrix.installed_operator_artifact import InstalledOperatorResolution
+
+    resolve_installed = mace_jit_operator_artifact.resolve_installed_operator_artifact
+
+    def resolve_without_prebuilt_r0(**arguments):
+        if arguments["operator"] == "R0":
+            return InstalledOperatorResolution(
+                status="disabled",
+                origin=None,
+                artifact_path=None,
+                artifact_id=None,
+                diagnostics=("builtin R0 launch-profile qualification",),
+            )
+        return resolve_installed(**arguments)
+
+    # Installed R0 modules use their generated persistent profile and bypass
+    # the builtin launch-profile override being qualified here.
+    monkeypatch.setattr(
+        mace_jit_operator_artifact,
+        "resolve_installed_operator_artifact",
+        resolve_without_prebuilt_r0,
+    )
     profile_id = "standard-r0-module-module-v2-cuda-float32-generic"
     # Large enough that the persistent grid is not clipped to the edge count.
     atoms = _small_structure().repeat((6, 6, 6))
@@ -2376,6 +2400,7 @@ def test_r0_reverse_persistent_grid_is_a_whole_resident_wave(
     default = Symmetrix(
         scalar_standard_model_path, dtype="float32", streamed_edges="direct"
     )
+    assert default.evaluator._r0_loader_implementation == "builtin"
     compute_unit_count = default.evaluator.execution_device_execution_environment[
         "compute_unit_count"
     ]
@@ -2398,6 +2423,7 @@ def test_r0_reverse_persistent_grid_is_a_whole_resident_wave(
     doubled = Symmetrix(
         scalar_standard_model_path, dtype="float32", streamed_edges="direct"
     )
+    assert doubled.evaluator._r0_loader_implementation == "builtin"
     doubled.evaluator._set_kernel_launch_profile_override(profile_id, 6)
     doubled.calculate(atoms, properties=["energy", "forces"])
     doubled_row = doubled.kernel_launch_profile_diagnostics["r0_reverse"]

@@ -617,7 +617,7 @@ def test_maceles_native_rejects_alchemical_coefficients(standard_mace_les_json):
         ("_load_jit_device_plugin", ("/missing/les-r1-device.so",), "device"),
         ("_load_m0_host_plugin", ("/missing/les-m0-host.so",), "M0 host plugin"),
         ("_load_m0_device_module", ("/missing/les-m0-device.bin",), "M0 device"),
-        ("_load_r0_device_module", ("/missing/les-r0-device.bin",), "R0 device"),
+        ("_load_r0_device_module", ("/missing/les-r0-device.bin", 4), "R0 device"),
         (
             "load_family_artifact",
             ("/missing/les-family-host.so", "host"),

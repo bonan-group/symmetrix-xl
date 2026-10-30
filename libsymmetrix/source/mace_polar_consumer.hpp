@@ -216,10 +216,25 @@ public:
 
     bool load_artifact(const std::string& path,const std::string& target)
     {
-        install_artifact_contract_identity(path);
+        const auto active_target=evaluator_.family_capabilities().target;
+        const auto selected_target=target.empty()?active_target:target;
+        if(selected_target!="host"&&selected_target!="cuda"
+            &&selected_target!="hip")
+            throw std::invalid_argument(
+                "MACE Polar artifact target is unsupported: "+selected_target);
+        if(selected_target!=active_target)
+            throw std::invalid_argument(
+                "MACE Polar artifact target does not match the active backend: "
+                +selected_target+" != "+active_target);
+        const bool device=selected_target!="host";
+        const auto launch_plan=install_artifact_contract_identity(path,device);
+        if(device) {
+            evaluator_.load_jit_mh1_cuda_plugin_v5(path,launch_plan.dump());
+            return evaluator_.jit_mh1_cuda_plugin_v5_ready();
+        }
         symmetrix::execution::ArtifactRequest request;
         request.path=path;
-        request.target=target;
+        request.target=selected_target;
         return evaluator_.load_family_artifact(request).ready;
     }
 
@@ -669,7 +684,8 @@ private:
                 "MACE Polar prepared graph extents are inconsistent.");
     }
 
-    void install_artifact_contract_identity(const std::string& artifact_path)
+    nlohmann::json install_artifact_contract_identity(
+        const std::string& artifact_path,const bool device)
     {
         const auto manifest_path=
             std::filesystem::path(artifact_path).parent_path()/"manifest.json";
@@ -686,17 +702,41 @@ private:
                 +exception.what());
         }
         try {
-            const auto& contract=manifest.at("key_inputs").at("build")
-                .at("contract");
-            if(contract.at("tag").get<std::string>()
+            const auto& build=manifest.at("key_inputs").at("build");
+            // NVRTC wraps the same request carried directly by host/NVCC
+            // manifests. Device admission still belongs to the v5 loader.
+            const auto& request=device&&build.contains("request")
+                ?build.at("request"):build;
+            const auto& contract=request.at("contract");
+            if(!contract.is_object())
+                throw std::invalid_argument(
+                    "MACE Polar artifact node contract must be an object.");
+            if(!device&&contract.at("tag").get<std::string>()
                 !="symmetrix.execution.mh1.node-metadata/1")
                 throw std::invalid_argument(
                     "MACE Polar artifact node contract tag is unsupported.");
-            const auto interactions=contract.at("layers").size();
+            if(device&&(contract.at("abi")!="symmetrix.jit.mh1.cuda-plugin/5"
+                ||contract.at("abi_version")!=5))
+                throw std::invalid_argument(
+                    "MACE Polar artifact device node contract is unsupported.");
+            const auto& layers=contract.at("layers");
+            if(!layers.is_array())
+                throw std::invalid_argument(
+                    "MACE Polar artifact node contract layers must be an array.");
+            const auto interactions=layers.size();
             if(interactions==0
                 ||interactions>std::numeric_limits<std::uint32_t>::max())
                 throw std::invalid_argument(
                     "MACE Polar artifact interaction count is invalid.");
+            nlohmann::json launch_plan;
+            if(device) {
+                const auto found=request.find("launch_plan");
+                if(found==request.end()||!found->is_object()||found->empty())
+                    throw std::invalid_argument(
+                        "MACE Polar artifact device launch plan is missing "
+                        "or malformed.");
+                launch_plan=*found;
+            }
             evaluator_.set_execution_mh1_v4_contract_identity(
                 "symmetrix.execution.mh1_uvu/4",
                 contract.at("generation_fingerprint").get<std::string>(),
@@ -704,6 +744,7 @@ private:
                 contract.at("structure_fingerprint").get<std::string>(),
                 contract.at("runtime_layout_fingerprint").get<std::string>(),
                 static_cast<std::uint32_t>(interactions));
+            return launch_plan;
         } catch(const nlohmann::json::exception& exception) {
             throw std::invalid_argument(
                 std::string("MACE Polar artifact node contract is incomplete: ")

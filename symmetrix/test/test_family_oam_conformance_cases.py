@@ -53,6 +53,32 @@ OAM_HOST_ADAPTER = oam_jit_artifact
 OAM_HOST_PREPARER = "prepare_nequip_oam_receiver_host_artifact"
 
 
+def _oam_direct_artifact_arguments(native, path, precision, cache):
+    if native._kokkos_default_execution_space() == "Cuda":
+        from symmetrix.oam_cuda_artifact import prepare_nequip_oam_cuda_artifact
+
+        artifact = prepare_nequip_oam_cuda_artifact(
+            path,
+            precision,
+            native._execution_device_execution_environment(),
+            cache_root=cache,
+        )
+        return {
+            "cuda_plugin_path": str(artifact.artifact_path),
+            "cuda_artifact_identity": {"manifest_path": str(artifact.manifest_path)},
+        }, "cuda"
+    if shutil.which("c++") is None:
+        raise Unqualified("the OAM receiver-owned host artifact", CXX_RUNNER)
+    artifact = oam_jit_artifact.prepare_nequip_oam_receiver_host_artifact(
+        path, precision, cache_dir=cache
+    )
+    return {
+        "host_plugin_path": str(artifact.artifact_path),
+        "host_active_target": artifact.active_host_target,
+        "host_artifact_origin": artifact.artifact_origin,
+    }, "host"
+
+
 class OAMAdapter(Adapter):
     """OAM: the neutral lifecycle spellings are bound directly on the evaluator.
 
@@ -94,16 +120,13 @@ class OAMAdapter(Adapter):
             evaluator = evaluator_class(str(self.model_path()))
             evaluator.set_streamed_edges("reference")
             return evaluator
-        if shutil.which("c++") is None:
-            raise Unqualified("the OAM receiver-owned host artifact", CXX_RUNNER)
-        from symmetrix.oam_jit_artifact import (
-            prepare_nequip_oam_receiver_host_artifact,
+        artifact_arguments, _ = _oam_direct_artifact_arguments(
+            native_symmetrix,
+            self.model_path(),
+            self.precision,
+            self._models["jit_cache"],
         )
-
-        artifact = prepare_nequip_oam_receiver_host_artifact(
-            self.model_path(), self.precision, cache_dir=self._models["jit_cache"]
-        )
-        evaluator = evaluator_class(str(self.model_path()), str(artifact.artifact_path))
+        evaluator = evaluator_class(str(self.model_path()), **artifact_arguments)
         evaluator.set_streamed_edges("direct")
         return evaluator
 
@@ -150,10 +173,15 @@ class OAMAdapter(Adapter):
         )
         return {
             "artifact_id": evaluator.family_artifact_readiness["artifact_id"],
-            # The receiver/source-owned ABI v7 program is the generated implementation
-            # the binding report steps the edge node to, and the dispatch
-            # accounting proves it served every edge region.
-            "receiver_owned_abi": fields.get("host_plugin_abi") == "v7",
+            # Generated ownership and dispatch accounting prove the active
+            # backend's artifact served every edge region.
+            "receiver_owned_execution": (
+                evaluator.cuda_r1_ready
+                and evaluator.cuda_r1_fallback_count == 0
+                and evaluator.cuda_r1_launch_count > 0
+                if execution_space() == "Cuda"
+                else fields.get("host_plugin_abi") == "v7"
+            ),
             "all_edge_regions_generated": int(
                 fields.get("edge_generic_dispatches", "-1")
             )
@@ -812,11 +840,9 @@ def test_oam_direct_rejects_a_structurally_different_contract(
     tmp_path, precision, profile, variant
 ):
     native = _native()
-    from symmetrix.oam_jit_artifact import prepare_nequip_oam_receiver_host_artifact
-
     tmp_path.chmod(0o700)
-    artifact = prepare_nequip_oam_receiver_host_artifact(
-        OAM_MINIMAL, precision, cache_dir=tmp_path
+    artifact_arguments, backend = _oam_direct_artifact_arguments(
+        native, OAM_MINIMAL, precision, tmp_path
     )
     changed = json.loads(OAM_MINIMAL.read_text())
     changed["layers"][0]["edge_tensor_product"]["instructions"][0]["path_weight"] *= 2.0
@@ -829,9 +855,7 @@ def test_oam_direct_rejects_a_structurally_different_contract(
     admitted_context = oam_cuda_r1_timing.prepare_direct_evaluator(
         lambda context: evaluator_class(
             str(OAM_MINIMAL),
-            str(artifact.artifact_path),
-            host_active_target=artifact.active_host_target,
-            host_artifact_origin=artifact.artifact_origin,
+            **artifact_arguments,
             requested_profile=context["profile"],
             requested_edge_variant=context["variant"],
             requested_precision=context["precision"],
@@ -848,7 +872,7 @@ def test_oam_direct_rejects_a_structurally_different_contract(
         num_nodes, node_types, num_neigh, indices, neigh_types
     )
     oam_cuda_r1_timing.admit_direct_candidate(
-        admitted_context, profile, "host", precision
+        admitted_context, profile, backend, precision
     )
     context_report = admitted_context.execution_plan_report
     assert context_report["selected_id"] == expected_plan
@@ -858,14 +882,12 @@ def test_oam_direct_rejects_a_structurally_different_contract(
 
     with pytest.raises(
         ValueError,
-        match=rf"candidate={expected_plan}.*profile={profile}.*variant={variant}.*precision={precision}.*generated for a different architecture",
+        match=rf"candidate={expected_plan}.*profile={profile}.*variant={variant}.*precision={precision}.*(?:generated|published) for a different architecture",
     ) as error:
         oam_cuda_r1_timing.prepare_direct_evaluator(
             lambda context: getattr(native, class_name)(
                 str(changed_path),
-                str(artifact.artifact_path),
-                host_active_target=artifact.active_host_target,
-                host_artifact_origin=artifact.artifact_origin,
+                **artifact_arguments,
                 requested_profile=context["profile"],
                 requested_edge_variant=context["variant"],
                 requested_precision=context["precision"],
@@ -874,7 +896,11 @@ def test_oam_direct_rejects_a_structurally_different_contract(
             variant=variant,
             precision=precision,
         )
-    assert "manifest architecture fingerprint=" in str(error.value)
+    assert (
+        "manifest contract_fingerprint="
+        if backend == "cuda"
+        else "manifest architecture fingerprint="
+    ) in str(error.value)
     assert "model architecture fingerprint=" in str(error.value)
     assert (
         f"OAM native artifact rejection for requested candidate={expected_plan}, "

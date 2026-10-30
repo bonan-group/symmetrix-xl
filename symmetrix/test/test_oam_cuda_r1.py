@@ -451,12 +451,16 @@ def test_binary_identity_cannot_be_replaced_by_another_manifest(
 ):
     artifact = artifact_for(runtime, "float64", compiler)
     contract = json.loads(runtime[3].read_text())
-    contract["per_type_shift"]["values"][0] += 0.25
+    # Learned shifts share generated code; change a baked tensor-product
+    # coefficient so the other manifest describes a genuinely different binary.
+    instruction = contract["layers"][0]["edge_tensor_product"]["instructions"][0]
+    instruction["path_weight"] *= 2.0
     other = tmp_path / "other-oam.json"
     other.write_text(json.dumps(contract))
     published = prepare_nequip_oam_cuda_artifact(
         other, "float64", runtime[1], compiler=compiler, cache_root=runtime[2]
     )
+    assert artifact.artifact_id != published.artifact_id
     native = runtime[0]
     evaluator = native.NequIPOAMKokkos(
         str(other),
@@ -465,8 +469,13 @@ def test_binary_identity_cannot_be_replaced_by_another_manifest(
         cuda_artifact_identity={"manifest_path": str(published.manifest_path)},
     )
     assert not evaluator.cuda_r1_ready
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="(?:rejected|requires an admitted)"):
         evaluator.set_streamed_edges("direct")
+        values = graph()
+        generation = prepare(evaluator, values)
+        evaluate(evaluator, generation, values[-1])
+    assert not evaluator.cuda_r1_ready
+    assert evaluator.cuda_r1_launch_count == 0
 
 
 def test_later_self_connection_preserves_expanded_node_features(runtime, tmp_path):

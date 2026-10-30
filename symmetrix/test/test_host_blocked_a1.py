@@ -31,7 +31,7 @@ _EVALUATION = textwrap.dedent(
     import sys
 
     from ase.build import molecule
-    from symmetrix import Symmetrix
+    from symmetrix import Symmetrix, selected_backend
 
     atoms = molecule("H2O")
     atoms.cell = [8.0, 8.0, 8.0]
@@ -45,6 +45,7 @@ _EVALUATION = textwrap.dedent(
     )
     atoms.calc = calculator
     report = {
+        "backend": selected_backend()["backend"],
         "energy": float(atoms.get_potential_energy()),
         "forces": atoms.get_forces().tolist(),
         "stress": atoms.get_stress().tolist(),
@@ -70,6 +71,7 @@ def a1_model_path(generated_standard_mace_zbl_model):
 def _run_evaluation(model_path, overrides):
     environment = dict(os.environ)
     environment.update(overrides)
+    environment["SYMMETRIX_BACKEND"] = "cpu"
     completed = subprocess.run(
         [sys.executable, "-c", _EVALUATION, str(model_path)],
         capture_output=True,
@@ -78,7 +80,9 @@ def _run_evaluation(model_path, overrides):
         timeout=1800,
     )
     assert completed.returncode == 0, completed.stderr
-    return json.loads(completed.stdout.strip().splitlines()[-1])
+    report = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert report["backend"] == "cpu"
+    return report
 
 
 def test_host_blocked_a1_matches_per_node_and_records_launches(a1_model_path):

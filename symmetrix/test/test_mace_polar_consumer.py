@@ -49,11 +49,18 @@ def _consumer(native_module, model_path, dtype):
     return cls(str(model_path), "")
 
 
+def _artifact_target():
+    import symmetrix.symmetrix as native_module
+
+    execution_space = native_module._kokkos_default_execution_space()
+    return {"Cuda": "cuda", "HIP": "hip"}.get(execution_space, "host")
+
+
 def _load_consumer_artifacts(consumer, calculator):
     """Transfer the prepared family artifact and its bound product modules."""
 
     assert calculator.jit_artifact_path is not None
-    assert consumer.load_artifact(calculator.jit_artifact_path, "host")
+    assert consumer.load_artifact(calculator.jit_artifact_path, _artifact_target())
     products = {
         key: record
         for key, record in calculator.jit_operator_modules.items()
@@ -84,6 +91,120 @@ def test_native_consumer_exposes_only_narrow_family_controls(
     assert consumer.streamed_edges == "direct_streamed"
     assert consumer.diagnostics["transaction_count"] == 0
     assert consumer.diagnostics["graph_rebuild_count"] == 0
+
+
+def test_native_consumer_rejects_unknown_artifact_target_before_manifest(
+    polar_consumer_model, tmp_path
+):
+    import symmetrix.symmetrix as native_module
+
+    consumer = _consumer(native_module, polar_consumer_model, "float64")
+    with pytest.raises(ValueError, match="artifact target.*unsupported"):
+        consumer.load_artifact(str(tmp_path / "missing.bin"), "unknown")
+    assert consumer.diagnostics["transaction_count"] == 0
+
+
+def test_native_consumer_rejects_inactive_artifact_targets_before_manifest(
+    polar_consumer_model, tmp_path
+):
+    import symmetrix.symmetrix as native_module
+
+    for target in {"host", "cuda", "hip"} - {_artifact_target()}:
+        consumer = _consumer(native_module, polar_consumer_model, "float64")
+        with pytest.raises(ValueError, match="artifact target.*active backend"):
+            consumer.load_artifact(str(tmp_path / "missing.bin"), target)
+        assert consumer.diagnostics["transaction_count"] == 0
+
+
+def test_native_consumer_resolves_empty_target_and_rejects_mislabeled_artifact(
+    polar_consumer_model, tmp_path, monkeypatch
+):
+    import symmetrix.symmetrix as native_module
+
+    cache = tmp_path / "jit"
+    cache.mkdir(mode=0o700)
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(cache))
+    calculator = Symmetrix(
+        str(polar_consumer_model), dtype="float64", streamed_edges="direct"
+    )
+    assert calculator.jit_artifact_path is not None
+    consumer = _consumer(native_module, polar_consumer_model, "float64")
+    assert consumer.load_artifact(calculator.jit_artifact_path, "")
+    for target in {"host", "cuda", "hip"} - {_artifact_target()}:
+        with pytest.raises(ValueError, match="artifact target.*active backend"):
+            consumer.load_artifact(calculator.jit_artifact_path, target)
+    assert consumer.diagnostics["transaction_count"] == 0
+
+
+@pytest.mark.parametrize("wrapped", (False, True), ids=("direct", "nvrtc"))
+@pytest.mark.parametrize("plan", (None, [], "invalid", {}))
+def test_native_consumer_rejects_missing_or_malformed_device_launch_plan(
+    polar_consumer_model, tmp_path, wrapped, plan
+):
+    import symmetrix.symmetrix as native_module
+    from symmetrix.mace_nonlinear_jit_codegen import jit_mh1_cuda_plugin_v5_metadata
+    from symmetrix.mace_polar_execution_contract import (
+        make_execution_polar_mh1_v4_contract,
+    )
+
+    target = _artifact_target()
+    if target == "host":
+        pytest.skip("device manifest admission requires the CUDA or HIP backend")
+    model = json.loads(polar_consumer_model.read_text())
+    request = {
+        "contract": jit_mh1_cuda_plugin_v5_metadata(
+            make_execution_polar_mh1_v4_contract(model), 120
+        )
+    }
+    if plan is not None:
+        request["launch_plan"] = plan
+    build = {"request": request} if wrapped else request
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"key_inputs": {"build": build}})
+    )
+    consumer = _consumer(native_module, polar_consumer_model, "float64")
+    with pytest.raises(ValueError, match="device launch plan"):
+        consumer.load_artifact(str(tmp_path / "missing.cubin"), target)
+    assert consumer.diagnostics["transaction_count"] == 0
+
+
+@pytest.mark.parametrize("wrapped", (False, True), ids=("direct", "nvrtc"))
+@pytest.mark.parametrize("contract", (None, [], "invalid", {}))
+def test_native_consumer_rejects_missing_or_malformed_device_contract(
+    polar_consumer_model, tmp_path, wrapped, contract
+):
+    import symmetrix.symmetrix as native_module
+
+    target = _artifact_target()
+    if target == "host":
+        pytest.skip("device manifest admission requires the CUDA or HIP backend")
+    request = {"launch_plan": {"schema": "invalid"}}
+    if contract is not None:
+        request["contract"] = contract
+    build = {"request": request} if wrapped else request
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"key_inputs": {"build": build}})
+    )
+    consumer = _consumer(native_module, polar_consumer_model, "float64")
+    with pytest.raises(ValueError, match="node contract"):
+        consumer.load_artifact(str(tmp_path / "missing.cubin"), target)
+    assert consumer.diagnostics["transaction_count"] == 0
+
+
+def test_native_consumer_preserves_host_node_contract_tag_validation(
+    polar_consumer_model, tmp_path
+):
+    import symmetrix.symmetrix as native_module
+
+    if _artifact_target() != "host":
+        pytest.skip("host node-contract admission requires the CPU backend")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"key_inputs": {"build": {"contract": {"tag": "invalid"}}}})
+    )
+    consumer = _consumer(native_module, polar_consumer_model, "float64")
+    with pytest.raises(ValueError, match="node contract tag is unsupported"):
+        consumer.load_artifact(str(tmp_path / "missing.so"), "host")
+    assert consumer.diagnostics["transaction_count"] == 0
 
 
 def test_native_consumer_rejects_solver_before_graph_or_geometry(
@@ -515,7 +636,7 @@ builtins.__import__ = rejecting_import
 import symmetrix.symmetrix as native
 native._init_kokkos()
 consumer = native.MACEPolarConsumer(MODEL, "")
-assert consumer.load_artifact(ARTIFACT, "host")
+assert consumer.load_artifact(ARTIFACT, TARGET)
 for record in PRODUCTS:
     assert consumer.load_product_artifact(
         record["layer"], record["operator"], record["artifact_path"],
@@ -543,6 +664,7 @@ assert result["diagnostics"]["transaction_count"] == 1
 assert result["diagnostics"]["backbone_fallback_count"] == 0
 """.replace("MODEL", repr(str(polar_consumer_model)))
         .replace("ARTIFACT", repr(preparer.jit_artifact_path))
+        .replace("TARGET", repr(_artifact_target()))
         .replace(
             "PRODUCTS",
             repr(
