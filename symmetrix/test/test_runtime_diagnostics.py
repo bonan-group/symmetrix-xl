@@ -134,6 +134,57 @@ def test_matching_runtime_hash_passes(tmp_path):
     assert report["runtime"]["loaded_runtime_family"] == "libgomp"
 
 
+@pytest.mark.parametrize("strict", [True, False])
+@pytest.mark.parametrize(
+    "native_issue", ["runtime identity rejected", "multiple OpenMP runtimes"]
+)
+def test_native_preflight_rejection_cannot_be_hidden_by_matching_hash(
+    tmp_path, strict, native_issue
+):
+    runtime_path = tmp_path / "libgomp.so.1"
+    runtime_path.write_bytes(b"qualified-runtime")
+    runtime = _runtime(runtime_path, runtime_path)
+    runtime["expected_runtime_sha256"] = hashlib.sha256(
+        runtime_path.read_bytes()
+    ).hexdigest()
+    runtime["native_preflight_issues"] = [native_issue]
+
+    report = openmp_runtime_diagnostics(native_module=_native(runtime), strict=strict)
+
+    assert report["ok"] is False
+    assert report["status"] == "error"
+    check = next(
+        item for item in report["checks"] if item["name"] == "native_preflight"
+    )
+    assert check["status"] == "error"
+    assert native_issue in check["message"]
+
+
+@pytest.mark.parametrize("strict", [True, False])
+@pytest.mark.parametrize(
+    "native_issues,expected_ok",
+    [([], True), ((), True), (None, False), ("issue", False), ([42], False)],
+)
+def test_native_preflight_issue_report_is_validated(
+    tmp_path, strict, native_issues, expected_ok
+):
+    runtime_path = tmp_path / "libgomp.so.1"
+    runtime_path.write_bytes(b"qualified-runtime")
+    runtime = _runtime(runtime_path, runtime_path)
+    runtime["expected_runtime_sha256"] = hashlib.sha256(
+        runtime_path.read_bytes()
+    ).hexdigest()
+    runtime["native_preflight_issues"] = native_issues
+
+    report = openmp_runtime_diagnostics(native_module=_native(runtime), strict=strict)
+
+    assert report["ok"] is expected_ok
+    check = next(
+        item for item in report["checks"] if item["name"] == "native_preflight"
+    )
+    assert check["status"] == ("ok" if expected_ok else "error")
+
+
 @pytest.mark.parametrize(
     ("provider", "threading", "runtime_compatible", "selected", "expected_ok"),
     (

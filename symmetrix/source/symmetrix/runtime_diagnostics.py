@@ -125,6 +125,21 @@ def openmp_runtime_diagnostics(
         elif status == "warning" and report["status"] == "ok":
             report["status"] = "warning"
 
+    if "native_preflight_issues" in runtime:
+        native_issues = runtime["native_preflight_issues"]
+        if not isinstance(native_issues, (list, tuple)) or any(
+            not isinstance(issue, str) for issue in native_issues
+        ):
+            add_check(
+                "native_preflight", "error", "invalid native preflight issue report"
+            )
+        elif native_issues:
+            add_check("native_preflight", "error", "; ".join(native_issues))
+        else:
+            add_check(
+                "native_preflight", "ok", "native runtime admission checks passed"
+            )
+
     loaded_path = runtime.get("loaded_runtime_path")
     expected_path = runtime.get("expected_runtime_path")
     expected_hash = runtime.get("expected_runtime_sha256")

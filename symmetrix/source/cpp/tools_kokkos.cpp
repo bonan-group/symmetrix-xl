@@ -38,6 +38,7 @@
 #include "host_worker_blas.hpp"
 #include "neighbor_graph_kokkos.hpp"
 #include "openmp_build_metadata.hpp"
+#include "openmp_runtime_identity.hpp"
 #include "cblas.hpp"
 
 namespace py = pybind11;
@@ -53,39 +54,7 @@ std::string canonical_path(const std::string& path)
     return error ? path : canonical.string();
 }
 
-bool files_are_byte_identical(
-    const std::string& first_path, const std::string& second_path)
-{
-    if (first_path.empty() || second_path.empty())
-        return false;
-    if (first_path == second_path)
-        return true;
-    std::error_code error;
-    const auto first_size = std::filesystem::file_size(first_path, error);
-    if (error)
-        return false;
-    const auto second_size = std::filesystem::file_size(second_path, error);
-    if (error || first_size != second_size)
-        return false;
-    std::ifstream first(first_path, std::ios::binary);
-    std::ifstream second(second_path, std::ios::binary);
-    if (!first || !second)
-        return false;
-    constexpr std::size_t buffer_size = 64*1024;
-    std::vector<char> first_buffer(buffer_size);
-    std::vector<char> second_buffer(buffer_size);
-    while (first && second) {
-        first.read(first_buffer.data(), first_buffer.size());
-        second.read(second_buffer.data(), second_buffer.size());
-        const auto count = first.gcount();
-        if (count != second.gcount()
-                || !std::equal(
-                    first_buffer.begin(), first_buffer.begin()+count,
-                    second_buffer.begin()))
-            return false;
-    }
-    return first.eof() && second.eof();
-}
+
 
 struct OpenMPWorkerRecord {
     int thread_id = -1;
@@ -433,45 +402,9 @@ bool is_openmp_runtime(const std::string& path)
         || starts_with("vcomp");
 }
 
-bool is_auditwheel_copy_of_expected_runtime(const std::string& path)
-{
-    auto filename = std::filesystem::path(path).filename().string();
-    const auto so = filename.find(".so");
-    const auto dash = filename.rfind('-', so);
-    if (so == std::string::npos || dash == std::string::npos
-        || so-dash-1 != 8)
-        return false;
-    auto prefix = filename.substr(dash+1, 8);
-    std::transform(prefix.begin(), prefix.end(), prefix.begin(),
-        [] (const unsigned char value) { return std::tolower(value); });
-    if (!std::all_of(prefix.begin(), prefix.end(), [] (const unsigned char value) {
-            return std::isxdigit(value);
-        }))
-        return false;
-    auto expected_filename = std::filesystem::path(
-        symmetrix::build::expected_openmp_runtime_path).filename().string();
-    const auto expected_so = expected_filename.find(".so");
-    if (expected_so == std::string::npos)
-        return false;
-    auto loaded_stem = filename.substr(0, dash);
-    auto expected_stem = expected_filename.substr(0, expected_so);
-    std::transform(loaded_stem.begin(), loaded_stem.end(), loaded_stem.begin(),
-        [] (const unsigned char value) { return std::tolower(value); });
-    std::transform(expected_stem.begin(), expected_stem.end(), expected_stem.begin(),
-        [] (const unsigned char value) { return std::tolower(value); });
-    if (loaded_stem != expected_stem)
-        return false;
-    std::string expected_hash =
-        symmetrix::build::expected_openmp_runtime_sha256;
-    std::transform(expected_hash.begin(), expected_hash.end(), expected_hash.begin(),
-        [] (const unsigned char value) { return std::tolower(value); });
-    return expected_hash.rfind(prefix, 0) == 0;
-}
 
-struct OpenMPRuntimeSnapshot {
-    std::string loaded_runtime_path;
-    std::vector<std::string> loaded_openmp_libraries;
-};
+
+using symmetrix::runtime::OpenMPRuntimeSnapshot;
 
 #if defined(__linux__)
 int collect_openmp_library(
@@ -510,24 +443,10 @@ OpenMPRuntimeSnapshot openmp_runtime_snapshot()
 std::vector<std::string> native_openmp_runtime_issues(
     const OpenMPRuntimeSnapshot& snapshot)
 {
-    std::vector<std::string> issues;
-    if (!symmetrix::build::openmp_enabled)
-        return issues;
-    const std::string expected = canonical_path(
-        symmetrix::build::expected_openmp_runtime_path);
-    if (snapshot.loaded_runtime_path.empty())
-        issues.emplace_back("the loaded OpenMP runtime symbol owner is unavailable");
-    else if (!expected.empty()
-            && !files_are_byte_identical(snapshot.loaded_runtime_path, expected)
-            && !is_auditwheel_copy_of_expected_runtime(
-                snapshot.loaded_runtime_path))
-        issues.emplace_back(
-            "loaded OpenMP runtime '"+snapshot.loaded_runtime_path
-            +"' is not byte-identical to build runtime '"+expected+"'");
-    if (snapshot.loaded_openmp_libraries.size() > 1)
-        issues.emplace_back(
-            "multiple OpenMP runtimes are loaded in the process");
-    return issues;
+    return symmetrix::runtime::openmp_runtime_issues(
+        snapshot, symmetrix::build::openmp_enabled,
+        canonical_path(symmetrix::build::expected_openmp_runtime_path),
+        symmetrix::build::expected_openmp_runtime_sha256);
 }
 
 void preflight_openmp_runtime()
