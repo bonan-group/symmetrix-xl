@@ -49,6 +49,7 @@
 #include "kernel_launch_profile.hpp"
 #include "mace_standard_m0.hpp"
 #include "mace_standard_m1.hpp"
+#include "mace_m1_dispatch.hpp"
 #include "mace_standard_r0.hpp"
 #include "jit_generation_version.hpp"
 #include "factorized_blas.hpp"
@@ -4998,14 +4999,27 @@ std::string MACEKokkos<Precision>::dispatched_implementation_id(
         return "generated_m0";
     }
     if (capability_key == "m1") {
-        if (selected_m1_implementation == M1Implementation::device_module
-            || selected_m1_implementation == M1Implementation::host_plugin)
-            return "generated_m1";
-        if (selected_m1_implementation == M1Implementation::builtin)
-            return "builtin_m1";
-        if (admits_m1_device_terms())
-            return "device_m1_terms";
-        return "generic_m1";
+        constexpr bool host_execution = std::is_same_v<
+            typename Kokkos::DefaultExecutionSpace::memory_space,
+            Kokkos::HostSpace>;
+        int host_tile = 0;
+        if constexpr (host_execution)
+            host_tile = symmetrix::standard_m1::host_channel_tile();
+        bool metal_forward_available = false;
+#ifdef SYMMETRIX_ENABLE_METAL
+        if constexpr (std::is_same_v<Precision,float>)
+            metal_forward_available = !single_layer_readout && metal_m1_module
+                && A1.span_is_contiguous() && M1.span_is_contiguous()
+                && M1_weights.span_is_contiguous();
+#endif
+        return symmetrix::execution::m1_dispatched_implementation_id(
+            selected_m1_implementation == M1Implementation::device_module
+                || selected_m1_implementation == M1Implementation::host_plugin,
+            m1_polynomial_policy == M1PolynomialPolicy::recompute,
+            admits_m1_device_terms(),
+            symmetrix::execution::m1_standard_forward_available(
+                standard_m1_module_ready, host_execution, host_tile,
+                metal_forward_available));
     }
     // The generated R1 nodes run only through the direct JIT profile; without
     // it the portable tier serves them, including the CUDA-scoped variants the

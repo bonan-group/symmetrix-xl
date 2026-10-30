@@ -1,6 +1,7 @@
 import copy
 import gc
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +50,17 @@ def _kokkos_execution_space():
 
 def _execution_fixed_weight_backend_supported():
     return _kokkos_execution_space() in _EXECUTION_FIXED_WEIGHT_EXECUTION_SPACES
+
+
+def _second_interaction_m1_binding(evaluator, diagnostics=None):
+    bindings = [
+        binding
+        for binding in evaluator.family_binding_report["bindings"]
+        if binding["capability_key"] == "m1"
+        and binding["operator_id"] == "mh0.interaction1.m1"
+    ]
+    assert len(bindings) == 1, {"bindings": bindings, "diagnostics": diagnostics}
+    return bindings[0]
 
 
 def _require_execution_fixed_weight_backend():
@@ -2860,12 +2872,42 @@ def test_m1_recompute_matches_retained_and_releases_polynomial_storage(
         evaluator._set_m1_polynomial_policy("retained")
         evaluator._set_m1_recompute_tile_channels(tile_channels)
         evaluator._set_m1_polynomial_policy(policy)
+        assert evaluator.m1_polynomial_policy == policy
+        assert not evaluator.m1_host_plugin_ready
+        assert not evaluator.m1_device_module_ready
+        assert not evaluator._metal_m1_module_ready()
+        assert "M1" not in calculator.jit_operator_modules
+        standard_forward_available = evaluator.standard_m1_module_ready and (
+            _kokkos_execution_space() not in ("OpenMP", "Serial")
+            or os.environ.get("SYMMETRIX_STANDARD_M1_HOST_TILE") != "runtime"
+        )
+        expected_m1_binding = "generic_m1"
+        if policy == "recompute":
+            expected_m1_binding = (
+                "device_m1_terms"
+                if evaluator.admits_m1_device_terms
+                else "builtin_m1"
+                if standard_forward_available
+                else "generic_m1"
+            )
+        assert (
+            _second_interaction_m1_binding(evaluator)["selected_implementation_id"]
+            == expected_m1_binding
+        )
         launch_counts = (
             evaluator.m1_recompute_forward_launch_count,
             evaluator.m1_recompute_reverse_launch_count,
         )
         evaluator.compute_node_energies_forces(*native_args)
         results = calculator._collect_mace_results(atoms, inputs)
+        assert evaluator.m1_polynomial_policy == policy
+        assert not evaluator.m1_host_plugin_ready
+        assert not evaluator.m1_device_module_ready
+        assert not evaluator._metal_m1_module_ready()
+        assert (
+            _second_interaction_m1_binding(evaluator)["selected_implementation_id"]
+            == expected_m1_binding
+        )
         return {
             "energy": results["energy"],
             "energies": np.array(results["energies"], copy=True),
@@ -4434,7 +4476,10 @@ def test_execution_standard_m0_prepared_steady_state_counters(
 
     repeated = [evaluate() for _ in range(3)]
     after = {name: int(getattr(evaluator, name)) for name in counter_names}
-    reverse_launches_per_evaluation = 1 if _kokkos_execution_space() == "Cuda" else 2
+    # Device R1 reverse is fused; hosts launch source and edge reverse separately.
+    reverse_launches_per_evaluation = (
+        1 if _kokkos_execution_space() in ("Cuda", "HIP") else 2
+    )
     expected_deltas = {
         "standard_m0_module_forward_launch_count": 3,
         "standard_m0_module_reverse_launch_count": 3,
@@ -4913,7 +4958,7 @@ def test_factorized_source_schedule_reuses_and_rebuilds_with_topology(
     assert evaluator.factorized_arena_allocation_count == initial_arena_allocations
 
 
-def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
+def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths, request):
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
@@ -4932,6 +4977,119 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
     )
     evaluator._set_standard_r0_executor(expected_r0_executor)
     inputs = calculator._mace_inputs(atoms)
+
+    model = json.loads(standard_path.read_text())
+    hidden_degrees = model["l_max"] + 1
+    counter_names = (
+        "factorized_graph_generation",
+        "factorized_prepared_graph_count",
+        "factorized_prepared_evaluation_count",
+        "factorized_fallback_evaluation_count",
+        "factorized_schedule_build_count",
+        "factorized_topology_validation_count",
+        "factorized_topology_validation_skip_count",
+        "factorized_preparation_fence_count",
+        "factorized_evaluation_fence_count",
+        "factorized_workspace_bytes",
+        "factorized_arena_allocation_count",
+        "execution_geometry_allocation_count",
+        "execution_geometry_capacity_edges",
+        "execution_geometry_workspace_bytes",
+        "execution_geometry_copy_count",
+        "execution_sphericart_initialization_count",
+        "execution_sphericart_launch_count",
+        "execution_sphericart_async_launch_count",
+        "standard_r0_module_launch_count",
+        "standard_r0_workspace_bytes",
+        "factorized_jit_launch_count",
+        "factorized_jit_forward_launch_count",
+        "factorized_jit_reverse_launch_count",
+        "execution_phi1r_active_bytes",
+        "execution_phi1r_capacity_bytes",
+        "execution_dphi1r_active_bytes",
+        "execution_dphi1r_capacity_bytes",
+        "standard_m1_module_forward_launch_count",
+        "standard_m1_module_reverse_launch_count",
+        "generated_m1_module_forward_launch_count",
+        "generated_m1_module_reverse_launch_count",
+        "m1_recompute_forward_launch_count",
+        "m1_recompute_reverse_launch_count",
+        "m1_device_terms_launch_count",
+        "m1_poly_values_active_bytes",
+        "m1_poly_values_capacity_bytes",
+        "m1_poly_adjoints_active_bytes",
+        "m1_poly_adjoints_capacity_bytes",
+        "device_h2_stage_launch_count",
+        "batched_a1_blas_launch_count",
+        "factorized_custom_blas_launch_count",
+        "factorized_blas_stream_bind_count",
+    )
+
+    def capture_snapshot(phase):
+        snapshot = {
+            "phase": phase,
+            "bindings": evaluator.family_binding_report["bindings"],
+            "profile": calculator.execution_profile,
+            "prepared_profile": evaluator.factorized_execution_profile,
+            "prepared_strategy": evaluator.factorized_execution_strategy,
+            "m1_policy": evaluator.m1_polynomial_policy,
+            "m1_policy_request": evaluator.m1_polynomial_policy_request,
+            "mh0_state_policy": evaluator.mh0_state_policy,
+            "admits_m1_device_terms": evaluator.admits_m1_device_terms,
+            "standard_m1_ready": evaluator.standard_m1_module_ready,
+            "m1_host_owner": evaluator.m1_host_plugin_ready,
+            "m1_device_owner": evaluator.m1_device_module_ready,
+            "m1_metal_owner": evaluator._metal_m1_module_ready(),
+            "device_environment": evaluator.execution_device_execution_environment,
+            "a1_policy_alias": os.environ.get("SYMMETRIX_A1_CUBLAS"),
+            "m1_host_tile_alias": os.environ.get("SYMMETRIX_STANDARD_M1_HOST_TILE"),
+            "counters": {name: int(getattr(evaluator, name)) for name in counter_names},
+        }
+        # Retain every observed counter even if an earlier route assertion fails.
+        request.node.user_properties.append(
+            (f"prepared_route_{phase}", json.dumps(snapshot))
+        )
+        return snapshot
+
+    baseline = capture_snapshot("before")
+    # The legacy spelling requests speed, not capacity artifacts. CUDA's
+    # recompute forward uses device terms; reverse uses the ready standard M1.
+    assert calculator.execution_profile == "speed", baseline
+    assert not calculator.low_memory_request, baseline
+    assert "M1" not in calculator.jit_operator_modules, baseline
+    assert len(model["M1_monomials"]) == 94, baseline
+    cuda_terms = _kokkos_execution_space() == "Cuda"
+    if _kokkos_execution_space() in ("OpenMP", "Serial"):
+        assert os.environ.get("SYMMETRIX_STANDARD_M1_HOST_TILE") != "runtime", baseline
+
+    def assert_m1_binding(diagnostics):
+        assert evaluator.m1_polynomial_policy == "recompute", diagnostics
+        assert evaluator.standard_m1_module_ready, diagnostics
+        assert not evaluator.m1_host_plugin_ready, diagnostics
+        assert not evaluator.m1_device_module_ready, diagnostics
+        assert not evaluator._metal_m1_module_ready(), diagnostics
+        assert evaluator.admits_m1_device_terms is cuda_terms, diagnostics
+        binding = _second_interaction_m1_binding(evaluator, diagnostics)
+        assert binding["selected_implementation_id"] == (
+            "device_m1_terms" if cuda_terms else "builtin_m1"
+        ), diagnostics
+
+    expected_owned_blas_launches = 0
+    if _execution_fixed_weight_backend_supported():
+        assert_m1_binding(baseline)
+        if _kokkos_execution_space() == "Cuda":
+            expected_owned_blas_launches = 2 * 2 * hidden_degrees
+        elif _kokkos_execution_space() == "HIP":
+            environment = evaluator.execution_device_execution_environment
+            assert environment["backend"] == "hip"
+            assert environment["available"]
+            # Match the native compatibility alias exactly: no strip/lower.
+            a1_policy = os.environ.get("SYMMETRIX_A1_CUBLAS", "")
+            a1_blas_enabled = a1_policy in ("", "1", "true", "on")
+            # Below the flatten threshold, each direction launches once per l.
+            assert len(atoms) < 512
+            if environment["batched_blas_available"] and a1_blas_enabled:
+                expected_owned_blas_launches = 2 * 2 * hidden_degrees
 
     token = evaluator._prepare_factorized_graph(*inputs[:5])
     assert token > 0
@@ -4952,7 +5110,10 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
     evaluator._compute_prepared_factorized(
         token, np.asarray(inputs[5]).flatten(), inputs[6]
     )
+    first_snapshot = capture_snapshot("after_first")
     reference = calculator._collect_mace_results(atoms, inputs)
+    if _execution_fixed_weight_backend_supported():
+        assert_m1_binding(first_snapshot)
     assert evaluator.factorized_prepared_evaluation_count == 1
     assert evaluator.factorized_fallback_evaluation_count == 0
     assert evaluator.factorized_topology_validation_count == 0
@@ -4975,6 +5136,7 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
         np.asarray(perturbed_inputs[5]).flatten(),
         perturbed_inputs[6],
     )
+    second_snapshot = capture_snapshot("after_second")
     perturbed = calculator._collect_mace_results(perturbed_atoms, perturbed_inputs)
     assert np.isfinite(reference["energy"])
     assert np.isfinite(perturbed["energy"])
@@ -5014,8 +5176,9 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
         )
         assert evaluator.factorized_execution_profile == "direct_fixed_weight"
         assert evaluator.factorized_execution_strategy == "direct_jit_reverse"
+        # Device R1 reverse is fused; hosts launch source and edge separately.
         reverse_launches_per_evaluation = (
-            1 if _kokkos_execution_space() == "Cuda" else 2
+            1 if _kokkos_execution_space() in ("Cuda", "HIP") else 2
         )
         assert evaluator.factorized_jit_launch_count == (
             2 + 2 * reverse_launches_per_evaluation
@@ -5031,34 +5194,36 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
         # These counters belong to the CUDA A1 strided-batched BLAS route.
         # Host/HIP execution does not enter that CUDA-specific branch.
         # Preserve its two-evaluation pin: both directions, per hidden degree.
-        hidden_degrees = json.loads(standard_path.read_text())["l_max"] + 1
         assert evaluator.batched_a1_blas_launch_count == (
             2 * hidden_degrees * 2 if _kokkos_execution_space() == "Cuda" else 0
         )
-        if _kokkos_execution_space() in ("OpenMP", "Serial"):
-            # This host profile binds the prebuilt standard M1 module. Check
-            # its actual work, rather than requiring an unrequested JIT owner.
-            assert evaluator.standard_m1_module_ready
-            assert not evaluator.m1_host_plugin_ready
-            assert evaluator.standard_m1_module_forward_launch_count == 2
-            assert evaluator.standard_m1_module_reverse_launch_count == 2
-            assert evaluator.generated_m1_module_forward_launch_count == 0
-            assert evaluator.generated_m1_module_reverse_launch_count == 0
-        else:
-            assert evaluator.generated_m1_module_forward_launch_count == 2
-            assert evaluator.generated_m1_module_reverse_launch_count == 2
-        assert evaluator.m1_device_terms_launch_count == 0
+        assert_m1_binding(second_snapshot)
+        assert evaluator.standard_m1_module_forward_launch_count == (
+            0 if cuda_terms else 2
+        ), second_snapshot
+        assert evaluator.standard_m1_module_reverse_launch_count == 2, second_snapshot
+        assert evaluator.generated_m1_module_forward_launch_count == 0, second_snapshot
+        assert evaluator.generated_m1_module_reverse_launch_count == 0, second_snapshot
+        assert evaluator.m1_device_terms_launch_count == (
+            2 if cuda_terms else 0
+        ), second_snapshot
+        assert evaluator.m1_recompute_forward_launch_count == 2, second_snapshot
+        assert evaluator.m1_recompute_reverse_launch_count == 2, second_snapshot
+        assert evaluator.m1_poly_values_capacity_bytes == 0, second_snapshot
+        assert evaluator.m1_poly_adjoints_capacity_bytes == 0, second_snapshot
         # The H2 forward and reverse each bind a CUDA-scoped fused kernel: two
         # launches per evaluation on the device, none on the host.
         assert evaluator.device_h2_stage_launch_count == (
             4 if _kokkos_execution_space() == "Cuda" else 0
-        )
-        assert evaluator.factorized_custom_blas_launch_count == (
-            evaluator.batched_a1_blas_launch_count
-        )
+        ), second_snapshot
+        # The owned context counts HIP rocBLAS too; batched_a1 is CUDA-only.
+        assert (
+            evaluator.factorized_custom_blas_launch_count
+            == expected_owned_blas_launches
+        ), second_snapshot
         assert evaluator.factorized_blas_stream_bind_count == (
-            1 if evaluator.batched_a1_blas_launch_count else 0
-        )
+            1 if expected_owned_blas_launches else 0
+        ), second_snapshot
 
     evaluator._set_factorized_planner_budget_bytes(evaluator.factorized_workspace_bytes)
     assert evaluator.factorized_graph_generation == 0

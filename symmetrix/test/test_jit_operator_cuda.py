@@ -886,7 +886,21 @@ def test_cuda_low_memory_runtime_specializes_custom_m0_r0(
     assert evaluator.standard_m0_poly_values_capacity_bytes == 0
     assert evaluator.standard_m0_poly_adjoints_capacity_bytes == 0
 
+    def assert_generated_m1_binding():
+        bindings = [
+            binding
+            for binding in evaluator.family_binding_report["bindings"]
+            if binding["capability_key"] == "m1"
+            and binding["operator_id"] == "mh0.interaction1.m1"
+        ]
+        assert len(bindings) == 1, bindings
+        assert bindings[0]["selected_implementation_id"] == "generated_m1"
+        assert evaluator.m1_device_module_ready
+        assert not evaluator.m1_host_plugin_ready
+
+    assert_generated_m1_binding()
     actual = _evaluate(compact, atoms)
+    assert_generated_m1_binding()
     tolerance = 8e-5 if dtype == "float32" else 8e-11
     assert actual["energy"] == pytest.approx(expected["energy"], rel=0.0, abs=tolerance)
     for name in ("energies", "forces", "stress"):
@@ -912,6 +926,7 @@ def test_cuda_low_memory_runtime_specializes_custom_m0_r0(
         assert first_addresses[4] != first_addresses[5]
 
     repeated = _evaluate(compact, atoms)
+    assert_generated_m1_binding()
     assert repeated["energy"] == pytest.approx(
         expected["energy"], rel=0.0, abs=tolerance
     )
@@ -928,7 +943,9 @@ def test_cuda_low_memory_runtime_specializes_custom_m0_r0(
 
     for policy in ("full-retention-v1", "reuse-adjoints-v1"):
         evaluator._set_mh0_state_policy(policy)
+        assert_generated_m1_binding()
         transitioned = _evaluate(compact, atoms)
+        assert_generated_m1_binding()
         for name in ("energies", "forces", "stress"):
             np.testing.assert_allclose(
                 transitioned[name], expected[name], rtol=0.0, atol=tolerance
