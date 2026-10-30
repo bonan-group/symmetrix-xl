@@ -1691,6 +1691,11 @@ template <typename Precision>
 void MACECPU<Precision>::compute_H1(
     const int num_nodes)
 {
+    if (has_field_coupling)
+        throw std::invalid_argument(
+            "compute_H1 is the field-free H1 entry; a MACEField model is evaluated "
+            "by compute_H1_product, the field coupling (compute_field_H1) and "
+            "compute_H1_linear_up, as in compute_node_energies_forces_field.");
     // Scalar input of the format-4 maps, retained before H1 is formed.
     capture_h1_affine_scalar(num_nodes);
     H1.resize(M0.size());

@@ -851,6 +851,50 @@ def test_field_zero_field_matches_field_free_model(field_models, use_kokkos):
 
 
 @pytest.mark.parametrize("use_kokkos", [False, True])
+def test_field_free_h1_entry_refuses_field_model(field_models, use_kokkos):
+    """compute_H1 (and so the field-free whole evaluator) forms H1 = M0 U without
+    the field coupling and in the wrong basis for the pre_linear_up maps; a
+    MACEField model must take compute_H1_product -> field -> compute_H1_linear_up."""
+    nc = _native()
+    import symmetrix as native
+
+    if use_kokkos:
+        if not native._kokkos_is_initialized():
+            native._init_kokkos()
+        cls = native.MACEKokkos
+    else:
+        cls = nc.MACE
+    plain_path, field_path = field_models
+    data = json.loads(Path(field_path).read_text())
+    K, LM = data["num_channels"], (data["L_max"] + 1) ** 2
+    atoms = _variant_atoms()
+    graph = _cluster_graph(atoms, data["r_cut"], data["atomic_numbers"])
+    n = len(atoms)
+    rng = np.random.default_rng(41)
+    for path, refuses in ((field_path, True), (plain_path, False)):
+        evaluator = cls(str(path), "")
+        try:
+            evaluator.M0 = rng.normal(size=n * LM * K)
+            if refuses:
+                with pytest.raises(ValueError, match="compute_H1_product"):
+                    evaluator.compute_H1(n)
+            else:
+                evaluator.compute_H1(n)
+            evaluator.set_streamed_edges("materialized")
+            args = (n, graph["node_types"], graph["num_neigh"], graph["j"],
+                    graph["neigh_types"], graph["xyz"], graph["r"])
+            if refuses:
+                with pytest.raises(ValueError, match="compute_H1_product"):
+                    evaluator.compute_node_energies_forces(*args)
+            else:
+                evaluator.compute_node_energies_forces(*args)
+                assert np.isfinite(np.sum(evaluator.node_energies))
+        finally:
+            del evaluator
+            gc.collect()
+
+
+@pytest.mark.parametrize("use_kokkos", [False, True])
 def test_field_derivatives_match_finite_differences(field_models, use_kokkos):
     """With a field: forces = -dE/dx, polarization = -dE/dE_field / V,
     polarizability = d(polarization)/dE_field / eps0 and BECs = dF/dE_field."""

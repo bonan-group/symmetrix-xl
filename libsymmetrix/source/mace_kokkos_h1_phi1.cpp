@@ -362,6 +362,11 @@ template <typename Precision>
 void MACEKokkos<Precision>::compute_H1(
     const int num_nodes)
 {
+    if (has_field_coupling)
+        throw std::invalid_argument(
+            "compute_H1 is the field-free H1 entry; a MACEField model is evaluated "
+            "by compute_H1_product, the field coupling (compute_field_H1) and "
+            "compute_H1_linear_up, as in compute_node_energies_forces_field.");
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
     if (H1.extent(0) < M0.extent(0))
