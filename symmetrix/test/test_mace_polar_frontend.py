@@ -4729,29 +4729,163 @@ def test_fp32_chain_long_range_adjoint_matches_a_difference_and_round_trips_tabl
 def test_resident_composed_chain_reverse_matches_fresh_finite_differences(
     polar_model_path, dtype, reverse_strategy
 ):
-    """Decompose the resident reverse independently of the backbone reverse."""
+    """Check VJPs against FP64 differences and FP32 same-state composition.
+
+    Both precisions represent the same JSON model to dtype rounding, not the
+    same bitwise function. Differentiate the high-precision physical objective
+    rather than the FP32 energy's quantization staircase. The numerical reference
+    uses the existing FP64 step, including when validating an FP32 VJP.
+    Learned-state accuracy has separate dtype-specific frozen-oracle gates;
+    this synthetic input does not impose universal cross-precision energy parity.
+    """
 
     evaluator = _polar_calculator(polar_model_path, dtype=dtype).evaluator
     _select_realspace_reverse_strategy(evaluator, reverse_strategy)
+    assert evaluator.polar_delta_shapes()["long_range_scalar_bits"] == (
+        32 if dtype == "float32" else 64
+    )
     inputs = _synthetic_chain_inputs(evaluator)
     analytic = evaluator.polar_delta_composed_forward(
         **inputs, compute_reverse=True, polar_electrostatics="realspace"
     )
-    step = 2.5e-3 if dtype == "float32" else 1e-5
+    step = 1e-5
     tolerance = 3e-3 if dtype == "float32" else 2e-5
 
-    def fresh_energy(changed):
-        fresh = _polar_calculator(polar_model_path, dtype=dtype).evaluator
-        _select_realspace_reverse_strategy(fresh, reverse_strategy)
-        return float(
-            np.sum(
-                fresh.polar_delta_composed_forward(
-                    **changed,
-                    compute_reverse=False,
-                    polar_electrostatics="realspace",
-                )["energy"]
+    energy_components = (
+        "energy",
+        "local_electron_energy",
+        "electrostatic_energy_kspace",
+        "electrostatic_energy_correction",
+        "external_field_energy",
+    )
+
+    def assert_execution(selected, *, reverse):
+        workspace = selected.polar_delta_workspace()
+        assert workspace["resolved_solver"] == "realspace"
+        assert workspace["realspace_reverse_strategy"] == reverse_strategy
+        if reverse:
+            assert workspace["realspace_reverse_strategy_resolved"] == reverse_strategy
+
+    assert_execution(evaluator, reverse=True)
+
+    def assert_same_state_forward(selected, actual, changed):
+        # This is a separate same-point chain forward, not a retained tap of
+        # the earlier composition. Reconstruct its exact resident FLOAT spin sum:
+        # public charge_density instead adds the promoted channels in DOUBLE.
+        assert selected.polar_delta_shapes()["long_range_scalar_bits"] == 32
+        state = selected.polar_delta_chain(**changed, polar_electrostatics="realspace")
+        assert_execution(selected, reverse=False)
+        spin = np.asarray(state["spin_charge_density"])
+        np.testing.assert_array_equal(spin, spin.astype(np.float32).astype(np.float64))
+        width = int(selected.polar_delta_shapes()["density_width"])
+        density = np.ascontiguousarray(
+            np.add(
+                spin[:, :width].astype(np.float32),
+                spin[:, width:].astype(np.float32),
+                dtype=np.float32,
+            ),
+            dtype=np.float64,
+        )
+        contract = dict(selected.polar_long_range_contract)
+        ops = symmetrix.PolarLongRangeOps(
+            kspace_cutoff=float(contract["kspace_cutoff"]),
+            density_max_l=int(contract["density_max_l"]),
+            density_smearing_width=float(contract["density_smearing_width"]),
+            feature_max_l=int(contract["feature_max_l"]),
+            feature_smearing_widths=list(contract["feature_smearing_widths"]),
+        )
+        cache = ops.realspace_geometry_cache(
+            changed["positions"], changed["cell"], changed["node_graph_index"]
+        )
+        assert cache.mode == "realspace"
+        assert cache.reciprocal_allocation_elements == 0
+        assert not np.asarray(changed["graph_pbc"]).any()
+        electrostatic = np.asarray(
+            ops.realspace_energy(
+                cache, density, bool(contract["include_electrostatic_self_interaction"])
             )
         )
+        graphs = len(changed["total_charge"])
+        local = np.bincount(
+            changed["node_graph_index"],
+            weights=np.asarray(state["local_electron_energy"]).reshape(-1),
+            minlength=graphs,
+        )
+        dipole = np.asarray(
+            ops.dipole_readout(
+                density, changed["positions"], changed["node_graph_index"]
+            )["total_dipole"]
+        )
+        field = np.sum(changed["external_potential"][:, 1:] * dipole, axis=1)
+        expected = {
+            "energy": local + electrostatic + field,
+            "local_electron_energy": local,
+            "electrostatic_energy_kspace": electrostatic,
+            "electrostatic_energy_correction": np.zeros(graphs),
+            "external_field_energy": field,
+        }
+        # New same-state FP32/FP64 real-space boundary extension, not a
+        # cross-precision learned-state bound or a reciprocal-kernel proof.
+        for name in energy_components:
+            value = np.asarray(actual[name])
+            assert value.shape == (graphs, 1), name
+            assert np.isfinite(value).all(), name
+            assert expected[name].shape == (graphs,), name
+            assert np.isfinite(expected[name]).all(), name
+            np.testing.assert_allclose(
+                value.reshape(-1), expected[name], rtol=0.0, atol=2e-5, err_msg=name
+            )
+        np.testing.assert_array_equal(
+            actual["energy"],
+            np.asarray(actual["local_electron_energy"])
+            + actual["electrostatic_energy_kspace"]
+            + actual["electrostatic_energy_correction"]
+            + actual["external_field_energy"],
+        )
+
+    reference_evaluator = evaluator
+    reference_analytic = analytic
+    if dtype == "float32":
+        reference_evaluator = _polar_calculator(
+            polar_model_path, dtype="float64"
+        ).evaluator
+        _select_realspace_reverse_strategy(reference_evaluator, reverse_strategy)
+        assert reference_evaluator.polar_delta_shapes()["long_range_scalar_bits"] == 64
+        reference_inputs = _synthetic_chain_inputs(reference_evaluator)
+        assert set(reference_inputs) == set(inputs)
+        for name in inputs:
+            assert (
+                np.asarray(reference_inputs[name]).dtype
+                == np.asarray(inputs[name]).dtype
+            )
+            np.testing.assert_array_equal(reference_inputs[name], inputs[name])
+        reference_analytic = reference_evaluator.polar_delta_composed_forward(
+            **inputs, compute_reverse=True, polar_electrostatics="realspace"
+        )
+        assert_execution(reference_evaluator, reverse=True)
+        assert_same_state_forward(evaluator, analytic, inputs)
+
+    def fresh_energy(changed):
+        fresh = paired = None
+        try:
+            fresh = _polar_calculator(polar_model_path, dtype="float64").evaluator
+            _select_realspace_reverse_strategy(fresh, reverse_strategy)
+            assert fresh.polar_delta_shapes()["long_range_scalar_bits"] == 64
+            result = fresh.polar_delta_composed_forward(
+                **changed, compute_reverse=False, polar_electrostatics="realspace"
+            )
+            assert_execution(fresh, reverse=False)
+            if dtype == "float32":
+                paired = _polar_calculator(polar_model_path, dtype="float32").evaluator
+                _select_realspace_reverse_strategy(paired, reverse_strategy)
+                paired_result = paired.polar_delta_composed_forward(
+                    **changed, compute_reverse=False, polar_electrostatics="realspace"
+                )
+                assert_execution(paired, reverse=False)
+                assert_same_state_forward(paired, paired_result, changed)
+            return float(np.sum(result["energy"]))
+        finally:
+            fresh = paired = None
 
     probes = (
         ("node_features", (0, 0), "node_features_adjoint", (0, 0)),
@@ -4768,6 +4902,15 @@ def test_resident_composed_chain_reverse_matches_fresh_finite_differences(
             fresh_energy({**inputs, input_name: plus})
             - fresh_energy({**inputs, input_name: minus})
         ) / (2.0 * step)
+        reference_value = float(
+            np.asarray(reference_analytic[output_name])[output_index]
+        )
+        assert reference_value == pytest.approx(numeric, abs=2e-5, rel=2e-5), (
+            "float64_reference",
+            input_name,
+            reference_value,
+            numeric,
+        )
         value = float(np.asarray(analytic[output_name])[output_index])
         assert value == pytest.approx(numeric, abs=tolerance, rel=tolerance), (
             dtype,
@@ -4794,12 +4937,15 @@ def test_resident_composed_chain_reverse_matches_fresh_finite_differences(
         2.0 * step
     )
     volume = abs(float(np.linalg.det(inputs["cell"][0])))
+    reference_strain = float(np.asarray(reference_analytic["stress"])[0, 1]) * volume
+    assert reference_strain == pytest.approx(numeric_strain, abs=2e-5, rel=2e-5)
     analytic_strain = float(np.asarray(analytic["stress"])[0, 1]) * volume
     assert analytic_strain == pytest.approx(
         numeric_strain, abs=tolerance, rel=tolerance
     )
     if reverse_strategy == "pair_atomic":
         _assert_pair_atomic_was_used(evaluator)
+        _assert_pair_atomic_was_used(reference_evaluator)
 
 
 def test_both_precisions_serve_the_family(polar_model_path):
