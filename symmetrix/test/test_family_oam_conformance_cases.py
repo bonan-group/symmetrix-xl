@@ -53,7 +53,21 @@ OAM_HOST_ADAPTER = oam_jit_artifact
 OAM_HOST_PREPARER = "prepare_nequip_oam_receiver_host_artifact"
 
 
+def _require_oam_runtime_backend(native):
+    query = getattr(native, "_execution_device_execution_environment", None)
+    environment = query() if callable(query) else {}
+    if isinstance(environment, dict) and (
+        str(environment.get("backend", "")).lower() == "hip"
+        or "hip" in str(environment.get("execution_space", "")).lower()
+    ):
+        pytest.skip(
+            "OAM runtime conformance requires host or CUDA; "
+            "HIP execution is intentionally unsupported"
+        )
+
+
 def _oam_direct_artifact_arguments(native, path, precision, cache):
+    _require_oam_runtime_backend(native)
     if native._kokkos_default_execution_space() == "Cuda":
         from symmetrix.oam_cuda_artifact import prepare_nequip_oam_cuda_artifact
 
@@ -105,6 +119,7 @@ class OAMAdapter(Adapter):
         return "NequIPOAMKokkos"
 
     def _build(self, tier: str):
+        _require_oam_runtime_backend(native_symmetrix)
         evaluator_class = getattr(native_symmetrix, self._class_name())
         if tier == "reference":
             # The consolidated T0 reference: the compiler-free Kokkos edge
@@ -342,6 +357,7 @@ def _build_routing_model(request, root: Path) -> Path:
 
 def _oam_routing_calculator(model_path, *, dtype, routing):
     """The OAM frontend, guarded by the surface its reference routing needs."""
+    _require_oam_runtime_backend(native_symmetrix)
     if routing == "reference":
         oam_host_oracle.require_host_execution_space(
             execution_space(), "the OAM reference routing"
@@ -414,6 +430,7 @@ def _oam_graph():
     return len(node_types), node_types, num_neigh, indices, neigh_types, xyz, distances
 
 
+@pytest.mark.oam_runtime
 def test_oam_reference_owns_the_portable_family_implementation():
     native = _native()
     if not hasattr(native, "NequIPOAMKokkos"):
@@ -576,6 +593,7 @@ def test_oam_host_direct_forces_are_the_energy_gradient():
     )
 
 
+@pytest.mark.oam_runtime
 @pytest.mark.parametrize("family", ("oam",))
 def test_selected_implementation_id_names_the_dispatched_implementation(family):
     """The per-node implementation id is the one the execution path dispatches.
