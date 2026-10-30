@@ -836,8 +836,10 @@ def audit_installed_oam_release_catalog(
             "cuda_codegen_common"
         ).canonical_cuda_target_identity(descriptor_target)
     )
+    # Native descriptors name the CPU backend; artifact catalogs name host code.
+    expected_descriptor_backend = "cpu" if backend == "host" else "cuda"
     if (
-        backend_descriptor.get("backend") != backend
+        backend_descriptor.get("backend") != expected_descriptor_backend
         or canonical_descriptor_target != expected_target
     ):
         raise ValueError("probe backend descriptor does not bind the requested target")

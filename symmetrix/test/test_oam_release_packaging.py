@@ -249,7 +249,7 @@ def _canonical_installed_package(tmp_path: Path, backend: str = "cuda") -> dict:
     }
     backend_descriptor = {
         "selector": "cuda13-sm120" if backend == "cuda" else "cpu",
-        "backend": backend,
+        "backend": "cpu" if backend == "host" else "cuda",
         "architecture": target,
         "source_commit": "c" * 40,
         "source_dirty": False,
@@ -417,17 +417,62 @@ def test_release_manifest_declares_pending_current_qualification():
     ]
 
 
-def test_repaired_wheel_audit_cli_reads_exact_installed_probe(tmp_path):
-    fixture = _canonical_installed_package(tmp_path)
+@pytest.mark.parametrize(
+    ("backend", "expected_target"),
+    (("host", "host-isa-x86-64-v3"), ("cuda", "sm120")),
+)
+def test_repaired_wheel_audit_cli_reads_exact_installed_probe(
+    tmp_path, backend, expected_target
+):
+    fixture = _canonical_installed_package(tmp_path, backend=backend)
 
     completed = _run_package_audit(fixture, tmp_path)
 
     assert completed.returncode == 0, completed.stderr
     report = json.loads(completed.stdout)
     assert report["oam_artifact_count"] == 8
-    assert report["target"] == "sm120"
+    assert report["target"] == expected_target
     assert report["wheel"] == str(fixture["wheel"].resolve())
     assert report["catalog_sha256"] == fixture["build_info"]["catalog_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("backend", "wrong_backend"),
+    (
+        ("host", "host"),
+        ("host", "cuda"),
+        ("host", "hip"),
+        ("cuda", "cpu"),
+        ("cuda", "host"),
+        ("cuda", "hip"),
+    ),
+)
+def test_repaired_wheel_audit_rejects_wrong_native_descriptor_backend(
+    tmp_path, backend, wrong_backend
+):
+    fixture = _canonical_installed_package(tmp_path, backend=backend)
+    fixture["probe"]["probe"]["backend"]["backend"] = wrong_backend
+
+    completed = _run_package_audit(fixture, tmp_path)
+
+    assert completed.returncode != 0
+    assert "probe backend descriptor" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("backend", "wrong_target"),
+    (("host", "x86-64-v4"), ("cuda", "sm90")),
+)
+def test_repaired_wheel_audit_rejects_wrong_native_descriptor_target(
+    tmp_path, backend, wrong_target
+):
+    fixture = _canonical_installed_package(tmp_path, backend=backend)
+    fixture["probe"]["probe"]["backend"]["architecture"] = wrong_target
+
+    completed = _run_package_audit(fixture, tmp_path)
+
+    assert completed.returncode != 0
+    assert "probe backend descriptor" in completed.stderr
 
 
 def test_repaired_wheel_audit_binds_host_policy_to_native_fast_math(tmp_path):
