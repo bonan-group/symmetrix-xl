@@ -1,9 +1,9 @@
 # What Symmetrix-XL Does
 
 Symmetrix-XL is a package for functions equivariant under translation, rotation,
-inversion, and exchange of particles. It provides compact MACE and MACEField
-inference through a Python frontend, an ASE calculator, Kokkos CPU/GPU
-backends, and LAMMPS pair styles.
+inversion, and exchange of particles. It provides compact MACE, MACELES, and
+MACEField inference through a Python frontend, an ASE calculator, Kokkos CPU/GPU
+backends, and LAMMPS pair styles where the selected model family supports them.
 
 The package is split into a stable Python frontend and a native execution
 backend. The default installation includes the CPU/OpenMP backend. Additional
@@ -26,6 +26,20 @@ forces, and stress. MACEField models extend this interface with polarization
 and supported analytical field-response properties. Multi-head model files can
 retain every prediction head, and `SymmetrixEnsemble` can evaluate compatible
 models together and report member values, means, and population variances.
+
+MACE Polar is a separate native family evaluator that shares the non-public
+MACE backbone engine but owns its complete electrostatic forward and reverse
+transaction. One solver-neutral JSON evaluates fully non-periodic systems in
+real space and periodic systems with direct reciprocal electrostatics. The ASE
+layer is a thin adapter; the compact C++ consumer and the one-rank,
+complete-system `symmetrix/mace/polar/kk` LAMMPS style call the same native
+evaluator. PME and distributed Polar LAMMPS are not yet implemented.
+
+MACELES models combine the MACE backbone and fitted LES stage in one model.
+Every call evaluates the complete model and publishes `les_energy`,
+`mace_les_energy`, and `latent_charges` alongside the standard energy, force,
+and stress results. D2 and D3 remain independently configured additive
+corrections.
 
 Compatible format-version-2 MACE and MACEField JSON can be used from Python/ASE
 or from the `pair_symmetrix` LAMMPS integration. Two-interaction direct LAMMPS
@@ -53,31 +67,10 @@ efficiency.
 
 ## Demonstrated Speed
 
-A matched FP32 RTX 5090 qualification compared complete warmed ASE
-energy/forces/stress calls for the standard MACE-OMAT-0 medium checkpoint:
-
-| Atoms | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
-|---:|---:|---:|---:|---:|
-| 864 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
-| 4,000 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
-
-The MACE-Torch baseline used cuEquivariance with the exact 6.0 A graph.
-Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving
-an effective cutoff of 6.5 A; the graph policies are therefore not identical.
-
-Across the matched FP32 LAMMPS benchmarks reported in the paper, Symmetrix-XL
-reduces complete step time by 3.1-5.0x relative to ML-IAP + cuEquivariance on
-the tested A100 and RTX 5090 workloads. A representative RTX 5090 result uses
-5,000-atom perturbed cubic SrTiO3 with MACE-OMAT-0 medium:
-
-| Implementation | Time (us/atom/step) | Speedup vs. ML-IAP |
-|---|---:|---:|
-| MACE-Torch + cuEquivariance through LAMMPS ML-IAP | 12.813 | 1.00x |
-| Symmetrix-XL LAMMPS pair style | 2.559 | 5.01x |
-
-Each value is the median of three 20-step runs after warmup. Both deployments
-used a 6.0 A model cutoff and a 0.5 A neighbor-list skin; see the paper for the
-full benchmark protocol and graph-policy details.
+The Symmetrix-XL paper reports the matched performance study, including the
+model, graph policy, hardware, warmup, and measurement protocol. Release
+documentation does not reproduce timings from comparison packages; consult the
+paper when evaluating performance claims.
 
 ## How Execution Is Chosen
 

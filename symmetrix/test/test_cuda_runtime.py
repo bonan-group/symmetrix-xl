@@ -18,7 +18,7 @@ def _evaluate(calculator, atoms):
     )
 
 
-def test_cuda_r1_nvrtc_module_matches_generic(
+def test_cuda_r1_generated_module_matches_generic(
     accelerator_capabilities,
     tmp_path,
     monkeypatch,
@@ -53,7 +53,6 @@ def test_cuda_r1_nvrtc_module_matches_generic(
 
     generic = debug_factorized_symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
@@ -61,12 +60,16 @@ def test_cuda_r1_nvrtc_module_matches_generic(
 
     module = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
-    assert module.jit_compiler_backend == "nvrtc"
-    assert module.jit_status in ("built", "cached")
+    assert module.jit_compiler_backend in ("nvrtc", "prebuilt")
+    if module.jit_compiler_backend == "prebuilt":
+        assert module.jit_origin == "prebuilt"
+        assert module.jit_status == "loaded"
+        assert module.jit_cache_key is None
+    else:
+        assert module.jit_status in ("built", "cached")
     assert module.jit_artifact_path.endswith(".cubin")
     assert module.evaluator.jit_cuda_plugin_ready
     launches = (

@@ -5,9 +5,9 @@
 
 #include "nlohmann/json.hpp"
 
-// Minimal, runtime-independent implementation of the e3nn pieces used by
-// MACE_Nonlinear.  The serialized model carries all Wigner tensors, so this
-// code deliberately has no e3nn or Python dependency.
+// Minimal, runtime-independent implementation of the e3nn pieces used by the
+// serialized equivariant model definitions.  The serialized model carries all
+// Wigner tensors, so this code deliberately has no e3nn or Python dependency.
 struct IrrepBlock {
     int multiplicity;
     int l;

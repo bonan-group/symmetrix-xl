@@ -1,0 +1,502 @@
+{
+  "cases": [
+    {
+      "atomic_numbers": [
+        8,
+        1,
+        1,
+        6
+      ],
+      "cell_angstrom": null,
+      "coordination_cutoff_angstrom": 6.0,
+      "coverage": [
+        "molecular",
+        "mixed-element"
+      ],
+      "cutoff_angstrom": 8.0,
+      "damping": "zero",
+      "directed_edges": 12,
+      "energy_ev": -0.014330450397158506,
+      "forces_ev_per_angstrom": [
+        [
+          -0.015780096289249704,
+          -0.0011962382355643394,
+          0.0005723759137653738
+        ],
+        [
+          0.0007044957648712584,
+          -0.0028587096238221845,
+          0.00014829646556608402
+        ],
+        [
+          0.00495127730521715,
+          0.0005943788751703802,
+          -0.0002766060582949628
+        ],
+        [
+          0.010124323219161294,
+          0.0034605689842161437,
+          -0.00044406632103649504
+        ]
+      ],
+      "functional": "pbe",
+      "method": "d2",
+      "name": "d2-pbe-mixed-molecule",
+      "pbc": [
+        false,
+        false,
+        false
+      ],
+      "positions_angstrom": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.96,
+          0.0,
+          0.0
+        ],
+        [
+          -0.24,
+          0.93,
+          0.0
+        ],
+        [
+          2.75,
+          0.2,
+          -0.1
+        ]
+      ]
+    },
+    {
+      "atomic_numbers": [
+        6,
+        6,
+        1,
+        1
+      ],
+      "cell_angstrom": null,
+      "coordination_cutoff_angstrom": 6.0,
+      "coverage": [
+        "molecular"
+      ],
+      "cutoff_angstrom": 8.0,
+      "damping": "zero",
+      "directed_edges": 12,
+      "energy_ev": -0.005871436287378301,
+      "forces_ev_per_angstrom": [
+        [
+          -0.006567379778692522,
+          0.0020170090887644846,
+          -0.0
+        ],
+        [
+          0.006567379778692522,
+          -0.0020170090887644855,
+          -0.0
+        ],
+        [
+          -0.005521675284620169,
+          0.001611322017358499,
+          -0.0
+        ],
+        [
+          0.005521675284620169,
+          -0.0016113220173584982,
+          -0.0
+        ]
+      ],
+      "functional": "pbe0",
+      "method": "d3",
+      "name": "d3-zero-pbe0-molecule",
+      "pbc": [
+        false,
+        false,
+        false
+      ],
+      "positions_angstrom": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          1.42,
+          0.0,
+          0.0
+        ],
+        [
+          -0.8,
+          0.7,
+          0.0
+        ],
+        [
+          2.22,
+          -0.7,
+          0.0
+        ]
+      ]
+    },
+    {
+      "atomic_numbers": [
+        14,
+        8
+      ],
+      "cell_angstrom": [
+        [
+          5.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          5.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          5.0
+        ]
+      ],
+      "coordination_cutoff_angstrom": 4.5,
+      "coverage": [
+        "periodic",
+        "mixed-element"
+      ],
+      "cutoff_angstrom": 5.2,
+      "damping": "bj",
+      "directed_edges": 28,
+      "energy_ev": -0.09483700835064043,
+      "forces_ev_per_angstrom": [
+        [
+          0.0023663843174216714,
+          0.0023663843174216714,
+          0.002366384317421671
+        ],
+        [
+          -0.002366384317421671,
+          -0.0023663843174216706,
+          -0.002366384317421671
+        ]
+      ],
+      "functional": "pbe",
+      "method": "d3",
+      "name": "d3-bj-pbe-periodic",
+      "pbc": [
+        true,
+        true,
+        true
+      ],
+      "positions_angstrom": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          2.1,
+          2.1,
+          2.1
+        ]
+      ],
+      "stress_ev_per_angstrom3": [
+        0.0012011849955123786,
+        0.0012011849955123784,
+        0.0012011849955123784,
+        -1.1719178966758955e-05,
+        -1.1719178966758955e-05,
+        -1.1719178966758955e-05
+      ]
+    },
+    {
+      "atomic_numbers": [
+        6,
+        8
+      ],
+      "cell_angstrom": null,
+      "coordination_cutoff_angstrom": 5.0,
+      "coverage": [
+        "molecular",
+        "cutoff-boundary",
+        "mixed-element"
+      ],
+      "cutoff_angstrom": 5.0,
+      "damping": "zerom",
+      "directed_edges": 2,
+      "energy_ev": -0.0009842574276039617,
+      "forces_ev_per_angstrom": [
+        [
+          0.0011353756709135856,
+          -0.0,
+          -0.0
+        ],
+        [
+          -0.0011353756709135856,
+          -0.0,
+          -0.0
+        ]
+      ],
+      "functional": "pbe",
+      "method": "d3",
+      "name": "d3-zerom-pbe-cutoff-boundary",
+      "pbc": [
+        false,
+        false,
+        false
+      ],
+      "positions_angstrom": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          5.0,
+          0.0,
+          0.0
+        ]
+      ]
+    },
+    {
+      "atomic_numbers": [
+        6,
+        8
+      ],
+      "cell_angstrom": null,
+      "coordination_cutoff_angstrom": 5.0,
+      "coverage": [
+        "molecular",
+        "cutoff-interior",
+        "mixed-element"
+      ],
+      "cutoff_angstrom": 5.0,
+      "damping": "zerom",
+      "directed_edges": 2,
+      "energy_ev": -0.0012436261485318826,
+      "forces_ev_per_angstrom": [
+        [
+          0.00147378433442402,
+          -0.0,
+          -0.0
+        ],
+        [
+          -0.00147378433442402,
+          -0.0,
+          -0.0
+        ]
+      ],
+      "functional": "pbe",
+      "method": "d3",
+      "name": "d3-zerom-pbe-interior",
+      "pbc": [
+        false,
+        false,
+        false
+      ],
+      "positions_angstrom": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          4.8,
+          0.0,
+          0.0
+        ]
+      ]
+    },
+    {
+      "atomic_numbers": [
+        1,
+        8
+      ],
+      "cell_angstrom": null,
+      "coordination_cutoff_angstrom": 4.0,
+      "coverage": [
+        "molecular",
+        "empty-edge",
+        "mixed-element"
+      ],
+      "cutoff_angstrom": 4.0,
+      "damping": "bjm",
+      "directed_edges": 0,
+      "energy_ev": 0.0,
+      "forces_ev_per_angstrom": [
+        [
+          -0.0,
+          -0.0,
+          -0.0
+        ],
+        [
+          -0.0,
+          -0.0,
+          -0.0
+        ]
+      ],
+      "functional": "pbe",
+      "method": "d3",
+      "name": "d3-bjm-pbe-empty-edge",
+      "pbc": [
+        false,
+        false,
+        false
+      ],
+      "positions_angstrom": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          9.0,
+          0.0,
+          0.0
+        ]
+      ]
+    },
+    {
+      "atomic_numbers": [
+        6,
+        8
+      ],
+      "cell_angstrom": null,
+      "coordination_cutoff_angstrom": 5.0,
+      "coverage": [
+        "molecular",
+        "nonzero-pair",
+        "mixed-element"
+      ],
+      "cutoff_angstrom": 5.0,
+      "damping": "bjm",
+      "directed_edges": 2,
+      "energy_ev": -0.011322191410857232,
+      "forces_ev_per_angstrom": [
+        [
+          0.009888739769257828,
+          -0.0,
+          -0.0
+        ],
+        [
+          -0.009888739769257828,
+          -0.0,
+          -0.0
+        ]
+      ],
+      "functional": "pbe",
+      "method": "d3",
+      "name": "d3-bjm-pbe-mixed-pair",
+      "pbc": [
+        false,
+        false,
+        false
+      ],
+      "positions_angstrom": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          3.0,
+          0.0,
+          0.0
+        ]
+      ]
+    },
+    {
+      "atomic_numbers": [
+        26
+      ],
+      "cell_angstrom": [
+        [
+          1.5,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.5,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.5
+        ]
+      ],
+      "coordination_cutoff_angstrom": 5.0,
+      "coverage": [
+        "periodic",
+        "high-coordination",
+        "interpolation-underflow"
+      ],
+      "cutoff_angstrom": 5.0,
+      "damping": "bj",
+      "directed_edges": 170,
+      "energy_ev": -0.843976563463819,
+      "forces_ev_per_angstrom": [
+        [
+          -0.0,
+          -0.0,
+          -0.0
+        ]
+      ],
+      "functional": "pbe",
+      "method": "d3",
+      "name": "d3-bj-pbe-high-coordination",
+      "pbc": [
+        true,
+        true,
+        true
+      ],
+      "positions_angstrom": [
+        [
+          0.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "stress_ev_per_angstrom3": [
+        0.143082427430611,
+        0.143082427430611,
+        0.143082427430611,
+        -1.2849803525754126e-18,
+        -5.13992141030165e-19,
+        0.0
+      ]
+    }
+  ],
+  "schema": "symmetrix.dispersion-reference/1",
+  "source": {
+    "ase": "3.29.0",
+    "commit": "28b43557e6d950502941990fa5a1c9a3aa9e8339",
+    "python": "3.12.13",
+    "source_hashes": {
+      "LICENSE": "7f7be264c10276c7772bdead5b3bcdb68082edf862ca0f67d97efdb36bc2d889",
+      "torch_dftd/__init__.py": "b0382200a901e94928a18656f8a8d98c775edeb85971b7e8f25d605a6d8b31d3",
+      "torch_dftd/_version.py": "b60ceea8729c11d28168fe7b179a17c6ae17956da7f49e058fc646bbb9c63998",
+      "torch_dftd/dftd3_xc_params.py": "30db7a75ffba3d8c4f65c959102c06ad60063a38d61cfcb00c93f4d73a99d71a",
+      "torch_dftd/functions/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "torch_dftd/functions/dftd2.py": "ce58eaab29f5ee83e707ecb77db984f2613331e9bbf4f23c4f7310a827e4c86e",
+      "torch_dftd/functions/dftd3.py": "0ef70d680aeb450a90af3aaeba0972ff89938c052f2309c0ec6d5347cf25f1f2",
+      "torch_dftd/functions/distance.py": "9835ebbd9820790411d62f7bbf6445c1cc8d5206204f83379ee6583e57c6ad6d",
+      "torch_dftd/functions/smoothing.py": "3e33be3edb2ab68fe6b113ddf6e5fe9cdff0ca5bbffab00e096306cf07f925a6",
+      "torch_dftd/functions/triplets.py": "e21781e60c2cdd5eda2677ffe49e1fdc983662a1addf5ea6795aefdd7a21525d",
+      "torch_dftd/functions/triplets_kernel.py": "abbb8fd293c7f6e5691791aa8437d37463c25053e35878482a5cf30f6da68a94",
+      "torch_dftd/nn/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "torch_dftd/nn/base_dftd_module.py": "9702458337e426795acfb6aae8a82a45b742a8ef96f2eee8547e12cd599005d4",
+      "torch_dftd/nn/dftd2_module.py": "321479cbc4ce2ae814aafb1ad831921d8c0a126ed4f7b36230c89b626e45995f",
+      "torch_dftd/nn/dftd3_module.py": "24970d4a267badab653b795b321b3f93c45994cb6c09b53a880cc214104fb72d",
+      "torch_dftd/nn/params/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "torch_dftd/nn/params/dftd2_params.py": "850d7d9fea302bc91583d09f2395afa0746c713a83425751d70898945eff0665",
+      "torch_dftd/nn/params/dftd3_params.npz": "52b7b35a957df55b813035ffde3a6b5a41dec585bdb1e281fb8ba67a729f3d92",
+      "torch_dftd/testing/damping.py": "ca221387b48666255fdcfa34269353754f901d678f19cd6f7719c38fb4f2216b"
+    },
+    "torch": "2.14.1+cu130",
+    "torch_dftd": "0.5.3"
+  }
+}

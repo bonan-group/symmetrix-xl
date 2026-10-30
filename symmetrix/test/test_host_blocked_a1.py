@@ -40,9 +40,8 @@ _EVALUATION = textwrap.dedent(
     atoms.cell = [14.0, 14.0, 14.0]
     calculator = Symmetrix(
         sys.argv[1],
-        use_kokkos=True,
         dtype="float64",
-        streamed_edges="materialized",
+        streamed_edges="reference",
     )
     atoms.calc = calculator
     report = {

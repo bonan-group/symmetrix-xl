@@ -38,7 +38,7 @@ E3Instruction parse_instruction(const nlohmann::json& value, bool tensor_product
         instruction.mode = value.at("connection_mode").get<std::string>();
         instruction.has_weight = value.at("has_weight").get<bool>();
         if (!value.contains("wigner_3j"))
-            throw std::invalid_argument("MACE_Nonlinear tensor-product instruction is missing wigner_3j.");
+            throw std::invalid_argument("Equivariant tensor-product instruction is missing wigner_3j.");
         instruction.wigner_3j = tensor_values(value.at("wigner_3j"));
         instruction.wigner_shape = tensor_shape(value.at("wigner_3j"));
     } else {
@@ -52,7 +52,7 @@ E3Instruction parse_instruction(const nlohmann::json& value, bool tensor_product
 void validate_vector_size(const std::vector<double>& value, int expected, const char* name)
 {
     if (static_cast<int>(value.size()) != expected)
-        throw std::invalid_argument(std::string("Invalid ") + name + " size in MACE_Nonlinear JSON.");
+        throw std::invalid_argument(std::string("Invalid ") + name + " size in the equivariant model JSON.");
 }
 
 void validate_batch_size(
@@ -62,7 +62,7 @@ void validate_batch_size(
         || static_cast<std::size_t>(samples) > std::numeric_limits<std::size_t>::max()
             / static_cast<std::size_t>(std::max(width, 1))
         || value.size() != static_cast<std::size_t>(samples)*static_cast<std::size_t>(width))
-        throw std::invalid_argument(std::string("Invalid ") + name + " size in MACE_Nonlinear JSON.");
+        throw std::invalid_argument(std::string("Invalid ") + name + " size in the equivariant model JSON.");
 }
 
 double sigmoid(double value)
@@ -87,11 +87,11 @@ Irreps::Irreps(const std::string& specification)
         const std::size_t x = token.find('x');
         const std::size_t parity_position = token.find_first_of("eo", x == std::string::npos ? 0 : x+1);
         if (x == std::string::npos || parity_position == std::string::npos || parity_position + 1 != token.size())
-            throw std::invalid_argument("Unsupported irreps specification in MACE_Nonlinear JSON: " + specification);
+            throw std::invalid_argument("Unsupported irreps specification in the equivariant model JSON: " + specification);
         const int multiplicity = std::stoi(token.substr(0, x));
         const int l = std::stoi(token.substr(x+1, parity_position-x-1));
         if (multiplicity <= 0 || l < 0)
-            throw std::invalid_argument("Invalid irreps specification in MACE_Nonlinear JSON.");
+            throw std::invalid_argument("Invalid irreps specification in the equivariant model JSON.");
         blocks.push_back({multiplicity, l, token[parity_position] == 'e' ? 1 : -1, dimension_});
         dimension_ += blocks.back().dimension();
         if (end == std::string::npos)
@@ -99,7 +99,7 @@ Irreps::Irreps(const std::string& specification)
         start = end + 1;
     }
     if (blocks.empty())
-        throw std::invalid_argument("MACE_Nonlinear JSON has an empty irreps specification.");
+        throw std::invalid_argument("The equivariant model JSON has an empty irreps specification.");
 }
 
 E3Linear::E3Linear(const nlohmann::json& data)
@@ -114,9 +114,9 @@ E3Linear::E3Linear(const nlohmann::json& data)
         auto instruction = parse_instruction(entry, false);
         if (instruction.input_1 < 0 || instruction.input_1 >= static_cast<int>(input.blocks.size())
             || instruction.output < 0 || instruction.output >= static_cast<int>(output.blocks.size()))
-            throw std::invalid_argument("MACE_Nonlinear linear instruction has an invalid irrep index.");
+            throw std::invalid_argument("Equivariant linear instruction has an invalid irrep index.");
         if (instruction.path_shape.size() != 2)
-            throw std::invalid_argument("MACE_Nonlinear linear instruction must have a two-dimensional weight.");
+            throw std::invalid_argument("Equivariant linear instruction must have a two-dimensional weight.");
         instruction.weight_offset = weight_offset;
         weight_offset += product(instruction.path_shape);
         instructions.push_back(std::move(instruction));
@@ -124,7 +124,7 @@ E3Linear::E3Linear(const nlohmann::json& data)
     validate_vector_size(weights, weight_offset, "linear weight");
     validate_vector_size(output_mask, output.dimension(), "linear output_mask");
     if (!bias.empty() && static_cast<int>(bias.size()) != output.dimension())
-        throw std::invalid_argument("MACE_Nonlinear linear bias has an invalid size.");
+        throw std::invalid_argument("Equivariant linear bias has an invalid size.");
 }
 
 std::vector<double> E3Linear::evaluate(const std::vector<double>& x) const
@@ -135,7 +135,7 @@ std::vector<double> E3Linear::evaluate(const std::vector<double>& x) const
         const auto& in = input.blocks[instruction.input_1];
         const auto& out = output.blocks[instruction.output];
         if (instruction.path_shape[0] != in.multiplicity || instruction.path_shape[1] != out.multiplicity || in.l != out.l)
-            throw std::invalid_argument("Unsupported MACE_Nonlinear e3nn Linear path.");
+            throw std::invalid_argument("Unsupported equivariant e3nn Linear path.");
         const int width = 2*in.l + 1;
         cblas_dgemm(
             CblasRowMajor, CblasTrans, CblasNoTrans,
@@ -187,10 +187,10 @@ void E3Linear::evaluate_batch(
         const auto& out = output.blocks[instruction.output];
         if (instruction.path_shape[0] != in.multiplicity
             || instruction.path_shape[1] != out.multiplicity || in.l != out.l)
-            throw std::invalid_argument("Unsupported MACE_Nonlinear e3nn Linear path.");
+            throw std::invalid_argument("Unsupported equivariant e3nn Linear path.");
         const int width = 2*in.l+1;
         if (samples > std::numeric_limits<int>::max()/width)
-            throw std::invalid_argument("MACE_Nonlinear linear batch is too large.");
+            throw std::invalid_argument("Equivariant linear batch is too large.");
         const int columns = samples*width;
         workspace.packed_input.resize(static_cast<std::size_t>(in.multiplicity)*columns);
         workspace.packed_output.assign(static_cast<std::size_t>(out.multiplicity)*columns, 0.0);
@@ -238,7 +238,7 @@ void E3Linear::reverse_batch(
         const auto& out = output.blocks[instruction.output];
         const int width = 2*in.l+1;
         if (samples > std::numeric_limits<int>::max()/width)
-            throw std::invalid_argument("MACE_Nonlinear linear batch is too large.");
+            throw std::invalid_argument("Equivariant linear batch is too large.");
         const int columns = samples*width;
         workspace.packed_output.resize(static_cast<std::size_t>(out.multiplicity)*columns);
         workspace.packed_input.assign(static_cast<std::size_t>(in.multiplicity)*columns, 0.0);
@@ -280,7 +280,7 @@ E3TensorProduct::E3TensorProduct(const nlohmann::json& data)
         if (instruction.input_1 < 0 || instruction.input_1 >= static_cast<int>(input_1.blocks.size())
             || instruction.input_2 < 0 || instruction.input_2 >= static_cast<int>(input_2.blocks.size())
             || instruction.output < 0 || instruction.output >= static_cast<int>(output.blocks.size()))
-            throw std::invalid_argument("MACE_Nonlinear tensor-product instruction has an invalid irrep index.");
+            throw std::invalid_argument("Equivariant tensor-product instruction has an invalid irrep index.");
         const auto& in1 = input_1.blocks[instruction.input_1];
         const auto& in2 = input_2.blocks[instruction.input_2];
         const auto& out = output.blocks[instruction.output];
@@ -288,7 +288,7 @@ E3TensorProduct::E3TensorProduct(const nlohmann::json& data)
             2*in1.l+1, 2*in2.l+1, 2*out.l+1};
         if (instruction.wigner_shape != expected_wigner_shape
             || product(instruction.wigner_shape) != static_cast<int>(instruction.wigner_3j.size()))
-            throw std::invalid_argument("MACE_Nonlinear tensor-product has an invalid Wigner tensor.");
+            throw std::invalid_argument("Equivariant tensor-product has an invalid Wigner tensor.");
         for (int a=0; a<expected_wigner_shape[0]; ++a)
             for (int b=0; b<expected_wigner_shape[1]; ++b)
                 for (int c=0; c<expected_wigner_shape[2]; ++c) {
@@ -300,15 +300,18 @@ E3TensorProduct::E3TensorProduct(const nlohmann::json& data)
         if (instruction.mode == "uvu") {
             if (out.multiplicity != in1.multiplicity
                 || instruction.path_shape != std::vector<int>{in1.multiplicity, in2.multiplicity})
-                throw std::invalid_argument("MACE_Nonlinear uvu path has incompatible multiplicities or weight shape.");
+                throw std::invalid_argument("Equivariant uvu path has incompatible multiplicities or weight shape.");
         } else if (instruction.mode == "uuu") {
             if (out.multiplicity != in1.multiplicity
                 || in2.multiplicity != in1.multiplicity
                 || instruction.path_shape != std::vector<int>{in1.multiplicity})
-                throw std::invalid_argument("MACE_Nonlinear uuu path has incompatible multiplicities or weight shape.");
+                throw std::invalid_argument("Equivariant uuu path has incompatible multiplicities or weight shape.");
+        } else if (instruction.mode == "uvw") {
+            if (instruction.path_shape != std::vector<int>{in1.multiplicity, in2.multiplicity, out.multiplicity})
+                throw std::invalid_argument("Equivariant uvw path has incompatible multiplicities or weight shape.");
         } else {
             throw std::invalid_argument(
-                "Unsupported MACE_Nonlinear tensor-product connection mode: " + instruction.mode);
+                "Unsupported equivariant tensor-product connection mode: " + instruction.mode);
         }
         instruction.weight_offset = weight_offset;
         if (instruction.has_weight)
@@ -341,11 +344,15 @@ std::vector<double> E3TensorProduct::evaluate(
         const int d3 = 2*out.l + 1;
         for (int u=0; u<in1.multiplicity; ++u)
             for (int v=0; v<in2.multiplicity; ++v) {
+                const int w_begin = instruction.mode == "uvw" ? 0 : u;
+                const int w_end = instruction.mode == "uvw" ? out.multiplicity : u + 1;
                 if (instruction.mode == "uuu" && u != v)
                     continue;
-                const int w = u;
+                for (int w = w_begin; w < w_end; ++w) {
                 const int weight_index = instruction.weight_offset
-                    + (instruction.mode == "uuu" ? u : u*in2.multiplicity + v);
+                    + (instruction.mode == "uvw"
+                        ? (u*in2.multiplicity + v)*out.multiplicity + w
+                        : (instruction.mode == "uuu" ? u : u*in2.multiplicity + v));
                 const double path = instruction.has_weight
                     ? weights[weight_index]
                     : 1.0;
@@ -354,6 +361,7 @@ std::vector<double> E3TensorProduct::evaluate(
                     result[out.offset+w*d3+entry.c] += scale*entry.value
                         *x1[in1.offset+u*d1+entry.a]
                         *x2[in2.offset+v*d2+entry.b];
+                }
             }
     }
     for (int i=0; i<output.dimension(); ++i)
@@ -384,10 +392,14 @@ void E3TensorProduct::reverse(
         const int d1 = 2*in1.l + 1, d2 = 2*in2.l + 1, d3 = 2*out.l + 1;
         for (int u=0; u<in1.multiplicity; ++u)
             for (int v=0; v<in2.multiplicity; ++v) {
+                const int w_begin = instruction.mode == "uvw" ? 0 : u;
+                const int w_end = instruction.mode == "uvw" ? out.multiplicity : u + 1;
                 if (instruction.mode == "uuu" && u != v) continue;
-                const int w = u;
+                for (int w = w_begin; w < w_end; ++w) {
                 const int weight_index = instruction.weight_offset
-                    + (instruction.mode == "uuu" ? u : u*in2.multiplicity + v);
+                    + (instruction.mode == "uvw"
+                        ? (u*in2.multiplicity + v)*out.multiplicity + w
+                        : (instruction.mode == "uuu" ? u : u*in2.multiplicity + v));
                 const double path = instruction.has_weight ? weights[weight_index] : 1.0;
                 for (const auto& entry : instruction.nonzero_wigner) {
                     const double common = instruction.path_weight*entry.value
@@ -402,6 +414,7 @@ void E3TensorProduct::reverse(
                             *x1[in1.offset+u*d1+entry.a]
                             *x2[in2.offset+v*d2+entry.b];
                 }
+            }
             }
     }
 }

@@ -1,0 +1,153 @@
+{
+  "description": "PolarMACE delta-chain inputs and state captured from the frozen torch oracle stack (docs/user/models.md#mace-polar-1).",
+  "oracle": {
+    "graph_electrostatics_sha": "e0eb8945c21e203656f4e0bbece5d1da488b6753",
+    "graph_longrange_version": "0.4.4",
+    "mace_ref": "v0.3.16-2-g22f08097",
+    "mace_sha": "22f0809735bd4dd1deba80cf8e16f89913a35ff4"
+  },
+  "records": [
+    {
+      "bytes": 115238,
+      "channel": "singlet",
+      "dtype": "float64",
+      "geometry": "mol_h2o",
+      "iterations": 2,
+      "name": "chain_M_mol_h2o_singlet_float64.npz",
+      "nodes": 3,
+      "size": "M"
+    },
+    {
+      "bytes": 69750,
+      "channel": "singlet",
+      "dtype": "float32",
+      "geometry": "mol_h2o",
+      "iterations": 2,
+      "name": "chain_M_mol_h2o_singlet_float32.npz",
+      "nodes": 3,
+      "size": "M"
+    },
+    {
+      "bytes": 115232,
+      "channel": "charged_triplet",
+      "dtype": "float64",
+      "geometry": "mol_h2o",
+      "iterations": 2,
+      "name": "chain_M_mol_h2o_charged_triplet_float64.npz",
+      "nodes": 3,
+      "size": "M"
+    },
+    {
+      "bytes": 69734,
+      "channel": "charged_triplet",
+      "dtype": "float32",
+      "geometry": "mol_h2o",
+      "iterations": 2,
+      "name": "chain_M_mol_h2o_charged_triplet_float32.npz",
+      "nodes": 3,
+      "size": "M"
+    },
+    {
+      "bytes": 115092,
+      "channel": "field",
+      "dtype": "float64",
+      "geometry": "mol_h2o",
+      "iterations": 2,
+      "name": "chain_M_mol_h2o_field_float64.npz",
+      "nodes": 3,
+      "size": "M"
+    },
+    {
+      "bytes": 69648,
+      "channel": "field",
+      "dtype": "float32",
+      "geometry": "mol_h2o",
+      "iterations": 2,
+      "name": "chain_M_mol_h2o_field_float32.npz",
+      "nodes": 3,
+      "size": "M"
+    },
+    {
+      "bytes": 288182,
+      "channel": "singlet",
+      "dtype": "float64",
+      "geometry": "slab_w2",
+      "iterations": 2,
+      "name": "chain_M_slab_w2_singlet_float64.npz",
+      "nodes": 6,
+      "size": "M"
+    },
+    {
+      "bytes": 168535,
+      "channel": "singlet",
+      "dtype": "float32",
+      "geometry": "slab_w2",
+      "iterations": 2,
+      "name": "chain_M_slab_w2_singlet_float32.npz",
+      "nodes": 6,
+      "size": "M"
+    },
+    {
+      "bytes": 288195,
+      "channel": "field",
+      "dtype": "float64",
+      "geometry": "slab_w2",
+      "iterations": 2,
+      "name": "chain_M_slab_w2_field_float64.npz",
+      "nodes": 6,
+      "size": "M"
+    },
+    {
+      "bytes": 168541,
+      "channel": "field",
+      "dtype": "float32",
+      "geometry": "slab_w2",
+      "iterations": 2,
+      "name": "chain_M_slab_w2_field_float32.npz",
+      "nodes": 6,
+      "size": "M"
+    },
+    {
+      "bytes": 573177,
+      "channel": "singlet",
+      "dtype": "float64",
+      "geometry": "bulk_w4",
+      "iterations": 2,
+      "name": "chain_M_bulk_w4_singlet_float64.npz",
+      "nodes": 12,
+      "size": "M"
+    },
+    {
+      "bytes": 332071,
+      "channel": "singlet",
+      "dtype": "float32",
+      "geometry": "bulk_w4",
+      "iterations": 2,
+      "name": "chain_M_bulk_w4_singlet_float32.npz",
+      "nodes": 12,
+      "size": "M"
+    },
+    {
+      "bytes": 573195,
+      "channel": "field",
+      "dtype": "float64",
+      "geometry": "bulk_w4",
+      "iterations": 2,
+      "name": "chain_M_bulk_w4_field_float64.npz",
+      "nodes": 12,
+      "size": "M"
+    },
+    {
+      "bytes": 332089,
+      "channel": "field",
+      "dtype": "float32",
+      "geometry": "bulk_w4",
+      "iterations": 2,
+      "name": "chain_M_bulk_w4_field_float32.npz",
+      "nodes": 12,
+      "size": "M"
+    }
+  ],
+  "schema": "symmetrix.polar.oracle-chain-state",
+  "version": 1
+}

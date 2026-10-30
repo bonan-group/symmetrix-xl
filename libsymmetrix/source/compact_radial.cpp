@@ -326,9 +326,18 @@ FactorizedRadialData CompactRadialModel::evaluate_factorized_network(
 std::vector<double> CompactRadialModel::spline_derivatives(
     const std::vector<double>& values) const
 {
-    if (values.size() != spline_points)
+    if (values.size() != static_cast<std::size_t>(spline_points))
         throw std::invalid_argument("Compact radial spline values have an invalid size.");
+    return spline_derivatives(values, h);
+}
 
+std::vector<double> CompactRadialModel::spline_derivatives(
+    const std::vector<double>& values, double h)
+{
+    if (values.size() < 4 || !std::isfinite(h) || !(h > 0.0))
+        throw std::invalid_argument("Compact radial spline values have an invalid grid.");
+
+    const int spline_points = static_cast<int>(values.size());
     const int unknowns = spline_points-2;
     auto lower = std::vector<double>(unknowns, 0.0);
     auto diagonal = std::vector<double>(unknowns, 4.0);

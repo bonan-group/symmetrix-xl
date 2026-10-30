@@ -35,6 +35,7 @@
 #include "metal_view_registry.hpp"
 #endif
 #include "device_backend.hpp"
+#include "mace_device_backend.hpp"
 #include "factorized_blas.hpp"
 
 using Kokkos::ALL;
@@ -104,21 +105,19 @@ void MACEKokkos<Precision>::compute_factorized(
     Kokkos::View<const int*> neigh_types,
     Kokkos::View<const double*> r)
 {
+    if (alchemical_edge_weights.data() != nullptr)
+        throw std::logic_error(
+            "Alchemical edge weights require stateless direct R1 execution.");
     if (!factorized_ready)
         throw std::runtime_error("Execution R1 model cache has not been prepared.");
     const auto execution_space = factorized_execution_space;
     ensure_factorized_stateful_workspace();
-    const bool plugin_tiled_fallback =
-        factorized_source_strategy == FactorizedSourceStrategy::jit_plugin
+    const bool tiled_execution =
+        factorized_source_strategy != FactorizedSourceStrategy::serial_reference
         && factorized_tiled_ready;
-    if (factorized_source_strategy == FactorizedSourceStrategy::tiled_coupling
-        || plugin_tiled_fallback) {
-        if (!factorized_tiled_ready)
-            throw std::runtime_error(
-                "Execution R1 tiled coupling workspace exceeds 64 MiB.");
+    if (tiled_execution)
         ensure_factorized_coupling_workspace(
             factorized_max_coupling_columns);
-    }
     if (A1.extent(0) < static_cast<std::size_t>(num_nodes))
         Kokkos::realloc(A1, num_nodes, num_lm, num_channels);
 
@@ -151,14 +150,8 @@ void MACEKokkos<Precision>::compute_factorized(
     auto compact_message = factorized_compact_message_view();
     const auto final_projections = execution_final_projection;
     const auto a1_weights = A1_weights;
-    const bool tiled_execution =
-        factorized_source_strategy == FactorizedSourceStrategy::tiled_coupling
-        || plugin_tiled_fallback;
 
     if (tiled_execution) {
-        if (!factorized_tiled_ready)
-            throw std::runtime_error(
-                "Execution R1 tiled coupling workspace exceeds 64 MiB.");
         if (execution_schedule_num_nodes != num_nodes
             || static_cast<int>(edge_receivers.extent(0))
                 != static_cast<int>(neigh_indices.extent(0)))
@@ -481,51 +474,221 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
     const bool compact_geometry = use_compact_edge_geometry();
     const bool recompute_harmonic_gradients = use_y_only_direct_harmonics();
     const auto unit_direction = execution_prepared_unit_direction;
-    if (use_factorized_direct_jit_reverse()) {
+    const auto edge_weights = alchemical_edge_weights;
+    if (!use_factorized_direct_inference())
+        throw std::runtime_error(
+            "Execution R1 direct reverse requires generated execution; "
+            "direct execution does not fall back to another algorithm.");
 #if defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_CUDA)
-        if (jit_device_plugin_ready()) {
-            if constexpr (!device_execution_space<
-                    Kokkos::DefaultExecutionSpace>) {
-                throw std::runtime_error(
-                    "Execution device plugins require device execution.");
-            } else {
+    if (jit_device_plugin_ready()) {
+        if constexpr (!device_execution_space<
+                Kokkos::DefaultExecutionSpace>) {
+            throw std::runtime_error(
+                "Execution device plugins require device execution.");
+        } else {
 #endif
 #if defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_CUDA)
-                static_assert(std::is_same_v<int,std::int32_t>);
-                require_execution_device_packet(num_nodes >= 0, "negative node count");
-                require_execution_device_packet(
-                    neigh_indices.extent(0)
-                        <= static_cast<std::size_t>(
-                            std::numeric_limits<std::int32_t>::max()),
-                    "edge count exceeds the CUDA ABI");
-                const int num_edges = static_cast<int>(neigh_indices.extent(0));
-                const int channels = num_channels;
-                const auto radial = make_execution_device_radial_spline(radial_1);
-                const int expected_edge_types =
-                    num_active_types*(num_active_types+1)/2;
-                const int expected_functions =
-                    static_cast<int>(Phi1_l.extent(0))*channels;
+            static_assert(std::is_same_v<int,std::int32_t>);
+            require_execution_device_packet(num_nodes >= 0, "negative node count");
+            require_execution_device_packet(
+                neigh_indices.extent(0)
+                    <= static_cast<std::size_t>(
+                        std::numeric_limits<std::int32_t>::max()),
+                "edge count exceeds the CUDA ABI");
+            const int num_edges = static_cast<int>(neigh_indices.extent(0));
+            const int channels = num_channels;
+            const auto radial = make_execution_device_radial_spline(radial_1);
+            const int expected_edge_types =
+                num_active_types*(num_active_types+1)/2;
+            const int expected_functions =
+                static_cast<int>(Phi1_l.extent(0))*channels;
 
-                if (use_receiver_local_phi1()) {
-                    require_execution_device_packet(
-                        execution_prepared_num_neigh.extent(0)
-                                >= static_cast<std::size_t>(num_nodes)
-                            && streamed_first_neigh.extent(0)
-                                >= static_cast<std::size_t>(num_nodes)
-                            && A1_adj.extent(0)
-                                >= static_cast<std::size_t>(num_nodes)
-                            && H1.extent(0)
-                                >= static_cast<std::size_t>(num_feature_nodes)
-                            && H1_adj.extent(0)
-                                >= static_cast<std::size_t>(num_feature_nodes),
-                        "projected R1 reverse node tensor extent is too small");
-                    require_execution_device_packet(
-                        execution_a1_projection_weights.data() != nullptr
-                            && A1_adj.span_is_contiguous()
-                            && H1_adj.span_is_contiguous(),
-                        "projected R1 reverse storage is invalid");
-                    const ExecutionDeviceR1ProjectedReverseArgs args {
-                        sizeof(ExecutionDeviceR1ProjectedReverseArgs),
+            if (use_receiver_local_phi1()) {
+                require_execution_device_packet(
+                    execution_prepared_num_neigh.extent(0)
+                            >= static_cast<std::size_t>(num_nodes)
+                        && streamed_first_neigh.extent(0)
+                            >= static_cast<std::size_t>(num_nodes)
+                        && A1_adj.extent(0)
+                            >= static_cast<std::size_t>(num_nodes)
+                        && H1.extent(0)
+                            >= static_cast<std::size_t>(num_feature_nodes)
+                        && H1_adj.extent(0)
+                            >= static_cast<std::size_t>(num_feature_nodes),
+                    "projected R1 reverse node tensor extent is too small");
+                require_execution_device_packet(
+                    execution_a1_projection_weights.data() != nullptr
+                        && A1_adj.span_is_contiguous()
+                        && H1_adj.span_is_contiguous(),
+                    "projected R1 reverse storage is invalid");
+                const ExecutionDeviceR1ProjectedReverseArgs args {
+                    sizeof(ExecutionDeviceR1ProjectedReverseArgs),
+                    static_cast<std::uint32_t>(num_active_types),
+                    compact_geometry
+                        ? static_cast<std::uint32_t>(sizeof(Precision))
+                        : static_cast<std::uint32_t>(sizeof(double)),
+                    compact_geometry ? 1u : 0u,
+                    num_nodes,
+                    num_edges,
+                    reinterpret_cast<const std::int32_t*>(node_types.data()),
+                    reinterpret_cast<const std::int32_t*>(
+                        execution_prepared_num_neigh.data()),
+                    reinterpret_cast<const std::int32_t*>(
+                        streamed_first_neigh.data()),
+                    reinterpret_cast<const std::int32_t*>(neigh_indices.data()),
+                    reinterpret_cast<const std::int32_t*>(neigh_types.data()),
+                    reinterpret_cast<const std::int32_t*>(type_to_active.data()),
+                    compact_geometry
+                        ? static_cast<const void*>(unit_direction.data())
+                        : static_cast<const void*>(xyz.data()),
+                    r.data(),
+                    radial,
+                    Y.data(),
+                    Y_grad.data(),
+                    H1.data(),
+                    A1_adj.data(),
+                    H1_adj.data(),
+                    node_forces.data(),
+                    execution_a1_projection_weights.data(),
+                    r_cut,
+                    edge_weights.data()};
+                const int persistent_blocks =
+                    resolve_jit_device_plugin_persistent_blocks(
+                        *jit_device_plugin,
+                        execution_space,
+                        static_cast<std::size_t>(num_nodes),
+                        "r1_projected_reverse");
+                ExecutionDeviceBackend::DeviceGuard device_guard(
+                    ExecutionDeviceBackend::device_ordinal(execution_space));
+                ExecutionDeviceBackend::check_status(
+                    jit_device_plugin->launch_r1_projected_reverse(
+                        &args,
+                        reinterpret_cast<void*>(
+                            ExecutionDeviceBackend::native_stream(execution_space)),
+                        persistent_blocks),
+                    "Launching the projected R1 reverse module");
+                if (num_edges > 0) {
+                    factorized_jit_launch_count += 1;
+                    factorized_jit_reverse_launch_count += 1;
+                }
+                return;
+            }
+
+            if (use_channel_tiled_phi1()) {
+                const bool receiver_tiled = dual_layer_tiled_plan_active;
+                Kokkos::View<int*> source_offsets;
+                Kokkos::View<int*> source_edges;
+                Kokkos::View<int*> edge_receivers;
+                Kokkos::View<int*> source_ids;
+                if (receiver_tiled) {
+                    const std::size_t segment_begin =
+                        static_cast<std::size_t>(
+                            dual_layer_active_segment_begin);
+                    const std::size_t segment_count =
+                        static_cast<std::size_t>(
+                            dual_layer_active_segment_count);
+                    const std::size_t segment_end =
+                        segment_begin+segment_count;
+                    source_offsets = Kokkos::subview(
+                        dual_layer_segment_edge_offsets,
+                        Kokkos::make_pair(
+                            segment_begin, segment_end+std::size_t(1)));
+                    source_edges = dual_layer_source_edges;
+                    edge_receivers = Kokkos::subview(
+                        dual_layer_edge_local_receivers,
+                        Kokkos::make_pair(
+                            std::size_t(0),
+                            static_cast<std::size_t>(num_edges)));
+                    source_ids = Kokkos::subview(
+                        dual_layer_segment_source_ids,
+                        Kokkos::make_pair(segment_begin, segment_end));
+                } else {
+                    source_offsets = execution_direct_source_offsets;
+                    source_edges = execution_direct_source_edges;
+                    edge_receivers = execution_edge_receivers;
+                }
+                const std::size_t required_source_offsets = receiver_tiled
+                    ? static_cast<std::size_t>(
+                        dual_layer_active_segment_count)+std::size_t(1)
+                    : static_cast<std::size_t>(num_feature_nodes)
+                        +std::size_t(1);
+                require_execution_device_packet(
+                    radial.edge_types == static_cast<std::uint32_t>(
+                        expected_edge_types)
+                        && radial.functions == static_cast<std::uint32_t>(
+                            expected_functions)
+                        && radial.intervals > 0 && radial.h > 0.0
+                        && std::isfinite(r_cut) && r_cut > 0.0
+                        && radial.coefficients != nullptr,
+                    "tiled R1 reverse radial spline storage is invalid");
+                require_execution_device_packet(
+                    Phi1.extent(0) >= static_cast<std::size_t>(num_nodes)
+                        && Phi1.extent_int(1) == num_lme
+                        && Phi1.extent_int(2) == phi1_channel_tile_size
+                        && H1.extent(0)
+                            >= static_cast<std::size_t>(num_feature_nodes)
+                        && H1_adj.extent(0)
+                            >= static_cast<std::size_t>(num_feature_nodes),
+                    "tiled R1 reverse node tensor shape is inconsistent");
+                require_execution_device_packet(
+                    source_offsets.extent(0)
+                            >= required_source_offsets
+                        && source_edges.extent(0)
+                            >= static_cast<std::size_t>(num_edges)
+                        && edge_receivers.extent(0)
+                            >= static_cast<std::size_t>(num_edges),
+                    "tiled R1 reverse source schedule is incomplete");
+                require_execution_device_packet(
+                    Phi1.span_is_contiguous()
+                        && H1.span_is_contiguous()
+                        && H1_adj.span_is_contiguous()
+                        && node_forces.span_is_contiguous(),
+                    "tiled R1 reverse storage is not contiguous");
+                const int persistent_blocks =
+                    resolve_jit_device_plugin_persistent_blocks(
+                        *jit_device_plugin,
+                        execution_space,
+                        static_cast<std::size_t>(num_feature_nodes),
+                        "r1_tiled_reverse");
+                ExecutionDeviceBackend::DeviceGuard device_guard(
+                    ExecutionDeviceBackend::device_ordinal(execution_space));
+                for (int channel_begin=0; channel_begin<channels;
+                     channel_begin += phi1_channel_tile_size) {
+                    const int channel_count = std::min(
+                        phi1_channel_tile_size, channels-channel_begin);
+                    reverse_A1_channel_tile(num_nodes, channel_begin);
+                    const ExecutionDeviceR1TiledSourceArgs source_args {
+                        sizeof(ExecutionDeviceR1TiledSourceArgs),
+                        static_cast<std::uint32_t>(num_active_types),
+                        static_cast<std::uint32_t>(channel_begin),
+                        static_cast<std::uint32_t>(channel_count),
+                        num_feature_nodes,
+                        num_edges,
+                        reinterpret_cast<const std::int32_t*>(node_types.data()),
+                        reinterpret_cast<const std::int32_t*>(neigh_types.data()),
+                        reinterpret_cast<const std::int32_t*>(
+                            source_offsets.data()),
+                        reinterpret_cast<const std::int32_t*>(
+                            source_edges.data()),
+                        reinterpret_cast<const std::int32_t*>(
+                            edge_receivers.data()),
+                        reinterpret_cast<const std::int32_t*>(
+                            type_to_active.data()),
+                        r.data(),
+                        radial,
+                        Y.data(),
+                        Phi1.data(),
+                        H1_adj.data(),
+                        r_cut,
+                        receiver_tiled
+                            ? dual_layer_active_segment_count : 0,
+                        receiver_tiled
+                            ? reinterpret_cast<const std::int32_t*>(
+                                source_ids.data())
+                            : nullptr,
+                        edge_weights.data()};
+                    const ExecutionDeviceR1TiledEdgeArgs edge_args {
+                        sizeof(ExecutionDeviceR1TiledEdgeArgs),
                         static_cast<std::uint32_t>(num_active_types),
                         compact_geometry
                             ? static_cast<std::uint32_t>(sizeof(Precision))
@@ -535,12 +698,12 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                         num_edges,
                         reinterpret_cast<const std::int32_t*>(node_types.data()),
                         reinterpret_cast<const std::int32_t*>(
-                            execution_prepared_num_neigh.data()),
-                        reinterpret_cast<const std::int32_t*>(
-                            streamed_first_neigh.data()),
-                        reinterpret_cast<const std::int32_t*>(neigh_indices.data()),
+                            neigh_indices.data()),
                         reinterpret_cast<const std::int32_t*>(neigh_types.data()),
-                        reinterpret_cast<const std::int32_t*>(type_to_active.data()),
+                        reinterpret_cast<const std::int32_t*>(
+                            edge_receivers.data()),
+                        reinterpret_cast<const std::int32_t*>(
+                            type_to_active.data()),
                         compact_geometry
                             ? static_cast<const void*>(unit_direction.data())
                             : static_cast<const void*>(xyz.data()),
@@ -549,911 +712,445 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                         Y.data(),
                         Y_grad.data(),
                         H1.data(),
-                        A1_adj.data(),
-                        H1_adj.data(),
+                        Phi1.data(),
                         node_forces.data(),
-                        execution_a1_projection_weights.data(),
-                        r_cut};
-                    const int persistent_blocks =
-                        resolve_jit_device_plugin_persistent_blocks(
-                            *jit_device_plugin,
-                            execution_space,
-                            static_cast<std::size_t>(num_nodes),
-                            "r1_projected_reverse");
-                    ExecutionDeviceBackend::DeviceGuard device_guard(
-                        ExecutionDeviceBackend::device_ordinal(execution_space));
+                        r_cut,
+                        edge_weights.data()};
                     ExecutionDeviceBackend::check_status(
-                        jit_device_plugin->launch_r1_projected_reverse(
-                            &args,
+                        jit_device_plugin->launch_r1_tiled_reverse(
+                            &source_args,
+                            &edge_args,
                             reinterpret_cast<void*>(
-                                ExecutionDeviceBackend::native_stream(execution_space)),
+                                ExecutionDeviceBackend::native_stream(
+                                    execution_space)),
                             persistent_blocks),
-                        "Launching the projected R1 reverse module");
+                        "Launching the tiled R1 reverse module");
                     if (num_edges > 0) {
                         factorized_jit_launch_count += 1;
                         factorized_jit_reverse_launch_count += 1;
                     }
-                    return;
-                }
 
-                if (use_channel_tiled_phi1()) {
-                    const bool receiver_tiled = dual_layer_tiled_plan_active;
-                    Kokkos::View<int*> source_offsets;
-                    Kokkos::View<int*> source_edges;
-                    Kokkos::View<int*> edge_receivers;
-                    Kokkos::View<int*> source_ids;
-                    if (receiver_tiled) {
-                        const std::size_t segment_begin =
-                            static_cast<std::size_t>(
-                                dual_layer_active_segment_begin);
-                        const std::size_t segment_count =
-                            static_cast<std::size_t>(
-                                dual_layer_active_segment_count);
-                        const std::size_t segment_end =
-                            segment_begin+segment_count;
-                        source_offsets = Kokkos::subview(
-                            dual_layer_segment_edge_offsets,
-                            Kokkos::make_pair(
-                                segment_begin, segment_end+std::size_t(1)));
-                        source_edges = dual_layer_source_edges;
-                        edge_receivers = Kokkos::subview(
-                            dual_layer_edge_local_receivers,
-                            Kokkos::make_pair(
-                                std::size_t(0),
-                                static_cast<std::size_t>(num_edges)));
-                        source_ids = Kokkos::subview(
-                            dual_layer_segment_source_ids,
-                            Kokkos::make_pair(segment_begin, segment_end));
-                    } else {
-                        source_offsets = execution_direct_source_offsets;
-                        source_edges = execution_direct_source_edges;
-                        edge_receivers = execution_edge_receivers;
-                    }
-                    const std::size_t required_source_offsets = receiver_tiled
-                        ? static_cast<std::size_t>(
-                            dual_layer_active_segment_count)+std::size_t(1)
-                        : static_cast<std::size_t>(num_feature_nodes)
-                            +std::size_t(1);
-                    require_execution_device_packet(
-                        radial.edge_types == static_cast<std::uint32_t>(
-                            expected_edge_types)
-                            && radial.functions == static_cast<std::uint32_t>(
-                                expected_functions)
-                            && radial.intervals > 0 && radial.h > 0.0
-                            && std::isfinite(r_cut) && r_cut > 0.0
-                            && radial.coefficients != nullptr,
-                        "tiled R1 reverse radial spline storage is invalid");
-                    require_execution_device_packet(
-                        Phi1.extent(0) >= static_cast<std::size_t>(num_nodes)
-                            && Phi1.extent_int(1) == num_lme
-                            && Phi1.extent_int(2) == phi1_channel_tile_size
-                            && H1.extent(0)
-                                >= static_cast<std::size_t>(num_feature_nodes)
-                            && H1_adj.extent(0)
-                                >= static_cast<std::size_t>(num_feature_nodes),
-                        "tiled R1 reverse node tensor shape is inconsistent");
-                    require_execution_device_packet(
-                        source_offsets.extent(0)
-                                >= required_source_offsets
-                            && source_edges.extent(0)
-                                >= static_cast<std::size_t>(num_edges)
-                            && edge_receivers.extent(0)
-                                >= static_cast<std::size_t>(num_edges),
-                        "tiled R1 reverse source schedule is incomplete");
-                    require_execution_device_packet(
-                        Phi1.span_is_contiguous()
-                            && H1.span_is_contiguous()
-                            && H1_adj.span_is_contiguous()
-                            && node_forces.span_is_contiguous(),
-                        "tiled R1 reverse storage is not contiguous");
-                    const int persistent_blocks =
-                        resolve_jit_device_plugin_persistent_blocks(
-                            *jit_device_plugin,
-                            execution_space,
-                            static_cast<std::size_t>(num_feature_nodes),
-                            "r1_tiled_reverse");
-                    ExecutionDeviceBackend::DeviceGuard device_guard(
-                        ExecutionDeviceBackend::device_ordinal(execution_space));
-                    for (int channel_begin=0; channel_begin<channels;
-                         channel_begin += phi1_channel_tile_size) {
-                        const int channel_count = std::min(
-                            phi1_channel_tile_size, channels-channel_begin);
-                        reverse_A1_channel_tile(num_nodes, channel_begin);
-                        const ExecutionDeviceR1TiledSourceArgs source_args {
-                            sizeof(ExecutionDeviceR1TiledSourceArgs),
-                            static_cast<std::uint32_t>(num_active_types),
-                            static_cast<std::uint32_t>(channel_begin),
-                            static_cast<std::uint32_t>(channel_count),
-                            num_feature_nodes,
-                            num_edges,
-                            reinterpret_cast<const std::int32_t*>(node_types.data()),
-                            reinterpret_cast<const std::int32_t*>(neigh_types.data()),
-                            reinterpret_cast<const std::int32_t*>(
-                                source_offsets.data()),
-                            reinterpret_cast<const std::int32_t*>(
-                                source_edges.data()),
-                            reinterpret_cast<const std::int32_t*>(
-                                edge_receivers.data()),
-                            reinterpret_cast<const std::int32_t*>(
-                                type_to_active.data()),
-                            r.data(),
-                            radial,
-                            Y.data(),
-                            Phi1.data(),
-                            H1_adj.data(),
-                            r_cut,
-                            receiver_tiled
-                                ? dual_layer_active_segment_count : 0,
-                            receiver_tiled
-                                ? reinterpret_cast<const std::int32_t*>(
-                                    source_ids.data())
-                                : nullptr};
-                        const ExecutionDeviceR1TiledEdgeArgs edge_args {
-                            sizeof(ExecutionDeviceR1TiledEdgeArgs),
-                            static_cast<std::uint32_t>(num_active_types),
-                            compact_geometry
-                                ? static_cast<std::uint32_t>(sizeof(Precision))
-                                : static_cast<std::uint32_t>(sizeof(double)),
-                            compact_geometry ? 1u : 0u,
-                            num_nodes,
-                            num_edges,
-                            reinterpret_cast<const std::int32_t*>(node_types.data()),
-                            reinterpret_cast<const std::int32_t*>(
-                                neigh_indices.data()),
-                            reinterpret_cast<const std::int32_t*>(neigh_types.data()),
-                            reinterpret_cast<const std::int32_t*>(
-                                edge_receivers.data()),
-                            reinterpret_cast<const std::int32_t*>(
-                                type_to_active.data()),
-                            compact_geometry
-                                ? static_cast<const void*>(unit_direction.data())
-                                : static_cast<const void*>(xyz.data()),
-                            r.data(),
-                            radial,
-                            Y.data(),
-                            Y_grad.data(),
-                            H1.data(),
-                            Phi1.data(),
-                            node_forces.data(),
-                            r_cut};
-                        ExecutionDeviceBackend::check_status(
-                            jit_device_plugin->launch_r1_tiled_reverse(
-                                &source_args,
-                                &edge_args,
-                                reinterpret_cast<void*>(
-                                    ExecutionDeviceBackend::native_stream(
-                                        execution_space)),
-                                persistent_blocks),
-                            "Launching the tiled R1 reverse module");
-                        if (num_edges > 0) {
-                            factorized_jit_launch_count += 1;
-                            factorized_jit_reverse_launch_count += 1;
-                        }
-                    }
-                    return;
-                }
-
-                require_execution_device_packet(
-                    radial.edge_types == static_cast<std::uint32_t>(
-                        expected_edge_types),
-                    "radial edge-type extent does not match active types");
-                require_execution_device_packet(
-                    radial.functions == static_cast<std::uint32_t>(
-                        expected_functions),
-                    "radial function extent does not match R1 paths");
-                require_execution_device_packet(
-                    radial.intervals > 0 && radial.h > 0.0
-                        && std::isfinite(r_cut) && r_cut > 0.0
-                        && radial.coefficients != nullptr,
-                    "radial spline storage is invalid");
-                require_execution_device_packet(
-                    node_types.extent(0) >= static_cast<std::size_t>(num_nodes)
-                        && H1.extent(0)
-                            >= static_cast<std::size_t>(num_feature_nodes)
-                        && H1_adj.extent(0)
-                            >= static_cast<std::size_t>(num_feature_nodes)
-                        && dPhi1.extent(0)
-                            >= static_cast<std::size_t>(num_nodes),
-                    "node tensor extent is too small");
-                require_execution_device_packet(
-                    neigh_types.extent(0) >= static_cast<std::size_t>(num_edges)
-                        && execution_edge_receivers.extent(0)
-                            >= static_cast<std::size_t>(num_edges)
-                        && (compact_geometry
-                            ? unit_direction.extent(0)
-                                >= static_cast<std::size_t>(3)*num_edges
-                            : xyz.extent(0)
-                                >= static_cast<std::size_t>(3)*num_edges)
-                        && r.extent(0) >= static_cast<std::size_t>(num_edges)
-                        && node_forces.extent(0)
-                            >= static_cast<std::size_t>(3)*num_edges,
-                    "edge tensor extent is too small");
-                require_execution_device_packet(
-                    execution_direct_source_offsets.extent(0)
-                            >= static_cast<std::size_t>(num_feature_nodes)+1
-                        && execution_direct_source_edges.extent(0)
-                            >= static_cast<std::size_t>(num_edges),
-                    "source schedule extent is too small");
-                require_execution_device_packet(
-                    type_to_active.extent(0)
-                        >= static_cast<std::size_t>(num_elements),
-                    "type map extent is too small");
-                require_execution_device_packet(
-                    Y.extent(0) >= static_cast<std::size_t>(num_edges)*num_lm
-                        && (recompute_harmonic_gradients
-                            || Y_grad.extent(0)
-                                >= static_cast<std::size_t>(3)*num_edges*num_lm),
-                    "harmonic tensor extent is too small");
-                require_execution_device_packet(
-                    H1.extent(1) >= static_cast<std::size_t>(num_LM)
-                        && H1.extent(2) >= static_cast<std::size_t>(channels)
-                        && H1_adj.extent(1)
-                            >= static_cast<std::size_t>(num_LM)
-                        && H1_adj.extent(2)
-                            >= static_cast<std::size_t>(channels)
-                        && dPhi1.extent(1)
-                            >= static_cast<std::size_t>(num_lme)
-                        && dPhi1.extent(2)
-                            >= static_cast<std::size_t>(channels),
-                    "R1 tensor shape is inconsistent with the plugin contract");
-                require_execution_device_packet(
-                    num_nodes == 0
-                        || (node_types.data() != nullptr
-                            && execution_direct_source_offsets.data() != nullptr
-                            && type_to_active.data() != nullptr
-                            && H1.data() != nullptr
-                            && dPhi1.data() != nullptr
-                            && H1_adj.data() != nullptr),
-                    "required node tensor pointer is null");
-                require_execution_device_packet(
-                    num_edges == 0
-                        || (neigh_indices.data() != nullptr
-                            && neigh_types.data() != nullptr
-                            && execution_direct_source_edges.data() != nullptr
-                            && execution_edge_receivers.data() != nullptr
-                            && (compact_geometry
-                                ? unit_direction.data() != nullptr
-                                : xyz.data() != nullptr)
-                            && r.data() != nullptr
-                            && Y.data() != nullptr
-                            && (recompute_harmonic_gradients
-                                || Y_grad.data() != nullptr)
-                            && node_forces.data() != nullptr),
-                    "required edge tensor pointer is null");
-                require_execution_device_packet(
-                    node_types.span_is_contiguous()
-                        && neigh_indices.span_is_contiguous()
-                        && neigh_types.span_is_contiguous()
-                        && execution_direct_source_offsets.span_is_contiguous()
-                        && execution_direct_source_edges.span_is_contiguous()
-                        && execution_edge_receivers.span_is_contiguous()
-                        && type_to_active.span_is_contiguous()
-                        && (compact_geometry
-                            ? unit_direction.span_is_contiguous()
-                            : xyz.span_is_contiguous())
-                        && r.span_is_contiguous()
-                        && Y.span_is_contiguous()
-                        && (recompute_harmonic_gradients
-                            || Y_grad.span_is_contiguous())
-                        && H1.span_is_contiguous()
-                        && dPhi1.span_is_contiguous()
-                        && H1_adj.span_is_contiguous()
-                        && node_forces.span_is_contiguous(),
-                    "tensor storage is not contiguous");
-
-                const ExecutionDeviceR1SourceArgs source_args {
-                    sizeof(ExecutionDeviceR1SourceArgs),
-                    static_cast<std::uint32_t>(num_active_types),
-                    num_feature_nodes,
-                    num_edges,
-                    reinterpret_cast<const std::int32_t*>(node_types.data()),
-                    reinterpret_cast<const std::int32_t*>(neigh_types.data()),
-                    reinterpret_cast<const std::int32_t*>(
-                        execution_direct_source_offsets.data()),
-                    reinterpret_cast<const std::int32_t*>(
-                        execution_direct_source_edges.data()),
-                    reinterpret_cast<const std::int32_t*>(
-                        execution_edge_receivers.data()),
-                    reinterpret_cast<const std::int32_t*>(type_to_active.data()),
-                    r.data(),
-                    radial,
-                    Y.data(),
-                    dPhi1.data(),
-                    H1_adj.data(),
-                    r_cut};
-                const ExecutionDeviceR1EdgeArgs edge_args {
-                    sizeof(ExecutionDeviceR1EdgeArgs),
-                    static_cast<std::uint32_t>(num_active_types),
-                    compact_geometry
-                        ? static_cast<std::uint32_t>(sizeof(Precision))
-                        : static_cast<std::uint32_t>(sizeof(double)),
-                    compact_geometry ? 1u : 0u,
-                    num_nodes,
-                    num_edges,
-                    reinterpret_cast<const std::int32_t*>(node_types.data()),
-                    reinterpret_cast<const std::int32_t*>(neigh_indices.data()),
-                    reinterpret_cast<const std::int32_t*>(neigh_types.data()),
-                    reinterpret_cast<const std::int32_t*>(
-                        execution_edge_receivers.data()),
-                    reinterpret_cast<const std::int32_t*>(type_to_active.data()),
-                    compact_geometry
-                        ? static_cast<const void*>(unit_direction.data())
-                        : static_cast<const void*>(xyz.data()),
-                    r.data(),
-                    radial,
-                    Y.data(),
-                    Y_grad.data(),
-                    H1.data(),
-                    dPhi1.data(),
-                    node_forces.data(),
-                    r_cut};
-                const int base_persistent_blocks =
-                    resolve_jit_device_plugin_persistent_blocks(
-                        *jit_device_plugin,
-                        execution_space,
-                        std::max(
-                            static_cast<std::size_t>(num_feature_nodes)
-                                *num_channels,
-                            neigh_indices.extent(0)),
-                        "r1_reverse");
-                int persistent_blocks = base_persistent_blocks;
-                if (jit_device_plugin->r1_reverse_physical_launch_count() == 1)
-                    persistent_blocks = resolve_r1_reverse_grid_blocks(
-                        num_feature_nodes, base_persistent_blocks);
-                ExecutionDeviceBackend::DeviceGuard device_guard(
-                    ExecutionDeviceBackend::device_ordinal(execution_space));
-                ExecutionDeviceBackend::check_status(
-                    jit_device_plugin->launch_r1_coordinate_reverse(
-                        &source_args,
-                        &edge_args,
-                        reinterpret_cast<void*>(
-                            ExecutionDeviceBackend::native_stream(execution_space)),
-                        persistent_blocks),
-                    "Launching the Execution device R1 coordinate-reverse plugin");
-                if (num_edges > 0) {
-                    const auto launch_count =
-                        jit_device_plugin->r1_reverse_physical_launch_count();
-                    factorized_jit_launch_count += launch_count;
-                    factorized_jit_reverse_launch_count += launch_count;
                 }
                 return;
             }
+
+            require_execution_device_packet(
+                radial.edge_types == static_cast<std::uint32_t>(
+                    expected_edge_types),
+                "radial edge-type extent does not match active types");
+            require_execution_device_packet(
+                radial.functions == static_cast<std::uint32_t>(
+                    expected_functions),
+                "radial function extent does not match R1 paths");
+            require_execution_device_packet(
+                radial.intervals > 0 && radial.h > 0.0
+                    && std::isfinite(r_cut) && r_cut > 0.0
+                    && radial.coefficients != nullptr,
+                "radial spline storage is invalid");
+            require_execution_device_packet(
+                node_types.extent(0) >= static_cast<std::size_t>(num_nodes)
+                    && H1.extent(0)
+                        >= static_cast<std::size_t>(num_feature_nodes)
+                    && H1_adj.extent(0)
+                        >= static_cast<std::size_t>(num_feature_nodes)
+                    && dPhi1.extent(0)
+                        >= static_cast<std::size_t>(num_nodes),
+                "node tensor extent is too small");
+            require_execution_device_packet(
+                neigh_types.extent(0) >= static_cast<std::size_t>(num_edges)
+                    && execution_edge_receivers.extent(0)
+                        >= static_cast<std::size_t>(num_edges)
+                    && (compact_geometry
+                        ? unit_direction.extent(0)
+                            >= static_cast<std::size_t>(3)*num_edges
+                        : xyz.extent(0)
+                            >= static_cast<std::size_t>(3)*num_edges)
+                    && r.extent(0) >= static_cast<std::size_t>(num_edges)
+                    && node_forces.extent(0)
+                        >= static_cast<std::size_t>(3)*num_edges,
+                "edge tensor extent is too small");
+            require_execution_device_packet(
+                execution_direct_source_offsets.extent(0)
+                        >= static_cast<std::size_t>(num_feature_nodes)+1
+                    && execution_direct_source_edges.extent(0)
+                        >= static_cast<std::size_t>(num_edges),
+                "source schedule extent is too small");
+            require_execution_device_packet(
+                type_to_active.extent(0)
+                    >= static_cast<std::size_t>(num_elements),
+                "type map extent is too small");
+            require_execution_device_packet(
+                Y.extent(0) >= static_cast<std::size_t>(num_edges)*num_lm
+                    && (recompute_harmonic_gradients
+                        || Y_grad.extent(0)
+                            >= static_cast<std::size_t>(3)*num_edges*num_lm),
+                "harmonic tensor extent is too small");
+            require_execution_device_packet(
+                H1.extent(1) >= static_cast<std::size_t>(num_LM)
+                    && H1.extent(2) >= static_cast<std::size_t>(channels)
+                    && H1_adj.extent(1)
+                        >= static_cast<std::size_t>(num_LM)
+                    && H1_adj.extent(2)
+                        >= static_cast<std::size_t>(channels)
+                    && dPhi1.extent(1)
+                        >= static_cast<std::size_t>(num_lme)
+                    && dPhi1.extent(2)
+                        >= static_cast<std::size_t>(channels),
+                "R1 tensor shape is inconsistent with the plugin contract");
+            require_execution_device_packet(
+                num_nodes == 0
+                    || (node_types.data() != nullptr
+                        && execution_direct_source_offsets.data() != nullptr
+                        && type_to_active.data() != nullptr
+                        && H1.data() != nullptr
+                        && dPhi1.data() != nullptr
+                        && H1_adj.data() != nullptr),
+                "required node tensor pointer is null");
+            require_execution_device_packet(
+                num_edges == 0
+                    || (neigh_indices.data() != nullptr
+                        && neigh_types.data() != nullptr
+                        && execution_direct_source_edges.data() != nullptr
+                        && execution_edge_receivers.data() != nullptr
+                        && (compact_geometry
+                            ? unit_direction.data() != nullptr
+                            : xyz.data() != nullptr)
+                        && r.data() != nullptr
+                        && Y.data() != nullptr
+                        && (recompute_harmonic_gradients
+                            || Y_grad.data() != nullptr)
+                        && node_forces.data() != nullptr),
+                "required edge tensor pointer is null");
+            require_execution_device_packet(
+                node_types.span_is_contiguous()
+                    && neigh_indices.span_is_contiguous()
+                    && neigh_types.span_is_contiguous()
+                    && execution_direct_source_offsets.span_is_contiguous()
+                    && execution_direct_source_edges.span_is_contiguous()
+                    && execution_edge_receivers.span_is_contiguous()
+                    && type_to_active.span_is_contiguous()
+                    && (compact_geometry
+                        ? unit_direction.span_is_contiguous()
+                        : xyz.span_is_contiguous())
+                    && r.span_is_contiguous()
+                    && Y.span_is_contiguous()
+                    && (recompute_harmonic_gradients
+                        || Y_grad.span_is_contiguous())
+                    && H1.span_is_contiguous()
+                    && dPhi1.span_is_contiguous()
+                    && H1_adj.span_is_contiguous()
+                    && node_forces.span_is_contiguous(),
+                "tensor storage is not contiguous");
+
+            const ExecutionDeviceR1SourceArgs source_args {
+                sizeof(ExecutionDeviceR1SourceArgs),
+                static_cast<std::uint32_t>(num_active_types),
+                num_feature_nodes,
+                num_edges,
+                reinterpret_cast<const std::int32_t*>(node_types.data()),
+                reinterpret_cast<const std::int32_t*>(neigh_types.data()),
+                reinterpret_cast<const std::int32_t*>(
+                    execution_direct_source_offsets.data()),
+                reinterpret_cast<const std::int32_t*>(
+                    execution_direct_source_edges.data()),
+                reinterpret_cast<const std::int32_t*>(
+                    execution_edge_receivers.data()),
+                reinterpret_cast<const std::int32_t*>(type_to_active.data()),
+                r.data(),
+                radial,
+                Y.data(),
+                dPhi1.data(),
+                H1_adj.data(),
+                r_cut,
+                edge_weights.data()};
+            const ExecutionDeviceR1EdgeArgs edge_args {
+                sizeof(ExecutionDeviceR1EdgeArgs),
+                static_cast<std::uint32_t>(num_active_types),
+                compact_geometry
+                    ? static_cast<std::uint32_t>(sizeof(Precision))
+                    : static_cast<std::uint32_t>(sizeof(double)),
+                compact_geometry ? 1u : 0u,
+                num_nodes,
+                num_edges,
+                reinterpret_cast<const std::int32_t*>(node_types.data()),
+                reinterpret_cast<const std::int32_t*>(neigh_indices.data()),
+                reinterpret_cast<const std::int32_t*>(neigh_types.data()),
+                reinterpret_cast<const std::int32_t*>(
+                    execution_edge_receivers.data()),
+                reinterpret_cast<const std::int32_t*>(type_to_active.data()),
+                compact_geometry
+                    ? static_cast<const void*>(unit_direction.data())
+                    : static_cast<const void*>(xyz.data()),
+                r.data(),
+                radial,
+                Y.data(),
+                Y_grad.data(),
+                H1.data(),
+                dPhi1.data(),
+                node_forces.data(),
+                r_cut,
+                edge_weights.data()};
+            const int base_persistent_blocks =
+                resolve_jit_device_plugin_persistent_blocks(
+                    *jit_device_plugin,
+                    execution_space,
+                    std::max(
+                        static_cast<std::size_t>(num_feature_nodes)*num_channels,
+                        neigh_indices.extent(0)),
+                    "r1_reverse");
+            int persistent_blocks = base_persistent_blocks;
+            if (jit_device_plugin->r1_reverse_physical_launch_count() == 1)
+                persistent_blocks = resolve_r1_reverse_grid_blocks(
+                    num_feature_nodes, base_persistent_blocks);
+            ExecutionDeviceBackend::DeviceGuard device_guard(
+                ExecutionDeviceBackend::device_ordinal(execution_space));
+            ExecutionDeviceBackend::check_status(
+                jit_device_plugin->launch_r1_coordinate_reverse(
+                    &source_args,
+                    &edge_args,
+                    reinterpret_cast<void*>(
+                        ExecutionDeviceBackend::native_stream(execution_space)),
+                    persistent_blocks),
+                "Launching the Execution device R1 coordinate-reverse plugin");
+            if (num_edges > 0) {
+                const auto launch_count =
+                    jit_device_plugin->r1_reverse_physical_launch_count();
+                factorized_jit_launch_count += launch_count;
+                factorized_jit_reverse_launch_count += launch_count;
+            }
+            return;
         }
+    }
 #endif
-        if (jit_host_plugin_ready()) {
-            if constexpr (!std::is_same_v<
-                    typename Kokkos::DefaultExecutionSpace::memory_space,
-                    Kokkos::HostSpace>) {
-                throw std::runtime_error(
-                    "Execution host plugins require host execution.");
-            } else {
-                static_assert(std::is_same_v<int,std::int32_t>);
-                const int num_edges = static_cast<int>(neigh_indices.extent(0));
-                const int channels = num_channels;
-                const auto radial = make_execution_host_radial_spline(radial_1);
-                const int expected_edge_types =
-                    num_active_types*(num_active_types+1)/2;
-                const int expected_functions =
-                    static_cast<int>(Phi1_l.extent(0))*channels;
+    if (jit_host_plugin_ready()) {
+        if constexpr (!std::is_same_v<
+                typename Kokkos::DefaultExecutionSpace::memory_space,
+                Kokkos::HostSpace>) {
+            throw std::runtime_error(
+                "Execution host plugins require host execution.");
+        } else {
+            static_assert(std::is_same_v<int,std::int32_t>);
+            const int num_edges = static_cast<int>(neigh_indices.extent(0));
+            const int channels = num_channels;
+            const auto radial = make_execution_host_radial_spline(radial_1);
+            const int expected_edge_types =
+                num_active_types*(num_active_types+1)/2;
+            const int expected_functions =
+                static_cast<int>(Phi1_l.extent(0))*channels;
 
-                require_execution_host_packet(num_nodes >= 0, "negative node count");
-                require_execution_host_packet(
-                    num_edges >= 0, "edge count exceeds the host ABI");
-                require_execution_host_packet(
-                    radial.edge_types == static_cast<std::uint32_t>(
-                        expected_edge_types),
-                    "radial edge-type extent does not match active types");
-                require_execution_host_packet(
-                    radial.functions == static_cast<std::uint32_t>(
-                        expected_functions),
-                    "radial function extent does not match R1 paths");
-                require_execution_host_packet(
-                    radial.intervals > 0 && radial.h > 0.0
-                        && std::isfinite(r_cut) && r_cut > 0.0,
-                    "radial spline has no positive interval grid");
-                require_execution_host_packet(
-                    radial.coefficients != nullptr,
-                    "radial coefficient storage is null");
-                require_execution_host_packet(
-                    node_types.extent(0) >= static_cast<std::size_t>(num_nodes)
-                        && H1.extent(0)
-                            >= static_cast<std::size_t>(num_feature_nodes)
-                        && H1_adj.extent(0)
-                            >= static_cast<std::size_t>(num_feature_nodes)
-                        && dPhi1.extent(0)
-                            >= static_cast<std::size_t>(num_nodes),
-                    "node tensor extent is too small");
-                require_execution_host_packet(
-                    neigh_types.extent(0) >= static_cast<std::size_t>(num_edges)
-                        && execution_edge_receivers.extent(0)
-                            >= static_cast<std::size_t>(num_edges)
+            require_execution_host_packet(num_nodes >= 0, "negative node count");
+            require_execution_host_packet(
+                num_edges >= 0, "edge count exceeds the host ABI");
+            require_execution_host_packet(
+                radial.edge_types == static_cast<std::uint32_t>(
+                    expected_edge_types),
+                "radial edge-type extent does not match active types");
+            require_execution_host_packet(
+                radial.functions == static_cast<std::uint32_t>(
+                    expected_functions),
+                "radial function extent does not match R1 paths");
+            require_execution_host_packet(
+                radial.intervals > 0 && radial.h > 0.0
+                    && std::isfinite(r_cut) && r_cut > 0.0,
+                "radial spline has no positive interval grid");
+            require_execution_host_packet(
+                radial.coefficients != nullptr,
+                "radial coefficient storage is null");
+            require_execution_host_packet(
+                node_types.extent(0) >= static_cast<std::size_t>(num_nodes)
+                    && H1.extent(0)
+                        >= static_cast<std::size_t>(num_feature_nodes)
+                    && H1_adj.extent(0)
+                        >= static_cast<std::size_t>(num_feature_nodes)
+                    && dPhi1.extent(0)
+                        >= static_cast<std::size_t>(num_nodes),
+                "node tensor extent is too small");
+            require_execution_host_packet(
+                neigh_types.extent(0) >= static_cast<std::size_t>(num_edges)
+                    && execution_edge_receivers.extent(0)
+                        >= static_cast<std::size_t>(num_edges)
+                    && (compact_geometry
+                        ? unit_direction.extent(0)
+                            >= static_cast<std::size_t>(3)*num_edges
+                        : xyz.extent(0)
+                            >= static_cast<std::size_t>(3)*num_edges)
+                    && r.extent(0) >= static_cast<std::size_t>(num_edges)
+                    && node_forces.extent(0)
+                        >= static_cast<std::size_t>(3)*num_edges,
+                "edge tensor extent is too small");
+            require_execution_host_packet(
+                execution_direct_source_offsets.extent(0)
+                        >= static_cast<std::size_t>(num_feature_nodes)+1
+                    && execution_direct_source_edges.extent(0)
+                        >= static_cast<std::size_t>(num_edges),
+                "source schedule extent is too small");
+            require_execution_host_packet(
+                type_to_active.extent(0)
+                    >= static_cast<std::size_t>(num_elements),
+                "type map extent is too small");
+            require_execution_host_packet(
+                Y.extent(0) >= static_cast<std::size_t>(num_edges)*num_lm
+                    && (recompute_harmonic_gradients
+                        || Y_grad.extent(0)
+                            >= static_cast<std::size_t>(3)*num_edges*num_lm),
+                "harmonic tensor extent is too small");
+            require_execution_host_packet(
+                H1.extent(1) >= static_cast<std::size_t>(num_LM)
+                    && H1.extent(2) >= static_cast<std::size_t>(channels)
+                    && H1_adj.extent(1)
+                        >= static_cast<std::size_t>(num_LM)
+                    && H1_adj.extent(2)
+                        >= static_cast<std::size_t>(channels)
+                    && dPhi1.extent(1)
+                        >= static_cast<std::size_t>(num_lme)
+                    && dPhi1.extent(2)
+                        >= static_cast<std::size_t>(channels),
+                "R1 tensor shape is inconsistent with the plugin contract");
+            require_execution_host_packet(
+                num_nodes == 0
+                    || (node_types.data() != nullptr
+                        && execution_direct_source_offsets.data() != nullptr
+                        && type_to_active.data() != nullptr
+                        && H1.data() != nullptr
+                        && dPhi1.data() != nullptr
+                        && H1_adj.data() != nullptr),
+                "required node tensor pointer is null");
+            require_execution_host_packet(
+                num_edges == 0
+                    || (neigh_indices.data() != nullptr
+                        && neigh_types.data() != nullptr
+                        && execution_direct_source_edges.data() != nullptr
+                        && execution_edge_receivers.data() != nullptr
                         && (compact_geometry
-                            ? unit_direction.extent(0)
-                                >= static_cast<std::size_t>(3)*num_edges
-                            : xyz.extent(0)
-                                >= static_cast<std::size_t>(3)*num_edges)
-                        && r.extent(0) >= static_cast<std::size_t>(num_edges)
-                        && node_forces.extent(0)
-                            >= static_cast<std::size_t>(3)*num_edges,
-                    "edge tensor extent is too small");
-                require_execution_host_packet(
-                    execution_direct_source_offsets.extent(0)
-                            >= static_cast<std::size_t>(num_feature_nodes)+1
-                        && execution_direct_source_edges.extent(0)
-                            >= static_cast<std::size_t>(num_edges),
-                    "source schedule extent is too small");
-                require_execution_host_packet(
-                    type_to_active.extent(0)
-                        >= static_cast<std::size_t>(num_elements),
-                    "type map extent is too small");
-                require_execution_host_packet(
-                    Y.extent(0) >= static_cast<std::size_t>(num_edges)*num_lm
+                            ? unit_direction.data() != nullptr
+                            : xyz.data() != nullptr)
+                        && r.data() != nullptr
+                        && Y.data() != nullptr
                         && (recompute_harmonic_gradients
-                            || Y_grad.extent(0)
-                                >= static_cast<std::size_t>(3)*num_edges*num_lm),
-                    "harmonic tensor extent is too small");
-                require_execution_host_packet(
-                    H1.extent(1) >= static_cast<std::size_t>(num_LM)
-                        && H1.extent(2) >= static_cast<std::size_t>(channels)
-                        && H1_adj.extent(1)
-                            >= static_cast<std::size_t>(num_LM)
-                        && H1_adj.extent(2)
-                            >= static_cast<std::size_t>(channels)
-                        && dPhi1.extent(1)
-                            >= static_cast<std::size_t>(num_lme)
-                        && dPhi1.extent(2)
-                            >= static_cast<std::size_t>(channels),
-                    "R1 tensor shape is inconsistent with the plugin contract");
-                require_execution_host_packet(
-                    num_nodes == 0
-                        || (node_types.data() != nullptr
-                            && execution_direct_source_offsets.data() != nullptr
-                            && type_to_active.data() != nullptr
-                            && H1.data() != nullptr
-                            && dPhi1.data() != nullptr
-                            && H1_adj.data() != nullptr),
-                    "required node tensor pointer is null");
-                require_execution_host_packet(
-                    num_edges == 0
-                        || (neigh_indices.data() != nullptr
-                            && neigh_types.data() != nullptr
-                            && execution_direct_source_edges.data() != nullptr
-                            && execution_edge_receivers.data() != nullptr
-                            && (compact_geometry
-                                ? unit_direction.data() != nullptr
-                                : xyz.data() != nullptr)
-                            && r.data() != nullptr
-                            && Y.data() != nullptr
-                            && (recompute_harmonic_gradients
-                                || Y_grad.data() != nullptr)
-                            && node_forces.data() != nullptr),
-                    "required edge tensor pointer is null");
-                require_execution_host_packet(
-                    node_types.span_is_contiguous()
-                        && neigh_indices.span_is_contiguous()
-                        && neigh_types.span_is_contiguous()
-                        && execution_direct_source_offsets.span_is_contiguous()
-                        && execution_direct_source_edges.span_is_contiguous()
-                        && execution_edge_receivers.span_is_contiguous()
-                        && type_to_active.span_is_contiguous()
-                        && (compact_geometry
-                            ? unit_direction.span_is_contiguous()
-                            : xyz.span_is_contiguous())
-                        && r.span_is_contiguous()
-                        && Y.span_is_contiguous()
-                        && (recompute_harmonic_gradients
-                            || Y_grad.span_is_contiguous())
-                        && H1.span_is_contiguous()
-                        && dPhi1.span_is_contiguous()
-                        && H1_adj.span_is_contiguous()
-                        && node_forces.span_is_contiguous(),
-                    "tensor storage is not contiguous");
+                            || Y_grad.data() != nullptr)
+                        && node_forces.data() != nullptr),
+                "required edge tensor pointer is null");
+            require_execution_host_packet(
+                node_types.span_is_contiguous()
+                    && neigh_indices.span_is_contiguous()
+                    && neigh_types.span_is_contiguous()
+                    && execution_direct_source_offsets.span_is_contiguous()
+                    && execution_direct_source_edges.span_is_contiguous()
+                    && execution_edge_receivers.span_is_contiguous()
+                    && type_to_active.span_is_contiguous()
+                    && (compact_geometry
+                        ? unit_direction.span_is_contiguous()
+                        : xyz.span_is_contiguous())
+                    && r.span_is_contiguous()
+                    && Y.span_is_contiguous()
+                    && (recompute_harmonic_gradients
+                        || Y_grad.span_is_contiguous())
+                    && H1.span_is_contiguous()
+                    && dPhi1.span_is_contiguous()
+                    && H1_adj.span_is_contiguous()
+                    && node_forces.span_is_contiguous(),
+                "tensor storage is not contiguous");
 
-                const SymmetrixJitHostR1SourceArgsV2 source_args {
-                    sizeof(SymmetrixJitHostR1SourceArgsV2),
-                    static_cast<std::uint32_t>(num_active_types),
-                    num_feature_nodes,
-                    num_edges,
-                    reinterpret_cast<const std::int32_t*>(node_types.data()),
-                    reinterpret_cast<const std::int32_t*>(neigh_types.data()),
-                    reinterpret_cast<const std::int32_t*>(
-                        execution_direct_source_offsets.data()),
-                    reinterpret_cast<const std::int32_t*>(
-                        execution_direct_source_edges.data()),
-                    reinterpret_cast<const std::int32_t*>(
-                        execution_edge_receivers.data()),
-                    reinterpret_cast<const std::int32_t*>(type_to_active.data()),
-                    r.data(),
-                    radial,
-                    Y.data(),
-                    dPhi1.data(),
-                    H1_adj.data(),
-                    r_cut};
-                const SymmetrixJitHostR1EdgeArgsV2 edge_args {
-                    sizeof(SymmetrixJitHostR1EdgeArgsV2),
-                    static_cast<std::uint32_t>(num_active_types),
-                    compact_geometry
-                        ? static_cast<std::uint32_t>(sizeof(Precision))
-                        : static_cast<std::uint32_t>(sizeof(double)),
-                    compact_geometry ? 1u : 0u,
-                    num_nodes,
-                    num_edges,
-                    reinterpret_cast<const std::int32_t*>(node_types.data()),
-                    reinterpret_cast<const std::int32_t*>(neigh_indices.data()),
-                    reinterpret_cast<const std::int32_t*>(neigh_types.data()),
-                    reinterpret_cast<const std::int32_t*>(
-                        execution_edge_receivers.data()),
-                    reinterpret_cast<const std::int32_t*>(type_to_active.data()),
-                    compact_geometry
-                        ? static_cast<const void*>(unit_direction.data())
-                        : static_cast<const void*>(xyz.data()),
-                    r.data(),
-                    radial,
-                    Y.data(),
-                    Y_grad.data(),
-                    H1.data(),
-                    dPhi1.data(),
-                    node_forces.data(),
-                    r_cut};
+            const SymmetrixJitHostR1SourceArgsV2 source_args {
+                sizeof(SymmetrixJitHostR1SourceArgsV2),
+                static_cast<std::uint32_t>(num_active_types),
+                num_feature_nodes,
+                num_edges,
+                reinterpret_cast<const std::int32_t*>(node_types.data()),
+                reinterpret_cast<const std::int32_t*>(neigh_types.data()),
+                reinterpret_cast<const std::int32_t*>(
+                    execution_direct_source_offsets.data()),
+                reinterpret_cast<const std::int32_t*>(
+                    execution_direct_source_edges.data()),
+                reinterpret_cast<const std::int32_t*>(
+                    execution_edge_receivers.data()),
+                reinterpret_cast<const std::int32_t*>(type_to_active.data()),
+                r.data(),
+                radial,
+                Y.data(),
+                dPhi1.data(),
+                H1_adj.data(),
+                r_cut,
+                edge_weights.data()};
+            const SymmetrixJitHostR1EdgeArgsV2 edge_args {
+                sizeof(SymmetrixJitHostR1EdgeArgsV2),
+                static_cast<std::uint32_t>(num_active_types),
+                compact_geometry
+                    ? static_cast<std::uint32_t>(sizeof(Precision))
+                    : static_cast<std::uint32_t>(sizeof(double)),
+                compact_geometry ? 1u : 0u,
+                num_nodes,
+                num_edges,
+                reinterpret_cast<const std::int32_t*>(node_types.data()),
+                reinterpret_cast<const std::int32_t*>(neigh_indices.data()),
+                reinterpret_cast<const std::int32_t*>(neigh_types.data()),
+                reinterpret_cast<const std::int32_t*>(
+                    execution_edge_receivers.data()),
+                reinterpret_cast<const std::int32_t*>(type_to_active.data()),
+                compact_geometry
+                    ? static_cast<const void*>(unit_direction.data())
+                    : static_cast<const void*>(xyz.data()),
+                r.data(),
+                radial,
+                Y.data(),
+                Y_grad.data(),
+                H1.data(),
+                dPhi1.data(),
+                node_forces.data(),
+                r_cut,
+                edge_weights.data()};
 #ifdef SYMMETRIX_ENABLE_METAL
-                if constexpr (std::is_same_v<Precision, float>) {
-                    if (metal_r1_module) {
-                        metal_views->map(Y);
-                        metal_views->map(H1);
-                        metal_views->map(dPhi1);
-                        metal_views->map(H1_adj);
-                        metal_r1_module->reverse(source_args, edge_args, {
-                            node_types.extent(0),
-                            type_to_active.extent(0),
-                            dPhi1.extent(0),
-                            H1.extent(0)});
-                        if (num_edges > 0) {
-                            factorized_jit_launch_count += 2;
-                            factorized_jit_reverse_launch_count += 2;
-                        }
-                        return;
+            if constexpr (std::is_same_v<Precision, float>) {
+                if (metal_r1_module) {
+                    metal_views->map(Y);
+                    metal_views->map(H1);
+                    metal_views->map(dPhi1);
+                    metal_views->map(H1_adj);
+                    metal_r1_module->reverse(source_args, edge_args, {
+                        node_types.extent(0),
+                        type_to_active.extent(0),
+                        dPhi1.extent(0),
+                        H1.extent(0)});
+                    if (num_edges > 0) {
+                        factorized_jit_launch_count += 2;
+                        factorized_jit_reverse_launch_count += 2;
                     }
+                    return;
                 }
+            }
 #endif
-                const auto& descriptor = jit_host_plugin->descriptor_v2();
-                const auto source_owner =
-                    descriptor.r1_compensated_source_owner;
-                const auto edge_owner = descriptor.r1_edge_owner;
-                constexpr int source_channel_tile = 32;
-                const int source_channel_tiles =
-                    (channels+source_channel_tile-1)/source_channel_tile;
-                Kokkos::parallel_for(
-                    "ExecutionHostPlugin::r1_source",
-                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
-                        execution_space, 0,
-                        num_feature_nodes*source_channel_tiles),
-                    [=] (const int flat) {
-                        source_owner(
-                            &source_args,
-                            flat/source_channel_tiles,
-                            (flat%source_channel_tiles)*source_channel_tile);
-                    });
-                Kokkos::parallel_for(
-                    "ExecutionHostPlugin::r1_edge",
-                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
-                        execution_space, 0, num_edges),
-                    [=] (const int edge) { edge_owner(&edge_args, edge); });
-                if (num_edges > 0) {
-                    factorized_jit_launch_count += 2;
-                    factorized_jit_reverse_launch_count += 2;
-                }
-                return;
-            }
-        }
-        throw std::runtime_error(
-            "Execution R1 JIT reverse selected without a loaded plugin.");
-    }
-
-    if (dPhi1r.extent(0) < static_cast<std::size_t>(num_nodes))
-        Kokkos::realloc(dPhi1r, num_nodes, num_lelm1lm2, num_channels);
-    Kokkos::deep_copy(execution_space, dPhi1r, Precision(0));
-
-    const int channels = num_channels;
-    const int harmonics = num_lm;
-    const int paths = static_cast<int>(Phi1_l.extent(0));
-    const int source_harmonics = static_cast<int>(H1.extent(1));
-    if (source_harmonics > streamed_fused_max_num_LM)
-        throw std::runtime_error(
-            "Execution direct source harmonics exceed the fused kernel limit.");
-    const int active_type_count = num_active_types;
-    const auto lme = Phi1_lme;
-    const auto row = Phi1_lelm1lm2;
-    const auto coefficients = Phi1_clebsch_gordan;
-    const auto output_adjoint = dPhi1;
-    auto row_adjoint = dPhi1r;
-    const Precision* const output_adjoint_data = output_adjoint.data();
-    Precision* const row_adjoint_data = row_adjoint.data();
-    const std::size_t output_adjoint_channels = output_adjoint.extent(2);
-    const std::size_t row_adjoint_channels = row_adjoint.extent(2);
-    const std::size_t output_adjoint_row_stride = static_cast<std::size_t>(
-        output_adjoint.extent(1))*output_adjoint_channels;
-    const std::size_t row_adjoint_row_stride = static_cast<std::size_t>(
-        row_adjoint.extent(1))*row_adjoint_channels;
-
-    const auto artifact_environment =
-        kernel_launch_environment(execution_space);
-    if (artifact_environment.backend == "host") {
-        Kokkos::parallel_for(
-            "ExecutionDirect::cg_transpose_host",
-            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
-                execution_space, 0, num_nodes*channels),
-            KOKKOS_LAMBDA (const int flat) {
-                const int receiver = flat/channels;
-                const int channel = flat%channels;
-                for (int term=0; term<coefficients.extent_int(0); ++term)
-                    row_adjoint_data[static_cast<std::size_t>(receiver)
-                            *row_adjoint_row_stride
-                        +static_cast<std::size_t>(row(term))
-                            *row_adjoint_channels
-                        +static_cast<std::size_t>(channel)] += coefficients(term)
-                        *output_adjoint_data[static_cast<std::size_t>(receiver)
-                                *output_adjoint_row_stride
-                            +static_cast<std::size_t>(lme(term))
-                                *output_adjoint_channels
-                            +static_cast<std::size_t>(channel)];
-            });
-    } else {
-        Kokkos::parallel_for(
-            "ExecutionDirect::cg_transpose",
-            Kokkos::TeamPolicy<>(
-                execution_space, num_nodes, Kokkos::AUTO, 32),
-            KOKKOS_LAMBDA (Kokkos::TeamPolicy<>::member_type member) {
-                const int receiver = member.league_rank();
-                for (int term=0; term<coefficients.extent_int(0); ++term) {
-                    const Precision coefficient = coefficients(term);
-                    Kokkos::parallel_for(
-                        Kokkos::TeamVectorRange(member, channels),
-                        [=] (const int channel) {
-                            row_adjoint_data[static_cast<std::size_t>(receiver)
-                                    *row_adjoint_row_stride
-                                +static_cast<std::size_t>(row(term))
-                                    *row_adjoint_channels
-                                +static_cast<std::size_t>(channel)] += coefficient
-                                *output_adjoint_data[
-                                    static_cast<std::size_t>(receiver)
-                                        *output_adjoint_row_stride
-                                    +static_cast<std::size_t>(lme(term))
-                                        *output_adjoint_channels
-                                    +static_cast<std::size_t>(channel)];
-                        });
-                }
-            });
-    }
-
-    const auto source_offsets = execution_direct_source_offsets;
-    const auto source_edges = execution_direct_source_edges;
-    const auto edge_receivers = execution_edge_receivers;
-    const auto type_map = type_to_active;
-    const auto path_row_offsets = Phi1_path_row_offsets;
-    const auto lm1_rows = Phi1_lm1;
-    const auto lm2_rows = Phi1_lm2;
-    const auto radial = radial_1;
-    const auto harmonics_values = Y;
-    auto source_adjoint = H1_adj;
-
-    Kokkos::parallel_for(
-        "ExecutionDirect::source_transpose",
-        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
-            execution_space, 0, num_feature_nodes*channels),
-        KOKKOS_LAMBDA (const int flat) {
-            const int channel = flat%channels;
-            const int source = flat/channels;
-            Precision values[streamed_fused_max_num_LM] = {};
-            Precision compensations[streamed_fused_max_num_LM] = {};
-            for (int scheduled=source_offsets(source);
-                 scheduled<source_offsets(source+1); ++scheduled) {
-                const int edge = source_edges(scheduled);
-                const int receiver = edge_receivers(edge);
-                const int receiver_type = type_map(node_types(receiver));
-                const int source_type = type_map(neigh_types(edge));
-                const int edge_type = receiver_type <= source_type
-                    ? receiver_type*(2*active_type_count-receiver_type-1)/2
-                        +source_type
-                    : source_type*(2*active_type_count-source_type-1)/2
-                        +receiver_type;
-                const auto point = radial.evaluation_point(r(edge));
-                for (int path=0; path<paths; ++path) {
-                    const Precision radial_value = radial.evaluate_function(
-                        edge_type, point, path*channels+channel);
-                    for (int sparse_row=path_row_offsets(path);
-                         sparse_row<path_row_offsets(path+1); ++sparse_row) {
-                        const int source_lm = lm2_rows(sparse_row);
-                        const Precision contribution = radial_value
-                            *harmonics_values(
-                                edge*harmonics+lm1_rows(sparse_row))
-                            *row_adjoint_data[
-                                static_cast<std::size_t>(receiver)
-                                    *row_adjoint_row_stride
-                                +static_cast<std::size_t>(sparse_row)
-                                    *row_adjoint_channels
-                                +static_cast<std::size_t>(channel)];
-                        const Precision corrected = contribution
-                            -compensations[source_lm];
-                        const Precision updated = values[source_lm]+corrected;
-                        compensations[source_lm] =
-                            (updated-values[source_lm])-corrected;
-                        values[source_lm] = updated;
-                    }
-                }
-            }
-            for (int source_lm=0; source_lm<source_harmonics; ++source_lm)
-                source_adjoint(source,source_lm,channel) += values[source_lm];
-        });
-
-    const auto harmonics_gradients = Y_grad;
-    const auto neighbor_features = H1;
-    auto forces = node_forces;
-    const int num_edges = static_cast<int>(neigh_indices.extent(0));
-    if (num_edges > 0) {
-        if (artifact_environment.backend == "host") {
+            const auto& descriptor = jit_host_plugin->descriptor_v2();
+            const auto source_owner =
+                descriptor.r1_compensated_source_owner;
+            const auto edge_owner = descriptor.r1_edge_owner;
+            constexpr int source_channel_tile = 32;
+            const int source_channel_tiles =
+                (channels+source_channel_tile-1)/source_channel_tile;
             Kokkos::parallel_for(
-                "ExecutionDirect::edge_force_host",
+                "ExecutionHostPlugin::r1_source",
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                    execution_space, 0,
+                    num_feature_nodes*source_channel_tiles),
+                [=] (const int flat) {
+                    source_owner(
+                        &source_args,
+                        flat/source_channel_tiles,
+                        (flat%source_channel_tiles)*source_channel_tile);
+                });
+            Kokkos::parallel_for(
+                "ExecutionHostPlugin::r1_edge",
                 Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
                     execution_space, 0, num_edges),
-                KOKKOS_LAMBDA (const int edge) {
-                    const int receiver = edge_receivers(edge);
-                    const int source = neigh_indices(edge);
-                    const int receiver_type = type_map(node_types(receiver));
-                    const int source_type = type_map(neigh_types(edge));
-                    const int edge_type = receiver_type <= source_type
-                        ? receiver_type
-                            *(2*active_type_count-receiver_type-1)/2
-                            +source_type
-                        : source_type
-                            *(2*active_type_count-source_type-1)/2
-                            +receiver_type;
-                    const auto point = radial.evaluation_point(r(edge));
-                    const Precision x_over_r = compact_geometry
-                        ? unit_direction(3*edge)
-                        : static_cast<Precision>(xyz(3*edge)/r(edge));
-                    const Precision y_over_r = compact_geometry
-                        ? unit_direction(3*edge+1)
-                        : static_cast<Precision>(xyz(3*edge+1)/r(edge));
-                    const Precision z_over_r = compact_geometry
-                        ? unit_direction(3*edge+2)
-                        : static_cast<Precision>(xyz(3*edge+2)/r(edge));
-                    Precision force_x = 0;
-                    Precision force_y = 0;
-                    Precision force_z = 0;
-                    for (int channel=0; channel<channels; ++channel)
-                        for (int path=0; path<paths; ++path) {
-                            Precision radial_value;
-                            Precision radial_derivative;
-                            radial.evaluate_function(
-                                edge_type, point, path*channels+channel,
-                                radial_value, radial_derivative);
-                            for (int sparse_row=path_row_offsets(path);
-                                 sparse_row<path_row_offsets(path+1);
-                                 ++sparse_row) {
-                                const int lm1 = lm1_rows(sparse_row);
-                                const int lm2 = lm2_rows(sparse_row);
-                                const Precision adjoint = row_adjoint(
-                                    receiver,sparse_row,channel);
-                                const Precision neighbor =
-                                    neighbor_features(source,lm2,channel);
-                                const Precision radial_force =
-                                    radial_derivative*neighbor*adjoint;
-                                const Precision angular_force =
-                                    radial_value*neighbor*adjoint;
-                                force_x += radial_force*x_over_r
-                                    *harmonics_values(edge*harmonics+lm1)
-                                    +angular_force*harmonics_gradients(
-                                        3*edge*harmonics+lm1);
-                                force_y += radial_force*y_over_r
-                                    *harmonics_values(edge*harmonics+lm1)
-                                    +angular_force*harmonics_gradients(
-                                        (3*edge+1)*harmonics+lm1);
-                                force_z += radial_force*z_over_r
-                                    *harmonics_values(edge*harmonics+lm1)
-                                    +angular_force*harmonics_gradients(
-                                        (3*edge+2)*harmonics+lm1);
-                            }
-                        }
-                    forces(3*edge) -= force_x;
-                    forces(3*edge+1) -= force_y;
-                    forces(3*edge+2) -= force_z;
-                });
-        } else {
-            constexpr int edges_per_team = 8;
-            using TeamMember = Kokkos::TeamPolicy<>::member_type;
-            Kokkos::parallel_for(
-                "ExecutionDirect::edge_force",
-                Kokkos::TeamPolicy<>(
-                    execution_space,
-                    (num_edges+edges_per_team-1)/edges_per_team,
-                    edges_per_team, 32),
-                KOKKOS_LAMBDA (TeamMember member) {
-                const int edge_begin = member.league_rank()*edges_per_team;
-                const int edge_count = Kokkos::min(
-                    edges_per_team, num_edges-edge_begin);
-                Kokkos::parallel_for(
-                    Kokkos::TeamThreadRange(member, edge_count),
-                    [=] (const int edge_offset) {
-                        const int edge = edge_begin+edge_offset;
-                        const int receiver = edge_receivers(edge);
-                        const int source = neigh_indices(edge);
-                        const int receiver_type = type_map(node_types(receiver));
-                        const int source_type = type_map(neigh_types(edge));
-                        const int edge_type = receiver_type <= source_type
-                            ? receiver_type
-                                *(2*active_type_count-receiver_type-1)/2
-                                +source_type
-                            : source_type
-                                *(2*active_type_count-source_type-1)/2
-                                +receiver_type;
-                        const auto point = radial.evaluation_point(r(edge));
-                        const Precision x_over_r = compact_geometry
-                            ? unit_direction(3*edge)
-                            : static_cast<Precision>(xyz(3*edge)/r(edge));
-                        const Precision y_over_r = compact_geometry
-                            ? unit_direction(3*edge+1)
-                            : static_cast<Precision>(xyz(3*edge+1)/r(edge));
-                        const Precision z_over_r = compact_geometry
-                            ? unit_direction(3*edge+2)
-                            : static_cast<Precision>(xyz(3*edge+2)/r(edge));
-                        Precision force_x, force_y, force_z;
-                        Kokkos::parallel_reduce(
-                            Kokkos::ThreadVectorRange(member, channels),
-                            [=] (const int channel,
-                                 Precision& force_x,
-                                 Precision& force_y,
-                                 Precision& force_z) {
-                                for (int path=0; path<paths; ++path) {
-                                    Precision radial_value;
-                                    Precision radial_derivative;
-                                    radial.evaluate_function(
-                                        edge_type, point,
-                                        path*channels+channel,
-                                        radial_value, radial_derivative);
-                                    for (int sparse_row=path_row_offsets(path);
-                                         sparse_row<path_row_offsets(path+1);
-                                         ++sparse_row) {
-                                        const int lm1 = lm1_rows(sparse_row);
-                                        const int lm2 = lm2_rows(sparse_row);
-                                        const Precision adjoint = row_adjoint(
-                                            receiver,sparse_row,channel);
-                                        const Precision neighbor =
-                                            neighbor_features(source,lm2,channel);
-                                        const Precision radial_force =
-                                            radial_derivative*neighbor*adjoint;
-                                        const Precision angular_force =
-                                            radial_value*neighbor*adjoint;
-                                        force_x += radial_force*x_over_r
-                                            *harmonics_values(
-                                                edge*harmonics+lm1)
-                                            +angular_force
-                                                *harmonics_gradients(
-                                                    3*edge*harmonics+lm1);
-                                        force_y += radial_force*y_over_r
-                                            *harmonics_values(
-                                                edge*harmonics+lm1)
-                                            +angular_force
-                                                *harmonics_gradients(
-                                                    (3*edge+1)*harmonics+lm1);
-                                        force_z += radial_force*z_over_r
-                                            *harmonics_values(
-                                                edge*harmonics+lm1)
-                                            +angular_force
-                                                *harmonics_gradients(
-                                                    (3*edge+2)*harmonics+lm1);
-                                    }
-                                }
-                            }, force_x, force_y, force_z);
-                        Kokkos::single(Kokkos::PerThread(member), [=] {
-                            forces(3*edge) -= force_x;
-                            forces(3*edge+1) -= force_y;
-                            forces(3*edge+2) -= force_z;
-                        });
-                    });
-                });
+                [=] (const int edge) { edge_owner(&edge_args, edge); });
+            if (num_edges > 0) {
+                factorized_jit_launch_count += 2;
+                factorized_jit_reverse_launch_count += 2;
+            }
+            return;
         }
     }
-    complete_device_stage("MACEKokkos::reverse_factorized_direct");
+    throw std::runtime_error(
+        "Execution R1 JIT reverse selected without a loaded plugin.");
 }
 
 template <typename Precision>
@@ -1466,6 +1163,9 @@ void MACEKokkos<Precision>::reverse_factorized(
     Kokkos::View<const double*> xyz,
     Kokkos::View<const double*> r)
 {
+    if (alchemical_edge_weights.data() != nullptr)
+        throw std::logic_error(
+            "Alchemical edge weights require stateless direct R1 execution.");
     if (!factorized_ready)
         throw std::runtime_error("Execution R1 model cache has not been prepared.");
     const auto execution_space = factorized_execution_space;
@@ -1517,12 +1217,9 @@ void MACEKokkos<Precision>::reverse_factorized(
     auto source_compensation = factorized_source_compensation_view();
     const int neighbor_harmonics = num_LM;
     auto compact_message = factorized_compact_message_view();
-    const bool plugin_tiled_fallback =
-        factorized_source_strategy == FactorizedSourceStrategy::jit_plugin
-        && factorized_tiled_ready;
     const bool tiled_execution =
-        factorized_source_strategy == FactorizedSourceStrategy::tiled_coupling
-        || plugin_tiled_fallback;
+        factorized_source_strategy != FactorizedSourceStrategy::serial_reference
+        && factorized_tiled_ready;
 
     if (execution_schedule_num_nodes != num_nodes
         || static_cast<int>(source_edges.extent(0))
@@ -1584,10 +1281,6 @@ void MACEKokkos<Precision>::reverse_factorized(
                     l, receiver_begin, receiver_count, state_adjoint);
 
             if (tiled_execution) {
-                if (!factorized_tiled_ready)
-                    throw std::runtime_error(
-                        "Execution R1 tiled coupling workspace exceeds 64 MiB.");
-
                 if (l == 0)
                     Kokkos::parallel_for(
                         "MACEKokkos::cache_factorized_radial_derivatives",

@@ -118,6 +118,19 @@ environment. CUDA and HIP backends are separate architecture-qualified
 extensions; see {doc}`backends`. Build and release commands are summarized in
 {doc}`/reference/build_frontend`.
 
+Source builds default to `--prebuilt-operator-artifacts r0` and
+`--prebuilt-oam-artifacts off`. The CPU and CUDA release-wheel workflows request
+`--prebuilt-oam-artifacts known`, which installs FP32/FP64 artifacts for the
+exact OAM-S/M/L/XL generated architectures; repaired-wheel inclusion remains a
+release gate. Catalog presence proves build availability, not current runtime
+qualification. Use the same option in a source build to avoid compilation on
+first use of those layouts. A custom OAM layout still compiles into the
+per-user cache when a matching compiler is available.
+For MACE, use `off` for a minimal compiler-dependent build or `full` to opt into
+all 32 verified foundation R1/R0/M0/M1 artifacts. Full is not currently a
+publication default because no cross-backend size, build-time, and first-call
+release budgets have been accepted.
+
 `uv` must be installed before this sequence. Activating `.venv` is required:
 the helper intentionally installs into the Python interpreter that invoked it.
 

@@ -37,8 +37,9 @@
 #endif
 #include "device_backend.hpp"
 #include "mace_kokkos_jit_plugin_detail.hpp"
-#include "standard_m0.hpp"
-#include "standard_r0.hpp"
+#include "mace_jit_r0_arguments.hpp"
+#include "mace_standard_m0.hpp"
+#include "mace_standard_r0.hpp"
 #include "factorized_blas.hpp"
 
 using Kokkos::ALL;
@@ -563,7 +564,6 @@ void MACEKokkos<Precision>::reverse_A0(
     auto Y = this->Y;
     auto Y_grad = this->Y_grad;
     auto node_forces = this->node_forces;
-
     Kokkos::View<int*> first_neigh("first_neigh", num_nodes);
     Kokkos::parallel_scan("first_neigh",
         num_nodes,
@@ -627,23 +627,50 @@ void MACEKokkos<Precision>::compute_A0_streamed(
 {
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
+    const double* edge_weights = alchemical_edge_weights.extent(0) == 0
+        ? nullptr : alchemical_edge_weights.data();
     if (num_active_types == 0)
         throw std::runtime_error("MACEKokkos radial cache has not been prepared.");
     ensure_mh0_a0_forward_capacity(num_nodes);
-    const bool module_scope =
-        streamed_edges == MACEStreamedEdgesMode::generic
-        || (mace_uses_prepared_execution(streamed_edges)
-            && (single_layer_readout
-                || factorized_source_strategy
-                    == FactorizedSourceStrategy::jit_plugin));
-    standard_r0_module_active = module_scope
-        && use_r0_module()
-        && (selected_r0_implementation == R0Implementation::device_module
-            || standard_r0_executor != StandardR0Executor::v1);
+    standard_r0_module_active = use_r0_comparison_dispatch();
     if (standard_r0_module_active) {
         if (A0_scaled && standard_r0_density_state.extent(0)
                 < static_cast<std::size_t>(num_nodes))
             Kokkos::realloc(standard_r0_density_state, num_nodes);
+        symmetrix::execution::R0LogicalArguments<Precision> r0_arguments{
+            .num_nodes = num_nodes,
+            .num_edges = static_cast<std::int64_t>(r.extent(0)),
+            .workspace_edge_begin = workspace_edge_begin,
+            .active_type_count = num_active_types,
+            .type_to_active_count = static_cast<std::int64_t>(type_to_active.extent(0)),
+            .channels = num_channels,
+            .l_max = l_max,
+            .harmonic_count = num_lm,
+            .apply_density_scale = A0_scaled,
+            .node_types = node_types.data(),
+            .num_neigh = num_neigh.data(),
+            .first_neigh = streamed_first_neigh.data(),
+            .neigh_types = neigh_types.data(),
+            .type_to_active = type_to_active.data(),
+            .radius = r.data(),
+            .radial = {
+                static_cast<std::uint32_t>(R0_spline_coefficients.extent(0)),
+                static_cast<std::uint32_t>(R0_spline_coefficients.extent(1)),
+                static_cast<std::uint32_t>(R0_spline_coefficients.extent(3)),
+                R0_spline_h, R0_spline_min, R0_spline_coefficients.data()},
+            .harmonics = Y.data(),
+            .output = A0.data(),
+            .density_state = standard_r0_density_state.data(),
+            .cutoff = r_cut,
+            .edge_weights = edge_weights,
+        };
+        if (A0_scaled)
+            r0_arguments.density = {
+                static_cast<std::uint32_t>(A0_splines.edge_type_count()),
+                static_cast<std::uint32_t>(A0_splines.interval_count()),
+                static_cast<std::uint32_t>(A0_splines.function_count()),
+                A0_splines.spline_h(), A0_splines.spline_x0(),
+                A0_splines.coefficient_data()};
         if (selected_r0_implementation == R0Implementation::device_module
             && !single_layer_tiled_plan_active
             && !dual_layer_tiled_plan_active) {
@@ -662,32 +689,8 @@ void MACEKokkos<Precision>::compute_A0_streamed(
             if (persistent_blocks <= 0)
                 throw std::runtime_error(
                     "Execution R0 device-module forward has no launch profile.");
-            const SymmetrixJitR0SplineV1 radial{
-                sizeof(SymmetrixJitR0SplineV1),
-                static_cast<std::uint32_t>(R0_spline_coefficients.extent(0)),
-                static_cast<std::uint32_t>(R0_spline_coefficients.extent(1)),
-                static_cast<std::uint32_t>(R0_spline_coefficients.extent(3)),
-                R0_spline_h, R0_spline_min,
-                R0_spline_coefficients.data()};
-            SymmetrixJitR0SplineV1 density{
-                sizeof(SymmetrixJitR0SplineV1), 0u, 0u, 0u,
-                0.0, 0.0, nullptr};
-            if (A0_scaled)
-                density = {
-                    sizeof(SymmetrixJitR0SplineV1),
-                    static_cast<std::uint32_t>(A0_splines.edge_type_count()),
-                    static_cast<std::uint32_t>(A0_splines.interval_count()),
-                    static_cast<std::uint32_t>(A0_splines.function_count()),
-                    A0_splines.spline_h(), A0_splines.spline_x0(),
-                    A0_splines.coefficient_data()};
-            const SymmetrixJitR0ArgsV1 args{
-                sizeof(SymmetrixJitR0ArgsV1), 0u, num_nodes,
-                static_cast<std::int64_t>(r.extent(0)), num_active_types,
-                num_channels, l_max, 0, A0_scaled ? 1 : 0, 0,
-                node_types.data(), num_neigh.data(), streamed_first_neigh.data(),
-                neigh_types.data(), nullptr, type_to_active.data(), nullptr,
-                r.data(), radial, density, Y.data(), nullptr, A0.data(), nullptr,
-                standard_r0_density_state.data(), nullptr, nullptr, r_cut};
+            const auto args =
+                symmetrix::execution::lower_r0_device_arguments(r0_arguments);
             ExecutionDeviceBackend::DeviceGuard device_guard(
                 ExecutionDeviceBackend::device_ordinal(execution_space));
             void* stream = reinterpret_cast<void*>(
@@ -707,20 +710,77 @@ void MACEKokkos<Precision>::compute_A0_streamed(
                 "Execution R0 device modules require a device backend.");
 #endif
         }
+        if constexpr (symmetrix::execution::host_execution_space<
+                Kokkos::DefaultExecutionSpace>)
+        if (selected_r0_implementation == R0Implementation::host_plugin
+            && !single_layer_tiled_plan_active
+            && !dual_layer_tiled_plan_active && workspace_edge_begin == 0) {
+            if (!r0_host_plugin_ready())
+                throw std::runtime_error(
+                    "Execution R0 host-plugin forward is unavailable.");
+            const auto args =
+                symmetrix::execution::lower_r0_host_arguments(r0_arguments);
+            const auto& descriptor = r0_host_plugin->descriptor();
+            if (A0_scaled) {
+                const auto range = descriptor.density_prepare_range;
+                const std::int64_t batches =
+                    (static_cast<std::int64_t>(num_nodes)
+                        +SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2-1)
+                    /SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2;
+                Kokkos::parallel_for(
+                    "MACEKokkos::r0_host_density_prepare",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                        Kokkos::IndexType<std::int64_t>>(
+                        execution_space, 0, batches),
+                    [=] (const std::int64_t batch) {
+                        const std::int64_t begin =
+                            batch*SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2;
+                        const std::int64_t end = begin
+                                +SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2
+                            < args.num_nodes
+                            ? begin+SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2
+                            : args.num_nodes;
+                        range(&args, begin, end);
+                    });
+                standard_r0_module_launch_count += 1;
+            }
+            const std::int64_t channel_tiles =
+                (static_cast<std::int64_t>(num_channels)
+                    +SYMMETRIX_JIT_R0_HOST_FORWARD_CHANNEL_TILE_V1-1)
+                /SYMMETRIX_JIT_R0_HOST_FORWARD_CHANNEL_TILE_V1;
+            const std::int64_t work_items =
+                static_cast<std::int64_t>(num_nodes)*channel_tiles;
+            const auto range = descriptor.forward_range;
+            const std::int64_t batches =
+                (work_items+SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2-1)
+                /SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2;
+            Kokkos::parallel_for(
+                "MACEKokkos::r0_host_forward",
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                    Kokkos::IndexType<std::int64_t>>(
+                    execution_space, 0, batches),
+                [=] (const std::int64_t batch) {
+                    const std::int64_t begin =
+                        batch*SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2;
+                    const std::int64_t end = begin
+                            +SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2 < work_items
+                        ? begin+SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2
+                        : work_items;
+                    range(&args, begin, end);
+                });
+            standard_r0_module_launch_count += 1;
+            standard_r0_density_scale_fused = A0_scaled;
+            return;
+        }
         if (A0_scaled) {
-            symmetrix::standard_r0::launch_density_prepare(
-                execution_space,
-                num_nodes,
-                num_active_types,
-                r_cut,
-                node_types,
-                num_neigh,
-                neigh_types,
-                streamed_first_neigh,
-                r,
-                type_to_active,
-                A0_splines,
-                standard_r0_density_state);
+            const auto launch_density = [&]<bool ApplyEdgeWeights>() {
+                symmetrix::standard_r0::launch_density_prepare<ApplyEdgeWeights>(
+                    execution_space, r0_arguments);
+            };
+            if (edge_weights == nullptr)
+                launch_density.template operator()<false>();
+            else
+                launch_density.template operator()<true>();
             standard_r0_module_launch_count += 1;
         }
 #ifdef SYMMETRIX_ENABLE_METAL
@@ -759,46 +819,18 @@ void MACEKokkos<Precision>::compute_A0_streamed(
         if constexpr (std::is_same_v<Precision,float>)
             use_fused_r0_forward = single_layer_readout;
 #endif
-        if (use_fused_r0_forward)
-            symmetrix::standard_r0::launch_forward_all_l(
-                execution_space,
-                num_nodes,
-                num_active_types,
-                R0_spline_h,
-                R0_spline_min,
-                r_cut,
-                node_types,
-                num_neigh,
-                neigh_types,
-                streamed_first_neigh,
-                r,
-                type_to_active,
-                R0_spline_coefficients,
-                Y,
-                A0_scaled,
-                standard_r0_density_state,
-                A0,
-                workspace_edge_begin);
+        const auto launch_standard_forward = [&]<bool ApplyEdgeWeights>() {
+            if (use_fused_r0_forward)
+                symmetrix::standard_r0::launch_forward_all_l<ApplyEdgeWeights>(
+                    execution_space, r0_arguments);
+            else
+                symmetrix::standard_r0::launch_forward<ApplyEdgeWeights>(
+                    execution_space, r0_arguments);
+        };
+        if (edge_weights == nullptr)
+            launch_standard_forward.template operator()<false>();
         else
-            symmetrix::standard_r0::launch_forward(
-                execution_space,
-                num_nodes,
-                num_active_types,
-                R0_spline_h,
-                R0_spline_min,
-                r_cut,
-                node_types,
-                num_neigh,
-                neigh_types,
-                streamed_first_neigh,
-                r,
-                type_to_active,
-                R0_spline_coefficients,
-                Y,
-                A0_scaled,
-                standard_r0_density_state,
-                A0,
-                workspace_edge_begin);
+            launch_standard_forward.template operator()<true>();
         standard_r0_module_launch_count += 1;
         standard_r0_density_scale_fused = A0_scaled;
         return;
@@ -830,6 +862,7 @@ void MACEKokkos<Precision>::compute_A0_streamed(
     const Kokkos::TeamPolicy<> policy(
         execution_space, num_nodes*(l_max+1), Kokkos::AUTO, 32);
 #endif
+    const bool apply_edge_weights = edge_weights != nullptr;
     Kokkos::parallel_for(
         "MACEKokkos::compute_A0_streamed",
         policy,
@@ -845,6 +878,8 @@ void MACEKokkos<Precision>::compute_A0_streamed(
             for (int j=0; j<num_neigh(node); ++j) {
                 const int ij = i0+j;
                 const std::size_t edge = static_cast<std::size_t>(ij);
+                const Precision weight = apply_edge_weights
+                    ? static_cast<Precision>(edge_weights[edge]) : Precision(1);
                 const int type_j = type_to_active(neigh_types(ij));
                 const int edge_type = type_i*num_types+type_j;
                 int interval = static_cast<int>(Kokkos::floor((r(ij)-x0)/h));
@@ -871,7 +906,7 @@ void MACEKokkos<Precision>::compute_A0_streamed(
                         const std::size_t workspace_edge =
                             edge-static_cast<std::size_t>(workspace_edge_begin);
                         for (int lm=lm_begin; lm<lm_end; ++lm)
-                            A0(node,lm,k) += value*Y(
+                            A0(node,lm,k) += weight*value*Y(
                                 workspace_edge*num_lm+lm);
                     });
             }
@@ -1002,6 +1037,8 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
 {
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
+    const double* edge_weights = alchemical_edge_weights.extent(0) == 0
+        ? nullptr : alchemical_edge_weights.data();
     const int active_edge_count = edge_count < 0
         ? static_cast<int>(r.extent(0)) : edge_count;
     if (receiver_base < 0 || edge_begin < 0 || active_edge_count < 0
@@ -1017,9 +1054,55 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
                     std::size_t(0),
                     static_cast<std::size_t>(active_edge_count)));
         } else {
-            edge_receivers = streamed_edges == MACEStreamedEdgesMode::generic
+            edge_receivers = streamed_edges == ExecutionMode::generic
                 ? streamed_edge_receivers : execution_edge_receivers;
         }
+        const bool compact = use_compact_edge_geometry();
+        symmetrix::execution::R0LogicalArguments<Precision> r0_arguments{
+            .receiver_base = static_cast<std::uint32_t>(receiver_base),
+            .num_nodes = num_nodes,
+            .num_edges = active_edge_count,
+            .edge_begin = edge_begin,
+            .workspace_edge_begin = edge_begin,
+            .active_type_count = num_active_types,
+            .type_to_active_count = static_cast<std::int64_t>(type_to_active.extent(0)),
+            .channels = num_channels,
+            .l_max = l_max,
+            .harmonic_count = num_lm,
+            .coordinates_are_unit = compact,
+            .apply_density_scale = A0_scaled,
+            .node_types = node_types.data(),
+            .num_neigh = num_neigh.data(),
+            .first_neigh = streamed_first_neigh.data(),
+            .neigh_types = neigh_types.data(),
+            .edge_receivers = edge_receivers.data(),
+            .type_to_active = type_to_active.data(),
+            .coordinates = compact
+                ? static_cast<const void*>(
+                    execution_prepared_unit_direction.data())
+                : static_cast<const void*>(xyz.data()),
+            .radius = r.data(),
+            .radial = {
+                static_cast<std::uint32_t>(R0_spline_coefficients.extent(0)),
+                static_cast<std::uint32_t>(R0_spline_coefficients.extent(1)),
+                static_cast<std::uint32_t>(R0_spline_coefficients.extent(3)),
+                R0_spline_h, R0_spline_min, R0_spline_coefficients.data()},
+            .harmonics = Y.data(),
+            .harmonic_gradients = Y_grad.data(),
+            .output = A0.data(),
+            .output_adjoint = A0_adj.data(),
+            .density_state = standard_r0_density_state.data(),
+            .directed_forces = node_forces.data(),
+            .cutoff = r_cut,
+            .edge_weights = edge_weights,
+        };
+        if (A0_scaled)
+            r0_arguments.density = {
+                static_cast<std::uint32_t>(A0_splines.edge_type_count()),
+                static_cast<std::uint32_t>(A0_splines.interval_count()),
+                static_cast<std::uint32_t>(A0_splines.function_count()),
+                A0_splines.spline_h(), A0_splines.spline_x0(),
+                A0_splines.coefficient_data()};
         if (selected_r0_implementation == R0Implementation::device_module
             && !single_layer_tiled_plan_active
             && !dual_layer_tiled_plan_active) {
@@ -1036,44 +1119,8 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
                 base_persistent_blocks,
                 r0_device_module->threads_per_block(),
                 environment.compute_unit_count);
-            const SymmetrixJitR0SplineV1 radial{
-                sizeof(SymmetrixJitR0SplineV1),
-                static_cast<std::uint32_t>(R0_spline_coefficients.extent(0)),
-                static_cast<std::uint32_t>(R0_spline_coefficients.extent(1)),
-                static_cast<std::uint32_t>(R0_spline_coefficients.extent(3)),
-                R0_spline_h, R0_spline_min,
-                R0_spline_coefficients.data()};
-            SymmetrixJitR0SplineV1 density{
-                sizeof(SymmetrixJitR0SplineV1), 0u, 0u, 0u,
-                0.0, 0.0, nullptr};
-            if (A0_scaled)
-                density = {
-                    sizeof(SymmetrixJitR0SplineV1),
-                    static_cast<std::uint32_t>(A0_splines.edge_type_count()),
-                    static_cast<std::uint32_t>(A0_splines.interval_count()),
-                    static_cast<std::uint32_t>(A0_splines.function_count()),
-                    A0_splines.spline_h(), A0_splines.spline_x0(),
-                    A0_splines.coefficient_data()};
-            const bool compact = use_compact_edge_geometry();
-            const void* coordinates = compact
-                ? static_cast<const void*>(
-                    execution_prepared_unit_direction.data()+3*edge_begin)
-                : static_cast<const void*>(xyz.data()+3*edge_begin);
-            const auto* harmonic_gradients = Y_grad.data() == nullptr
-                ? nullptr : Y_grad.data()+static_cast<std::size_t>(3)*edge_begin*num_lm;
-            const SymmetrixJitR0ArgsV1 args{
-                sizeof(SymmetrixJitR0ArgsV1),
-                static_cast<std::uint32_t>(receiver_base), num_nodes,
-                static_cast<std::int64_t>(active_edge_count), num_active_types,
-                num_channels, l_max, compact ? 1 : 0, A0_scaled ? 1 : 0, 0,
-                node_types.data(), num_neigh.data(), streamed_first_neigh.data(),
-                neigh_types.data()+edge_begin,
-                edge_receivers.data()+edge_begin, type_to_active.data(),
-                coordinates, r.data()+edge_begin, radial, density,
-                Y.data()+static_cast<std::size_t>(edge_begin)*num_lm,
-                harmonic_gradients,
-                A0.data(), A0_adj.data(), standard_r0_density_state.data(),
-                nullptr, node_forces.data()+3*edge_begin, r_cut};
+            const auto args =
+                symmetrix::execution::lower_r0_device_arguments(r0_arguments);
             ExecutionDeviceBackend::DeviceGuard device_guard(
                 ExecutionDeviceBackend::device_ordinal(execution_space));
             r0_device_module->launch_r0_coordinate_reverse(
@@ -1088,7 +1135,41 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
                 "Execution R0 device modules require a device backend.");
 #endif
         }
-        const auto launch_standard_reverse = [&] (
+        if constexpr (symmetrix::execution::host_execution_space<
+                Kokkos::DefaultExecutionSpace>)
+        if (selected_r0_implementation == R0Implementation::host_plugin
+            && !single_layer_tiled_plan_active
+            && !dual_layer_tiled_plan_active) {
+            if (!r0_host_plugin_ready())
+                throw std::runtime_error(
+                    "Execution R0 host-plugin reverse is unavailable.");
+            const auto args =
+                symmetrix::execution::lower_r0_host_arguments(r0_arguments);
+            const auto& descriptor = r0_host_plugin->descriptor();
+            const auto range = descriptor.coordinate_reverse_range;
+            const std::int64_t batches =
+                (static_cast<std::int64_t>(num_nodes)
+                    +SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2-1)
+                /SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2;
+            Kokkos::parallel_for(
+                "MACEKokkos::r0_host_coordinate_reverse",
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                    Kokkos::IndexType<std::int64_t>>(
+                    execution_space, 0, batches),
+                [=] (const std::int64_t batch) {
+                    const std::int64_t begin =
+                        batch*SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2;
+                    const std::int64_t end = begin
+                            +SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2
+                        < args.num_nodes
+                        ? begin+SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2
+                        : args.num_nodes;
+                    range(&args, begin, end);
+                });
+            standard_r0_module_launch_count += 1;
+            return;
+        }
+        const auto launch_standard_reverse = [&]<bool ApplyEdgeWeights> (
                 const auto& coordinates, const bool coordinates_are_unit) {
             auto resolved_executor = standard_r0_executor;
             if (resolved_executor == StandardR0Executor::automatic) {
@@ -1109,64 +1190,24 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
                 const int base_persistent_blocks =
                     resolve_execution_persistent_blocks(
                         symmetrix::standard_r0::module_id,
-                        execution_space, r.extent(0), "r0_reverse");
+                        execution_space, r0_arguments.num_edges, "r0_reverse");
                 if (base_persistent_blocks <= 0)
                     throw std::runtime_error(
                         "Execution R0 standard-module reverse has no launch profile.");
                 const auto environment = execution_device_execution_environment();
                 const int persistent_blocks =
                     resolve_r0_coordinate_reverse_blocks(
-                        r.extent(0), base_persistent_blocks,
+                        r0_arguments.num_edges, base_persistent_blocks,
                         symmetrix::standard_r0::edge_threads_per_block,
                         environment.compute_unit_count);
                 if (standard_r0_executor != StandardR0Executor::v2_edge32)
-                    symmetrix::standard_r0::launch_coordinate_reverse_edge16(
-                        execution_space,
-                        persistent_blocks,
-                        r.extent(0),
-                        num_active_types,
-                        R0_spline_h,
-                        R0_spline_min,
-                        r_cut,
-                        node_types,
-                        neigh_types,
-                        edge_receivers,
-                        coordinates,
-                        r,
-                        coordinates_are_unit,
-                        type_to_active,
-                        R0_spline_coefficients,
-                        A0_scaled,
-                        A0_splines,
-                        standard_r0_density_state,
-                        A0_adj,
-                        Y,
-                        Y_grad,
-                        node_forces);
+                    symmetrix::standard_r0::
+                        launch_coordinate_reverse_edge16<ApplyEdgeWeights>(
+                        execution_space, persistent_blocks, r0_arguments);
                 else
-                    symmetrix::standard_r0::launch_coordinate_reverse_edge32(
-                        execution_space,
-                        persistent_blocks,
-                        r.extent(0),
-                        num_active_types,
-                        R0_spline_h,
-                        R0_spline_min,
-                        r_cut,
-                        node_types,
-                        neigh_types,
-                        edge_receivers,
-                        coordinates,
-                        r,
-                        coordinates_are_unit,
-                        type_to_active,
-                        R0_spline_coefficients,
-                        A0_scaled,
-                        A0_splines,
-                        standard_r0_density_state,
-                        A0_adj,
-                        Y,
-                        Y_grad,
-                        node_forces);
+                    symmetrix::standard_r0::
+                        launch_coordinate_reverse_edge32<ApplyEdgeWeights>(
+                        execution_space, persistent_blocks, r0_arguments);
                 break;
             }
             default:
@@ -1181,37 +1222,24 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
                     }
                 }
 #endif
-                symmetrix::standard_r0::launch_coordinate_reverse(
-                    execution_space,
-                    num_nodes,
-                    num_active_types,
-                    R0_spline_h,
-                    R0_spline_min,
-                    r_cut,
-                    node_types,
-                    num_neigh,
-                    neigh_types,
-                    streamed_first_neigh,
-                    coordinates,
-                    r,
-                    coordinates_are_unit,
-                    type_to_active,
-                    R0_spline_coefficients,
-                    A0_scaled,
-                    A0_splines,
-                    standard_r0_density_state,
-                    A0_adj,
-                    Y,
-                    Y_grad,
-                    node_forces,
-                    edge_begin);
+                symmetrix::standard_r0::
+                    launch_coordinate_reverse<ApplyEdgeWeights>(
+                    execution_space, r0_arguments);
                 break;
             }
         };
-        if (use_compact_edge_geometry())
-            launch_standard_reverse(execution_prepared_unit_direction, true);
+        const auto launch_reverse = [&]<bool ApplyEdgeWeights>() {
+            if (use_compact_edge_geometry())
+                launch_standard_reverse.template operator()<ApplyEdgeWeights>(
+                    execution_prepared_unit_direction, true);
+            else
+                launch_standard_reverse.template operator()<ApplyEdgeWeights>(
+                    xyz, false);
+        };
+        if (edge_weights == nullptr)
+            launch_reverse.template operator()<false>();
         else
-            launch_standard_reverse(xyz, false);
+            launch_reverse.template operator()<true>();
         standard_r0_module_launch_count += 1;
         return;
     }
@@ -1240,6 +1268,7 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
     const Kokkos::TeamPolicy<> policy(
         execution_space, num_nodes, Kokkos::AUTO, 32);
 #endif
+    const bool apply_edge_weights = edge_weights != nullptr;
     Kokkos::parallel_for(
         "MACEKokkos::reverse_A0_streamed",
         policy,
@@ -1251,6 +1280,8 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
             for (int j=0; j<num_neigh(node); ++j) {
                 const int ij = i0+j;
                 const std::size_t edge = static_cast<std::size_t>(ij);
+                const Precision weight = apply_edge_weights
+                    ? static_cast<Precision>(edge_weights[edge]) : Precision(1);
                 const std::size_t workspace_edge = edge
                     -static_cast<std::size_t>(edge_begin);
                 const int type_j = type_to_active(neigh_types(ij));
@@ -1302,7 +1333,7 @@ void MACEKokkos<Precision>::reverse_A0_streamed(
                                     + c1*x+c2*xx+c3*xxx;
                                 const Precision derivative = c1+2*c2*x+3*c3*xx;
                                 for (int lm=lm_begin; lm<lm_end; ++lm) {
-                                    const Precision adjoint = A0_adj(node,lm,k);
+                                    const Precision adjoint = weight*A0_adj(node,lm,k);
                                     const Precision radial = derivative
                                         *Y(workspace_edge*num_lm+lm)*adjoint;
                                     const Precision angular = value*adjoint;
@@ -1342,7 +1373,7 @@ void MACEKokkos<Precision>::compute_A0_scaled(
     if (not A0_scaled) return;
     if (standard_r0_density_scale_fused) return;
     const bool streamed_recompute =
-        mace_uses_prepared_execution(streamed_edges);
+        uses_prepared_execution(streamed_edges);
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
 
@@ -1428,25 +1459,38 @@ void MACEKokkos<Precision>::reverse_A0_scaled(
 {
     if (not A0_scaled) return;
     if (standard_r0_module_active) {
+        const bool precomputed = use_mh0_adjoint_reuse();
+        const symmetrix::execution::R0LogicalArguments<Precision> r0_arguments{
+            .num_nodes = num_nodes,
+            .active_type_count = num_active_types,
+            .type_to_active_count = static_cast<std::int64_t>(type_to_active.extent(0)),
+            .channels = num_channels,
+            .l_max = l_max,
+            .harmonic_count = num_lm,
+            .apply_density_scale = true,
+            .use_precomputed_scale_adjoint = precomputed,
+            .node_types = node_types.data(),
+            .num_neigh = num_neigh.data(),
+            .first_neigh = streamed_first_neigh.data(),
+            .neigh_types = neigh_types.data(),
+            .type_to_active = type_to_active.data(),
+            .radius = r.data(),
+            .output = A0.data(),
+            .output_adjoint = A0_adj.data(),
+            .density_state = standard_r0_density_state.data(),
+            .precomputed_scale_adjoint = mh0_a0_scale_adjoint.data(),
+            .cutoff = r_cut,
+            .edge_weights = alchemical_edge_weights.extent(0) == 0
+                ? nullptr : alchemical_edge_weights.data(),
+        };
         if (selected_r0_implementation == R0Implementation::device_module) {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
             const auto environment = execution_device_execution_environment();
             const int persistent_blocks = std::max(
                 1, r0_device_persistent_blocks_per_compute_unit
                     *environment.compute_unit_count);
-            const SymmetrixJitR0SplineV1 empty_spline{
-                sizeof(SymmetrixJitR0SplineV1), 0u, 0u, 0u,
-                0.0, 0.0, nullptr};
-            const bool precomputed = use_mh0_adjoint_reuse();
-            const SymmetrixJitR0ArgsV1 args{
-                sizeof(SymmetrixJitR0ArgsV1), 0u, num_nodes, 0,
-                num_active_types, num_channels, l_max, 0, 1,
-                precomputed ? 1 : 0, node_types.data(), num_neigh.data(),
-                streamed_first_neigh.data(), neigh_types.data(), nullptr,
-                type_to_active.data(), nullptr, r.data(), empty_spline,
-                empty_spline, nullptr, nullptr, A0.data(), A0_adj.data(),
-                standard_r0_density_state.data(),
-                mh0_a0_scale_adjoint.data(), nullptr, r_cut};
+            const auto args =
+                symmetrix::execution::lower_r0_device_arguments(r0_arguments);
             ExecutionDeviceBackend::DeviceGuard device_guard(
                 ExecutionDeviceBackend::device_ordinal(
                     factorized_execution_space));
@@ -1462,20 +1506,47 @@ void MACEKokkos<Precision>::reverse_A0_scaled(
                 "Execution R0 device modules require a device backend.");
 #endif
         }
+        if constexpr (symmetrix::execution::host_execution_space<
+                Kokkos::DefaultExecutionSpace>)
+        if (selected_r0_implementation == R0Implementation::host_plugin) {
+            if (!r0_host_plugin_ready())
+                throw std::runtime_error(
+                    "Execution R0 host-plugin reverse prepare is unavailable.");
+            const auto args =
+                symmetrix::execution::lower_r0_host_arguments(r0_arguments);
+            const auto& descriptor = r0_host_plugin->descriptor();
+            const auto range = descriptor.reverse_prepare_range;
+            const auto execution_space = factorized_execution_space;
+            const std::int64_t batches =
+                (static_cast<std::int64_t>(num_nodes)
+                    +SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2-1)
+                /SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2;
+            Kokkos::parallel_for(
+                "MACEKokkos::r0_host_reverse_prepare",
+                Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                    Kokkos::IndexType<std::int64_t>>(
+                    execution_space, 0, batches),
+                [=] (const std::int64_t batch) {
+                    const std::int64_t begin =
+                        batch*SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2;
+                    const std::int64_t end = begin
+                            +SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2
+                        < args.num_nodes
+                        ? begin+SYMMETRIX_JIT_R0_HOST_OWNER_BATCH_V2
+                        : args.num_nodes;
+                    range(&args, begin, end);
+                });
+            standard_r0_module_launch_count += 1;
+            return;
+        }
         symmetrix::standard_r0::launch_reverse_prepare(
-            factorized_execution_space,
-            num_nodes,
-            A0,
-            A0_adj,
-            standard_r0_density_state,
-            mh0_a0_scale_adjoint,
-            use_mh0_adjoint_reuse());
+            factorized_execution_space, r0_arguments);
         standard_r0_module_launch_count += 1;
         return;
     }
     if (standard_r0_density_scale_fused) return;
     const bool streamed_recompute =
-        mace_uses_prepared_execution(streamed_edges);
+        uses_prepared_execution(streamed_edges);
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
 
@@ -1616,7 +1687,7 @@ void MACEKokkos<Precision>::compute_M0_module(
 #endif
     }
     if (selected_m0_implementation == M0Implementation::host_plugin) {
-        if constexpr (symmetrix::standard_r0::host_execution_space<
+        if constexpr (symmetrix::execution::host_execution_space<
                 Kokkos::DefaultExecutionSpace>) {
             if (!m0_host_plugin_ready())
                 throw std::runtime_error(
@@ -1740,7 +1811,7 @@ void MACEKokkos<Precision>::launch_M0_module_reverse(
             "Execution M0 device modules require a device backend.");
 #endif
     } else if (selected_m0_implementation == M0Implementation::host_plugin) {
-        if constexpr (symmetrix::standard_r0::host_execution_space<
+        if constexpr (symmetrix::execution::host_execution_space<
                 Kokkos::DefaultExecutionSpace>) {
             if (!m0_host_plugin_ready())
                 throw std::runtime_error(
@@ -1824,18 +1895,25 @@ void MACEKokkos<Precision>::reverse_M0_module(
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
     const bool reuse_adjoint = use_mh0_adjoint_reuse();
+    const bool generated_m0 =
+        selected_m0_implementation == M0Implementation::device_module
+        || selected_m0_implementation == M0Implementation::host_plugin;
     const bool capture_input_scale_adjoint = reuse_adjoint && A0_scaled;
-    if (reuse_adjoint) {
+    if (reuse_adjoint && !generated_m0)
         A0_adj = A0;
-        if (A0_scaled && mh0_a0_scale_adjoint.extent(0)
-                < static_cast<std::size_t>(num_nodes))
-            Kokkos::realloc(mh0_a0_scale_adjoint, num_nodes);
-        if (A0_scaled)
-            Kokkos::deep_copy(
-                execution_space, mh0_a0_scale_adjoint, double(0));
-    }
-    if (A0_adj.extent(0) < num_nodes)
+    if (reuse_adjoint && A0_scaled && mh0_a0_scale_adjoint.extent(0)
+            < static_cast<std::size_t>(num_nodes))
+        Kokkos::realloc(mh0_a0_scale_adjoint, num_nodes);
+    if (reuse_adjoint && A0_scaled)
+        Kokkos::deep_copy(
+            execution_space, mh0_a0_scale_adjoint, double(0));
+    if (generated_m0 && A0_adj.data() != nullptr
+        && A0_adj.data() == A0.data())
+        A0_adj = decltype(A0_adj)();
+    if (A0_adj.extent(0) < num_nodes) {
         Kokkos::realloc(A0_adj, A0.extent(0), A0.extent(1), A0.extent(2));
+        mh0_a0_adjoint_allocation_count += 1;
+    }
     launch_M0_module_reverse(
         execution_space, num_nodes, node_types, A0, M0_adj, A0_adj,
         mh0_a0_scale_adjoint, capture_input_scale_adjoint);

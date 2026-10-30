@@ -11,10 +11,13 @@ except ImportError as exc:
     )
 
 
+# Only the Kokkos pair styles exist, so both axes run with `-k on`; the
+# MACE_Nonlinear rejection happens during `pair_coeff`, before either Kokkos
+# configuration initializes execution.
 @pytest.mark.parametrize(
     "cmdargs,pair_style",
     [
-        ([], "symmetrix/mace"),
+        (["-k", "on", "t", "1", "-sf", "kk"], "symmetrix/mace/kk"),
         (["-k", "on", "-sf", "kk"], "symmetrix/mace/kk"),
     ],
 )

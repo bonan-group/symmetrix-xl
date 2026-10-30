@@ -103,6 +103,21 @@ int AffineMLP::output_size() const
     throw std::logic_error("AffineMLP has no sized layer.");
 }
 
+const std::vector<double>& AffineMLP::runtime_parameters() const
+{
+    if (!runtime_parameters_cache_.empty())
+        return runtime_parameters_cache_;
+    for (const auto& layer : layers) {
+        if (layer.type == Layer::Type::Linear) {
+            runtime_parameters_cache_.insert(
+                runtime_parameters_cache_.end(), layer.weight.begin(), layer.weight.end());
+            runtime_parameters_cache_.insert(
+                runtime_parameters_cache_.end(), layer.bias.begin(), layer.bias.end());
+        }
+    }
+    return runtime_parameters_cache_;
+}
+
 bool AffineMLP::supports_conditioned_input(int dynamic_input_size) const
 {
     return !layers.empty() && layers.front().type == Layer::Type::Linear

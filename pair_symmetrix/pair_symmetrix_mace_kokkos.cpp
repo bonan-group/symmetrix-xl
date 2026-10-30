@@ -349,6 +349,16 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
   if (mode == "no_domain_decomposition" and comm->nprocs != 1)
     error->all(FLERR, "Cannot use no_domain_decomposition with multiple MPI processes");
 
+  // Plain hybrid wrappers may give a many-body sub-style a type-filtered
+  // neighbor list.  The MPI path requires one receiver for every owned atom;
+  // hybrid/overlay/kk preserves that invariant because one_coeff maps this
+  // style to every type pair.
+  if (mode == "mpi_message_passing" and force->pair != this
+      and !utils::strmatch(force->pair_style, "^hybrid/overlay/kk$"))
+    error->all(
+      FLERR,
+      "pair_style symmetrix/mace/kk mpi_message_passing is supported under hybrid/overlay/kk only");
+
   ghostneigh = (mode == "no_mpi_message_passing");
   if (low_memory_alias_set) {
     const std::string alias_profile =
@@ -413,7 +423,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
   if (narg != atom->ntypes + 3)
     error->all(FLERR, "Incorrect args for pair coefficients");
 
-  if (symmetrix_is_nonlinear_mace_model(arg[2]))
+  if (symmetrix_is_nonlinear_model(arg[2]))
     error->all(FLERR, "MACE_Nonlinear models are not supported by pair_style symmetrix/mace/kk in this release");
 
   utils::logmesg(lmp, "Loading MACEKokkos model from \'{}\' ... ", arg[2]);
@@ -450,18 +460,18 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
       lmp,
       "Symmetrix streamed_edges requested='{}' resolved='{}'\n",
       requested_streamed_edges, mace->streamed_edges_mode());
-  if (allow_fixed_workspace && !mace_uses_direct_execution(mace->streamed_edges))
+  if (allow_fixed_workspace && !uses_direct_execution(mace->streamed_edges))
     error->all(
       FLERR,
       "pair_style symmetrix/mace/kk allow_fixed_workspace yes requires streamed_edges direct");
-  if (mace_uses_prepared_execution(mace->streamed_edges)) {
+  if (uses_prepared_execution(mace->streamed_edges)) {
     if (mode == "no_mpi_message_passing")
       error->all(
         FLERR,
         "pair_style symmetrix/mace/kk prepared execution requires "
         "no_domain_decomposition or mpi_message_passing");
   }
-  if (mace_uses_direct_execution(mace->streamed_edges)) {
+  if (uses_direct_execution(mace->streamed_edges)) {
     if (!jit_host_artifact.empty()) {
       try {
         mace->load_jit_host_plugin(jit_host_artifact);
@@ -1002,7 +1012,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
   const double r_cut = mace->r_cut;
   const double r_cut_squared = r_cut*r_cut;
   const bool stable_execution =
-    mace_uses_prepared_execution(mace->streamed_edges);
+    uses_prepared_execution(mace->streamed_edges);
 
   NeighListKokkos<DeviceType>* k_list = static_cast<NeighListKokkos<DeviceType>*>(list);
   auto d_numneigh = k_list->d_numneigh;
@@ -1276,7 +1286,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
   auto tag = atomKK->k_tag.view<DeviceType>();
 
   const bool stable_execution =
-    mace_uses_prepared_execution(mace->streamed_edges);
+    uses_prepared_execution(mace->streamed_edges);
 
   // node_indices, node_types, and num_neigh
   const double r_cut = mace->r_cut;
@@ -1686,11 +1696,11 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
       num_nodes, node_types, num_neigh, neigh_types,
       mace->atomic_numbers, r, xyz, mace->node_energies, mace->node_forces);
 
-  if (mace->streamed_edges != MACEStreamedEdgesMode::materialized)
+  if (mace->streamed_edges != ExecutionMode::materialized)
     mace->prepare_streamed_edge_schedule(num_nodes, num_edges, num_neigh);
   mace->compute_Y(xyz);
 
-  if (mace->streamed_edges == MACEStreamedEdgesMode::generic)
+  if (mace->streamed_edges == ExecutionMode::generic)
     mace->compute_A0_streamed(num_nodes, node_types, num_neigh, neigh_types, r);
   else {
     mace->compute_R0(num_nodes, node_types, num_neigh, neigh_types, r);
@@ -1731,7 +1741,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
     mace->compute_H1_linear_up(num_h1_nodes);
   }
 
-  if (mace->streamed_edges == MACEStreamedEdgesMode::materialized) {
+  if (mace->streamed_edges == ExecutionMode::materialized) {
     mace->compute_R1(num_nodes, node_types, num_neigh, neigh_types, r);
     mace->compute_Phi1(num_nodes, num_neigh, neigh_indices);
   } else {
@@ -1749,7 +1759,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
   mace->reverse_M1(num_nodes, node_types);
   mace->reverse_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
   mace->reverse_A1(num_nodes);
-  if (mace->streamed_edges == MACEStreamedEdgesMode::materialized)
+  if (mace->streamed_edges == ExecutionMode::materialized)
     mace->reverse_Phi1(
       num_nodes, num_neigh, neigh_indices, xyz, r, false, false);
   else
@@ -1778,7 +1788,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
     mace->reverse_H1(num_nodes);
   mace->reverse_M0(num_nodes, node_types);
   mace->reverse_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
-  if (mace->streamed_edges == MACEStreamedEdgesMode::generic)
+  if (mace->streamed_edges == ExecutionMode::generic)
     mace->reverse_A0_streamed(
       num_nodes, node_types, num_neigh, neigh_types, xyz, r);
   else
@@ -2111,14 +2121,14 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_mpi_message_pass
       num_local_nodes, node_types, num_neigh, neigh_types,
       mace->atomic_numbers, r, xyz, mace->node_energies, mace->node_forces);
 
-  if (mace->streamed_edges == MACEStreamedEdgesMode::generic)
+  if (mace->streamed_edges == ExecutionMode::generic)
     mace->prepare_streamed_edge_schedule(
       num_local_nodes+num_ghost_nodes,
       num_local_edges+num_ghost_edges,
       num_neigh);
   mace->compute_Y(xyz);
 
-  if (mace->streamed_edges == MACEStreamedEdgesMode::generic)
+  if (mace->streamed_edges == ExecutionMode::generic)
     mace->compute_A0_streamed(
       num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
   else {
@@ -2137,7 +2147,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_mpi_message_pass
     mace->compute_H1(num_local_nodes+num_ghost_nodes);
   }
 
-  if (mace->streamed_edges == MACEStreamedEdgesMode::materialized) {
+  if (mace->streamed_edges == ExecutionMode::materialized) {
     mace->compute_R1(num_local_nodes, node_types, num_neigh, neigh_types, r);
     mace->compute_Phi1(num_local_nodes, num_neigh, neigh_ii_indices);
   } else {
@@ -2155,7 +2165,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_mpi_message_pass
   mace->reverse_M1(num_local_nodes, node_types);
   mace->reverse_A1_scaled(num_local_nodes, node_types, num_neigh, neigh_types, xyz, r);
   mace->reverse_A1(num_local_nodes);
-  if (mace->streamed_edges == MACEStreamedEdgesMode::materialized)
+  if (mace->streamed_edges == ExecutionMode::materialized)
     mace->reverse_Phi1(
       num_local_nodes, num_neigh, neigh_ii_indices, xyz, r, false, false);
   else
@@ -2172,7 +2182,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_mpi_message_pass
   }
   mace->reverse_M0(num_local_nodes+num_ghost_nodes, node_types);
   mace->reverse_A0_scaled(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, xyz, r);
-  if (mace->streamed_edges == MACEStreamedEdgesMode::generic)
+  if (mace->streamed_edges == ExecutionMode::generic)
     mace->reverse_A0_streamed(
       num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types,
       xyz, r);

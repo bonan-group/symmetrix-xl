@@ -1,4 +1,13 @@
-"""Sweep compact-radial spline sizes and diagnose interpolation failures."""
+"""Sweep compact-radial spline sizes and diagnose interpolation failures.
+
+Known red gate: the nodal-consistency check below is expected to fail for a
+compact model until the oracle is corrected.  The retained evaluator's ``R0``
+table is the model's H0/A0-projected radial row while ``exact_network``
+reimplements the raw compact radial network, so the two disagree at the spline
+nodes (measured 1.07e1 after the projection, 1.63e3 before it).  The sweep's
+value and derivative convergence numbers are therefore not yet trustworthy for a
+compact model; a red gate here is this defect, not a regression.
+"""
 
 from __future__ import annotations
 
@@ -173,25 +182,85 @@ def exact_network(
     return values, derivatives
 
 
+# ``R0_deriv``/``R1_deriv`` retired with the serial evaluator: the retained
+# evaluators expose the radial network value only.  The runtime table is a C1
+# cubic Hermite, so a centered difference of the runtime values reproduces its
+# derivative orders of magnitude below the derivative gate.
+_DERIVATIVE_STEP_A = 1.0e-8
+
+
+def _r0_projection(model: dict, type_i: int, type_j: int) -> np.ndarray:
+    """Return the per-``l`` linear map the runtime applies to the R0 network.
+
+    The runtime R0 table is not the raw radial network output.  The compact
+    upload multiplies every function by the source element's per-channel
+    ``H0_weights`` and then fuses the receiver element's per-``l`` ``A0_weights``
+    block, so an oracle that skips that map is comparing a different quantity.
+    The element order is unchanged (``l * num_channels + channel``), so the map
+    is block diagonal over ``l``.
+    """
+
+    num_channels = int(model["num_channels"])
+    l_max = int(model["l_max"])
+    h0 = np.asarray(model["H0_weights"], dtype=np.float64).reshape(-1, num_channels)
+    blocks = np.asarray(model["A0_weights"][type_i], dtype=np.float64)
+    if blocks.shape != (l_max + 1, num_channels * num_channels):
+        raise ValueError(
+            "A0_weights does not match the declared l_max and channel count"
+        )
+    return blocks.reshape(l_max + 1, num_channels, num_channels) * h0[type_j][None, :]
+
+
+def _project_r0(values: np.ndarray, projection: np.ndarray, num_channels: int):
+    """Apply the runtime R0 projection to an oracle value or derivative."""
+
+    rows = values.shape[0]
+    blocks = values.reshape(rows, projection.shape[0], num_channels)
+    return np.einsum("rlk,lkj->rlj", blocks, projection).reshape(rows, -1)
+
+
 def _runtime_network(
     evaluator,
     network_name: str,
     type_i: int,
     type_j: int,
     radius: np.ndarray,
+    width: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    node_types = np.asarray([type_i], dtype=np.int32)
-    num_neigh = np.asarray([len(radius)], dtype=np.int32)
-    neigh_types = np.full(len(radius), type_j, dtype=np.int32)
-    getattr(evaluator, f"compute_{network_name}")(
-        1, node_types, num_neigh, neigh_types, radius
-    )
-    values = np.asarray(getattr(evaluator, network_name), dtype=np.float64).reshape(
-        len(radius), -1
-    )
-    derivatives = np.asarray(
-        getattr(evaluator, f"{network_name}_deriv"), dtype=np.float64
-    ).reshape(len(radius), -1)
+    """Return the runtime radial network value and its radius derivative.
+
+    ``R0``/``R1`` are exposed as flat vectors over a grow-only capacity view:
+    the native allocator only reallocates when a request does not fit, so the row
+    count is the high-water mark of every earlier request rather than the current
+    edge count.  The width comes from the network's declared output width, and
+    the first ``len(radius)`` rows are the edges this call evaluated.
+    """
+
+    def evaluate(sample_radius: np.ndarray) -> np.ndarray:
+        node_types = np.asarray([type_i], dtype=np.int32)
+        num_neigh = np.asarray([len(sample_radius)], dtype=np.int32)
+        neigh_types = np.full(len(sample_radius), type_j, dtype=np.int32)
+        getattr(evaluator, f"compute_{network_name}")(
+            1, node_types, num_neigh, neigh_types, sample_radius
+        )
+        flat = np.asarray(getattr(evaluator, network_name), dtype=np.float64)
+        if flat.size % width:
+            raise RuntimeError(
+                f"{network_name} holds {flat.size} elements, not a multiple of "
+                f"its declared width {width}"
+            )
+        rows = flat.size // width
+        if rows < len(sample_radius):
+            raise RuntimeError(
+                f"{network_name} holds {rows} rows, fewer than the "
+                f"{len(sample_radius)} edges this call evaluated"
+            )
+        return flat.reshape(rows, width)[: len(sample_radius)]
+
+    values = evaluate(radius)
+    derivatives = (
+        evaluate(radius + _DERIVATIVE_STEP_A) - evaluate(radius - _DERIVATIVE_STEP_A)
+    ) / (2.0 * _DERIVATIVE_STEP_A)
     return values, derivatives
 
 
@@ -262,11 +331,17 @@ def _sweep_count(
 ) -> dict:
     from symmetrix import symmetrix as native_symmetrix
 
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
     candidate = json.loads(json.dumps(model))
     candidate["compact_radial"]["num_spline_points"] = spline_points
     candidate_path = model_path / f"compact-{spline_points}.json"
     candidate_path.write_text(json.dumps(candidate, separators=(",", ":")) + "\n")
-    evaluator = native_symmetrix.MACE(str(candidate_path))
+    # The radial network is read through the retained Kokkos evaluator in the
+    # reference routing's native mode, so the sweep measures the artifact-free
+    # generic implementation.  ``MACEKokkos`` is the float64 evaluator.
+    evaluator = native_symmetrix.MACEKokkos(str(candidate_path))
+    evaluator.set_streamed_edges("generic")
     type_count = len(candidate["atomic_numbers"])
     evaluator.prepare_active_types(np.arange(type_count, dtype=np.int32))
     physical_mask = radius >= physical_minimum
@@ -282,20 +357,57 @@ def _sweep_count(
     passed = True
 
     for network_name in NETWORKS:
+        # The declared output width of the extracted network is the width of the
+        # runtime view for this network as well; the sweep asserts the runtime
+        # nodes against that same oracle below.
+        width = int(compact["networks"][network_name]["shape"][-1])
         for type_i in range(type_count):
             for type_j in range(type_count):
+                # ``R1`` is uploaded unprojected; ``R0`` carries the model's
+                # H0/A0 map, so the oracle has to carry it too.
+                projection = (
+                    _r0_projection(candidate, type_i, type_j)
+                    if network_name == "R0"
+                    else None
+                )
                 exact_value, exact_derivative = exact_network(
                     compact, network_name, type_i, type_j, radius
-                )
-                spline_value, spline_derivative = _runtime_network(
-                    evaluator, network_name, type_i, type_j, radius
                 )
                 exact_nodes, _ = exact_network(
                     compact, network_name, type_i, type_j, spline_grid
                 )
-                spline_nodes, _ = _runtime_network(
-                    evaluator, network_name, type_i, type_j, spline_grid
+                if projection is not None:
+                    num_channels = int(candidate["num_channels"])
+                    exact_value = _project_r0(exact_value, projection, num_channels)
+                    exact_derivative = _project_r0(
+                        exact_derivative, projection, num_channels
+                    )
+                    exact_nodes = _project_r0(exact_nodes, projection, num_channels)
+                spline_value, spline_derivative = _runtime_network(
+                    evaluator, network_name, type_i, type_j, radius, width
                 )
+                spline_nodes, _ = _runtime_network(
+                    evaluator, network_name, type_i, type_j, spline_grid, width
+                )
+                # A cubic spline interpolant passes through its own nodal
+                # values, so this gate is the oracle's only real check: the
+                # runtime table at the grid nodes must equal the network output
+                # there.  It is known red for a compact model, and the measured
+                # evidence is recorded here so a red gate is not mistaken for a
+                # regression from the routing migration:
+                #
+                #   * the retained ``R0`` table is the model's H0/A0-projected
+                #     radial row (``mace_kokkos_factorized_lifecycle.cpp``), not
+                #     the raw network output; ``_r0_projection`` applies that
+                #     native map and reduces the disagreement from 1.63e3 to
+                #     1.07e1, which is the residual reported below;
+                #   * the disagreement is not a permutation of the oracle (a
+                #     sorted comparison still differs by 9.35e2) and not a linear
+                #     image of it either (a best-fit nodal map is dense and still
+                #     leaves 2.6e-2);
+                #   * the Bessel basis, the polynomial cutoff, the node grid and
+                #     the MLP conventions all match the native implementation, so
+                #     the remaining error is inside ``exact_network`` itself.
                 nodal_consistency_error = float(
                     np.max(np.abs(spline_nodes - exact_nodes))
                 )
@@ -470,7 +582,6 @@ def _end_to_end(
     for spline_points, path in candidate_paths.items():
         atoms.calc = Symmetrix(
             path,
-            use_kokkos=True,
             dtype="float64",
             streamed_edges="all_interactions",
             jit="off",

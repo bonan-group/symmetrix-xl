@@ -22,13 +22,14 @@ def test_macefield_uses_selected_m0_module_boundaries():
 
 
 def test_macefield_admits_only_r0_v2_standard_module_route():
+    predicate = RUNTIME_SOURCE.split(
+        "bool MACEKokkos<Precision>::use_r0_comparison_dispatch() const", 1
+    )[1].split("template <typename Precision>", 1)[0]
     forward = FIRST_INTERACTION_SOURCE.split(
         "void MACEKokkos<Precision>::compute_A0_streamed(", 1
     )[1].split("void MACEKokkos<Precision>::reverse_A0_streamed(", 1)[0]
-    scope = forward.split("const bool module_scope =", 1)[1].split(
-        "standard_r0_module_active =", 1
-    )[0]
-    assert "mace_uses_prepared_execution(streamed_edges)" in scope
-    assert "factorized_source_strategy" in scope
-    assert "FactorizedSourceStrategy::jit_plugin" in scope
-    assert "has_field_coupling" not in scope
+    assert "uses_prepared_execution(streamed_edges)" in predicate
+    assert "factorized_source_strategy" in predicate
+    assert "FactorizedSourceStrategy::jit_plugin" in predicate
+    assert "has_field_coupling" not in predicate
+    assert "standard_r0_module_active = use_r0_comparison_dispatch();" in forward

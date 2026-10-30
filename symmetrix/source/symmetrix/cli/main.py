@@ -33,6 +33,58 @@ def accelerator_runtime_diagnostics(*args, **kwargs):
     return diagnose(*args, **kwargs)
 
 
+def fourier_d3_capability(*args, **kwargs):
+    """Import the FourierD3 capability accessor only where it is reported."""
+
+    from ..fourier_d3_capability import fourier_d3_capability as capability
+
+    return capability(*args, **kwargs)
+
+
+def _validate_installed_operator_artifacts(native, build_info):
+    compiled = build_info.get("prebuilt_operator_artifacts")
+    if not compiled:
+        return None
+    from ..generated_operator_core import validate_installed_operator_artifacts
+
+    return validate_installed_operator_artifacts(
+        getattr(native, "__file__", ""), compiled
+    )
+
+
+def _fourier_d3_summary(value):
+    """Render a reported capability dict without claiming more than it says."""
+
+    if value.get("available"):
+        provider = value.get("provider") or "unknown provider"
+        variant = value.get("provider_variant")
+        version = value.get("kokkosfft_version") or "unknown version"
+        detail = f"KokkosFFT {version} via {provider}"
+        if variant:
+            detail = f"{detail} ({variant})"
+        # The Kokkos release is part of what the build reports, and it is omitted
+        # rather than guessed when the build does not name one.
+        kokkos = value.get("kokkos_version")
+        return f"{detail} (Kokkos {kokkos})" if kokkos else detail
+    reason = value.get("reason") or "no reason reported"
+    return f"unavailable ({reason})"
+
+
+def _human_prebuilt_operator_summary(build, *, prefix=""):
+    artifacts = build.get("prebuilt_operator_artifacts") or {}
+    if not artifacts:
+        return
+    print(
+        f"{prefix}Prebuilt operators: {artifacts.get('mode', 'unknown')}, "
+        f"{artifacts.get('artifact_count', 'unknown')} artifacts, "
+        f"{artifacts.get('installed_bytes', 'unknown')} bytes, target "
+        f"{artifacts.get('target') or 'none'}"
+    )
+    catalog_hash = artifacts.get("catalog_sha256")
+    if catalog_hash:
+        print(f"{prefix}  catalog sha256: {catalog_hash}")
+
+
 def _human_report(report):
     runtime = report.get("runtime") or {}
     backend = report.get("backend") or {}
@@ -57,6 +109,10 @@ def _human_report(report):
             f"device compiler {build.get('device_compiler_id') or 'none'} "
             f"{build.get('device_compiler_version') or ''}".rstrip()
         )
+        _human_prebuilt_operator_summary(build)
+    capability = report.get("fourier_d3") or {}
+    if capability:
+        print(f"FourierD3: {_fourier_d3_summary(capability)}")
     if runtime:
         if accelerator:
             print(f"Kokkos execution space: {runtime.get('execution_space')}")
@@ -257,6 +313,7 @@ def _version_report(*, probe=False):
 
     from .. import __version__
     from .. import backend_loader
+    from ..r0_reporting import r0_reporting_schema
 
     try:
         distribution_version = importlib.metadata.version("symmetrix-xl")
@@ -270,6 +327,7 @@ def _version_report(*, probe=False):
         "package": getattr(package, "__file__", ""),
         "python_executable": sys.executable,
         "backends": backend_loader.available_backends(__version__),
+        "r0_reporting": r0_reporting_schema(),
     }
     if probe:
         native = package.load_backend()
@@ -301,10 +359,14 @@ def _version_report(*, probe=False):
                     host_blas.get(key)
                     for key in ("library_path", "threading_library_path")
                 )
+            build_info = build_info_query() if callable(build_info_query) else {}
             report["probe"] = {
                 "backend": selected,
                 "extension": getattr(native, "__file__", ""),
-                "build_info": build_info_query() if callable(build_info_query) else {},
+                "build_info": build_info,
+                "installed_operator_artifacts": (
+                    _validate_installed_operator_artifacts(native, build_info)
+                ),
                 "runtime": runtime,
                 "device_environment": (
                     device_query() if callable(device_query) else None
@@ -376,6 +438,10 @@ def _human_version_report(report):
                 "  native source content sha256: "
                 f"{build.get('native_source_content_sha256') or 'unknown'}"
             )
+            capability = build.get("fourier_d3") or {}
+            if capability:
+                print(f"  FourierD3: {_fourier_d3_summary(capability)}")
+            _human_prebuilt_operator_summary(build, prefix="  ")
         print("Linked libraries:")
         for library in probe.get("linked_libraries") or ("unavailable",):
             print(f"  {library}")
@@ -590,6 +656,7 @@ def main(argv=None):
             native = load_backend(args.selector)
             query = getattr(native, "_openmp_runtime_info", None)
             value["runtime"] = query() if callable(query) else None
+            value["fourier_d3"] = fourier_d3_capability(native).to_dict()
         if args.json:
             print(json.dumps(value, indent=2, sort_keys=True))
         else:
@@ -619,9 +686,13 @@ def main(argv=None):
                     "OpenBLAS threads: "
                     f"{host_blas.get('openblas_threads', 'unknown')}"
                 )
+                capability = value.get("fourier_d3") or {}
+                if capability:
+                    print(f"FourierD3: {_fourier_d3_summary(capability)}")
         return 0
 
     from .. import load_backend, selected_backend
+    from ..r0_reporting import r0_reporting_schema
 
     native = load_backend()
     selected = selected_backend()
@@ -630,10 +701,43 @@ def main(argv=None):
     else:
         report = openmp_runtime_diagnostics(strict=not args.advisory)
         report.setdefault("backend", selected)
+    build_info = getattr(native, "_backend_build_info", dict)()
     report["native"] = {
         "extension": getattr(native, "__file__", ""),
-        "build_info": getattr(native, "_backend_build_info", dict)(),
+        "build_info": build_info,
     }
+    report["r0_reporting"] = r0_reporting_schema()
+    try:
+        installed_validation = _validate_installed_operator_artifacts(
+            native, build_info
+        )
+    except (OSError, ValueError) as error:
+        installed_validation = {"status": "error", "message": str(error)}
+        report["ok"] = False
+        report["status"] = "error"
+        report["checks"].append(
+            {
+                "name": "prebuilt_operator_artifacts",
+                "status": "error",
+                "message": str(error),
+            }
+        )
+    else:
+        if installed_validation is not None:
+            report["checks"].append(
+                {
+                    "name": "prebuilt_operator_artifacts",
+                    "status": installed_validation["status"],
+                    "message": (
+                        "installed generated operator catalog and artifacts match "
+                        "compiled provenance"
+                        if installed_validation["status"] == "ok"
+                        else "prebuilt generated operator package data is disabled"
+                    ),
+                }
+            )
+    report["native"]["installed_operator_artifacts"] = installed_validation
+    report["fourier_d3"] = fourier_d3_capability(native).to_dict()
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:

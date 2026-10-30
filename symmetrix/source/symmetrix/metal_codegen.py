@@ -14,8 +14,10 @@ from __future__ import annotations
 import re
 from collections import Counter
 
-from . import jit_codegen as _host
-from .execution_contract import normalize_jit_r1_contract
+# The shared host codegen module is ``mace_jit_codegen`` in the merged
+# tree: this branch renamed the family-prefixed codegen modules.
+from . import mace_jit_codegen as _host
+from .mace_execution_contract import normalize_jit_r1_contract
 
 METAL_R1_ABI_VERSION = 1
 
@@ -411,6 +413,7 @@ def render_jit_r1_metal_source(contract: dict) -> str:
     source_harmonics = metadata["source_harmonics"]
     output_components = metadata["output_components"]
 
+    # Metal packets have no coefficient views; alchemical admission rejects Metal.
     forward = _host._render_tiled_host_forward_owner(
         path_rows,
         channels=channels,
@@ -418,6 +421,7 @@ def render_jit_r1_metal_source(contract: dict) -> str:
         source_harmonics=source_harmonics,
         output_components=output_components,
         channel_tile=1,
+        apply_edge_weights=False,
     )
     source = _host._render_tiled_host_source_owner(
         path_rows,
@@ -426,6 +430,7 @@ def render_jit_r1_metal_source(contract: dict) -> str:
         source_harmonics=source_harmonics,
         output_components=output_components,
         channel_tile=1,
+        apply_edge_weights=False,
     )
     loaders_msl = _msl_row_loaders(
         path_rows, channels=channels, output_components=output_components
@@ -542,7 +547,7 @@ METAL_M0_ABI_VERSION = 1
 
 
 def _product_terms(contract: dict, output_components: int | None):
-    from .jit_operator_codegen import _m0_terms, jit_m0_host_metadata
+    from .mace_jit_operator_codegen import _m0_terms, jit_m0_host_metadata
 
     host = jit_m0_host_metadata(contract, precision="float32")
     terms = _m0_terms(host["contract"])

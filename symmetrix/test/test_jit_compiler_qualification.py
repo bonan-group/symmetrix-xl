@@ -29,7 +29,7 @@ def test_cuda_forced_compiler_produces_expected_artifact(
     accelerator_capabilities, tmp_path, monkeypatch, compiler
 ):
     from symmetrix import jit
-    from symmetrix.jit_codegen import (
+    from symmetrix.mace_jit_codegen import (
         render_jit_r1_cuda_module,
         render_jit_r1_cuda_plugin,
         jit_r1_cuda_plugin_metadata,
@@ -82,7 +82,7 @@ def test_hip_forced_compiler_produces_expected_artifact(
     accelerator_capabilities, tmp_path, monkeypatch, compiler
 ):
     from symmetrix import jit
-    from symmetrix.jit_codegen import (
+    from symmetrix.mace_jit_codegen import (
         render_jit_r1_hip_module,
         render_jit_r1_hip_plugin,
         factorized_hip_plugin_metadata,

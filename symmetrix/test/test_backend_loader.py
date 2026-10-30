@@ -1,4 +1,5 @@
 import json
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -11,6 +12,49 @@ def _installed_frontend_version():
 
 
 FRONTEND_VERSION = _installed_frontend_version()
+
+
+def test_cpu_descriptor_searches_editable_package_paths(tmp_path, monkeypatch):
+    source_package = tmp_path / "source" / "symmetrix"
+    installed_package = tmp_path / "site-packages" / "symmetrix"
+    source_package.mkdir(parents=True)
+    installed_package.mkdir(parents=True)
+    descriptor_path = installed_package / "_backend_cpu.json"
+    descriptor_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "selector": "cpu",
+                "backend": "cpu",
+                "architecture": "native",
+                "distribution": "symmetrix-xl",
+                "frontend_version": FRONTEND_VERSION,
+                "native_abi": 1,
+                "package": "symmetrix",
+                "module": "_native_cpu",
+                "source_commit": "4e080a5",
+                "source_content_sha256": "a" * 64,
+                "native_source_content_sha256": "b" * 64,
+                "source_dirty": True,
+            }
+        )
+    )
+    monkeypatch.setattr(
+        sys.modules["symmetrix"],
+        "__path__",
+        [str(source_package), str(installed_package)],
+    )
+    monkeypatch.setattr(
+        backend_loader, "__file__", str(source_package / "backend_loader.py")
+    )
+
+    descriptor = backend_loader._cpu_descriptor(FRONTEND_VERSION)
+
+    assert descriptor.descriptor_path == str(descriptor_path)
+    assert descriptor.source_commit == "4e080a5"
+    assert descriptor.source_content_sha256 == "a" * 64
+    assert descriptor.native_source_content_sha256 == "b" * 64
+    assert descriptor.source_dirty is True
 
 
 def _descriptor(tmp_path, **overrides):
@@ -84,6 +128,31 @@ def test_backend_load_rejects_native_module_without_required_identity(
     with pytest.raises(
         backend_loader.BackendError, match="does not report native source"
     ):
+        backend_loader.load_backend(FRONTEND_VERSION, "cuda13-sm120")
+
+
+def test_backend_load_rejects_descriptor_native_dirty_disagreement(
+    tmp_path, monkeypatch
+):
+    path = _descriptor(tmp_path, source_dirty=False)
+    descriptor = backend_loader._read_descriptor(path)
+    native = SimpleNamespace(
+        _backend_build_info=lambda: {
+            "native_abi": 1,
+            "backend": "cuda",
+            "architecture": "sm120",
+            "distribution": "symmetrix-xl-cuda13-sm120",
+            "source_dirty": True,
+        }
+    )
+    monkeypatch.setattr(
+        backend_loader, "select_backend", lambda *_args, **_kwargs: descriptor
+    )
+    monkeypatch.setattr(backend_loader.importlib, "import_module", lambda _name: native)
+    monkeypatch.setattr(backend_loader, "_native_module", None)
+    monkeypatch.setattr(backend_loader, "_selected", None)
+
+    with pytest.raises(backend_loader.BackendError, match="reports source_dirty"):
         backend_loader.load_backend(FRONTEND_VERSION, "cuda13-sm120")
 
 
@@ -249,6 +318,40 @@ def _local_native_descriptor():
         package="symmetrix",
         module="_native_cpu",
     )
+
+
+@pytest.mark.parametrize(
+    ("descriptor_updates", "build_updates", "message"),
+    [
+        ({"source_commit": "4e080a5"}, {"source_commit": "other"}, "source commit"),
+        ({"source_dirty": False}, {"source_dirty": True}, "source_dirty"),
+    ],
+)
+def test_backend_load_rejects_native_commit_or_dirty_mismatch(
+    monkeypatch, descriptor_updates, build_updates, message
+):
+    descriptor = replace(_local_native_descriptor(), **descriptor_updates)
+    build_info = {
+        "native_abi": 1,
+        "backend": "cpu",
+        "distribution": "symmetrix-xl",
+        "architecture": "native",
+        **build_updates,
+    }
+    native = SimpleNamespace(_backend_build_info=lambda: build_info)
+    monkeypatch.setattr(
+        backend_loader, "select_backend", lambda *_args, **_kwargs: descriptor
+    )
+    monkeypatch.setattr(
+        backend_loader.importlib,
+        "import_module",
+        lambda _name: native,
+    )
+    monkeypatch.setattr(backend_loader, "_native_module", None)
+    monkeypatch.setattr(backend_loader, "_selected", None)
+
+    with pytest.raises(backend_loader.BackendError, match=message):
+        backend_loader.load_backend(FRONTEND_VERSION, "cpu")
 
 
 def test_native_cpu_priority_exceeds_matching_v4_level():

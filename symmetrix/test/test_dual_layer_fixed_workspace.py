@@ -1,5 +1,6 @@
 import json
 import math
+from itertools import combinations_with_replacement
 from pathlib import Path
 
 import numpy as np
@@ -7,8 +8,11 @@ import pytest
 from ase import Atoms
 from compact_r1_model import foundation_r1_test_model
 from symmetrix import Symmetrix
-from symmetrix.execution_contract import normalize_standard_m0_contract
-
+from symmetrix.mace_execution_contract import (
+    make_generated_m1_contract,
+    make_standard_m0_contract,
+    normalize_standard_m0_contract,
+)
 
 PLAN = "mh0-dual-layer-tiled-v1"
 REFERENCE_PLAN = "mh0-direct-capacity-y-only"
@@ -66,6 +70,45 @@ def dual_layer_model(tmp_path_factory):
     return output
 
 
+@pytest.fixture(scope="module")
+def generated_dual_layer_model(tmp_path_factory, dual_layer_model):
+    model = json.loads(Path(dual_layer_model).read_text())
+    zero_component = 0 if 0 in model["M0_monomials"] else "0"
+    existing = {tuple(term) for term in model["M0_monomials"][zero_component]}
+    input_components = (model["l_max"] + 1) ** 2
+    additional = next(
+        list(term)
+        for degree in range(1, 4)
+        for term in combinations_with_replacement(range(input_components), degree)
+        if term not in existing
+    )
+    model["M0_monomials"][zero_component].append(additional)
+    for type_weights in model["M0_weights"].values():
+        for channel, weights in type_weights[zero_component].items():
+            weights.append(1e-4 * (1 + int(channel) % 7))
+    monomials = {
+        int(component): terms for component, terms in model["M0_monomials"].items()
+    }
+    model["execution_contracts"]["M0"] = make_standard_m0_contract(
+        channels=model["num_channels"],
+        type_count=model["num_elements"],
+        input_l_max=model["l_max"],
+        output_l_max=model["L_max"],
+        correlation=max(len(term) for terms in monomials.values() for term in terms),
+        monomials=monomials,
+    )
+    model["execution_contracts"]["M1"] = make_generated_m1_contract(
+        channels=model["num_channels"],
+        type_count=model["num_elements"],
+        input_l_max=model["l_max"],
+        correlation=max(len(term) for term in model["M1_monomials"]),
+        monomials=model["M1_monomials"],
+    )
+    output = tmp_path_factory.mktemp("generated-dual-layer-workspace") / "model.json"
+    output.write_text(json.dumps(model, separators=(",", ":")))
+    return output
+
+
 def _atoms(count):
     grid = np.indices((3, 3, 3)).reshape(3, -1).T[:count]
     positions = 0.7 + 1.6 * grid
@@ -77,7 +120,6 @@ def _atoms(count):
 def _calculator(model, plan, capacity=None, skin=0.5, dtype="float32"):
     calculator = Symmetrix(
         model,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="direct",
         execution_profile="capacity",
@@ -104,6 +146,25 @@ def _evaluate(calculator, atoms):
 def _assert_results(actual, expected):
     for name in PROPERTIES:
         np.testing.assert_allclose(actual[name], expected[name], rtol=2.0e-4, atol=2e-5)
+
+
+def test_tiled_plan_reports_generic_r0_with_loaded_backend_artifact(
+    dual_layer_model,
+):
+    _require_cuda_backend()
+    calculator = _calculator(dual_layer_model, PLAN, capacity=2, dtype="float64")
+    evaluator = calculator.evaluator
+
+    assert evaluator._r0_loader_implementation == "device_module"
+    _evaluate(calculator, _atoms(3))
+
+    assert calculator.execution_plan["selected_id"] == PLAN
+    assert evaluator._r0_loader_implementation == "device_module"
+    assert evaluator.r0_implementation == "generic"
+    assert evaluator.r0_artifact_origin is None
+    assert evaluator.r0_schedule == "generic"
+    assert evaluator.r0_profile == "generic"
+    assert evaluator.r0_module_id == ""
 
 
 @pytest.mark.parametrize("neighbor_backend", ("host", "kokkos"))
@@ -279,6 +340,82 @@ def test_dual_layer_float64_matches_y_only(dual_layer_model):
     assert evaluator.factorized_fallback_evaluation_count == 0
 
 
+@pytest.mark.parametrize("schedule", ("chunk32", "tiled128x4-v1"))
+@pytest.mark.parametrize("dtype", ("float32", "float64"))
+def test_dual_layer_tail_batches_reuse_disjoint_generated_adjoints(
+    generated_dual_layer_model, dtype, schedule, monkeypatch
+):
+    _require_cuda_backend()
+    monkeypatch.setenv("SYMMETRIX_M0_RTC_SCHEDULE", schedule)
+    monkeypatch.setenv("SYMMETRIX_M1_RTC_SCHEDULE", schedule)
+    capacity = 4
+    atoms = _atoms(9)
+    reference = _calculator(generated_dual_layer_model, REFERENCE_PLAN, dtype=dtype)
+    expected, _ = _evaluate(reference, atoms)
+    tiled = _calculator(
+        generated_dual_layer_model, PLAN, capacity=capacity, dtype=dtype
+    )
+    evaluator = tiled.evaluator
+
+    first, _ = _evaluate(tiled, atoms)
+    _assert_results(first, expected)
+    assert evaluator.dual_layer_workspace_batch_count == 3 * math.ceil(
+        len(atoms) / capacity
+    )
+    assert evaluator.dual_layer_workspace_active_receivers == capacity
+    assert evaluator.m0_module_forward_launch_count > 0
+    assert evaluator.m0_module_reverse_launch_count > 0
+    assert evaluator.generated_m1_module_forward_launch_count > 0
+    assert evaluator.generated_m1_module_reverse_launch_count > 0
+    first_addresses = evaluator._test_mh0_adjoint_addresses()
+    generated_a_addresses = first_addresses[2:6]
+    assert all(address != 0 for address in generated_a_addresses)
+    assert len(set(generated_a_addresses)) == 4
+    first_replacements = evaluator.dual_layer_workspace_replacement_count
+    first_allocations = (
+        evaluator.mh0_a0_adjoint_allocation_count,
+        evaluator.mh0_a1_adjoint_allocation_count,
+    )
+    itemsize = np.dtype(dtype).itemsize
+    model = json.loads(Path(generated_dual_layer_model).read_text())
+    a_slot_bytes = (
+        capacity * (model["l_max"] + 1) ** 2 * model["num_channels"] * itemsize
+    )
+    coupled = len(model["Phi1_lme"])
+    channels = model["num_channels"]
+    output_components = (model["L_max"] + 1) ** 2
+    precision_bytes = (
+        4 * a_slot_bytes
+        + 2 * capacity * output_components * channels * itemsize
+        + capacity * coupled * 64 * itemsize
+        + capacity * channels * itemsize
+    )
+    receiver_payload = (
+        precision_bytes
+        + capacity * channels * np.dtype(np.float64).itemsize
+        + capacity * 2 * np.dtype(np.float64).itemsize
+        + capacity * np.dtype(np.int32).itemsize
+    )
+    assert first_allocations == (0, 0)
+    assert evaluator.dual_layer_workspace_bytes_per_receiver == (
+        receiver_payload // capacity
+    )
+    assert evaluator.dual_layer_workspace_bytes == (
+        receiver_payload
+        + evaluator.dual_layer_workspace_bytes_per_edge
+        * evaluator.dual_layer_workspace_planned_edges
+    )
+
+    second, _ = _evaluate(tiled, atoms)
+    _assert_results(second, expected)
+    assert evaluator._test_mh0_adjoint_addresses() == first_addresses
+    assert evaluator.dual_layer_workspace_replacement_count == first_replacements
+    assert (
+        evaluator.mh0_a0_adjoint_allocation_count,
+        evaluator.mh0_a1_adjoint_allocation_count,
+    ) == first_allocations
+
+
 def test_dual_layer_rejects_host_backend(dual_layer_model):
     import symmetrix as native
 
@@ -300,7 +437,6 @@ def test_normal_two_layer_execution_does_not_select_dual_plan(dual_layer_model, 
     )
     calculator = Symmetrix(
         dual_layer_model,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         execution_profile="capacity",
@@ -321,25 +457,25 @@ def test_normal_two_layer_execution_does_not_select_dual_plan(dual_layer_model, 
     assert (calculator._neighbor_cache is None) == (skin == 0.0)
 
 
+@pytest.mark.parametrize("dtype", ("float32", "float64"))
 def test_dual_layer_fixed_workspace_is_selected_automatically_at_memory_boundary(
-    dual_layer_model,
+    dual_layer_model, dtype
 ):
     _require_cuda_backend()
     atoms = _atoms(9)
     capacity = 4
     device_bytes = 32 * 1024**3
 
-    reference = _calculator(dual_layer_model, REFERENCE_PLAN)
+    reference = _calculator(dual_layer_model, REFERENCE_PLAN, dtype=dtype)
     expected, expected_h1_adjoint = _evaluate(reference, atoms)
 
     probe = Symmetrix(
         dual_layer_model,
-        use_kokkos=True,
-        dtype="float32",
+        dtype=dtype,
         streamed_edges="direct",
         execution_profile="capacity",
         neighbor_skin=0.5,
-        _debug_execution_plan=REFERENCE_PLAN,
+        _debug_execution_plan=PLAN,
     )
     probe.evaluator._set_dual_layer_workspace_receiver_limit_for_testing(capacity)
     probe_inputs = probe._mace_inputs(atoms)
@@ -354,11 +490,53 @@ def test_dual_layer_fixed_workspace_is_selected_automatically_at_memory_boundary
     tiled_estimate = estimates[PLAN]
     y_only_estimate = estimates[REFERENCE_PLAN]
     assert tiled_estimate < y_only_estimate
+    schedule = probe.evaluator._dual_layer_source_schedule_for_testing()
+    edge_count = len(probe._neighbor_cache.receivers)
+    receiver_count = len(atoms)
+    feature_count = receiver_count
+    itemsize = np.dtype(dtype).itemsize
+    model = json.loads(Path(dual_layer_model).read_text())
+    channels = model["num_channels"]
+    harmonics = (model["l_max"] + 1) ** 2
+    outputs = (model["L_max"] + 1) ** 2
+    coupled = len(model["Phi1_lme"])
+    receiver_payload = capacity * (
+        (4 * harmonics * channels + 2 * outputs * channels + coupled * 64 + channels)
+        * itemsize
+        + channels * np.dtype(np.float64).itemsize
+        + 2 * np.dtype(np.float64).itemsize
+        + np.dtype(np.int32).itemsize
+    )
+    workspace_edge_count = probe.evaluator.dual_layer_workspace_planned_edges
+    edge_payload = workspace_edge_count * (
+        harmonics * itemsize
+        + 3 * np.dtype(np.float64).itemsize
+        + 3 * (itemsize if dtype == "float32" else 8)
+        + np.dtype(np.float64).itemsize
+        + 2 * np.dtype(np.int32).itemsize
+    )
+    persistent = (
+        16 * edge_count
+        + 44 * receiver_count
+        + 52 * feature_count
+        + 2 * feature_count * outputs * channels * itemsize
+    )
+    source_schedule = (
+        4 * edge_count
+        + 8 * len(schedule["segment_source_ids"])
+        + 4 * (math.ceil(receiver_count / capacity) + 2)
+    )
+    assert tiled_estimate == (
+        persistent
+        + source_schedule
+        + receiver_payload
+        + edge_payload
+        + 9 * np.dtype(np.float64).itemsize
+    )
 
     calculator = Symmetrix(
         dual_layer_model,
-        use_kokkos=True,
-        dtype="float32",
+        dtype=dtype,
         streamed_edges="direct",
         execution_profile="capacity",
         allow_fixed_workspace=True,
@@ -377,7 +555,7 @@ def test_dual_layer_fixed_workspace_is_selected_automatically_at_memory_boundary
     assert calculator.execution_plan["selected_id"] == PLAN
     assert calculator.execution_plan["boundary_attempt"] is False
     assert evaluator.low_memory_policy == "capacity-y-only"
-    assert evaluator.low_memory_selected_estimated_bytes <= tiled_estimate
+    assert evaluator.low_memory_selected_estimated_bytes == tiled_estimate
     assert evaluator.dual_layer_workspace_active_receivers == capacity
     assert evaluator.low_memory_selection_reason.startswith(
         "fixed-workspace selection:"
@@ -393,3 +571,26 @@ def test_dual_layer_fixed_workspace_is_selected_automatically_at_memory_boundary
     )
     assert evaluator.dual_layer_tiled_evaluation_count == 1
     assert evaluator.factorized_fallback_evaluation_count == 0
+
+    for available_bytes, boundary_attempt in (
+        (tiled_estimate, False),
+        (tiled_estimate - 1, True),
+    ):
+        boundary = Symmetrix(
+            dual_layer_model,
+            dtype=dtype,
+            streamed_edges="direct",
+            execution_profile="capacity",
+            allow_fixed_workspace=True,
+            neighbor_skin=0.5,
+        )
+        boundary.evaluator._set_dual_layer_workspace_receiver_limit_for_testing(
+            capacity
+        )
+        boundary_inputs = boundary._mace_inputs(atoms)
+        boundary.evaluator._set_low_memory_device_memory_info_for_testing(
+            reserve + available_bytes, device_bytes
+        )
+        boundary.evaluator._prepare_factorized_graph(*boundary_inputs[:5])
+        assert boundary.execution_plan["selected_id"] == PLAN
+        assert boundary.execution_plan["boundary_attempt"] is boundary_attempt

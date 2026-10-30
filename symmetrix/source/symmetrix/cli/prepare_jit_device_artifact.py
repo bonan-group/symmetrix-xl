@@ -6,7 +6,7 @@ import sys
 from argparse import ArgumentParser
 
 from .. import symmetrix as native_symmetrix
-from ..jit_device_artifact import (
+from ..mace_jit_device_artifact import (
     JitDeviceArtifactError,
     prepare_jit_device_artifact,
 )
@@ -65,7 +65,11 @@ def _format_lammps_arguments(result):
             )
         )
     r0_module = operator_modules.get("R0", {})
-    if r0_module.get("implementation") == "device_module":
+    if (
+        r0_module.get("implementation") == "generated"
+        and r0_module.get("backend") in {"cuda", "hip"}
+        and r0_module.get("artifact_origin") in {"prebuilt", "cache", "runtime"}
+    ):
         arguments.extend(
             (
                 "jit_r0_device_artifact",

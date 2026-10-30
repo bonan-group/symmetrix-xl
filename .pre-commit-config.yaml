@@ -6,6 +6,7 @@ repos:
     -   id: end-of-file-fixer
     -   id: check-yaml
     -   id: check-added-large-files
+        exclude: ^libsymmetrix/source/dispersion_parameters\.cpp$
 
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.3.0

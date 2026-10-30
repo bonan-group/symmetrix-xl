@@ -34,6 +34,21 @@ reverse stages. Built-in standard modules cover common M0/R0 structures;
 other admitted structures use runtime-generated modules. R1 and compatible
 MACE-MH-1 programs are specialized from versioned model contracts.
 
+For admitted MH-1 models, each nonlinear layer stops at a canonical product
+boundary. Non-final products dispatch ordinary M0 modules and the final scalar
+product dispatches M1. These modules are type-agnostic (`type_count=1`) and see
+a zero type-index view even for multi-element models. Product output linear,
+skip, readout, gates, conditioned messages, density normalization, tensor
+products, and their nonlinear reverse phases remain inside the MH-1 pipeline;
+the common module owns only the symmetric contraction and its reverse.
+
+One common module is loaded per product layer and invoked in both directions.
+Its identity and origin are independent of the full nonlinear plugin. Thus an
+installed common module may be reused exactly across standard MACE and MH-1
+while the surrounding MH-1 plugin comes from the cache or runtime compilation.
+Reporting the whole plugin as prebuilt because one or more product modules are
+prebuilt is incorrect.
+
 ## Public Selection
 
 The supported public spellings are:
@@ -41,7 +56,7 @@ The supported public spellings are:
 | Request | Role |
 |---|---|
 | `direct` | Default prepared execution; two-interaction models require a matching R1 specialization, while admitted single-layer models use prepared R0/M0 execution without an R1 specialization. Capacity may still specialize their M0/R0 operators. |
-| `non-compiled` | Compiler-free debug path; not optimized and not a performance target. |
+| `non-compiled` | Compiler-free compatibility and diagnostic path; no performance guarantee. |
 | `materialized` | Original Symmetrix execution path, principally for the original Symmetrix model format (named v1 here) and retained numerical controls. |
 | `auto` | Temporary compatibility request resolved from model and evaluator capability. |
 
@@ -54,10 +69,14 @@ for capacity behavior. They do not emit a deprecation warning. The removed
 historical benchmark records that mention it describe an earlier
 implementation.
 
-The non-Kokkos evaluator selected with `use_kokkos=False` does not implement
-the prepared direct path: a `direct` request resolves to serial non-compiled
-execution with a warning, while an explicit `materialized` request remains
-materialized.
+There is one evaluator stack. A `direct` request runs the prepared path against
+a contract-bound generated artifact and fails at graph preparation without one;
+a `reference` request — reached by the `reference`, `non-compiled`, `generic`,
+`all_interactions`, or `materialized` spelling — runs the generic implementation
+through the whole-evaluator entry point on the default host execution space with
+no artifact at all. The retired `use_kokkos` argument and the standalone
+CPU-native evaluators it selected are gone; both legacy forms of the argument
+are rejected explicitly.
 
 ## Capacity Planning
 
@@ -92,24 +111,49 @@ precision-, ABI-, generation-, and target-specific artifact:
 - HIP uses hipRTC by default for device specialization.
 - LAMMPS loads prepared host or device artifacts and never invokes a compiler.
 
-Compilation or loading failure is fatal for direct execution. Set
-`SYMMETRIX_JIT_POLICY=none` only for diagnosis and select `non-compiled` only
-when a compiler-free debug evaluation is intended.
+CUDA compilation gives each generated unit two internal compiler threads with
+`--split-compile=2`. When R1, M0, M1, and R0 require generated device modules,
+artifact preparation compiles the independent units concurrently and then
+loads and validates them in R1, M0, M1, R0 order. The outer pool is capped at
+two compiler processes. The bounded per-unit split avoids
+letting each concurrent compiler instance consume every host CPU.
 
-Artifacts are stored below a per-user cache. Set `SYMMETRIX_JIT_CACHE` before
-Python starts to choose an explicit location. The cache contains executable
-code, so its root must not be writable by other users; group or other read
-access is allowed, and symbolic links are followed with the checks applied to
-the resolved target. An existing `artifacts/` child carries the same
-no-write-by-other-users rule. Every ancestor of the resolved root must likewise
-be non-writable by other users or carry the sticky bit (for example `/tmp`), so
-the root cannot be renamed or replaced before an artifact is loaded. Reusing a
-root owned by another user — for example a site-managed read-only artifact
-store — requires an explicit `SYMMETRIX_JIT_TRUST_SHARED_CACHE=1`, which accepts
-code compiled by that user. Compiling a missing artifact still requires a root
-owned by the current user.
-Publication uses content-addressed entries and validates manifests, target
-identity, file size, and SHA-256 digests before reuse.
+Host low-memory preparation likewise compiles generated R1, M0, and M1 plugins
+concurrently in a pool bounded to two compiler processes, then loads them in
+that order. GCC and Clang do not have a portable single-translation-unit equivalent of
+NVRTC split compilation, so host parallelism is applied between independent
+artifacts rather than within one compiler invocation.
+
+Compilation or loading failure is fatal for direct execution. Set
+`SYMMETRIX_JIT_POLICY=none` only for diagnosis and select `non-compiled` when a
+compiler-free evaluation is intended.
+
+Generation-19 MH-1 device composition admits common operator ABI v3 with the
+`chunk32` production schedule. `tiled128x4-v1` remains disabled and is not a
+production alternative. The model-specific device module is version 5 and its
+launch plan is version 6; the current host plugin ABI is v7. Release evidence
+requires plan schema `/6`, plan version 6, device ABI 5, generation 19, and
+`split_phase_composition=true`; the old `external_product` marker is not a
+release-compatible alias. Stale, incomplete, or partial identities are rejected
+rather than adapted. Common product buffers are disjoint. Device M0 uses
+`table` revision 1, `chunk32` revision 2, and experimental `tiled128x4-v1`
+revision 3 with capability mask `0x1b`; device M1 uses revisions 2, 3, and 4
+respectively with capability mask `0x0b`. Host M1 `chunk32` remains revision 2
+with the host-ABI `0x1b` mask. No device schedule advertises alias safety, and
+exact input/output and input/input-adjoint aliases are rejected before launch.
+HIP follows the same contract and artifact split, but runtime support
+must be qualified on accessible architecture-matched AMD hardware. Compiler and
+rendered-source checks alone are not a HIP execution claim.
+
+Artifacts are stored below a per-user cache created with owner-only
+permissions. Set `SYMMETRIX_JIT_CACHE` before Python starts to choose an
+explicit location. Cache roots, artifact directories, entries, manifests,
+sources, and compiled modules writable by group or other are rejected. Paths
+must be owned by the current user by default; a foreign-owned read-only cache
+is admitted only when `SYMMETRIX_JIT_TRUST_SHARED_CACHE=1` is set explicitly.
+Trust is checked again immediately before loading compiled code. Publication
+uses content-addressed entries and validates permissions, ownership, manifests,
+target identity, file size, and SHA-256 digests before reuse.
 
 Concurrent cache misses compile in private staging directories. Publication
 prefers atomic no-replace rename; on filesystems that do not support it,
@@ -173,19 +217,25 @@ qualification boundary is maintained in {doc}`user/lammps` and the
 
 - Public selection and artifact orchestration:
   `symmetrix/source/symmetrix/calculator.py`
-- Public mode parser: `libsymmetrix/source/mace_streamed_edges.hpp`
+- Declared family registry, the shared compact mode vocabulary, and the
+  per-family declarations beside each family's modules:
+  `symmetrix/source/symmetrix/family_registry.py` with `mace_family.py`,
+  `mace_nonlinear_family.py`, `mace_polar_family.py`, and `oam_family.py`
+- Neutral host neighbor-graph builder shared by both frontends:
+  `symmetrix/source/symmetrix/neighbor_graph.py`
+- Public, family-neutral mode parser: `libsymmetrix/source/execution_mode.hpp`
 - Native execution planner: `libsymmetrix/source/execution_plan.hpp`
 - MACE Kokkos lifecycle and execution:
   `libsymmetrix/source/mace_kokkos_factorized_lifecycle.cpp` and
   `libsymmetrix/source/mace_kokkos_factorized_execution.cpp`
-- Host, CUDA, and HIP artifact loaders: `libsymmetrix/source/jit_host_plugin.cpp`,
-  `libsymmetrix/source/jit_cuda_plugin.cpp`, and
-  `libsymmetrix/source/jit_hip_plugin.cpp`
+- Host, CUDA, and HIP artifact loaders: `libsymmetrix/source/mace_jit_host_plugin.cpp`,
+  `libsymmetrix/source/mace_jit_cuda_plugin.cpp`, and
+  `libsymmetrix/source/mace_jit_hip_plugin.cpp`
 - CUDA and HIP runtime compilers: `libsymmetrix/source/jit_nvrtc.cpp` and
   `libsymmetrix/source/jit_hiprtc.cpp`
 - Generated MH-1 contracts and source:
-  `symmetrix/source/symmetrix/execution_mh1_contract.py` and
-  `symmetrix/source/symmetrix/mh1_jit_codegen.py`
+  `symmetrix/source/symmetrix/mace_nonlinear_execution_contract.py` and
+  `symmetrix/source/symmetrix/mace_nonlinear_jit_codegen.py`
 
 The detailed native ownership map is maintained in
 {doc}`mace_kokkos_source_layout`. Benchmark Markdown files are dated evidence,

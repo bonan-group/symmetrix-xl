@@ -38,19 +38,55 @@ set(SYMMETRIX_PYTHON_INSTALL_PACKAGE "" CACHE STRING
     "Python package receiving the native extension.")
 set(SYMMETRIX_DISTRIBUTION_NAME "symmetrix-xl" CACHE STRING
     "Owning Python distribution recorded in backend metadata.")
-set(SYMMETRIX_FRONTEND_VERSION "0.1.1" CACHE STRING
+set(SYMMETRIX_FRONTEND_VERSION "0.2.0" CACHE STRING
     "Compatible Symmetrix Python frontend version.")
 set(SYMMETRIX_BACKEND_SELECTOR "" CACHE STRING
     "Runtime backend selector recorded in backend metadata.")
 set(SYMMETRIX_BACKEND_ARCHITECTURE "" CACHE STRING
     "Normalized architecture recorded in backend metadata.")
+set(SYMMETRIX_DEVICE_COMPILER_TARGET "" CACHE STRING
+    "Exact CUDA or HIP compiler target for architecture-qualified artifacts.")
+set(SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS "r0" CACHE STRING
+    "Build-tree generated operator artifacts: off, r0, or full.")
+option(SYMMETRIX_ENABLE_DEVELOPMENT_RUNTIME_COMPONENT
+  "Enable the runtime-only component used by the development build frontend." OFF)
+set(SYMMETRIX_TARGET_MANIFEST_FINGERPRINT "" CACHE STRING
+    "Build-frontend target fingerprint for development runtime metadata.")
+set(SYMMETRIX_DEVELOPMENT_BACKEND "" CACHE STRING
+    "Normalized backend name for development runtime metadata.")
+set(SYMMETRIX_DEVELOPMENT_DESCRIPTOR_SELECTOR "" CACHE STRING
+    "Architecture-qualified selector for development runtime metadata.")
+set(SYMMETRIX_DEVELOPMENT_TOOLKIT "" CACHE STRING
+    "Normalized toolkit name for development runtime metadata.")
+set(SYMMETRIX_PREBUILT_OAM_ARTIFACTS "off" CACHE STRING
+    "Build-tree OAM architecture artifacts: off or known.")
 set_property(CACHE SYMMETRIX_DEVICE_BACKEND PROPERTY STRINGS AUTO NONE CUDA HIP)
+set_property(CACHE SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS PROPERTY STRINGS off r0 full)
+set_property(CACHE SYMMETRIX_PREBUILT_OAM_ARTIFACTS PROPERTY STRINGS off known)
 string(TOUPPER "${SYMMETRIX_DEVICE_BACKEND}" SYMMETRIX_DEVICE_BACKEND)
 set(_symmetrix_valid_device_backends AUTO NONE CUDA HIP)
 if(NOT SYMMETRIX_DEVICE_BACKEND IN_LIST _symmetrix_valid_device_backends)
   message(FATAL_ERROR
     "Invalid SYMMETRIX_DEVICE_BACKEND='${SYMMETRIX_DEVICE_BACKEND}'; "
     "expected AUTO, NONE, CUDA, or HIP.")
+endif()
+string(TOLOWER "${SYMMETRIX_PREBUILT_OAM_ARTIFACTS}"
+  SYMMETRIX_PREBUILT_OAM_ARTIFACTS)
+set(_symmetrix_valid_prebuilt_oam_modes off known)
+if(NOT SYMMETRIX_PREBUILT_OAM_ARTIFACTS IN_LIST
+    _symmetrix_valid_prebuilt_oam_modes)
+  message(FATAL_ERROR
+    "Invalid SYMMETRIX_PREBUILT_OAM_ARTIFACTS="
+    "'${SYMMETRIX_PREBUILT_OAM_ARTIFACTS}'; expected off or known.")
+endif()
+string(TOLOWER "${SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS}"
+  SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS)
+set(_symmetrix_valid_prebuilt_operator_modes off r0 full)
+if(NOT SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS IN_LIST
+    _symmetrix_valid_prebuilt_operator_modes)
+  message(FATAL_ERROR
+    "Invalid SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS="
+    "'${SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS}'; expected off, r0, or full.")
 endif()
 
 set(Kokkos_ENABLE_AGGRESSIVE_VECTORIZATION ON CACHE BOOL "Set Kokkos_ENABLE_AGGRESSIVE_VECTORIZATION.")
@@ -301,8 +337,23 @@ else()
     "Build from the published sdist or a recursive source checkout, or run "
     "'git submodule update --init --recursive' first.")
 endif()
+if(NOT DEFINED SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256)
+  set(SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256 "unknown")
+endif()
+if(NOT DEFINED SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256)
+  set(SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256 "unknown")
+endif()
 add_subdirectory("${SYMMETRIX_LIBSYM_SOURCE_DIR}"
   ${CMAKE_CURRENT_BINARY_DIR}/libsymmetrix)
+
+if(NOT SYMMETRIX_PREBUILT_OPERATOR_CATALOG_HEADER)
+  set(SYMMETRIX_PREBUILT_OPERATOR_CATALOG_HEADER
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/prebuilt_operator_build_info.hpp")
+  configure_file(
+    source/cpp/prebuilt_operator_build_info_off.hpp.in
+    "${SYMMETRIX_PREBUILT_OPERATOR_CATALOG_HEADER}"
+    @ONLY)
+endif()
 
 add_subdirectory(external/pybind11)
 
@@ -310,7 +361,15 @@ set(SYMMETRIX_BUILD_OPENMP_ENABLED 0)
 set(SYMMETRIX_BUILD_OPENMP_VERSION "")
 set(SYMMETRIX_BUILD_OPENMP_RUNTIME_PATH "")
 set(SYMMETRIX_BUILD_OPENMP_RUNTIME_SHA256 "")
-file(REAL_PATH "${CMAKE_CXX_COMPILER}" SYMMETRIX_BUILD_CXX_COMPILER_PATH)
+if(_symmetrix_resolved_device_backend STREQUAL "NONE")
+  file(REAL_PATH "${CMAKE_CXX_COMPILER}" SYMMETRIX_BUILD_CXX_COMPILER_PATH)
+else()
+  # Device builds commonly use a source-tree nvcc_wrapper/hipcc shim.  Keep
+  # the diagnostic compiler name without baking that non-relocatable build
+  # path into the extension and wheel.
+  get_filename_component(SYMMETRIX_BUILD_CXX_COMPILER_PATH
+    "${CMAKE_CXX_COMPILER}" NAME)
+endif()
 set(SYMMETRIX_BUILD_DEVICE_COMPILER_ID "")
 set(SYMMETRIX_BUILD_DEVICE_COMPILER_VERSION "")
 if(_symmetrix_resolved_device_backend STREQUAL "CUDA"
@@ -336,8 +395,12 @@ elseif(_symmetrix_resolved_device_backend STREQUAL "HIP")
     SYMMETRIX_BUILD_DEVICE_COMPILER_VERSION
     "${_symmetrix_device_compiler_version}")
 endif()
-set(SYMMETRIX_BUILD_SOURCE_COMMIT "unknown")
-set(SYMMETRIX_BUILD_SOURCE_DIRTY 0)
+if(NOT DEFINED SYMMETRIX_BUILD_SOURCE_COMMIT)
+  set(SYMMETRIX_BUILD_SOURCE_COMMIT "unknown")
+endif()
+if(NOT DEFINED SYMMETRIX_BUILD_SOURCE_DIRTY)
+  set(SYMMETRIX_BUILD_SOURCE_DIRTY 0)
+endif()
 if(NOT DEFINED SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256)
   set(SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256 "unknown")
 endif()
@@ -345,7 +408,7 @@ if(NOT DEFINED SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256)
   set(SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256 "unknown")
 endif()
 find_package(Git QUIET)
-if(Git_FOUND)
+if(Git_FOUND AND SYMMETRIX_BUILD_SOURCE_COMMIT STREQUAL "unknown")
   execute_process(
     COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
@@ -364,6 +427,11 @@ if(Git_FOUND)
   if(_symmetrix_git_status)
     set(SYMMETRIX_BUILD_SOURCE_DIRTY 1)
   endif()
+endif()
+if(SYMMETRIX_BUILD_SOURCE_DIRTY)
+  set(SYMMETRIX_BUILD_SOURCE_DIRTY_JSON true)
+else()
+  set(SYMMETRIX_BUILD_SOURCE_DIRTY_JSON false)
 endif()
 if(SYMMETRIX_KOKKOS AND Kokkos_ENABLE_OPENMP)
   set(SYMMETRIX_BUILD_OPENMP_ENABLED 1)
@@ -425,8 +493,7 @@ set(SYMMETRIX_BINDINGS
     source/cpp/cubic_spline.cpp
     source/cpp/cubic_spline_set.cpp
     source/cpp/e3nn.cpp
-    source/cpp/mace.cpp
-    source/cpp/mace_nonlinear.cpp
+    source/cpp/oam_schema.cpp
     source/cpp/multilayer_perceptron.cpp
     source/cpp/multivariate_polynomial.cpp
     source/cpp/spherical_harmonic.cpp
@@ -437,41 +504,69 @@ set(SYMMETRIX_BINDINGS
 set(SYMMETRIX_BINDINGS_KOKKOS
     source/cpp/cubic_spline_kokkos.cpp
     source/cpp/cubic_spline_set_kokkos.cpp
+    source/cpp/dispersion_kokkos.cpp
+    source/cpp/les_monopole.cpp
     source/cpp/mace_kokkos.cpp
+    source/cpp/mace_les_kokkos.cpp
     source/cpp/mace_nonlinear_kokkos.cpp
+    source/cpp/oam_kokkos.cpp
     source/cpp/multilayer_perceptron_kokkos.cpp
     source/cpp/multivariate_polynomial_kokkos.cpp
     # source/spherical_harmonic_kokkos.cpp
     source/cpp/tools_kokkos.cpp
-    source/cpp/zbl_kokkos.cpp)
+    source/cpp/zbl_kokkos.cpp
+    source/cpp/long_range_kokkos.cpp
+    source/cpp/mace_polar_program.cpp
+    source/cpp/mace_polar_deltas.cpp)
 
 if(SYMMETRIX_KOKKOS)
     message(STATUS "Symmetrix will have Kokkos support.")
     list(APPEND SYMMETRIX_BINDINGS ${SYMMETRIX_BINDINGS_KOKKOS})
 endif()
 
+if(SYMMETRIX_KOKKOS AND SYMMETRIX_PARTICLE_MESH_AVAILABLE)
+    # Private physics-neutral spread/FFT/gather qualification seam.
+    list(APPEND SYMMETRIX_BINDINGS source/cpp/particle_mesh.cpp)
+    # Private storage/cache seam; it publishes no evaluator and exists only so
+    # the native storage contract is testable in a qualified build.
+    list(APPEND SYMMETRIX_BINDINGS source/cpp/fourier_d3_storage.cpp)
+    # Private coordination/coefficient seam; it evaluates no energy or force and
+    # publishes no evaluator.
+    list(APPEND SYMMETRIX_BINDINGS source/cpp/fourier_d3_coordination.cpp)
+    # Private forward-path seam; it publishes no evaluator and exposes only the
+    # stages, readbacks, and accounting a qualified build checks.
+    list(APPEND SYMMETRIX_BINDINGS source/cpp/fourier_d3_reciprocal.cpp)
+    # Private reverse-path seam; it publishes no evaluator and exists so the
+    # reverse chain is testable against the frozen references.
+    list(APPEND SYMMETRIX_BINDINGS source/cpp/fourier_d3_reverse.cpp)
+    # Private evaluator binding: the dtype-specific evaluator classes the Python
+    # correction runtime resolves, plus the canonical-table accessor and its
+    # provenance fingerprint.  No package export is published here.
+    list(APPEND SYMMETRIX_BINDINGS source/cpp/fourier_d3_evaluator.cpp)
+endif()
+
 pybind11_add_module(symmetrix_bindings MODULE ${SYMMETRIX_BINDINGS} source/cpp/symmetrix.cpp)
+target_sources(symmetrix_bindings PRIVATE
+  "${SYMMETRIX_PREBUILT_OPERATOR_CATALOG_HEADER}")
+if(TARGET symmetrix_prebuilt_operator_catalog)
+  add_dependencies(symmetrix_bindings symmetrix_prebuilt_operator_catalog)
+endif()
 set_target_properties(symmetrix_bindings PROPERTIES
   OUTPUT_NAME "${SYMMETRIX_PYTHON_MODULE_NAME}")
 target_include_directories(symmetrix_bindings PRIVATE
   ${CMAKE_CURRENT_BINARY_DIR}/generated)
-# These values are consumed only by the module initializer. Keeping them off
-# the target-wide command line prevents provenance changes from recompiling
-# every binding translation unit during an incremental source build.
-set_property(SOURCE source/cpp/symmetrix.cpp APPEND PROPERTY COMPILE_DEFINITIONS
-  SYMMETRIX_PYTHON_MODULE=${SYMMETRIX_PYTHON_MODULE_NAME}
-  SYMMETRIX_NATIVE_ABI=1
-  SYMMETRIX_BUILD_BACKEND="${SYMMETRIX_BACKEND_SELECTOR}"
-  SYMMETRIX_BUILD_ARCHITECTURE="${SYMMETRIX_BACKEND_ARCHITECTURE}"
-  SYMMETRIX_BUILD_DISTRIBUTION="${SYMMETRIX_DISTRIBUTION_NAME}"
-  SYMMETRIX_BUILD_SOURCE_COMMIT="${SYMMETRIX_BUILD_SOURCE_COMMIT}"
-  SYMMETRIX_BUILD_SOURCE_DIRTY=${SYMMETRIX_BUILD_SOURCE_DIRTY}
-  SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256="${SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256}"
-  SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256="${SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256}"
-  SYMMETRIX_BUILD_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
-  SYMMETRIX_BUILD_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
-  SYMMETRIX_BUILD_DEVICE_COMPILER_ID="${SYMMETRIX_BUILD_DEVICE_COMPILER_ID}"
-  SYMMETRIX_BUILD_DEVICE_COMPILER_VERSION="${SYMMETRIX_BUILD_DEVICE_COMPILER_VERSION}")
+# Family evaluators and the module initializer must agree on particle-mesh
+# availability.  This definition also keeps header-defined family state and
+# capability routing identical in every binding translation unit.
+target_compile_definitions(symmetrix_bindings PRIVATE
+  SYMMETRIX_PARTICLE_MESH_AVAILABLE=${SYMMETRIX_PARTICLE_MESH_AVAILABLE})
+# These values are consumed only by the module initializer.  A generated
+# header, rather than source-specific COMPILE_DEFINITIONS, keeps changing
+# provenance out of Unix Makefiles' target-wide flags.make.
+set(SYMMETRIX_BUILD_FAST_MATH ${SYMMETRIX_FAST_MATH})
+configure_file(
+  source/cpp/build_metadata.hpp.in
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/build_metadata.hpp")
 target_link_libraries(symmetrix_bindings PRIVATE symmetrix)
 if(SYMMETRIX_HIDE_STATIC_BLAS_SYMBOLS)
   if(UNIX AND NOT APPLE)
@@ -497,4 +592,30 @@ if(_symmetrix_resolved_device_backend STREQUAL "NONE"
     @ONLY)
   install(FILES ${CMAKE_CURRENT_BINARY_DIR}/generated/backend_cpu.json
     DESTINATION symmetrix RENAME _backend_cpu.json)
+endif()
+
+# The fast development path explicitly requests this component and installs it
+# straight into one selected interpreter. It is disabled for normal package
+# installs and wheels, whose file ownership remains unchanged.
+if(SYMMETRIX_ENABLE_DEVELOPMENT_RUNTIME_COMPONENT)
+  if(NOT SYMMETRIX_TARGET_MANIFEST_FINGERPRINT)
+    message(FATAL_ERROR
+      "Development runtime installation requires a target manifest fingerprint.")
+  endif()
+  configure_file(
+    source/cpp/backend_development.json.in
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/backend_development.json
+    @ONLY)
+  install(TARGETS symmetrix_bindings
+    DESTINATION "${SYMMETRIX_PYTHON_INSTALL_PACKAGE}"
+    COMPONENT symmetrix_development_runtime)
+  if(SYMMETRIX_PYTHON_INSTALL_PACKAGE STREQUAL "symmetrix")
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/generated/backend_development.json
+      DESTINATION symmetrix RENAME _backend_cpu.json
+      COMPONENT symmetrix_development_runtime)
+  else()
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/generated/backend_development.json
+      DESTINATION "${SYMMETRIX_PYTHON_INSTALL_PACKAGE}" RENAME backend.json
+      COMPONENT symmetrix_development_runtime)
+  endif()
 endif()

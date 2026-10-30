@@ -31,31 +31,32 @@ if not os.path.exists("mace-mp-0b3-medium-hea.json"):
     )
 
 
+# Only the Kokkos pair styles exist, so every case below runs with `-k on`: the
+# first axis pins a single Kokkos thread and the second uses the default Kokkos
+# execution space.
 @pytest.mark.parametrize(
     "cmdargs",
     [
-        ["-screen", "none"],
-        ["-screen", "none", "-k", "on", "-sf", "kk"],  # kokkos
+        ["-screen", "none", "-k", "on", "t", "1", "-sf", "kk"],  # single thread
+        ["-screen", "none", "-k", "on", "-sf", "kk"],  # default Kokkos
     ],
 )
 @pytest.mark.parametrize(
     "pair_style",
     [
-        "symmetrix/mace",
-        "symmetrix/mace no_domain_decomposition",
-        "symmetrix/mace mpi_message_passing",
-        "symmetrix/mace no_mpi_message_passing",
-        "symmetrix/mace/float32",
-        "symmetrix/mace/float32 no_domain_decomposition",
-        "symmetrix/mace/float32 mpi_message_passing",
-        "symmetrix/mace/float32 no_mpi_message_passing",
+        "symmetrix/mace/kk",
+        "symmetrix/mace/kk no_domain_decomposition",
+        "symmetrix/mace/kk mpi_message_passing",
+        "symmetrix/mace/kk no_mpi_message_passing",
+        "symmetrix/mace/float32/kk",
+        "symmetrix/mace/float32/kk no_domain_decomposition",
+        "symmetrix/mace/float32/kk mpi_message_passing",
+        "symmetrix/mace/float32/kk no_mpi_message_passing",
     ],
 )
 def test_h20(cmdargs, pair_style):
     if "float32" in pair_style:
-        pytest.skip("Skipping float32 lammps tests.")
-    if "float32" in pair_style and "kk" not in cmdargs:
-        pytest.skip("Kokkos required for symmetrix/mace/float32.")
+        pytest.skip("Skipping float32 lammps tests: not qualified on this runner.")
 
     # ----- setup -----
     lmp = lammps(cmdargs=cmdargs)
@@ -163,24 +164,28 @@ def _hybrid_atomic_energies(cmdargs, pair_style, mode):
     return atom_types[order], per_atom[order], repeated[order], energy, num_ghosts
 
 
+# The serial pair style is retired, so the strictly local (no domain
+# decomposition, no pair communication) case is now the single-thread Kokkos
+# one.
 @pytest.mark.parametrize(
     ("cmdargs", "pair_style", "rtol", "atol"),
     [
         pytest.param(
-            ["-screen", "none"],
-            "symmetrix/mace",
+            ["-screen", "none", "-k", "on", "t", "1", "-sf", "kk"],
+            "symmetrix/mace/kk",
             1.0e-12,
             1.0e-10,
-            id="cpu-float64",
+            id="kokkos-float64",
         ),
     ],
 )
 def test_per_atom_energy_uses_neighbor_list_atom_indices(
     cmdargs, pair_style, rtol, atol
 ):
+    # Plain hybrid wrappers cannot preserve the full many-body receiver list;
+    # the separately qualified hybrid/overlay/kk path can.
     for mode in (
         "no_domain_decomposition",
-        "mpi_message_passing",
         "no_mpi_message_passing",
     ):
         atom_types, per_atom, repeated, energy, num_ghosts = _hybrid_atomic_energies(
@@ -194,31 +199,49 @@ def test_per_atom_energy_uses_neighbor_list_atom_indices(
             assert num_ghosts > 0
 
 
+def test_mpi_message_passing_accepts_only_the_qualified_hybrid_overlay():
+    cmdargs = ["-screen", "none", "-k", "on", "t", "1", "-sf", "kk"]
+    lmp = lammps(cmdargs=cmdargs)
+    try:
+        with pytest.raises(
+            Exception,
+            match="mpi_message_passing is supported under hybrid/overlay/kk only",
+        ):
+            lmp.command(
+                "pair_style hybrid symmetrix/mace/kk mpi_message_passing zero 6.0"
+            )
+        lmp.command(
+            "pair_style hybrid/overlay/kk "
+            "symmetrix/mace/kk mpi_message_passing zero 6.0"
+        )
+        lmp.command("pair_style symmetrix/mace/kk mpi_message_passing")
+    finally:
+        lmp.close()
+
+
 @pytest.mark.parametrize(
     "cmdargs",
     [
-        ["-screen", "none"],
-        ["-screen", "none", "-k", "on", "-sf", "kk"],  # kokkos
+        ["-screen", "none", "-k", "on", "t", "1", "-sf", "kk"],  # single thread
+        ["-screen", "none", "-k", "on", "-sf", "kk"],  # default Kokkos
     ],
 )
 @pytest.mark.parametrize(
     "pair_style",
     [
-        "symmetrix/mace",
-        "symmetrix/mace no_domain_decomposition",
-        "symmetrix/mace mpi_message_passing",
-        "symmetrix/mace no_mpi_message_passing",
-        "symmetrix/mace/float32",
-        "symmetrix/mace/float32 no_domain_decomposition",
-        "symmetrix/mace/float32 mpi_message_passing",
-        "symmetrix/mace/float32 no_mpi_message_passing",
+        "symmetrix/mace/kk",
+        "symmetrix/mace/kk no_domain_decomposition",
+        "symmetrix/mace/kk mpi_message_passing",
+        "symmetrix/mace/kk no_mpi_message_passing",
+        "symmetrix/mace/float32/kk",
+        "symmetrix/mace/float32/kk no_domain_decomposition",
+        "symmetrix/mace/float32/kk mpi_message_passing",
+        "symmetrix/mace/float32/kk no_mpi_message_passing",
     ],
 )
 def test_h20_zbl(cmdargs, pair_style):
     if "float32" in pair_style:
-        pytest.skip("Skipping float32 lammps tests.")
-    if "float32" in pair_style and "kk" not in cmdargs:
-        pytest.skip("Kokkos required for symmetrix/mace/float32.")
+        pytest.skip("Skipping float32 lammps tests: not qualified on this runner.")
 
     # ----- setup -----
     lmp = lammps(cmdargs=cmdargs)
@@ -274,28 +297,26 @@ def test_h20_zbl(cmdargs, pair_style):
 @pytest.mark.parametrize(
     "cmdargs",
     [
-        ["-screen", "none"],
-        ["-screen", "none", "-k", "on", "-sf", "kk"],  # kokkos
+        ["-screen", "none", "-k", "on", "t", "1", "-sf", "kk"],  # single thread
+        ["-screen", "none", "-k", "on", "-sf", "kk"],  # default Kokkos
     ],
 )
 @pytest.mark.parametrize(
     "pair_style",
     [
-        "symmetrix/mace",
-        "symmetrix/mace no_domain_decomposition",
-        "symmetrix/mace mpi_message_passing",
-        "symmetrix/mace no_mpi_message_passing",
-        "symmetrix/mace/float32",
-        "symmetrix/mace/float32 no_domain_decomposition",
-        "symmetrix/mace/float32 mpi_message_passing",
-        "symmetrix/mace/float32 no_mpi_message_passing",
+        "symmetrix/mace/kk",
+        "symmetrix/mace/kk no_domain_decomposition",
+        "symmetrix/mace/kk mpi_message_passing",
+        "symmetrix/mace/kk no_mpi_message_passing",
+        "symmetrix/mace/float32/kk",
+        "symmetrix/mace/float32/kk no_domain_decomposition",
+        "symmetrix/mace/float32/kk mpi_message_passing",
+        "symmetrix/mace/float32/kk no_mpi_message_passing",
     ],
 )
 def test_water(cmdargs, pair_style):
     if "float32" in pair_style:
-        pytest.skip("Skipping float32 lammps tests.")
-    if "float32" in pair_style and "kk" not in cmdargs:
-        pytest.skip("Kokkos required for symmetrix/mace/float32.")
+        pytest.skip("Skipping float32 lammps tests: not qualified on this runner.")
 
     # ----- setup -----
     lmp = lammps(cmdargs=cmdargs)
@@ -379,28 +400,26 @@ def test_water(cmdargs, pair_style):
 @pytest.mark.parametrize(
     "cmdargs",
     [
-        ["-screen", "none"],
-        ["-screen", "none", "-k", "on", "-sf", "kk"],  # kokkos
+        ["-screen", "none", "-k", "on", "t", "1", "-sf", "kk"],  # single thread
+        ["-screen", "none", "-k", "on", "-sf", "kk"],  # default Kokkos
     ],
 )
 @pytest.mark.parametrize(
     "pair_style",
     [
-        "symmetrix/mace",
-        "symmetrix/mace no_domain_decomposition",
-        "symmetrix/mace mpi_message_passing",
-        "symmetrix/mace no_mpi_message_passing",
-        "symmetrix/mace/float32",
-        "symmetrix/mace/float32 no_domain_decomposition",
-        "symmetrix/mace/float32 mpi_message_passing",
-        "symmetrix/mace/float32 no_mpi_message_passing",
+        "symmetrix/mace/kk",
+        "symmetrix/mace/kk no_domain_decomposition",
+        "symmetrix/mace/kk mpi_message_passing",
+        "symmetrix/mace/kk no_mpi_message_passing",
+        "symmetrix/mace/float32/kk",
+        "symmetrix/mace/float32/kk no_domain_decomposition",
+        "symmetrix/mace/float32/kk mpi_message_passing",
+        "symmetrix/mace/float32/kk no_mpi_message_passing",
     ],
 )
 def test_hea(cmdargs, pair_style):
     if "float32" in pair_style:
-        pytest.skip("Skipping float32 lammps tests.")
-    if "float32" in pair_style and "kk" not in cmdargs:
-        pytest.skip("Kokkos required for symmetrix/mace/float32.")
+        pytest.skip("Skipping float32 lammps tests: not qualified on this runner.")
 
     # ----- setup -----
     lmp = lammps(cmdargs=cmdargs)

@@ -1,6 +1,106 @@
 {
   "schema": "symmetrix.foundation-model-support-matrix",
-  "version": 1,
+  "version": 5,
+  "nequip_support": {
+    "format_version": 2,
+    "model_type": "NequIP",
+    "runtime_input": "exported_json",
+    "tolerances": {
+      "float32":{"energy_abs_eV_per_atom":0.00001,"forces_max_abs_eV_per_A":0.0005,"stress_max_abs_eV_per_A3":0.0005},
+      "float64":{"energy_abs_eV_per_atom":0.000005,"forces_max_abs_eV_per_A":0.00001,"stress_max_abs_eV_per_A3":0.000001}
+    },
+    "performance_gates": {
+      "production_min_speedup_vs_reference": 1.1,
+      "small_min_speedup_vs_reference": 0.95,
+      "production_geomean_min_speedup_vs_reference": 1.2,
+      "approved_baseline_min_ratio": 0.95,
+      "host_100_min_speedup_vs_reference": 1.1,
+      "host_min_scaling_speedup": 1.0
+    },
+    "element_mapping": "universal H-Pu atomic-number map",
+    "release_matrix": [
+      {"size":"S","backend":"host","precision":"float32","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1,4],"graph_classes":{"host-100":"required"},"capacity_boundary":"none","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_oam_host_abi_v7","abi_version":7,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"host_100_performance":{"status":"required","record":null},"scaling":{"status":"required","record":null}},"tolerances":{"energy_abs_eV_per_atom":1.0e-05,"forces_max_abs_eV_per_A":0.0005,"stress_max_abs_eV_per_A3":0.0005}},
+      {"size":"S","backend":"host","precision":"float64","state":"available_unqualified","runtime_qualification":"available_not_runtime_qualified","threads":[],"graph_classes":{"host-100":"available_not_runtime_qualified"},"capacity_boundary":"none","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_oam_host_abi_v7","abi_version":7,"origins":["prebuilt","cache","runtime"]},"tested_compute_capabilities":[],"baseline":{"status":"not_in_campaign","record":null},"evidence":{"correctness":{"status":"not_in_campaign","record":null},"host_100_performance":{"status":"not_in_campaign","record":null},"scaling":{"status":"not_in_campaign","record":null}},"tolerances":{"energy_abs_eV_per_atom":5.0e-06,"forces_max_abs_eV_per_A":1.0e-05,"stress_max_abs_eV_per_A3":1.0e-06}},
+      {"size":"S","backend":"cuda","precision":"float32","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1],"graph_classes":{"small":"required","production":"required"},"capacity_boundary":"not_required","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_cuda_r1","abi_version":3,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"small_performance":{"status":"required","record":null},"production_performance":{"status":"required","record":null},"capacity":{"status":"not_required","record":null}},"tolerances":{"energy_abs_eV_per_atom":1.0e-05,"forces_max_abs_eV_per_A":0.0005,"stress_max_abs_eV_per_A3":0.0005}},
+      {"size":"S","backend":"cuda","precision":"float64","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1],"graph_classes":{"small":"required","production":"required"},"capacity_boundary":"not_required","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_cuda_r1","abi_version":3,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"small_performance":{"status":"required","record":null},"production_performance":{"status":"required","record":null},"capacity":{"status":"not_required","record":null}},"tolerances":{"energy_abs_eV_per_atom":5.0e-06,"forces_max_abs_eV_per_A":1.0e-05,"stress_max_abs_eV_per_A3":1.0e-06}},
+      {"size":"M","backend":"host","precision":"float32","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1,4],"graph_classes":{"host-100":"required"},"capacity_boundary":"none","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_oam_host_abi_v7","abi_version":7,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"host_100_performance":{"status":"required","record":null},"scaling":{"status":"required","record":null}},"tolerances":{"energy_abs_eV_per_atom":1.0e-05,"forces_max_abs_eV_per_A":0.0005,"stress_max_abs_eV_per_A3":0.0005}},
+      {"size":"M","backend":"host","precision":"float64","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1,4],"graph_classes":{"host-100":"required"},"capacity_boundary":"none","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_oam_host_abi_v7","abi_version":7,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"host_100_performance":{"status":"required","record":null},"scaling":{"status":"required","record":null}},"tolerances":{"energy_abs_eV_per_atom":5.0e-06,"forces_max_abs_eV_per_A":1.0e-05,"stress_max_abs_eV_per_A3":1.0e-06}},
+      {"size":"M","backend":"cuda","precision":"float32","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1],"graph_classes":{"small":"required","production":"required"},"capacity_boundary":"not_required","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_cuda_r1","abi_version":3,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"small_performance":{"status":"required","record":null},"production_performance":{"status":"required","record":null},"capacity":{"status":"not_required","record":null}},"tolerances":{"energy_abs_eV_per_atom":1.0e-05,"forces_max_abs_eV_per_A":0.0005,"stress_max_abs_eV_per_A3":0.0005}},
+      {"size":"M","backend":"cuda","precision":"float64","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1],"graph_classes":{"small":"required","production":"required"},"capacity_boundary":"not_required","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_cuda_r1","abi_version":3,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"small_performance":{"status":"required","record":null},"production_performance":{"status":"required","record":null},"capacity":{"status":"not_required","record":null}},"tolerances":{"energy_abs_eV_per_atom":5.0e-06,"forces_max_abs_eV_per_A":1.0e-05,"stress_max_abs_eV_per_A3":1.0e-06}},
+      {"size":"L","backend":"host","precision":"float32","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1,4],"graph_classes":{"host-100":"required"},"capacity_boundary":"none","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_oam_host_abi_v7","abi_version":7,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"host_100_performance":{"status":"required","record":null},"scaling":{"status":"required","record":null}},"tolerances":{"energy_abs_eV_per_atom":1.0e-05,"forces_max_abs_eV_per_A":0.0005,"stress_max_abs_eV_per_A3":0.0005}},
+      {"size":"L","backend":"host","precision":"float64","state":"available_unqualified","runtime_qualification":"available_not_runtime_qualified","threads":[],"graph_classes":{"host-100":"available_not_runtime_qualified"},"capacity_boundary":"none","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_oam_host_abi_v7","abi_version":7,"origins":["prebuilt","cache","runtime"]},"tested_compute_capabilities":[],"baseline":{"status":"not_in_campaign","record":null},"evidence":{"correctness":{"status":"not_in_campaign","record":null},"host_100_performance":{"status":"not_in_campaign","record":null},"scaling":{"status":"not_in_campaign","record":null}},"tolerances":{"energy_abs_eV_per_atom":5.0e-06,"forces_max_abs_eV_per_A":1.0e-05,"stress_max_abs_eV_per_A3":1.0e-06}},
+      {"size":"L","backend":"cuda","precision":"float32","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1],"graph_classes":{"small":"required","production":"required"},"capacity_boundary":"not_required","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_cuda_r1","abi_version":3,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"small_performance":{"status":"required","record":null},"production_performance":{"status":"required","record":null},"capacity":{"status":"not_required","record":null}},"tolerances":{"energy_abs_eV_per_atom":1.0e-05,"forces_max_abs_eV_per_A":0.0005,"stress_max_abs_eV_per_A3":0.0005}},
+      {"size":"L","backend":"cuda","precision":"float64","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1],"graph_classes":{"small":"required","production":"required"},"capacity_boundary":"not_required","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_cuda_r1","abi_version":3,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"small_performance":{"status":"required","record":null},"production_performance":{"status":"required","record":null},"capacity":{"status":"not_required","record":null}},"tolerances":{"energy_abs_eV_per_atom":5.0e-06,"forces_max_abs_eV_per_A":1.0e-05,"stress_max_abs_eV_per_A3":1.0e-06}},
+      {"size":"XL","backend":"host","precision":"float32","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1,4],"graph_classes":{"host-100":"required"},"capacity_boundary":"none","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_oam_host_abi_v7","abi_version":7,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"host_100_performance":{"status":"required","record":null},"scaling":{"status":"required","record":null}},"tolerances":{"energy_abs_eV_per_atom":1.0e-05,"forces_max_abs_eV_per_A":0.0005,"stress_max_abs_eV_per_A3":0.0005}},
+      {"size":"XL","backend":"host","precision":"float64","state":"available_unqualified","runtime_qualification":"available_not_runtime_qualified","threads":[],"graph_classes":{"host-100":"available_not_runtime_qualified"},"capacity_boundary":"none","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_oam_host_abi_v7","abi_version":7,"origins":["prebuilt","cache","runtime"]},"tested_compute_capabilities":[],"baseline":{"status":"not_in_campaign","record":null},"evidence":{"correctness":{"status":"not_in_campaign","record":null},"host_100_performance":{"status":"not_in_campaign","record":null},"scaling":{"status":"not_in_campaign","record":null}},"tolerances":{"energy_abs_eV_per_atom":5.0e-06,"forces_max_abs_eV_per_A":1.0e-05,"stress_max_abs_eV_per_A3":1.0e-06}},
+      {"size":"XL","backend":"cuda","precision":"float32","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1],"graph_classes":{"small":"required","production":"required"},"capacity_boundary":"required","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_cuda_r1","abi_version":3,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"small_performance":{"status":"required","record":null},"production_performance":{"status":"required","record":null},"capacity":{"status":"required","record":null}},"tolerances":{"energy_abs_eV_per_atom":1.0e-05,"forces_max_abs_eV_per_A":0.0005,"stress_max_abs_eV_per_A3":0.0005}},
+      {"size":"XL","backend":"cuda","precision":"float64","state":"available_unqualified","runtime_qualification":"campaign_required","threads":[1],"graph_classes":{"small":"required","production":"required"},"capacity_boundary":"not_required","properties":{"energy":"available_unqualified","forces":"available_unqualified","stress":"available_unqualified"},"artifact":{"availability":"available","kind":"generated_cuda_r1","abi_version":3,"origins":["prebuilt"]},"tested_compute_capabilities":[],"baseline":{"status":"required","record":null},"evidence":{"correctness":{"status":"required","record":null},"small_performance":{"status":"required","record":null},"production_performance":{"status":"required","record":null},"capacity":{"status":"not_required","record":null}},"tolerances":{"energy_abs_eV_per_atom":5.0e-06,"forces_max_abs_eV_per_A":1.0e-05,"stress_max_abs_eV_per_A3":1.0e-06}}
+    ],
+    "models": {
+      "nequip-oam-s": {
+        "display_name": "NequIP-OAM-S",
+        "release_matrix_size": "S",
+        "open_gates": [
+          "live upstream-reference float64 parity",
+          "HIP",
+          "multi-GPU"
+        ]
+      },
+      "nequip-oam-m": {
+        "display_name": "NequIP-OAM-M",
+        "release_matrix_size": "M",
+        "open_gates": [
+          "live upstream-reference float64 parity",
+          "HIP",
+          "multi-GPU"
+        ]
+      },
+      "nequip-oam-l": {
+        "display_name": "NequIP-OAM-L",
+        "release_matrix_size": "L",
+        "open_gates": [
+          "live upstream-reference float64 parity",
+          "HIP",
+          "multi-GPU"
+        ]
+      },
+      "nequip-oam-xl": {
+        "display_name": "NequIP-OAM-XL",
+        "release_matrix_size": "XL",
+        "open_gates": [
+          "live upstream-reference float64 parity",
+          "HIP",
+          "multi-GPU",
+          "other CUDA architectures"
+        ]
+      }
+    },
+    "prerequisites": {
+      "export": [
+        "python >= 3.10",
+        "torch",
+        "nequip",
+        "e3nn",
+        "ASE"
+      ],
+      "runtime": [
+        "symmetrix_nequip_format_version=2",
+        "native Symmetrix extension",
+        "exported universal H-Pu JSON contract"
+      ],
+      "parity": [
+        "ASE + upstream NequIP reference",
+        "OAM-S reference via SYMMETRIX_NEQUIP_OAM_S",
+        "OAM-XL reference via SYMMETRIX_NEQUIP_OAM_XL",
+        "fresh process with matching precision and cutoff"
+      ],
+      "capacity": [
+        "fresh-process backend execution record",
+        "exact cutoff, atom count, and directed-edge count",
+        "model and contract hashes"
+      ]
+    }
+  },
   "models": [
     {"id":"mace-omat-0-small","downloader_key":"small-omat-0","filename":"mace-omat-0-small.model","url":"https://github.com/ACEsuit/mace-foundations/releases/download/mace_omat_0/mace-omat-0-small.model","sha256":"0abfde07862cf1e93b8b4d03cb702f29ce9c344ff2fc4de2ec0d7166d6c113a5","head":null,"contract_group":"standard-l0","chemistry":{"C64":true,"STO40":true}},
     {"id":"mace-omat-0-medium","downloader_key":"medium-omat-0","filename":"mace-omat-0-medium.model","url":"https://github.com/ACEsuit/mace-foundations/releases/download/mace_omat_0/mace-omat-0-medium.model","sha256":"d4b14be9afa294eebdbe31a0280b26a0fa29715771e978cbfd3ca24e0d90307a","head":null,"contract_group":"standard-l1","chemistry":{"C64":true,"STO40":true}},
@@ -36,6 +136,21 @@
     {"model":"mace-off23-large","structure":"C64","dtype":"float32","backend":"hip"},
     {"model":"mace-off23-large","structure":"C64","dtype":"float64","backend":"hip"}
   ],
+  "long_range_capacity": {
+    "version": 1,
+    "description": "Optional vocabulary for the global (k-space) operator layer; see docs/developer/execution_planner.md for workspace and capacity reporting. A capacity probe carries it as a long_range block only when its model has that layer; probes and manifests without it are unaffected.",
+    "probe_fields": {
+      "n_k": "positive int; half-sphere k-point count flattened over graphs. At fixed k-cut it grows linearly with cell volume (N_k ~= V*k_c^3/(12*pi^2) for orthogonal cells), so molecular systems in large vacuum boxes pay n_k proportional to box volume.",
+      "table_bytes": "non-negative int; dense cos/sin table bytes = 2 * n_k * atoms * dtype itemsize (fp32: 8 * n_k * atoms; fp64: 16 * n_k * atoms). Both tables are [n_k, atoms], dominate the layer's memory, and are rebuilt every step.",
+      "correction_mode": "one of correction_modes; the analytic O(N) correction terms selected by the graph pbc class.",
+      "rebuild_on_cell_change": "bool; true when a cell change forces the k-grid, masks, per-k factors, and tables to rebuild. Fixed-cell steps rebuild only the tables (one K*R^T GEMM plus transcendentals); under NPT every step pays the full rebuild."
+    },
+    "correction_modes": {
+      "makov-payne-dabo": "molecule (F,F,F): monopole-dipole-quadrupole box energy term plus point-charge corrective node fields",
+      "slab-dipole": "slab (T,T,F): dipole energy term plus z-dipole corrective node fields",
+      "none": "bulk (T,T,T) and any other pbc pattern: k-space term only"
+    }
+  },
   "cross_precision_tolerances": {
     "energy_abs_eV_per_atom":0.0005,
     "forces_max_abs_eV_per_A":0.005,

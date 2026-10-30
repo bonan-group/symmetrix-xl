@@ -97,6 +97,22 @@ std::string _kokkos_default_execution_space()
     return Kokkos::DefaultExecutionSpace::name();
 }
 
+std::string _kokkos_build_version()
+{
+#if defined(KOKKOS_VERSION_MAJOR) && defined(KOKKOS_VERSION_MINOR) \
+    && defined(KOKKOS_VERSION_PATCH)
+    return std::to_string(KOKKOS_VERSION_MAJOR) + "." + std::to_string(KOKKOS_VERSION_MINOR)
+        + "." + std::to_string(KOKKOS_VERSION_PATCH);
+#elif defined(KOKKOS_VERSION)
+    // Older headers publish one packed integer: major * 10000 + minor * 100 + patch.
+    const int version = KOKKOS_VERSION;
+    return std::to_string(version / 10000) + "." + std::to_string(version / 100 % 100)
+        + "." + std::to_string(version % 100);
+#else
+    return {};
+#endif
+}
+
 struct InitView {
   explicit InitView(view_type _v) : m_view(_v) {}
 

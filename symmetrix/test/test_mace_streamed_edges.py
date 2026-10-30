@@ -1,7 +1,6 @@
 import copy
 import gc
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -18,7 +17,7 @@ from symmetrix import (
     prepare_jit_host_artifact,
 )
 from symmetrix import symmetrix as native_symmetrix
-from symmetrix.execution_contract import make_standard_m0_contract
+from symmetrix.mace_execution_contract import make_standard_m0_contract
 
 try:
     from symmetrix.extract_mace_data import extract_mace_data
@@ -59,6 +58,13 @@ def _require_execution_fixed_weight_backend():
             "Execution fixed-weight paths require Kokkos CUDA, HIP, or a "
             "HostSpace backend (OpenMP/Serial)"
         )
+    return execution_space
+
+
+def _require_host_generated_backend():
+    execution_space = _kokkos_execution_space()
+    if execution_space not in ("OpenMP", "Serial"):
+        pytest.skip("receiver-factorized RTC requires Kokkos OpenMP or Serial")
     return execution_space
 
 
@@ -178,6 +184,20 @@ def scalar_standard_model_path(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
+def portable_m1_model_path(tmp_path_factory, scalar_standard_model_path):
+    """Give the portable CUDA M1 control its required three-leaf stride."""
+
+    model = json.loads(scalar_standard_model_path.read_text())
+    model["M1_monomials"].append([0, 1, 2])
+    for type_weights in model["M1_weights"].values():
+        for channel_weights in type_weights.values():
+            channel_weights.append(0.07)
+    output = tmp_path_factory.mktemp("portable-m1") / "model.json"
+    output.write_text(json.dumps(model, separators=(",", ":")))
+    return output
+
+
+@pytest.fixture(scope="module")
 def legacy_standard_model_path(tmp_path_factory, macefield_model_path):
     legacy_data = extract_mace_data(
         macefield_model_path,
@@ -206,6 +226,29 @@ def _small_structure():
         cell=[8.0, 8.0, 8.0],
         pbc=False,
     )
+
+
+# Tolerances for the flattened A1 route's own parity cases, which run above its
+# 512-node admission threshold and therefore at node counts the four-node cases
+# cannot reach.  Both are the reference-versus-direct reassociation gap *measured*
+# on the structure each test builds, declared with headroom.
+#
+# The float64 case at 512 nodes agrees to better than 1e-15 for energy, forces
+# and stress on this structure; 1e-12 is declared rather than the observed
+# floor.
+#
+# The two-tile case at 8,788 nodes measures 1.0475e-09 eV absolute and 2.83e-07
+# relative on this structure, so 1e-07 is ~100x the gap.  The margin is stated
+# at this fixture's own scale, which is small: its two-tile total energy is
+# 3.706e-03 eV, so a tile loop that dropped, duplicated or mis-offset the 596
+# nodes of the final partial tile would move the energy by ~(596/8788)*3.706e-03
+# = 2.5e-04 eV, i.e. ~2.5e+03x the bound -- 3.4 orders of discrimination rather
+# than the ten a full-scale model would give.  The force bound below is looser
+# still on this model and would not catch that class of defect on its own, which
+# is why the structural assertion above (the launch count must *double*) is the
+# primary check and this numerical comparison is the secondary one.
+_FLATTEN_FP64_ATOL = 1e-12
+_FLATTEN_TWO_TILE_ENERGY_ATOL = 1e-7
 
 
 def _ragged_structure():
@@ -326,93 +369,75 @@ def _torch_compact_radial_weight_gradients(
     return [weight.grad.detach().numpy().flatten() for weight in weights]
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
 def test_compact_v2_defaults_to_fully_streamed_execution(
     streamed_model_paths,
-    use_kokkos,
 ):
     standard_path, _ = streamed_model_paths
-    calculator = Symmetrix(standard_path, use_kokkos=use_kokkos)
+    calculator = Symmetrix(standard_path)
 
-    assert calculator.streamed_edges == ("direct" if use_kokkos else "generic")
+    assert calculator.streamed_edges == "direct"
     assert calculator.evaluator.supports_streamed_edges
     assert calculator.evaluator.streamed_edges_mode == calculator.streamed_edges
 
 
 @pytest.mark.parametrize(
-    "use_kokkos,dtype,atol",
+    "dtype,atol",
     [
-        (False, "float64", 2e-11),
-        (False, "float32", 2e-5),
-        (True, "float64", 2e-11),
-        (True, "float32", 2e-5),
+        ("float64", 2e-11),
+        ("float32", 2e-5),
     ],
 )
-def test_all_interactions_matches_materialized_and_releases_radial_storage(
+def test_materialized_matches_generic_native_modes(
     streamed_model_paths,
-    use_kokkos,
     dtype,
     atol,
 ):
+    # The materialized edge representation is no longer a routing, so the gate
+    # compares the two native execution modes the evaluator still admits rather
+    # than two spellings that resolve to the same reference routing.
     standard_path, _ = streamed_model_paths
-    outputs = {}
-    storage = {}
-    for mode in ("materialized", "all_interactions"):
-        atoms = _small_structure()
-        calculator = Symmetrix(
-            standard_path,
-            use_kokkos=use_kokkos,
-            dtype=dtype,
-            streamed_edges=mode,
-        )
-        assert calculator.evaluator.supports_streamed_edges
-        assert calculator.evaluator.streamed_edges_mode == (
-            "generic" if mode == "all_interactions" else mode
-        )
-        atoms.calc = calculator
-        outputs[mode] = (
-            atoms.get_potential_energy(),
-            atoms.get_forces(),
-            atoms.get_stress(),
-        )
-        storage[mode] = (
-            calculator.evaluator.R0_storage_size,
-            calculator.evaluator.R1_storage_size,
-        )
-        if mode == "materialized":
-            materialized_evaluator = calculator.evaluator
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    evaluator_type = (
+        native_symmetrix.MACEKokkosFloat
+        if dtype == "float32"
+        else native_symmetrix.MACEKokkos
+    )
+    calculator = Symmetrix(standard_path, dtype=dtype, streamed_edges="reference")
+    inputs = calculator._mace_inputs(_small_structure())
+    native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 
-    reference_energy, reference_forces, reference_stress = outputs["materialized"]
-    energy, forces, stress = outputs["all_interactions"]
-    assert energy == pytest.approx(reference_energy, rel=0.0, abs=atol)
-    np.testing.assert_allclose(forces, reference_forces, rtol=0.0, atol=atol)
-    np.testing.assert_allclose(stress, reference_stress, rtol=0.0, atol=atol)
+    evaluators = {}
+    for mode in ("materialized", "generic"):
+        evaluator = evaluator_type(str(standard_path))
+        evaluator.set_streamed_edges(mode)
+        evaluator.prepare_active_types(inputs[1])
+        evaluator.compute_node_energies_forces(*native_args)
+        evaluators[mode] = evaluator
 
-    assert storage["materialized"][0] > 0
-    assert storage["materialized"][1] > 0
-    assert storage["all_interactions"] == (0, 0)
+    materialized = evaluators["materialized"]
+    generic = evaluators["generic"]
+    assert materialized.streamed_edges_mode == "materialized"
+    assert generic.streamed_edges_mode == "generic"
 
-    materialized_evaluator.set_streamed_edges("all_interactions")
-    assert materialized_evaluator.R0_storage_size == 0
-    assert materialized_evaluator.R1_storage_size == 0
+    np.testing.assert_allclose(
+        np.asarray(generic.node_energies),
+        np.asarray(materialized.node_energies),
+        rtol=0.0,
+        atol=atol,
+    )
+    np.testing.assert_allclose(
+        np.asarray(generic.node_forces),
+        np.asarray(materialized.node_forces),
+        rtol=0.0,
+        atol=atol,
+    )
 
 
 def test_field_coupled_models_expose_backend_appropriate_streamed_modes(
     streamed_model_paths,
 ):
     _, field_path = streamed_model_paths
-    serial = native_symmetrix.MACE(str(field_path))
-    assert serial.supports_streamed_edges
-    for mode in ("all_interactions", "materialized"):
-        serial.set_streamed_edges(mode)
-        assert serial.streamed_edges_mode == (
-            "generic" if mode == "all_interactions" else mode
-        )
-    with pytest.raises(
-        ValueError, match="direct execution requires the Kokkos evaluator"
-    ):
-        serial.set_streamed_edges("factorized")
-
     if not native_symmetrix._kokkos_is_initialized():
         native_symmetrix._init_kokkos()
     kokkos = native_symmetrix.MACEKokkos(str(field_path))
@@ -429,128 +454,98 @@ def test_field_coupled_models_expose_backend_appropriate_streamed_modes(
         }.get(mode, mode)
 
 
-@pytest.mark.parametrize(
-    "use_kokkos,dtype,first_order_atol,response_atol",
-    [
-        (False, "float64", 2e-9, 2e-6),
-        (False, "float32", 5e-5, 5e-4),
-        (True, "float64", 2e-9, 2e-6),
-        (True, "float32", 5e-5, 5e-4),
-    ],
-    ids=[
-        "native-float64",
-        "native-float32",
-        "kokkos-float64",
-        "kokkos-float32",
-    ],
-)
-def test_field_streamed_modes_match_materialized(
+def test_serial_evaluator_field_modes_are_retired_with_use_kokkos(
     streamed_model_paths,
-    use_kokkos,
+):
+    """Kept from origin/main: the serial evaluator's streamed-mode surface.
+
+    The serial MACE evaluator was retired in commit ebe9d47 on this branch, so
+    this origin/main assertion set cannot run here and its text is kept behind
+    the skip rather than dropped: the ``reference`` routing is the replacement
+    for the evaluator these assertions describe.
+    """
+
+    pytest.skip(
+        "the serial MACE evaluator was retired in commit ebe9d47; the "
+        "reference routing replaces it"
+    )
+    _, field_path = streamed_model_paths
+    serial = native_symmetrix.MACE(str(field_path))
+    assert serial.supports_streamed_edges
+    for mode in ("all_interactions", "materialized"):
+        serial.set_streamed_edges(mode)
+        assert serial.streamed_edges_mode == (
+            "generic" if mode == "all_interactions" else mode
+        )
+    with pytest.raises(
+        ValueError, match="direct execution requires the Kokkos evaluator"
+    ):
+        serial.set_streamed_edges("factorized")
+
+
+@pytest.mark.parametrize(
+    "dtype,first_order_atol,response_atol",
+    [
+        ("float64", 2e-9, 2e-6),
+        ("float32", 5e-5, 5e-4),
+    ],
+    ids=["float64", "float32"],
+)
+def test_field_materialized_matches_generic_native_modes(
+    streamed_model_paths,
     dtype,
     first_order_atol,
     response_atol,
 ):
+    # The field counterpart of the standard native-mode gate: the materialized
+    # and generic native modes must agree on the first-order and response
+    # surfaces the evaluator still admits.
     _, field_path = streamed_model_paths
-    electric_field = np.array([0.01, -0.02, 0.03])
-    outputs = {}
-    storage = {}
-    for mode in ("materialized", "all_interactions"):
-        atoms = _small_structure()
-        calculator = Symmetrix(
-            field_path,
-            use_kokkos=use_kokkos,
-            dtype=dtype,
-            streamed_edges=mode,
-            electric_field=electric_field,
-        )
-        assert calculator.evaluator.supports_streamed_edges
-        atoms.calc = calculator
-        calculator.calculate(
-            atoms,
-            properties=[
-                "energy",
-                "forces",
-                "stress",
-                "polarization",
-                "polarizability",
-                "becs",
-            ],
-        )
-        results = calculator.results
-        field_adjoint = np.asarray(calculator.evaluator.electric_field_adj).copy()
-        field_hessian = np.asarray(calculator.evaluator.electric_field_hessian).copy()
-        field_force_derivative = np.asarray(
-            calculator.evaluator.electric_field_force_derivative
-        ).copy()
-        outputs[mode] = (
-            results["energy"],
-            results["forces"],
-            results["stress"],
-            results["polarization"],
-            results["polarizability"],
-            results["becs"],
-            field_adjoint,
-            field_hessian,
-            field_force_derivative,
-        )
-        storage[mode] = (
-            calculator.evaluator.R0_storage_size,
-            calculator.evaluator.R1_storage_size,
-        )
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    evaluator_type = (
+        native_symmetrix.MACEKokkosFloat
+        if dtype == "float32"
+        else native_symmetrix.MACEKokkos
+    )
+    electric_field = np.asarray([0.01, -0.02, 0.03], dtype=np.float64)
+    calculator = Symmetrix(
+        field_path,
+        dtype=dtype,
+        streamed_edges="reference",
+        electric_field=electric_field,
+    )
+    inputs = calculator._mace_inputs(_small_structure())
+    native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 
-    (
-        reference_energy,
-        reference_forces,
-        reference_stress,
-        reference_polarization,
-        reference_polarizability,
-        reference_becs,
-        reference_field_adj,
-        reference_field_hessian,
-        reference_field_force_derivative,
-    ) = outputs["materialized"]
-    (
-        energy,
-        forces,
-        stress,
-        polarization,
-        polarizability,
-        becs,
-        field_adj,
-        field_hessian,
-        field_force_derivative,
-    ) = outputs["all_interactions"]
-    assert energy == pytest.approx(reference_energy, rel=0.0, abs=first_order_atol)
-    np.testing.assert_allclose(
-        forces, reference_forces, rtol=0.0, atol=first_order_atol
-    )
-    np.testing.assert_allclose(
-        stress, reference_stress, rtol=0.0, atol=first_order_atol
-    )
-    np.testing.assert_allclose(
-        polarization, reference_polarization, rtol=0.0, atol=first_order_atol
-    )
-    np.testing.assert_allclose(
-        polarizability, reference_polarizability, rtol=0.0, atol=response_atol
-    )
-    np.testing.assert_allclose(becs, reference_becs, rtol=0.0, atol=response_atol)
-    np.testing.assert_allclose(
-        field_adj, reference_field_adj, rtol=0.0, atol=first_order_atol
-    )
-    np.testing.assert_allclose(
-        field_hessian, reference_field_hessian, rtol=0.0, atol=response_atol
-    )
-    np.testing.assert_allclose(
-        field_force_derivative,
-        reference_field_force_derivative,
-        rtol=0.0,
-        atol=response_atol,
-    )
+    evaluators = {}
+    for mode in ("materialized", "generic"):
+        evaluator = evaluator_type(str(field_path))
+        evaluator.set_streamed_edges(mode)
+        evaluator.prepare_active_types(inputs[1])
+        evaluator.compute_node_energies_forces_field(*native_args, electric_field)
+        evaluator.compute_electric_field_hessian(*native_args, electric_field)
+        evaluators[mode] = evaluator
 
-    assert storage["materialized"][0] > 0
-    assert storage["materialized"][1] > 0
-    assert storage["all_interactions"] == (0, 0)
+    materialized = evaluators["materialized"]
+    generic = evaluators["generic"]
+    assert materialized.streamed_edges_mode == "materialized"
+    assert generic.streamed_edges_mode == "generic"
+
+    for name, atol in (
+        ("node_energies", first_order_atol),
+        ("node_forces", first_order_atol),
+        ("electric_field_adj", first_order_atol),
+        ("electric_field_hessian", response_atol),
+        ("electric_field_force_derivative", response_atol),
+    ):
+        np.testing.assert_allclose(
+            np.asarray(getattr(generic, name)),
+            np.asarray(getattr(materialized, name)),
+            rtol=0.0,
+            atol=atol,
+            err_msg=name,
+        )
 
 
 def test_native_float32_matches_native_float64(streamed_model_paths):
@@ -560,14 +555,15 @@ def test_native_float32_matches_native_float64(streamed_model_paths):
     def evaluate(model_path, dtype, electric_field=None):
         calculator = Symmetrix(
             model_path,
-            use_kokkos=False,
             dtype=dtype,
             streamed_edges="all_interactions",
             electric_field=electric_field,
         )
         assert isinstance(
             calculator.evaluator,
-            native_symmetrix.MACEFloat if dtype == "float32" else native_symmetrix.MACE,
+            native_symmetrix.MACEKokkosFloat
+            if dtype == "float32"
+            else native_symmetrix.MACEKokkos,
         )
         assert calculator.evaluator.scalar_size_bytes == (
             4 if dtype == "float32" else 8
@@ -609,6 +605,10 @@ def test_kokkos_rejects_out_of_range_phi1_hidden_degree(
     streamed_model_paths,
     tmp_path,
 ):
+    # The native check runs before Kokkos would be initialized for this model,
+    # and a Kokkos::View constructed before initialization aborts the process
+    # rather than raising, so this test has to be the one that initializes.
+    _kokkos_execution_space()
     _, field_path = streamed_model_paths
     model = json.loads(field_path.read_text())
     model["Phi1_l2"][0] = model["L_max"] + 1
@@ -619,85 +619,73 @@ def test_kokkos_rejects_out_of_range_phi1_hidden_degree(
         native_symmetrix.MACEKokkos(str(invalid_path))
 
 
-def test_native_float32_rejects_out_of_range_model_values(
-    streamed_model_paths,
-    tmp_path,
+def test_zero_skin_singular_non_periodic_inputs_build_with_ase(
+    scalar_standard_model_path, monkeypatch
 ):
-    standard_path, _ = streamed_model_paths
-    model = json.loads(standard_path.read_text())
-    model["H0_weights"][0] = 1e100
-    invalid_path = tmp_path / "float32-overflow.json"
-    invalid_path.write_text(json.dumps(model))
+    """A zero-cell molecule with no skin must not reach the fast neighbor list.
 
-    with pytest.raises(ValueError, match="outside the requested precision range"):
-        native_symmetrix.MACEFloat(str(invalid_path))
+    ``_mace_inputs`` builds the host geometry itself when the skin is zero and
+    the geometry is not native, and that path asked the module-level provider
+    directly, so a singular cell still reached matscipy's cell inversion.
+    Substituting the preferred provider with a failure proves the routing, and
+    the arrays must still describe the molecule's bonds.
+    """
+
+    import symmetrix.neighbor_graph as neighbor_graph_module
+
+    try:
+        from matscipy.neighbours import neighbour_list as fast_neighbor_list
+    except ImportError:
+        pytest.skip("matscipy is not installed, so ASE is already the provider")
+    assert (
+        neighbor_graph_module.neighbor_list is fast_neighbor_list
+    ), "the matscipy fast path is expected to be the preferred provider here"
+
+    def _fast_path_must_not_run(*_args):
+        raise AssertionError("the fast path was asked for a singular cell")
+
+    monkeypatch.setattr(neighbor_graph_module, "neighbor_list", _fast_path_must_not_run)
+
+    calculator = Symmetrix(
+        scalar_standard_model_path,
+        dtype="float64",
+        streamed_edges="all_interactions",
+        neighbor_skin=0.0,
+    )
+    atoms = _small_structure()
+    atoms.set_cell(np.zeros((3, 3)))
+    assert not np.any(atoms.pbc)
+
+    num_nodes, node_types, num_neigh, sources, neigh_types, xyz, r, receivers = (
+        calculator._mace_inputs(atoms)
+    )
+
+    assert num_nodes == len(atoms)
+    assert len(sources) > 0
+    assert int(np.sum(num_neigh)) == len(sources)
+    np.testing.assert_allclose(
+        np.asarray(r),
+        np.linalg.norm(np.asarray(xyz).reshape(-1, 3), axis=1),
+        rtol=0,
+        atol=1e-12,
+    )
 
 
-@pytest.mark.parametrize(
-    "use_kokkos,dtype",
-    [
-        (False, "float64"),
-        (False, "float32"),
-        (True, "float64"),
-        (True, "float32"),
-    ],
-)
-def test_legacy_pair_spline_models_warn_and_default_to_legacy(
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
+def test_legacy_pair_spline_models_are_refused(
     legacy_standard_model_path,
-    use_kokkos,
     dtype,
 ):
-    with pytest.warns(
-        UserWarning, match="named v1 here.*streamed_edges='materialized'"
-    ):
-        calculator = Symmetrix(
+    with pytest.raises(ValueError, match="the original Symmetrix pair-spline format"):
+        Symmetrix(
             legacy_standard_model_path,
-            use_kokkos=use_kokkos,
             dtype=dtype,
         )
-
-    evaluator = calculator.evaluator
-    assert calculator.streamed_edges == "materialized"
-    assert not evaluator.supports_streamed_edges
-    assert evaluator.streamed_edges_mode == "materialized"
-    with pytest.raises(ValueError, match="format-v2 compact MACE or MACEField"):
-        evaluator.set_streamed_edges("all_interactions")
-
-
-@pytest.mark.parametrize("use_kokkos", [False, True])
-def test_legacy_pair_spline_float32_matches_float64(
-    legacy_standard_model_path,
-    use_kokkos,
-):
-    outputs = {}
-    for dtype in ("float64", "float32"):
-        atoms = _small_structure()
-        with pytest.warns(
-            UserWarning, match="named v1 here.*streamed_edges='materialized'"
-        ):
-            atoms.calc = Symmetrix(
-                legacy_standard_model_path,
-                use_kokkos=use_kokkos,
-                dtype=dtype,
-            )
-        assert atoms.calc.evaluator.scalar_size_bytes == (
-            8 if dtype == "float64" else 4
-        )
-        outputs[dtype] = (atoms.get_potential_energy(), atoms.get_forces())
-
-    assert outputs["float32"][0] == pytest.approx(
-        outputs["float64"][0], rel=0.0, abs=2e-4
-    )
-    np.testing.assert_allclose(
-        outputs["float32"][1], outputs["float64"][1], rtol=0.0, atol=2e-4
-    )
 
 
 def test_kokkos_streamed_path_offsets_match_model_layout(streamed_model_paths):
     standard_path, _ = streamed_model_paths
-    calculator = Symmetrix(
-        standard_path, use_kokkos=True, streamed_edges="all_interactions"
-    )
+    calculator = Symmetrix(standard_path, streamed_edges="all_interactions")
     model = json.loads(standard_path.read_text())
 
     expected = [0]
@@ -716,7 +704,6 @@ def test_kokkos_standalone_readout_returns_total_energy(
     standard_path, _ = streamed_model_paths
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges=mode,
     )
@@ -746,7 +733,6 @@ def test_kokkos_finalize_rejects_live_mace_evaluator(streamed_model_paths):
     baseline = native_symmetrix._kokkos_live_object_count()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="all_interactions",
     )
@@ -972,8 +958,23 @@ def test_execution_parameter_gradient_boundary_is_opt_in_and_model_sized(
 
 
 def test_direct_execution_rejects_parameter_gradients(streamed_model_paths):
-    """The surviving direct path must refuse parameter gradients explicitly."""
+    """Kept from origin/main: the direct path's refusal of parameter gradients.
 
+    origin/main removed execution observers and parameter gradients from the
+    surviving direct path and refuses them there; this branch keeps both
+    features on the direct route (``test_execution_interaction_parameter_replay_
+    populates_equation_36_groups`` and its siblings exercise them), so the
+    refusal asserted below does not exist in the merged tree.  The assertions
+    are kept verbatim behind the skip rather than dropped: reconciling this
+    divergence is a deliberate decision for the pull request, not a merge
+    resolution.
+    """
+
+    pytest.skip(
+        "this branch keeps execution observers and parameter gradients on the "
+        "direct route; origin/main's refusal of them is the one semantic "
+        "divergence this merge did not take"
+    )
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
@@ -1005,14 +1006,13 @@ def test_direct_execution_rejects_parameter_gradients(streamed_model_paths):
 def test_execution_interaction_parameter_replay_populates_equation_36_groups(
     streamed_model_paths,
 ):
-    _skip_removed_observer_gradient_support()
+    _require_host_generated_backend()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
-        streamed_edges="direct",
+        streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     inputs = calculator._mace_inputs(atoms)
@@ -1048,14 +1048,13 @@ def test_execution_interaction_parameter_replay_populates_equation_36_groups(
 def test_execution_field_parameter_replay_completes_interaction_groups(
     streamed_model_paths,
 ):
-    _skip_removed_observer_gradient_support()
+    _require_host_generated_backend()
     _, field_path = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         field_path,
-        use_kokkos=True,
         dtype="float32",
-        streamed_edges="direct",
+        streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     inputs = calculator._mace_inputs(atoms)
@@ -1086,12 +1085,11 @@ def test_execution_parameter_replay_handles_zero_and_one_directed_edge(
     streamed_model_paths,
     edge_count,
 ):
-    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     if not native_symmetrix._kokkos_is_initialized():
         native_symmetrix._init_kokkos()
     evaluator = native_symmetrix.MACEKokkos(str(standard_path))
-    _load_direct_artifact(evaluator, standard_path)
+    evaluator.set_streamed_edges("direct")
     evaluator.set_execution_parameter_gradients(True)
     if edge_count == 0:
         native_args = (
@@ -1126,14 +1124,13 @@ def test_execution_parameter_replay_handles_zero_and_one_directed_edge(
 def test_execution_parameter_replay_supports_prepared_graph_tokens(
     streamed_model_paths,
 ):
-    _skip_removed_observer_gradient_support()
+    _require_host_generated_backend()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
-        streamed_edges="direct",
+        streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     inputs = calculator._mace_inputs(atoms)
@@ -1183,20 +1180,18 @@ def test_execution_parameter_replay_supports_prepared_graph_tokens(
 def test_execution_parameter_replay_ignores_skin_only_edges(
     streamed_model_paths,
 ):
-    _skip_removed_observer_gradient_support()
+    _require_host_generated_backend()
     standard_path, _ = streamed_model_paths
     candidate = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
-        streamed_edges="direct",
+        streamed_edges="factorized",
         neighbor_skin=0.5,
     )
     exact = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
-        streamed_edges="direct",
+        streamed_edges="factorized",
         neighbor_skin=0.0,
     )
     atoms = Atoms(
@@ -1235,17 +1230,16 @@ def test_execution_parameter_replay_ignores_skin_only_edges(
         )
 
 
-def test_execution_native_parameter_replay_matches_tiled_float32(
+def test_execution_native_parameter_replay_matches_reference_float32(
     streamed_model_paths,
 ):
-    _skip_removed_observer_gradient_support()
+    _require_host_generated_backend()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
-        streamed_edges="direct",
+        streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     inputs = calculator._mace_inputs(atoms)
@@ -1253,7 +1247,7 @@ def test_execution_native_parameter_replay_matches_tiled_float32(
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
     evaluator.set_execution_parameter_gradients(True)
     gradients = {}
-    for strategy in ("tiled_coupling", "jit_plugin"):
+    for strategy in ("serial_reference", "jit_plugin"):
         evaluator._set_factorized_source_strategy(strategy)
         evaluator.compute_node_energies_forces(*native_args)
         assert evaluator.execution_parameter_gradients_ready
@@ -1261,7 +1255,7 @@ def test_execution_native_parameter_replay_matches_tiled_float32(
             group["name"]: np.asarray(group["values"]).copy()
             for group in evaluator.execution_parameter_gradients()["groups"]
         }
-    for name, reference in gradients["tiled_coupling"].items():
+    for name, reference in gradients["serial_reference"].items():
         np.testing.assert_allclose(
             gradients["jit_plugin"][name],
             reference,
@@ -1275,7 +1269,7 @@ def test_execution_interaction_parameter_replay_matches_energy_finite_difference
     streamed_model_paths,
     tmp_path,
 ):
-    _skip_removed_observer_gradient_support()
+    _require_host_generated_backend()
     standard_path, _ = streamed_model_paths
     model = json.loads(standard_path.read_text())
     atoms = _small_structure()
@@ -1285,9 +1279,8 @@ def test_execution_interaction_parameter_replay_matches_energy_finite_difference
         path.write_text(json.dumps(candidate, separators=(",", ":")))
         calculator = Symmetrix(
             path,
-            use_kokkos=True,
             dtype="float32",
-            streamed_edges="direct",
+            streamed_edges="factorized",
         )
         inputs = calculator._mace_inputs(atoms)
         native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
@@ -1382,18 +1375,23 @@ def test_native_evaluators_reject_removed_second_interaction(streamed_model_path
     standard_path, _ = streamed_model_paths
     message = "materialized.*all_interactions.*factorized"
 
-    serial = native_symmetrix.MACE(str(standard_path))
-    with pytest.raises(ValueError, match=message):
-        serial.set_streamed_edges("second_interaction")
-
     if not native_symmetrix._kokkos_is_initialized():
         native_symmetrix._init_kokkos()
-    kokkos = native_symmetrix.MACEKokkos(str(standard_path))
-    with pytest.raises(ValueError, match=message):
-        kokkos.set_streamed_edges("second_interaction")
+    for evaluator_type in (
+        native_symmetrix.MACEKokkos,
+        native_symmetrix.MACEKokkosFloat,
+    ):
+        evaluator = evaluator_type(str(standard_path))
+        evaluator.set_streamed_edges("direct")
+        with pytest.raises(ValueError, match=message):
+            evaluator.set_streamed_edges("second_interaction")
 
 
 def test_serial_evaluator_downgrades_factorized_to_generic(streamed_model_paths):
+    pytest.skip(
+        "use_kokkos and the serial evaluator were retired in commit ebe9d47; "
+        "the reference routing replaces them"
+    )
     standard_path, _ = streamed_model_paths
     with pytest.warns(RuntimeWarning, match="serial non-compiled"):
         calculator = Symmetrix(
@@ -1415,12 +1413,11 @@ def test_factorized_matches_materialized_with_bounded_workspace(
         atoms = _small_structure()
         calculator = Symmetrix(
             standard_path,
-            use_kokkos=True,
             dtype=dtype,
             streamed_edges=mode,
         )
         if mode == "factorized":
-            calculator.evaluator._set_factorized_source_strategy("team_cached")
+            calculator.evaluator._set_factorized_source_strategy("serial_reference")
         atoms.calc = calculator
         outputs[mode] = (atoms.get_potential_energy(), atoms.get_forces())
         evaluators[mode] = calculator.evaluator
@@ -1440,7 +1437,7 @@ def test_factorized_matches_materialized_with_bounded_workspace(
     )
     assert evaluator.factorized_source_owned_reverse
     assert evaluator.factorized_schedule_entries > 0
-    assert evaluator.factorized_source_strategy == "team_cached"
+    assert evaluator.factorized_source_strategy == "serial_reference"
     assert evaluator.factorized_radial_workspace_bytes > 0
     assert evaluator.factorized_chunk_size == (24 if dtype == "float32" else 16)
 
@@ -1456,12 +1453,11 @@ def test_factorized_compact_mace_reduces_stress_on_device(
     atoms.set_pbc(True)
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
-    evaluator._set_factorized_source_strategy("team_cached")
+    evaluator._set_factorized_source_strategy("serial_reference")
     inputs = calculator._mace_inputs(atoms)
     token = evaluator._prepare_factorized_graph(*inputs[:5])
     xyz = np.asarray(inputs[5], dtype=float)
@@ -1490,15 +1486,12 @@ def test_factorized_compact_edge_geometry_reduces_stress_on_device(
     def make_calculator(edge_geometry_policy):
         calculator = Symmetrix(
             standard_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges="factorized",
             m1_polynomial_policy="recompute",
         )
         evaluator = calculator.evaluator
         evaluator._set_factorized_source_strategy("jit_plugin")
-        evaluator._set_factorized_direct_forward_executor("jit_all")
-        evaluator._set_factorized_direct_reverse_executor("jit")
         evaluator._set_standard_r0_executor("v2_edge16")
         evaluator._set_standard_m0_executor("standard")
         evaluator._set_mh0_state_policy("reuse-adjoints-v1")
@@ -1553,7 +1546,6 @@ def test_factorized_source_strategies_match_serial_reference(
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="factorized",
     )
@@ -1561,12 +1553,7 @@ def test_factorized_source_strategies_match_serial_reference(
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 
-    strategies = (
-        "serial_reference",
-        "team_cached",
-        "tiled_coupling",
-        "jit_plugin",
-    )
+    strategies = ("serial_reference", "jit_plugin")
     results = {}
     for strategy in strategies:
         evaluator._set_factorized_source_strategy(strategy)
@@ -1589,61 +1576,131 @@ def test_factorized_source_strategies_match_serial_reference(
             candidate_h1_adj, reference_h1_adj, rtol=0.0, atol=atol
         )
     assert evaluator.factorized_source_strategy == "jit_plugin"
-    jit_forward_ready = (
-        evaluator.factorized_selected_direct_forward_executor == "jit_all"
-    )
-    jit_reverse_ready = evaluator.factorized_selected_direct_reverse_executor == "jit"
-    assert evaluator.factorized_execution_strategy == (
-        "direct_jit_reverse" if jit_reverse_ready else "tiled_coupling"
-    )
+    assert evaluator.factorized_selected_direct_forward_executor == "jit_all"
+    assert evaluator.factorized_selected_direct_reverse_executor == "jit"
+    assert evaluator.factorized_execution_strategy == "direct_jit_reverse"
     assert evaluator.factorized_tiled_ready
     assert evaluator.factorized_coupling_capacity_bytes > 0
-    assert evaluator.factorized_execution_profile == (
-        "direct_fixed_weight" if jit_reverse_ready else "factorized_state"
-    )
-    assert evaluator.factorized_derivative_signature == (
-        "fixed_weight_coordinate" if jit_reverse_ready else "factorized_coordinate"
-    )
-    if jit_reverse_ready:
-        assert evaluator.factorized_selected_reverse_cache_policy == "not_applicable"
-        assert evaluator.factorized_retained_reverse_groups == []
-        assert evaluator.factorized_recomputed_reverse_groups == []
-        assert evaluator.factorized_planned_coupling_workspace_bytes == 0
-    assert evaluator.factorized_coupling_workspace_bytes == (
-        0
-        if evaluator.factorized_execution_profile == "direct_fixed_weight"
-        else evaluator.factorized_coupling_capacity_bytes
-    )
-    if evaluator.factorized_execution_profile == "direct_fixed_weight":
-        assert evaluator.factorized_compact_workspace_bytes == 0
-        assert evaluator.factorized_arena_workspace_bytes == 0
-        assert evaluator.factorized_radial_workspace_bytes == 0
-    else:
-        assert evaluator.factorized_compact_workspace_bytes > 0
+    assert evaluator.factorized_execution_profile == "direct_fixed_weight"
+    assert evaluator.factorized_derivative_signature == "fixed_weight_coordinate"
+    assert evaluator.factorized_selected_reverse_cache_policy == "not_applicable"
+    assert evaluator.factorized_retained_reverse_groups == []
+    assert evaluator.factorized_recomputed_reverse_groups == []
+    assert evaluator.factorized_planned_coupling_workspace_bytes == 0
+    assert evaluator.factorized_coupling_workspace_bytes == 0
+    assert evaluator.factorized_compact_workspace_bytes == 0
+    assert evaluator.factorized_arena_workspace_bytes == 0
+    assert evaluator.factorized_radial_workspace_bytes == 0
     assert evaluator.factorized_jit_ready
-    assert evaluator.factorized_jit_artifact_id.startswith("jit-r1-gen11-")
+    assert evaluator.factorized_jit_artifact_id.startswith("jit-r1-gen12-")
     assert evaluator.factorized_jit_contract_fingerprint.startswith("sha256:")
-    assert evaluator.factorized_forward_coupling_workspace_bytes == (
-        0 if jit_forward_ready else evaluator.factorized_coupling_workspace_bytes
-    )
-    assert evaluator.factorized_reverse_coupling_workspace_bytes == (
-        0
-        if evaluator.factorized_execution_profile == "direct_fixed_weight"
-        else evaluator.factorized_coupling_workspace_bytes
-    )
+    assert evaluator.factorized_forward_coupling_workspace_bytes == 0
+    assert evaluator.factorized_reverse_coupling_workspace_bytes == 0
     assert evaluator.factorized_has_model_contract
     assert evaluator.factorized_model_contract_fingerprint.startswith("sha256:")
     assert evaluator.factorized_model_semantic_fingerprint.startswith("sha256:")
-    if jit_reverse_ready:
-        assert evaluator.factorized_selected_direct_reverse_executor == "jit"
-    if jit_forward_ready:
-        assert evaluator.factorized_selected_direct_forward_executor == ("jit_all")
+
+    with pytest.raises(ValueError, match="serial_reference.*jit_plugin"):
+        evaluator._set_factorized_source_strategy("unknown")
+
+
+@pytest.mark.parametrize("strategy", ("team_cached", "tiled_coupling"))
+def test_direct_source_strategy_rejects_removed_variants(
+    streamed_model_paths,
+    strategy,
+):
+    standard_path, _ = streamed_model_paths
+    calculator = Symmetrix(
+        standard_path,
+        dtype="float32",
+        streamed_edges="factorized",
+    )
+    evaluator = calculator.evaluator
+    assert evaluator.factorized_source_strategy == "jit_plugin"
+
+    with pytest.raises(ValueError, match="serial_reference.*jit_plugin"):
+        evaluator._set_factorized_source_strategy(strategy)
+    assert evaluator.factorized_source_strategy == "jit_plugin"
+
+    evaluator._set_factorized_source_strategy("serial_reference")
+    assert evaluator.factorized_source_strategy == "serial_reference"
+
+
+def test_direct_runtime_executor_overrides_are_removed(streamed_model_paths):
+    standard_path, _ = streamed_model_paths
+    calculator = Symmetrix(
+        standard_path,
+        dtype="float32",
+        streamed_edges="factorized",
+    )
+    evaluator = calculator.evaluator
+
+    assert not hasattr(evaluator, "_set_factorized_direct_forward_executor")
+    assert not hasattr(evaluator, "_set_factorized_direct_reverse_executor")
+    assert not hasattr(evaluator, "factorized_direct_forward_executor")
+    assert not hasattr(evaluator, "factorized_direct_reverse_executor")
+    assert evaluator.factorized_selected_direct_forward_executor == "jit_all"
+    assert evaluator.factorized_selected_direct_reverse_executor == "jit"
+
+
+def test_direct_graph_preparation_requires_qualified_artifact(streamed_model_paths):
+    standard_path, _ = streamed_model_paths
+    reference = Symmetrix(
+        standard_path,
+        dtype="float64",
+        streamed_edges="non-compiled",
+    )
+    inputs = reference._mace_inputs(_small_structure())
+
+    evaluator = native_symmetrix.MACEKokkos(str(standard_path))
+    evaluator.set_streamed_edges("direct")
+    assert not evaluator.jit_host_plugin_ready
 
     with pytest.raises(
-        ValueError,
-        match="serial_reference.*team_cached.*tiled_coupling.*jit_plugin",
+        RuntimeError,
+        match=(
+            "(?s)requires a qualified R1 execution artifact.*"
+            "the R1 artifact cache is empty.*"
+            "no compiler is available.*"
+            "prebuilt R1 artifact is missing.*"
+            "rejected as stale"
+        ),
     ):
-        evaluator._set_factorized_source_strategy("unknown")
+        evaluator._prepare_factorized_graph(*inputs[:5])
+
+    del evaluator, reference
+    gc.collect()
+
+
+def test_direct_graph_preparation_reports_recorded_artifact_cause(
+    streamed_model_paths,
+):
+    standard_path, _ = streamed_model_paths
+    reference = Symmetrix(
+        standard_path,
+        dtype="float64",
+        streamed_edges="non-compiled",
+    )
+    inputs = reference._mace_inputs(_small_structure())
+
+    evaluator = native_symmetrix.MACEKokkos(str(standard_path))
+    evaluator.set_streamed_edges("direct")
+    evaluator._set_direct_artifact_diagnostic(
+        "compilation-unavailable",
+        "no working host compiler is available in this environment",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "(?s)Direct R1 artifact diagnostic \\(compilation-unavailable\\): "
+            "no working host compiler is available"
+        ),
+    ):
+        evaluator._prepare_factorized_graph(*inputs[:5])
+
+    del evaluator, reference
+    gc.collect()
 
 
 def test_jit_reverse_and_standard_r0_v2_match_forced_fallbacks(
@@ -1655,14 +1712,11 @@ def test_jit_reverse_and_standard_r0_v2_match_forced_fallbacks(
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     evaluator._set_factorized_source_strategy("jit_plugin")
-    evaluator._set_factorized_direct_forward_executor("jit_all")
-    evaluator._set_factorized_direct_reverse_executor("jit")
     evaluator._set_standard_r0_executor("v2_receiver")
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
@@ -1699,16 +1753,6 @@ def test_jit_reverse_and_standard_r0_v2_match_forced_fallbacks(
     assert evaluator.execution_phi1r_capacity_bytes == 0
     assert evaluator.execution_dphi1r_active_bytes == 0
 
-    evaluator._set_factorized_direct_forward_executor("runtime")
-    runtime = evaluate()
-    assert evaluator.factorized_selected_direct_forward_executor == "runtime"
-    assert evaluator.execution_phi1r_active_bytes > 0
-    assert evaluator.execution_phi1r_capacity_bytes > 0
-    assert runtime["energy"] == pytest.approx(generated["energy"], rel=0.0, abs=3e-5)
-    for name in ("Phi1", "A1", "forces", "H1_adj", "directed_forces"):
-        np.testing.assert_allclose(runtime[name], generated[name], rtol=0.0, atol=3e-5)
-
-    evaluator._set_factorized_direct_forward_executor("jit_all")
     regenerated = evaluate()
     assert evaluator.execution_phi1r_active_bytes == 0
     assert evaluator.execution_phi1r_capacity_bytes == 0
@@ -1737,51 +1781,14 @@ def test_jit_reverse_and_standard_r0_v2_match_forced_fallbacks(
                 repeated_candidate[name], candidate[name], rtol=0.0, atol=3e-5
             )
 
-    legacy_r0_launch_count = 0
-    generated_reverse_launch_count = 1 if _kokkos_execution_space() == "Cuda" else 2
-    controls = (
-        (
-            "jit",
-            "v1",
-            generated_reverse_launch_count,
-            legacy_r0_launch_count,
-            False,
-        ),
-        ("runtime", "v2_receiver", 0, 4, True),
-        ("runtime", "v1", 0, legacy_r0_launch_count, True),
-    )
-    for direct_executor, r0_executor, r1_count, r0_count, uses_dphi1r in controls:
-        evaluator._set_factorized_direct_reverse_executor(direct_executor)
-        evaluator._set_standard_r0_executor(r0_executor)
-        fallback_launches = (
-            evaluator.factorized_jit_forward_launch_count,
-            evaluator.factorized_jit_reverse_launch_count,
-            evaluator.standard_r0_module_launch_count,
-        )
-        fallback = evaluate()
-        assert evaluator.factorized_selected_direct_reverse_executor == direct_executor
-        assert evaluator.standard_r0_selected_executor == r0_executor
-        assert evaluator.factorized_jit_forward_launch_count - fallback_launches[0] == 1
-        assert (
-            evaluator.factorized_jit_reverse_launch_count - fallback_launches[1]
-            == r1_count
-        )
-        assert (
-            evaluator.standard_r0_module_launch_count - fallback_launches[2] == r0_count
-        )
-        assert bool(evaluator.execution_dphi1r_active_bytes) is uses_dphi1r
-        if uses_dphi1r:
-            assert evaluator.execution_dphi1r_capacity_bytes > 0
+    evaluator._set_standard_r0_executor("v1")
+    legacy = evaluate()
+    assert evaluator.standard_r0_selected_executor == "v1"
+    assert evaluator.execution_dphi1r_active_bytes == 0
+    assert legacy["energy"] == pytest.approx(generated["energy"], rel=0.0, abs=3e-5)
+    for name in ("forces", "H1_adj", "directed_forces"):
+        np.testing.assert_allclose(legacy[name], generated[name], rtol=0.0, atol=3e-5)
 
-        assert generated["energy"] == pytest.approx(
-            fallback["energy"], rel=0.0, abs=3e-5
-        )
-        for name in ("forces", "H1_adj", "directed_forces"):
-            np.testing.assert_allclose(
-                generated[name], fallback[name], rtol=0.0, atol=3e-5
-            )
-
-    evaluator._set_factorized_direct_reverse_executor("jit")
     evaluator._set_standard_r0_executor("v2_receiver")
     repeated = evaluate()
     assert evaluator.execution_dphi1r_active_bytes == 0
@@ -1789,18 +1796,628 @@ def test_jit_reverse_and_standard_r0_v2_match_forced_fallbacks(
     for name in ("forces", "H1_adj", "directed_forces"):
         np.testing.assert_allclose(repeated[name], generated[name], rtol=0.0, atol=3e-5)
 
-    with pytest.raises(ValueError, match="automatic.*runtime.*jit"):
-        evaluator._set_factorized_direct_reverse_executor("unknown")
-    with pytest.raises(
-        ValueError,
-        match="automatic.*runtime.*jit_all",
-    ):
-        evaluator._set_factorized_direct_forward_executor("unknown")
     with pytest.raises(
         ValueError,
         match="automatic.*v1.*v2_receiver.*v2_edge16.*v2_edge32",
     ):
         evaluator._set_standard_r0_executor("unknown")
+
+
+def test_selected_implementation_id_follows_the_dispatch_not_the_readiness_flags(
+    scalar_standard_model_path,
+    monkeypatch,
+):
+    """The binding report states the implementation the dispatch runs.
+
+    The standard model ships the frozen M0 module, so readiness qualifies the
+    frozen tier and the plan names it.  The dispatch gate is narrower: a caller
+    that forces the runtime M0 executor declines the module and runs the generic
+    implementation.  The report follows the dispatch -- the node's
+    ``selected_implementation_id`` moves to the generic implementation while
+    ``implementation_id`` keeps naming the tier that qualified -- and the
+    module's own launch counter stays flat across the evaluation, which is the
+    execution evidence that the dispatch declined it.
+    """
+    _require_execution_fixed_weight_backend()
+
+    from symmetrix import installed_operator_artifact, mace_jit_operator_artifact
+    from symmetrix.installed_operator_artifact import InstalledOperatorResolution
+
+    def disabled_resolution(**_arguments):
+        return InstalledOperatorResolution(
+            status="disabled",
+            origin=None,
+            artifact_path=None,
+            artifact_id=None,
+            diagnostics=("origin=prebuilt status=skipped reason=disabled",),
+        )
+
+    # This test exercises builtin-to-runtime dispatch reporting.  Package-mode
+    # tests cover exact installed artifact selection separately.
+    monkeypatch.setattr(
+        installed_operator_artifact,
+        "resolve_installed_operator_artifact",
+        disabled_resolution,
+    )
+    monkeypatch.setattr(
+        mace_jit_operator_artifact,
+        "resolve_installed_operator_artifact",
+        disabled_resolution,
+    )
+
+    calculator = Symmetrix(
+        scalar_standard_model_path, dtype="float64", streamed_edges="direct"
+    )
+    evaluator = calculator.evaluator
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+    inputs = calculator._mace_inputs(atoms)
+    native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
+
+    def bindings():
+        return {
+            binding["capability_key"]: binding
+            for binding in evaluator.family_binding_report["bindings"]
+        }
+
+    # The M0 module-backed node: the report names the implementation the
+    # evaluator's own dispatch state selected, in the registry's vocabulary.
+    # R0 may independently resolve an exact installed artifact, so its loader
+    # route is intentionally outside this M0 dispatch test.
+    assert evaluator.m0_implementation == "builtin"
+    assert bindings()["m0"]["implementation_id"] == "builtin_m0"
+    assert bindings()["m0"]["selected_implementation_id"] == "builtin_m0"
+    assert bindings()["m0"]["tier"] == "frozen"
+
+    evaluator._set_standard_m0_executor("standard")
+    launches = evaluator.standard_m0_module_forward_launch_count
+    evaluator.compute_node_energies_forces(*native_args)
+    assert evaluator.standard_m0_module_forward_launch_count == launches + 1
+
+    # Forcing the runtime executor declines the module the plan names, and the
+    # report follows the dispatch rather than the readiness flags.
+    evaluator._set_standard_m0_executor("runtime")
+    assert bindings()["m0"]["implementation_id"] == "builtin_m0"
+    assert bindings()["m0"]["selected_implementation_id"] == "generic_m0"
+    launches = evaluator.standard_m0_module_forward_launch_count
+    evaluator.compute_node_energies_forces(*native_args)
+    assert evaluator.standard_m0_module_forward_launch_count == launches
+
+
+def test_r0_reporting_follows_actual_dispatch_with_a_loaded_module(
+    scalar_standard_model_path,
+):
+    _require_execution_fixed_weight_backend()
+    calculator = Symmetrix(
+        scalar_standard_model_path, dtype="float64", streamed_edges="direct"
+    )
+    evaluator = calculator.evaluator
+    inputs = calculator._mace_inputs(_small_structure())
+    native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
+
+    retained_loader = evaluator._r0_loader_implementation
+    expected_loader = (
+        "host_plugin"
+        if _kokkos_execution_space() in {"OpenMP", "Serial"}
+        else "device_module"
+    )
+    assert retained_loader == expected_loader
+    assert evaluator.r0_implementation == "generated"
+    generated_identity = (
+        evaluator.r0_artifact_origin,
+        evaluator.r0_schedule,
+        evaluator.r0_profile,
+        evaluator.r0_module_id,
+    )
+    assert generated_identity[1] != "generic"
+    assert generated_identity[2] != "generic"
+    assert evaluator.r0_module_id
+
+    evaluator._set_standard_r0_executor("v1")
+    assert evaluator._r0_loader_implementation == retained_loader
+    assert evaluator.r0_implementation == "generic"
+    assert evaluator.r0_artifact_origin is None
+    assert evaluator.r0_schedule == "generic"
+    assert evaluator.r0_profile == "generic"
+    assert evaluator.r0_module_id == ""
+    launches = evaluator.standard_r0_module_launch_count
+    evaluator.compute_node_energies_forces(*native_args)
+    assert evaluator.standard_r0_module_launch_count == launches
+
+    evaluator._set_standard_r0_executor("automatic")
+    assert evaluator.r0_implementation == "generated"
+    assert (
+        evaluator.r0_artifact_origin,
+        evaluator.r0_schedule,
+        evaluator.r0_profile,
+        evaluator.r0_module_id,
+    ) == generated_identity
+
+    evaluator._set_factorized_observer(True)
+    assert evaluator._r0_loader_implementation == retained_loader
+    assert evaluator.r0_implementation == "generic"
+    assert evaluator.r0_artifact_origin is None
+    assert evaluator.r0_schedule == "generic"
+    assert evaluator.r0_profile == "generic"
+    assert evaluator.r0_module_id == ""
+
+    evaluator._set_factorized_observer(False)
+    assert evaluator.r0_implementation == "generated"
+    assert (
+        evaluator.r0_artifact_origin,
+        evaluator.r0_schedule,
+        evaluator.r0_profile,
+        evaluator.r0_module_id,
+    ) == generated_identity
+
+
+@pytest.mark.cuda
+def test_batched_a1_blas_binds_the_cuda_portable_tier(scalar_standard_model_path):
+    """The A1 contraction binds the strided-batched BLAS implementation.
+
+    The report must name the CUDA-scoped implementation for the ``a1`` nodes,
+    leave the ``m1`` nodes on the generic implementation (their kernel is the
+    polynomial recomputation, not a batched contraction), and the dispatch must
+    admit the route the report claims.
+    """
+
+    _require_execution_fixed_weight_backend()
+    calculator = Symmetrix(
+        scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+    )
+    evaluator = calculator.evaluator
+    report = evaluator.family_binding_report
+    bindings = {binding["capability_key"]: binding for binding in report["bindings"]}
+
+    assert bindings["a1"]["implementation_id"] == "blas_batched_a1"
+    assert bindings["a1"]["tier"] == "portable"
+    assert bindings["a1"]["qualified"] is True
+    # The M1 stage keeps its own implementation: its kernel is the polynomial
+    # recomputation, which the batched contraction route does not serve.
+    assert bindings["m1"]["implementation_id"] != "blas_batched_a1"
+    assert bindings["m1"]["tier"] in ("portable", "generated")
+    assert evaluator.admits_batched_a1_blas is True
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype,tolerance", (("float32", 3e-5), ("float64", 1e-11)))
+def test_batched_a1_matches_the_reference_routing(
+    scalar_standard_model_path,
+    dtype,
+    tolerance,
+):
+    """The strided-batched A1 contraction matches the generic kernels.
+
+    The batched route reassociates the contraction, so the two routings agree
+    within a tolerance rather than bit for bit, and the second-interaction state
+    the adjoint-reuse bundle retains is still produced by the bound path.
+    """
+
+    _require_execution_fixed_weight_backend()
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+
+    direct = Symmetrix(scalar_standard_model_path, dtype=dtype, streamed_edges="direct")
+    direct.calculate(atoms, properties=["energy", "forces", "stress"])
+    reference = Symmetrix(
+        scalar_standard_model_path, dtype=dtype, streamed_edges="reference"
+    )
+    reference.calculate(atoms, properties=["energy", "forces", "stress"])
+
+    evaluator = direct.evaluator
+    assert (
+        evaluator.batched_a1_blas_launch_count > 0
+    ), "the bound A1 route did not launch, so the parity below would be vacuous"
+    for name in ("energy", "forces", "stress"):
+        np.testing.assert_allclose(
+            direct.results[name], reference.results[name], rtol=0, atol=tolerance
+        )
+    assert evaluator.mh0_state_policy == "reuse-adjoints-v1"
+    assert evaluator.mh0_reused_state_bytes > 0
+
+
+@pytest.mark.cuda
+def test_flattened_a1_blas_admission_and_reference_parity(
+    scalar_standard_model_path,
+):
+    """The node-tile flattened A1 contraction is a threshold-gated route.
+
+    Below the admission threshold the batched node-per-matrix call stays in
+    place and no staging is allocated; at and above it every A1 contraction of
+    an evaluation is served by the flattened route, which is the only thing that
+    allocates that staging.  The two routings disagree only by the summation
+    order the flattening changes, so the parity below is tolerance-based, with
+    the family's own float32 tolerance.
+    """
+
+    _require_execution_fixed_weight_backend()
+
+    # Below the threshold: the staging must stay unallocated, so the small case
+    # keeps the batching that already serves it.
+    small = Symmetrix(
+        scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+    )
+    small.calculate(_small_structure(), properties=["energy"])
+    assert small.evaluator.a1_blas_flatten_workspace_bytes == 0
+
+    atoms = _small_structure().repeat((6, 6, 6))
+    atoms.set_pbc(True)
+    direct = Symmetrix(
+        scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+    )
+    direct.calculate(atoms, properties=["energy", "forces", "stress"])
+    evaluator = direct.evaluator
+    assert evaluator.a1_blas_flatten_workspace_bytes > 0, (
+        "the flattened A1 route never allocated its staging, so the parity "
+        "below would be vacuous"
+    )
+    reference = Symmetrix(
+        scalar_standard_model_path, dtype="float32", streamed_edges="reference"
+    )
+    reference.calculate(atoms, properties=["energy", "forces", "stress"])
+    for name in ("energy", "forces", "stress"):
+        np.testing.assert_allclose(
+            direct.results[name], reference.results[name], rtol=0, atol=3e-5
+        )
+    assert evaluator.mh0_state_policy == "reuse-adjoints-v1"
+    assert evaluator.mh0_reused_state_bytes > 0
+
+
+@pytest.mark.cuda
+def test_flattened_a1_blas_admits_exactly_at_the_declared_threshold(
+    scalar_standard_model_path,
+):
+    """The flattened A1 route's node threshold is pinned at its boundary.
+
+    The threshold is a declaration, so the boundary is tested rather than
+    sampled: 512 nodes are admitted and 511 are not.  That is what separates
+    `num_nodes >= 512` from `num_nodes > 512` on one side and from any smaller
+    threshold on the other, which a 4-node case cannot.  Reachability is read
+    from the staging byte count, not from the launch counter: both A1 routes
+    issue one GEMM per hidden degree per direction, so the counter is the same
+    eight per evaluation either way.
+    """
+
+    _require_execution_fixed_weight_backend()
+
+    admitted = _small_structure().repeat((8, 4, 4))
+    admitted.set_pbc(True)
+    assert len(admitted) == 512
+    at_threshold = Symmetrix(
+        scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+    )
+    at_threshold.calculate(admitted, properties=["energy"])
+    assert at_threshold.evaluator.a1_blas_flatten_workspace_bytes > 0
+
+    below = _small_structure().repeat((8, 4, 4))
+    below.set_pbc(True)
+    del below[-1]
+    assert len(below) == 511
+    under_threshold = Symmetrix(
+        scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+    )
+    under_threshold.calculate(below, properties=["energy"])
+    assert under_threshold.evaluator.a1_blas_flatten_workspace_bytes == 0
+
+
+@pytest.mark.cuda
+def test_flattened_a1_blas_float64_reaches_the_single_matrix_dispatch(
+    scalar_standard_model_path,
+):
+    """The float64 flattened route exercises the batch-one GEMM dispatch.
+
+    The float64 A1 parity case runs at four nodes, below this route's admission
+    threshold, so its contractions take the batched entry point; this case runs
+    above the threshold and therefore reaches the `batch_count == 1` `cublasDgemm`
+    path of the shared dispatcher, which no other test covers.
+
+    Scope, stated exactly: this is an **execution** test.  The two cuBLAS entry
+    points compute the same product from the same leading dimensions for a
+    single matrix, so they are numerically identical by construction and no
+    assertion here can fail if the single-matrix shortcut were removed and the
+    strided entry point were called with a batch of one.  What the case
+    establishes is that the float64 flattened route is *admitted and correct*
+    above the threshold, which is where the new dispatch runs; the dispatch
+    choice itself is not, and cannot be, pinned by a numerical tolerance.  The
+    tolerance below is the float64 prepared-path bound, because the reference
+    and the direct routing differ by summation order.
+    """
+
+    _require_execution_fixed_weight_backend()
+
+    atoms = _small_structure().repeat((8, 4, 4))
+    atoms.set_pbc(True)
+    direct = Symmetrix(
+        scalar_standard_model_path, dtype="float64", streamed_edges="direct"
+    )
+    direct.calculate(atoms, properties=["energy", "forces", "stress"])
+    assert direct.evaluator.a1_blas_flatten_workspace_bytes > 0
+
+    reference = Symmetrix(
+        scalar_standard_model_path, dtype="float64", streamed_edges="reference"
+    )
+    reference.calculate(atoms, properties=["energy", "forces", "stress"])
+    for name in ("energy", "forces", "stress"):
+        np.testing.assert_allclose(
+            direct.results[name],
+            reference.results[name],
+            rtol=0,
+            atol=_FLATTEN_FP64_ATOL,
+        )
+
+
+@pytest.mark.cuda
+def test_flattened_a1_blas_matches_the_reference_across_two_node_tiles(
+    scalar_standard_model_path,
+):
+    """The flattened A1 route is correct across a partial second node tile.
+
+    The route packs one tile of 8192 nodes per hidden degree, so a cell larger
+    than that exercises the tile loop's second iteration and its short final
+    tile -- the arithmetic the single-tile cases never reach.  The structural
+    half of the assertion is exact and model-independent: the contraction is
+    issued once per hidden degree per tile per direction, so a two-tile
+    evaluation must double the single-tile launch count rather than merely
+    exceed it.  The numerical half compares against the reference routing, whose
+    summation order differs, at the float32 prepared-path tolerance.
+    """
+
+    _require_execution_fixed_weight_backend()
+
+    def launch_count(repeat):
+        structure = _small_structure().repeat(repeat)
+        structure.set_pbc(True)
+        calculator = Symmetrix(
+            scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+        )
+        calculator.calculate(structure, properties=["energy"])
+        assert calculator.evaluator.a1_blas_flatten_workspace_bytes > 0
+        return calculator.evaluator.batched_a1_blas_launch_count, structure
+
+    one_tile, _ = launch_count((6, 6, 6))  # 864 nodes, single tile
+    two_tiles, atoms = launch_count((13, 13, 13))  # 8788 nodes: 8192 + 596
+    assert len(atoms) == 8788
+    assert two_tiles == 2 * one_tile, (
+        "the partial second tile did not launch, so this case does not cover the "
+        "tile loop's second iteration"
+    )
+
+    direct = Symmetrix(
+        scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+    )
+    direct.calculate(atoms, properties=["energy", "forces"])
+    reference = Symmetrix(
+        scalar_standard_model_path, dtype="float32", streamed_edges="reference"
+    )
+    reference.calculate(atoms, properties=["energy", "forces"])
+    np.testing.assert_allclose(
+        direct.results["energy"],
+        reference.results["energy"],
+        rtol=0,
+        atol=_FLATTEN_TWO_TILE_ENERGY_ATOL,
+    )
+    np.testing.assert_allclose(
+        direct.results["forces"], reference.results["forces"], rtol=0, atol=3e-5
+    )
+
+
+@pytest.mark.cuda
+def test_m1_device_terms_binds_the_cuda_portable_tier(portable_m1_model_path):
+    """The contract-free M1 polynomial binds the portable CUDA route."""
+
+    _require_execution_fixed_weight_backend()
+    calculator = Symmetrix(
+        portable_m1_model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        m1_polynomial_policy="recompute",
+    )
+    evaluator = calculator.evaluator
+    evaluator._set_m1_polynomial_policy("recompute")
+    bindings = {
+        binding["capability_key"]: binding
+        for binding in evaluator.family_binding_report["bindings"]
+    }
+
+    assert bindings["m1"]["implementation_id"] == "device_m1_terms"
+    assert bindings["m1"]["selected_implementation_id"] == "device_m1_terms"
+    assert bindings["m1"]["tier"] == "portable"
+    assert bindings["m1"]["qualified"] is True
+    assert evaluator.m1_device_module_ready is False
+    assert evaluator.admits_m1_device_terms is True
+
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+    calculator.calculate(atoms, properties=["energy", "forces", "stress"])
+    assert evaluator.generated_m1_module_forward_launch_count == 0
+    assert evaluator.generated_m1_module_reverse_launch_count == 0
+    assert evaluator.m1_device_terms_launch_count > 0
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype,tolerance", (("float32", 3e-5), ("float64", 1e-11)))
+def test_m1_device_terms_matches_the_reference_routing(
+    portable_m1_model_path,
+    dtype,
+    tolerance,
+):
+    """The portable M1 recomputation matches the generic kernels.
+
+    The two routings agree within a tolerance rather than bit for bit, and the
+    second-interaction state the adjoint-reuse bundle retains is still produced
+    by the bound path.
+    """
+
+    _require_execution_fixed_weight_backend()
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+
+    direct = Symmetrix(
+        portable_m1_model_path,
+        dtype=dtype,
+        streamed_edges="direct",
+        m1_polynomial_policy="recompute",
+    )
+    direct.evaluator._set_m1_polynomial_policy("recompute")
+    direct.calculate(atoms, properties=["energy", "forces", "stress"])
+    reference = Symmetrix(
+        portable_m1_model_path, dtype=dtype, streamed_edges="reference"
+    )
+    reference.calculate(atoms, properties=["energy", "forces", "stress"])
+
+    evaluator = direct.evaluator
+    assert evaluator.m1_device_module_ready is False
+    assert evaluator.generated_m1_module_forward_launch_count == 0
+    assert evaluator.generated_m1_module_reverse_launch_count == 0
+    assert evaluator.m1_device_terms_launch_count > 0
+    for name in ("energy", "forces", "stress"):
+        np.testing.assert_allclose(
+            direct.results[name], reference.results[name], rtol=0, atol=tolerance
+        )
+    assert evaluator.mh0_state_policy == "reuse-adjoints-v1"
+    assert evaluator.mh0_reused_state_bytes > 0
+
+
+@pytest.mark.cuda
+def test_device_h2_stages_binds_the_cuda_portable_tier(scalar_standard_model_path):
+    """The second-interaction stages bind the fused CUDA implementation.
+
+    The report must name the CUDA-scoped implementation for the ``h2`` nodes,
+    and the dispatch must run the route the report claims.
+    """
+
+    _require_execution_fixed_weight_backend()
+    calculator = Symmetrix(
+        scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+    )
+    evaluator = calculator.evaluator
+    bindings = {
+        binding["capability_key"]: binding
+        for binding in evaluator.family_binding_report["bindings"]
+    }
+
+    # No generated h2 tier exists today, so the portable implementation is the
+    # one the report names; this assertion breaks if one is ever declared.
+    assert bindings["h2"]["implementation_id"] == "device_h2_stages"
+    assert bindings["h2"]["tier"] == "portable"
+    assert bindings["h2"]["qualified"] is True
+    assert evaluator.admits_device_h2_stages is True
+
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+    calculator.calculate(atoms, properties=["energy"])
+    assert (
+        evaluator.device_h2_stage_launch_count > 0
+    ), "the declared H2 route did not launch: the dispatch is not bound to it"
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype,tolerance", (("float32", 3e-5), ("float64", 1e-11)))
+def test_device_h2_stages_matches_the_reference_routing(
+    scalar_standard_model_path,
+    dtype,
+    tolerance,
+):
+    """The fused H2 stages match the generic kernels.
+
+    The forward sums both second-interaction contributions in one accumulator
+    and the reverse keeps both adjoint outputs in registers, so the two routings
+    agree within a tolerance rather than bit for bit, and the second-interaction
+    state the adjoint-reuse bundle retains is still produced by the bound path.
+    """
+
+    _require_execution_fixed_weight_backend()
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+
+    direct = Symmetrix(scalar_standard_model_path, dtype=dtype, streamed_edges="direct")
+    direct.calculate(atoms, properties=["energy", "forces", "stress"])
+    reference = Symmetrix(
+        scalar_standard_model_path, dtype=dtype, streamed_edges="reference"
+    )
+    reference.calculate(atoms, properties=["energy", "forces", "stress"])
+
+    evaluator = direct.evaluator
+    assert (
+        evaluator.device_h2_stage_launch_count > 0
+    ), "the bound H2 route did not launch, so the parity below would be vacuous"
+    for name in ("energy", "forces", "stress"):
+        np.testing.assert_allclose(
+            direct.results[name], reference.results[name], rtol=0, atol=tolerance
+        )
+    assert evaluator.mh0_state_policy == "reuse-adjoints-v1"
+    assert evaluator.mh0_reused_state_bytes > 0
+
+
+@pytest.mark.cuda
+def test_r0_reverse_persistent_grid_is_a_whole_resident_wave(
+    scalar_standard_model_path,
+):
+    """The coordinate reverse launches one whole resident wave per declaration.
+
+    The kernel is register-limited to three 256-thread blocks per multiprocessor
+    (16x16 threads, 80 registers, 3216 B dynamic shared memory), so a persistent
+    grid that declares four blocks per compute unit leaves a third of a second
+    wave resident and costs ~29 % of the launch.  The declaration is geometry
+    only: the arithmetic is per directed edge inside one 16-thread team, so the
+    results cannot depend on the grid beyond last-bit instance noise, which the
+    override comparison below pins.
+    """
+
+    _require_execution_fixed_weight_backend()
+    profile_id = "standard-r0-module-module-v2-cuda-float32-generic"
+    # Large enough that the persistent grid is not clipped to the edge count.
+    atoms = _small_structure().repeat((6, 6, 6))
+    atoms.set_pbc(True)
+
+    # A launch override is only valid before an evaluator's first evaluation (it
+    # invalidates the prepared graph), so each grid gets its own calculator --
+    # the same application point the calibration path uses.
+    default = Symmetrix(
+        scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+    )
+    compute_unit_count = default.evaluator.execution_device_execution_environment[
+        "compute_unit_count"
+    ]
+    assert compute_unit_count > 0
+
+    default.calculate(atoms, properties=["energy", "forces"])
+    reference_energy = default.results["energy"]
+    reference_forces = np.array(default.results["forces"])
+    row = default.kernel_launch_profile_diagnostics["r0_reverse"]
+
+    assert row["profile_id"] == profile_id
+    assert row["calibration_candidates"] == [2, 3, 6]
+    assert row["default_blocks_per_compute_unit"] == 3
+    assert row["active_blocks_per_compute_unit"] == 3
+    assert row["persistent_blocks"] == 3 * compute_unit_count
+
+    with pytest.raises(ValueError, match="admitted calibration candidate"):
+        default.evaluator._set_kernel_launch_profile_override(profile_id, 5)
+
+    doubled = Symmetrix(
+        scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+    )
+    doubled.evaluator._set_kernel_launch_profile_override(profile_id, 6)
+    doubled.calculate(atoms, properties=["energy", "forces"])
+    doubled_row = doubled.kernel_launch_profile_diagnostics["r0_reverse"]
+    assert doubled_row["active_blocks_per_compute_unit"] == 6
+    assert doubled_row["persistent_blocks"] == 6 * compute_unit_count
+
+    # Grid geometry is not arithmetic.  Energies are bit-identical across grids,
+    # and forces agree to the floor of last-bit instance noise that two
+    # *identical* calculators already show.  The relative floor is ~9.0e-16 on
+    # both structures measured; the absolute floor is structure-dependent --
+    # 1.776e-15 over ~570 of 2592 components on this test's 864-atom structure,
+    # 3.4e-21 over ~100 of 2592 on the benchmark workload's larger structure.
+    # The bound below therefore rests on its relative term: rtol=1e-13 is ~110x
+    # the relative floor, while atol=1e-20 sits below the absolute floor and does
+    # not bind, leaving >=40x margin on the tighter structure.  A grid that
+    # dropped or duplicated edges would miss it by orders of magnitude.
+    assert doubled.results["energy"] == reference_energy
+    np.testing.assert_allclose(
+        doubled.results["forces"], reference_forces, rtol=1e-13, atol=1e-20
+    )
 
 
 @pytest.mark.parametrize(
@@ -1822,7 +2439,6 @@ def test_execution_standard_m0_matches_runtime_forward_reverse_oracle(
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges=streamed_edges,
     )
@@ -1831,8 +2447,6 @@ def test_execution_standard_m0_matches_runtime_forward_reverse_oracle(
         assert evaluator.standard_m0_selected_executor == "standard"
     if streamed_edges == "factorized":
         evaluator._set_factorized_source_strategy("jit_plugin")
-        evaluator._set_factorized_direct_forward_executor("jit_all")
-        evaluator._set_factorized_direct_reverse_executor("jit")
         evaluator._set_standard_r0_executor("v2_edge16")
     _pin_forward_mh0_state(evaluator)
     inputs = calculator._mace_inputs(atoms)
@@ -1942,7 +2556,6 @@ def test_scalar_standard_m0_matches_runtime_forward_reverse_oracle(
 
     calculator = Symmetrix(
         scalar_standard_model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="all_interactions",
     )
@@ -2041,7 +2654,6 @@ def test_scalar_standard_m0_rejects_perturbed_structure(
 
     calculator = Symmetrix(
         path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="all_interactions",
     )
@@ -2074,7 +2686,6 @@ def test_scalar_standard_m0_rejects_incompatible_angular_topology(
     with pytest.raises(ValueError, match=error):
         Symmetrix(
             path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges="all_interactions",
         )
@@ -2094,14 +2705,12 @@ def test_scalar_standard_m0_low_memory_matches_retained_direct(
     calculators = {
         "retained": Symmetrix(
             scalar_standard_model_path,
-            use_kokkos=True,
             dtype=dtype,
             streamed_edges="factorized",
             low_memory=False,
         ),
         "low_memory": Symmetrix(
             scalar_standard_model_path,
-            use_kokkos=True,
             dtype=dtype,
             streamed_edges="factorized",
             low_memory=True,
@@ -2130,12 +2739,16 @@ def test_scalar_standard_m0_low_memory_matches_retained_direct(
     evaluator = low_memory_evaluator
     assert evaluator.low_memory
     assert evaluator.standard_m0_module_id == "standard-m0-lmax0-module-v1"
-    if native_symmetrix._kokkos_default_execution_space() in ("Cuda", "HIP"):
+    m0 = calculators["low_memory"].jit_operator_modules["M0"]
+    if m0["status"] == "loaded":
+        assert m0["origin"] == "prebuilt"
+        assert evaluator.standard_m0_selected_executor == "runtime"
+        assert evaluator.m0_implementation in {"host_plugin", "device_module"}
+    else:
+        assert m0["status"] == "builtin"
+        assert m0["compiler"] is None
         assert evaluator.standard_m0_selected_executor == "standard"
         assert evaluator.m0_implementation == "builtin"
-    else:
-        assert evaluator.standard_m0_selected_executor == "runtime"
-        assert evaluator.m0_implementation == "host_plugin"
     assert evaluator.standard_r0_selected_executor != "v1"
     assert evaluator.factorized_jit_artifact_id
     assert evaluator.factorized_fallback_evaluation_count == 0
@@ -2166,7 +2779,6 @@ def test_m1_recompute_matches_retained_and_releases_polynomial_storage(
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges=streamed_edges,
         m1_polynomial_policy="retained",
@@ -2178,8 +2790,6 @@ def test_m1_recompute_matches_retained_and_releases_polynomial_storage(
     assert evaluator.m1_recompute_tile_channels in (8, 16, 32)
     if streamed_edges == "factorized":
         evaluator._set_factorized_source_strategy("jit_plugin")
-        evaluator._set_factorized_direct_forward_executor("jit_all")
-        evaluator._set_factorized_direct_reverse_executor("jit")
         evaluator._set_standard_r0_executor("v2_edge16")
     evaluator._set_standard_m0_executor("standard")
     _pin_forward_mh0_state(evaluator)
@@ -2290,7 +2900,6 @@ def test_m1_recompute_automatic_admission_and_precise_fallback(
     standard_path, _ = streamed_model_paths
     calculator = debug_factorized_symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="all_interactions",
         m1_polynomial_policy="retained",
@@ -2344,15 +2953,12 @@ def test_mh0_adjoint_reuse_matches_full_retention_and_rolls_back(
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
         m1_polynomial_policy="recompute",
     )
     evaluator = calculator.evaluator
     evaluator._set_factorized_source_strategy("jit_plugin")
-    evaluator._set_factorized_direct_forward_executor("jit_all")
-    evaluator._set_factorized_direct_reverse_executor("jit")
     evaluator._set_standard_r0_executor("v2_edge16")
     evaluator._set_standard_m0_executor("standard")
     direct_scratch = evaluator.m1_recompute_scratch_bytes
@@ -2464,14 +3070,12 @@ def test_factorized_low_memory_bundle_matches_full_retention_and_is_transactiona
 
     retained = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="factorized",
         m1_polynomial_policy="retained",
     )
     low_memory = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="factorized",
         low_memory=True,
@@ -2626,7 +3230,6 @@ def test_low_memory_selects_speed_or_capacity_from_graph_memory_estimate(
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="direct",
         low_memory=True,
@@ -2734,6 +3337,81 @@ def test_low_memory_selects_speed_or_capacity_from_graph_memory_estimate(
     evaluator._set_low_memory_device_memory_info_for_testing(0, 0)
 
 
+_SOURCE_ROOT = Path(__file__).resolve().parents[2] / "libsymmetrix" / "source"
+
+_DECLARED_PLAN_IDS = (
+    "mh0-direct-speed",
+    "mh0-direct-capacity-y-only",
+    "mh0-direct-capacity-retained",
+    "mh0-single-layer-tiled-v1",
+    "mh0-dual-layer-tiled-v1",
+)
+
+
+def test_declared_plan_space_is_the_cross_language_plan_id_contract(
+    scalar_standard_model_path,
+):
+    """The family-declared candidate space is the plan-id contract on both sides.
+
+    The native declaration order is pinned here, and every declared id is
+    accepted by the native plan pin while the Python debug-plan constant is the
+    same set -- so the family declaration cannot drift from either consumer.
+    """
+    from symmetrix.calculator import (
+        _DEBUG_EXECUTION_PLANS,
+        _FIXED_WORKSPACE_TILED_PLANS,
+    )
+
+    _require_execution_fixed_weight_backend()
+    calculator = Symmetrix(
+        scalar_standard_model_path,
+        dtype="float64",
+        streamed_edges="direct",
+        execution_profile="capacity",
+    )
+    evaluator = calculator.evaluator
+    inputs = calculator._mace_inputs(_small_structure())
+    evaluator._prepare_factorized_graph(*inputs[:5])
+
+    candidates = calculator.execution_plan["candidates"]
+
+    assert tuple(candidate["id"] for candidate in candidates) == _DECLARED_PLAN_IDS
+    assert {candidate["id"] for candidate in candidates} == _DEBUG_EXECUTION_PLANS
+    assert _FIXED_WORKSPACE_TILED_PLANS <= _DEBUG_EXECUTION_PLANS
+    assert set(_FIXED_WORKSPACE_TILED_PLANS) <= set(_DECLARED_PLAN_IDS)
+    for plan in _DECLARED_PLAN_IDS:
+        evaluator._set_execution_plan_request(
+            "direct",
+            "speed" if plan == "mh0-direct-speed" else "capacity",
+            plan,
+        )
+    with pytest.raises(ValueError) as rejection:
+        evaluator._set_execution_plan_request("direct", "capacity", "mh0-bogus")
+    assert str(rejection.value) == (
+        "_debug_execution_plan must be one of 'mh0-direct-speed', "
+        "'mh0-direct-capacity-retained', or "
+        "'mh0-direct-capacity-y-only', or "
+        "'mh0-single-layer-tiled-v1', or "
+        "'mh0-dual-layer-tiled-v1'."
+    )
+
+
+def test_plan_candidate_space_is_family_declared_and_not_relisted():
+    """The candidate descriptors own the plan space; no consumer re-lists it."""
+    native = _SOURCE_ROOT
+    runtime = (native / "mace_kokkos_runtime.cpp").read_text()
+    lifecycle = (native / "mace_kokkos_factorized_lifecycle.cpp").read_text()
+    space_header = (native / "plan_candidate_space.hpp").read_text()
+
+    assert "execution_plan_.candidates = {" not in runtime
+    assert 'debug_plan != "mh0-' not in lifecycle
+    assert "plan_candidate_space().declares(debug_plan)" in lifecycle
+    assert "class PlanCandidateSpace" in space_header
+    assert "struct PlanCandidateDescriptor" in space_header
+    for plan in _DECLARED_PLAN_IDS:
+        assert runtime.count(f'space.declare("{plan}"') == 1, plan
+
+
 @pytest.mark.parametrize("dtype", ("float32", "float64"))
 def test_speed_uses_backend_throughput_policy_and_debug_override_is_exact(
     scalar_standard_model_path,
@@ -2752,7 +3430,6 @@ def test_speed_uses_backend_throughput_policy_and_debug_override_is_exact(
     ):
         calculator = Symmetrix(
             scalar_standard_model_path,
-            use_kokkos=True,
             dtype=dtype,
             streamed_edges="direct",
             execution_profile=profile,
@@ -2840,7 +3517,6 @@ def test_explicit_evaluator_policy_pins_survive_the_automatic_bundle(
     atoms.set_pbc(True)
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float64",
         streamed_edges="factorized",
     )
@@ -2864,7 +3540,6 @@ def test_pinned_harmonic_storage_survives_indirect_bundle_writes(
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
         execution_profile="speed",
@@ -2910,7 +3585,6 @@ def test_low_memory_high_water_reuses_graph_and_mh0_state_capacity(
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         low_memory=True,
@@ -2958,7 +3632,6 @@ def test_low_memory_high_water_reuses_graph_and_mh0_state_capacity(
     gc.collect()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         low_memory=True,
@@ -3139,7 +3812,6 @@ def test_low_memory_high_water_reuses_prepared_geometry_state_capacity(
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         low_memory=True,
@@ -3175,7 +3847,6 @@ def test_low_memory_high_water_reuses_prepared_geometry_state_capacity(
     gc.collect()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         low_memory=True,
@@ -3259,7 +3930,6 @@ def test_speed_policy_narrows_geometry_growth_before_device_boundary(
 
     probe_calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         low_memory=False,
@@ -3281,7 +3951,6 @@ def test_speed_policy_narrows_geometry_growth_before_device_boundary(
 
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         low_memory=False,
@@ -3361,7 +4030,6 @@ def test_readout_recompute_matches_macefield_directional_response(
     for policy in ("retained", "recompute"):
         calculator = Symmetrix(
             field_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges="factorized",
             electric_field=electric_field,
@@ -3421,7 +4089,6 @@ def test_standard_m0_module_admits_validated_payload_without_contract_metadata(
 
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
@@ -3461,7 +4128,6 @@ def test_m0_payload_dimensions_are_validated(
     with pytest.raises(ValueError, match=error):
         Symmetrix(
             model_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges="all_interactions",
         )
@@ -3495,7 +4161,6 @@ def test_m0_payload_accepts_degree_four(
 
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="all_interactions",
     )
@@ -3523,7 +4188,6 @@ def test_execution_standard_m0_repacks_shuffled_payload_rows(
     atoms = _small_structure()
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
@@ -3567,14 +4231,11 @@ def test_execution_structural_m0_generalizes_species_count(
     atoms.numbers[al_index] = 14
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     evaluator._set_factorized_source_strategy("jit_plugin")
-    evaluator._set_factorized_direct_forward_executor("jit_all")
-    evaluator._set_factorized_direct_reverse_executor("jit")
     evaluator._set_standard_r0_executor("v2_edge16")
     _pin_forward_mh0_state(evaluator)
     inputs = calculator._mace_inputs(atoms)
@@ -3624,15 +4285,12 @@ def test_execution_standard_m0_rejects_mismatched_contract_and_falls_back(
     atoms = _small_structure()
     calculator = Symmetrix(
         mismatched_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges=streamed_edges,
     )
     evaluator = calculator.evaluator
     if streamed_edges == "factorized":
         evaluator._set_factorized_source_strategy("jit_plugin")
-        evaluator._set_factorized_direct_forward_executor("jit_all")
-        evaluator._set_factorized_direct_reverse_executor("jit")
         evaluator._set_standard_r0_executor("v2_edge16")
     evaluator._set_standard_m0_executor("automatic")
     with pytest.raises(ValueError, match="Standard M0 is unavailable"):
@@ -3673,14 +4331,11 @@ def test_execution_standard_m0_prepared_steady_state_counters(
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     evaluator._set_factorized_source_strategy("jit_plugin")
-    evaluator._set_factorized_direct_forward_executor("jit_all")
-    evaluator._set_factorized_direct_reverse_executor("jit")
     evaluator._set_standard_r0_executor("v2_edge16")
     evaluator._set_standard_m0_executor("standard")
     inputs = calculator._mace_inputs(atoms)
@@ -3760,93 +4415,11 @@ def test_execution_standard_m0_prepared_steady_state_counters(
             )
 
 
-def test_execution_prepared_runtime_path_stays_on_evaluator_stream(
-    streamed_model_paths,
-):
-    if not native_symmetrix._kokkos_is_initialized():
-        native_symmetrix._init_kokkos()
-    if native_symmetrix._kokkos_default_execution_space() != "Cuda":
-        pytest.skip("asynchronous Execution lifecycle counters require Kokkos CUDA")
-
-    standard_path, _ = streamed_model_paths
-    atoms = _small_structure()
-    reference_calculator = Symmetrix(
-        standard_path,
-        use_kokkos=True,
-        dtype="float32",
-        streamed_edges="generic",
-    )
-    reference_inputs = reference_calculator._mace_inputs(atoms)
-    reference_calculator.evaluator.compute_node_energies_forces(
-        *reference_inputs[:5],
-        np.asarray(reference_inputs[5]).flatten(),
-        reference_inputs[6],
-    )
-    reference = reference_calculator._collect_mace_results(atoms, reference_inputs)
-
-    calculator = Symmetrix(
-        standard_path,
-        use_kokkos=True,
-        dtype="float32",
-        streamed_edges="direct",
-    )
-    evaluator = calculator.evaluator
-    evaluator._set_factorized_source_strategy("team_cached")
-    evaluator._set_factorized_direct_forward_executor("runtime")
-    evaluator._set_factorized_direct_reverse_executor("runtime")
-    inputs = calculator._mace_inputs(atoms)
-    token = evaluator._prepare_factorized_graph(*inputs[:5])
-    xyz = np.asarray(inputs[5]).flatten()
-    radii = inputs[6]
-
-    def evaluate():
-        evaluator._compute_prepared_factorized(token, xyz, radii)
-        return calculator._collect_mace_results(atoms, inputs)
-
-    evaluate()
-    assert evaluator.factorized_selected_direct_forward_executor == "runtime"
-    assert evaluator.factorized_selected_direct_reverse_executor == "runtime"
-    assert evaluator.factorized_execution_profile == "factorized_state"
-
-    before = {
-        "async_sphericart": evaluator.execution_sphericart_async_launch_count,
-        "sphericart": evaluator.execution_sphericart_launch_count,
-        "stage_fences": evaluator.factorized_stage_fence_count,
-        "evaluation_fences": evaluator.factorized_evaluation_fence_count,
-        "preparation_fences": evaluator.factorized_preparation_fence_count,
-    }
-    schedule_build_count = evaluator.factorized_schedule_build_count
-    arena_allocation_count = evaluator.factorized_arena_allocation_count
-    geometry_allocation_count = evaluator.execution_geometry_allocation_count
-
-    fallback = evaluate()
-
-    assert (
-        evaluator.execution_sphericart_async_launch_count - before["async_sphericart"]
-    ) == 1
-    assert evaluator.execution_sphericart_launch_count - before["sphericart"] == 1
-    assert evaluator.factorized_stage_fence_count - before["stage_fences"] == 0
-    assert (
-        evaluator.factorized_evaluation_fence_count - before["evaluation_fences"]
-    ) == 1
-    assert (
-        evaluator.factorized_preparation_fence_count - before["preparation_fences"]
-    ) == 0
-    assert evaluator.factorized_schedule_build_count == schedule_build_count
-    assert evaluator.factorized_arena_allocation_count == arena_allocation_count
-    assert evaluator.execution_geometry_allocation_count == geometry_allocation_count
-
-    assert fallback["energy"] == pytest.approx(reference["energy"], rel=0.0, abs=3e-5)
-    for name in ("energies", "forces", "stress"):
-        np.testing.assert_allclose(fallback[name], reference[name], rtol=0.0, atol=3e-5)
-
-
 def test_generic_fp32_source_adjoint_workspace_is_reused(streamed_model_paths):
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
@@ -3864,6 +4437,10 @@ def test_generic_fp32_source_adjoint_workspace_is_reused(streamed_model_paths):
     calculator.calculate(atoms, properties=["energy", "forces", "stress"])
     assert evaluator.generic_phi1_source_adjoint_workspace_bytes == expected_bytes
     assert evaluator.generic_phi1_source_adjoint_allocation_count == 1
+    # Above one worker the Kokkos reductions reassociate, so a repeated call is
+    # reproducible to a tight bound rather than bit for bit (6e-16..1.4e-15 eV/A
+    # observed on the forces at four workers); the workspace counts above are the
+    # subject of this test.
     for name in first:
         # The reused workspace must not change the results, but the host force
         # reduction accumulates in OpenMP work-sharing order, so repeated
@@ -3889,13 +4466,11 @@ def test_execution_standard_r0_v2_state_clears_on_mode_switch(
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     evaluator._set_factorized_source_strategy("jit_plugin")
-    evaluator._set_factorized_direct_reverse_executor("jit")
     evaluator._set_standard_r0_executor("v2_edge16")
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
@@ -3912,7 +4487,6 @@ def test_execution_standard_r0_v2_state_clears_on_mode_switch(
     for mode in ("materialized",):
         fresh_calculator = Symmetrix(
             standard_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges=mode,
         )
@@ -3959,13 +4533,11 @@ def test_factorized_contract_gate_and_legacy_compatibility(
     with pytest.raises(RuntimeError, match="does not contain a Execution R1 contract"):
         Symmetrix(
             legacy_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges="direct",
         )
     legacy_calculator = Symmetrix(
         legacy_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
@@ -3985,7 +4557,6 @@ def test_factorized_contract_gate_and_legacy_compatibility(
     with pytest.raises(RuntimeError, match="generation fingerprint"):
         Symmetrix(
             mismatched_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges="direct",
         )
@@ -3993,7 +4564,6 @@ def test_factorized_contract_gate_and_legacy_compatibility(
     atoms = _small_structure()
     r0_mismatched_calculator = Symmetrix(
         r0_mismatched_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
@@ -4040,7 +4610,6 @@ def test_factorized_exact_artifact_is_bound_to_loaded_phi_payload(
 
     reference = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="all_interactions",
     )
@@ -4056,7 +4625,6 @@ def test_factorized_exact_artifact_is_bound_to_loaded_phi_payload(
     with pytest.raises(RuntimeError, match=reason_fragment):
         Symmetrix(
             model_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges="direct",
         )
@@ -4065,14 +4633,13 @@ def test_factorized_exact_artifact_is_bound_to_loaded_phi_payload(
 def test_factorized_observer_matches_reference_across_execution_strategies(
     streamed_model_paths,
 ):
-    _skip_removed_observer_gradient_support()
+    _require_host_generated_backend()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
-        streamed_edges="direct",
+        streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     inputs = calculator._mace_inputs(atoms)
@@ -4152,7 +4719,7 @@ def test_factorized_observer_matches_reference_across_execution_strategies(
         return observation
 
     reference = observe("serial_reference")
-    for strategy in ("tiled_coupling", "jit_plugin"):
+    for strategy in ("jit_plugin",):
         candidate = observe(strategy)
         assert len(candidate["groups"]) == len(reference["groups"])
         for (state, state_adjoint), (ref_state, ref_state_adjoint) in zip(
@@ -4194,14 +4761,13 @@ def test_factorized_observer_matches_reference_across_execution_strategies(
 def test_factorized_observer_rejects_capture_above_host_byte_limit(
     streamed_model_paths,
 ):
-    _skip_removed_observer_gradient_support()
+    _require_host_generated_backend()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
-        streamed_edges="direct",
+        streamed_edges="factorized",
     )
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
@@ -4223,7 +4789,6 @@ def test_factorized_source_schedule_reuses_and_rebuilds_with_topology(
     standard_path, _ = streamed_model_paths
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float64",
         streamed_edges="factorized",
     )
@@ -4279,18 +4844,15 @@ def test_factorized_source_schedule_reuses_and_rebuilds_with_topology(
 
 
 def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
-    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     evaluator._set_factorized_source_strategy("jit_plugin")
-    evaluator._set_factorized_direct_reverse_executor("jit")
     evaluator._set_standard_r0_executor("v2_edge16")
     inputs = calculator._mace_inputs(atoms)
 
@@ -4361,7 +4923,6 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
         assert evaluator.standard_r0_module_id == "standard-r0-module-module-v2"
         assert evaluator.standard_r0_selected_executor == "v2_edge16"
         assert evaluator.factorized_jit_ready
-        assert evaluator.factorized_jit_artifact_id.startswith("jit-r1-gen11-")
         assert evaluator.factorized_jit_contract_fingerprint.startswith("sha256:")
         assert evaluator.factorized_selected_direct_forward_executor == ("jit_all")
         assert evaluator.factorized_selected_direct_reverse_executor == "jit"
@@ -4390,26 +4951,30 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
         assert evaluator.execution_phi1r_capacity_bytes == 0
         assert evaluator.execution_dphi1r_active_bytes == 0
         assert evaluator.execution_dphi1r_capacity_bytes == 0
-        requested_a1_cublas = os.environ.get("SYMMETRIX_A1_CUBLAS", "")
-        a1_cublas_enabled = requested_a1_cublas in ("", "1", "true", "on")
-        device_environment = getattr(
-            evaluator, "execution_device_execution_environment", {}
+        # The A1 kind binds the strided-batched BLAS route, which shares the
+        # BLAS context: these counters are that route's, and the R1 stage adds
+        # no legacy factorized custom-BLAS launch or stream bind on top of them.
+        # The absolute pin is two evaluations, both directions, one call per
+        # hidden degree.
+        hidden_degrees = json.loads(standard_path.read_text())["l_max"] + 1
+        assert evaluator.batched_a1_blas_launch_count == 2 * hidden_degrees * 2
+        # The model carries a generated M1 contract, so both directions run the
+        # architecture-specialized module and the portable CUDA route is
+        # shadowed.
+        assert evaluator.generated_m1_module_forward_launch_count == 2
+        assert evaluator.generated_m1_module_reverse_launch_count == 2
+        assert evaluator.m1_device_terms_launch_count == 0
+        # The H2 forward and reverse each bind a CUDA-scoped fused kernel: two
+        # launches per evaluation on the device, none on the host.
+        assert evaluator.device_h2_stage_launch_count == (
+            4 if _kokkos_execution_space() == "Cuda" else 0
         )
-        batched_blas_available = (
-            device_environment.get("batched_blas_available", False)
-            if isinstance(device_environment, dict)
-            else False
+        assert evaluator.factorized_custom_blas_launch_count == (
+            evaluator.batched_a1_blas_launch_count
         )
-        if (
-            _kokkos_execution_space() in ("Cuda", "HIP")
-            and a1_cublas_enabled
-            and batched_blas_available
-        ):
-            assert evaluator.factorized_custom_blas_launch_count > 0
-            assert evaluator.factorized_blas_stream_bind_count == 1
-        else:
-            assert evaluator.factorized_custom_blas_launch_count == 0
-            assert evaluator.factorized_blas_stream_bind_count == 0
+        assert evaluator.factorized_blas_stream_bind_count == (
+            1 if evaluator.batched_a1_blas_launch_count else 0
+        )
 
     evaluator._set_factorized_planner_budget_bytes(evaluator.factorized_workspace_bytes)
     assert evaluator.factorized_graph_generation == 0
@@ -4500,14 +5065,12 @@ def test_factorized_jit_position_geometry_matches_exact_graph(streamed_model_pat
     atoms.set_pbc(True)
     native = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
         neighbor_skin=0.5,
     )
     exact = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
         neighbor_skin=0.0,
@@ -4603,7 +5166,6 @@ def test_direct_skin_mask_matches_exact_graph_across_cutoff(
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
     native = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="direct",
         low_memory=low_memory,
@@ -4611,7 +5173,6 @@ def test_direct_skin_mask_matches_exact_graph_across_cutoff(
     )
     exact = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="direct",
         low_memory=low_memory,
@@ -4696,7 +5257,6 @@ def test_macefield_direct_skin_mask_matches_exact_graph_across_cutoff(
     def make_calculator(neighbor_skin):
         calculator = Symmetrix(
             field_path,
-            use_kokkos=True,
             dtype=dtype,
             streamed_edges="direct",
             low_memory=low_memory,
@@ -4779,14 +5339,12 @@ def test_all_interactions_native_positions_compact_exact_cutoff_edges(
     standard_path, _ = streamed_model_paths
     native = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="all_interactions",
         neighbor_skin=0.5,
     )
     exact = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="all_interactions",
         neighbor_skin=0.0,
@@ -4845,14 +5403,11 @@ def test_factorized_operator_session_tracks_successful_evaluation_epoch(
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     evaluator._set_factorized_source_strategy("jit_plugin")
-    evaluator._set_factorized_direct_forward_executor("jit_all")
-    evaluator._set_factorized_direct_reverse_executor("jit")
 
     inputs = calculator._mace_inputs(atoms)
     graph_token = evaluator._prepare_factorized_graph(*inputs[:5])
@@ -4909,12 +5464,11 @@ def test_factorized_matches_materialized_on_ragged_graph_with_isolated_atom(
         atoms = _ragged_structure()
         calculator = Symmetrix(
             standard_path,
-            use_kokkos=True,
             dtype="float64",
             streamed_edges=mode,
         )
         if mode == "factorized":
-            calculator.evaluator._set_factorized_source_strategy("tiled_coupling")
+            calculator.evaluator._set_factorized_source_strategy("serial_reference")
         atoms.calc = calculator
         outputs[mode] = (atoms.get_potential_energy(), atoms.get_forces())
 
@@ -4931,7 +5485,6 @@ def test_execution_native_receiver_matches_tiled_on_ragged_graph(
     atoms = _ragged_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
@@ -4939,13 +5492,10 @@ def test_execution_native_receiver_matches_tiled_on_ragged_graph(
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 
-    evaluator._set_factorized_source_strategy("tiled_coupling")
+    evaluator._set_factorized_source_strategy("serial_reference")
     evaluator.compute_node_energies_forces(*native_args)
     tiled = calculator._collect_mace_results(atoms, inputs)
     tiled_h1_adjoint = np.asarray(evaluator.H1_adj).copy()
-    assert evaluator.factorized_forward_coupling_workspace_bytes > 0
-    assert evaluator.factorized_reverse_coupling_workspace_bytes > 0
-    assert evaluator.factorized_coupling_workspace_bytes > 0
 
     evaluator._set_factorized_source_strategy("jit_plugin")
     evaluator._set_factorized_reverse_cache_policy("recompute")
@@ -4973,7 +5523,6 @@ def test_execution_direct_float32_repeated_and_reordered_edges_are_stable(
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
@@ -5060,13 +5609,11 @@ def test_execution_direct_float32_force_matches_finite_displacement(
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     evaluator._set_factorized_source_strategy("jit_plugin")
-    evaluator._set_factorized_direct_reverse_executor("jit")
     evaluator._set_standard_r0_executor("v2_edge16")
     reference_inputs = calculator._mace_inputs(atoms)
     token = evaluator._prepare_factorized_graph(*reference_inputs[:5])
@@ -5117,12 +5664,10 @@ def test_execution_direct_float32_force_matches_finite_displacement(
 def test_execution_direct_reenters_after_tight_budget_factorized_workspace(
     streamed_model_paths,
 ):
-    _skip_removed_observer_gradient_support()
     standard_path, _ = streamed_model_paths
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
@@ -5202,7 +5747,6 @@ def test_factorized_schedule_handles_reordered_and_repeated_edges(
     atoms = _small_structure()
     calculator = Symmetrix(
         standard_path,
-        use_kokkos=True,
         dtype="float64",
         streamed_edges="factorized",
     )

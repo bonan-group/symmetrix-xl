@@ -11,9 +11,24 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-from e3nn import o3
 
-from .execution_mh1_contract import MH1_CONTRACT_KEY, maybe_make_execution_mh1_contract
+# e3nn 0.4.x stores trusted package constants containing slices, which newer
+# PyTorch releases only unpickle inside an explicit weights-only allowlist.
+# Importing e3nn outside the allowlist raises, so the guard wraps the import and
+# degrades to a plain import on a PyTorch that predates the allowlist.
+_safe_globals = getattr(torch.serialization, "safe_globals", None)
+if _safe_globals is None:
+    from e3nn import o3
+else:
+    with _safe_globals([slice]):
+        from e3nn import o3
+
+# Keep local imports after the guarded e3nn import so package initialization
+# cannot run before the safe-globals context has loaded e3nn.
+from .mace_nonlinear_execution_contract import (  # noqa: E402
+    MH1_CONTRACT_KEY,
+    maybe_make_execution_mh1_contract,
+)
 
 
 def _tensor(value: torch.Tensor) -> dict[str, Any]:
@@ -26,6 +41,10 @@ def _tensor(value: torch.Tensor) -> dict[str, Any]:
 def _instructions(module) -> list[dict[str, Any]]:
     serialized = []
     for instruction in module.instructions:
+        if getattr(instruction, "i_in", 0) == -1:
+            # e3nn biased linears append a bias pseudo-path (i_in == -1); the
+            # bias tensor itself is serialized separately below.
+            continue
         entry = {}
         for name in (
             "i_in",
@@ -56,7 +75,7 @@ def _linear(module) -> dict[str, Any]:
 
 
 def _readout(readout) -> dict[str, Any]:
-    return {
+    output = {
         "class": type(readout).__name__,
         "linear": _linear(readout.linear) if hasattr(readout, "linear") else None,
         "linear_1": _linear(readout.linear_1) if hasattr(readout, "linear_1") else None,
@@ -68,6 +87,12 @@ def _readout(readout) -> dict[str, Any]:
         if hasattr(readout, "non_linearity")
         else None,
     }
+    # Preserve the established ordinary MH-1 JSON byte-for-byte. Backbones
+    # with a biased nonlinear readout add this third linear stage, while
+    # standard nonlinear readouts must not acquire a null field.
+    if hasattr(readout, "linear_mid"):
+        output["linear_mid"] = _linear(readout.linear_mid)
+    return output
 
 
 def extract_mace_nonlinear_head_payload(model) -> dict[str, Any]:
@@ -325,15 +350,21 @@ def extract_mace_nonlinear_data(
             ],
         }
 
-    from mace.modules.blocks import LinearReadoutBlock, NonLinearReadoutBlock
+    from mace.modules.blocks import (
+        LinearReadoutBlock,
+        NonLinearBiasReadoutBlock,
+        NonLinearReadoutBlock,
+    )
 
+    nonlinear_readout_classes = (NonLinearReadoutBlock, NonLinearBiasReadoutBlock)
     for readout in model.readouts:
-        if type(readout) not in (LinearReadoutBlock, NonLinearReadoutBlock):
+        if type(readout) not in (LinearReadoutBlock,) + nonlinear_readout_classes:
             raise RuntimeError(
-                "Native nonlinear-MACE extraction only supports LinearReadoutBlock and "
-                f"NonLinearReadoutBlock; found {type(readout).__name__}."
+                "Native nonlinear-MACE extraction only supports LinearReadoutBlock, "
+                "NonLinearReadoutBlock, and NonLinearBiasReadoutBlock; found "
+                f"{type(readout).__name__}."
             )
-        if isinstance(readout, NonLinearReadoutBlock) and not all(
+        if isinstance(readout, nonlinear_readout_classes) and not all(
             activation.f is torch.nn.functional.silu
             for activation in readout.non_linearity.acts
         ):

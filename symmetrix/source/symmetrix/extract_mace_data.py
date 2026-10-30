@@ -14,17 +14,128 @@ from mace.modules.radial import ZBLBasis
 from mace.tools.cg import U_matrix_real
 from mace.tools.scripts_utils import remove_pt_head
 
-from .execution_contract import (
+from .mace_execution_contract import (
     make_factorized_contract,
+    make_generated_m1_contract,
     make_standard_m0_contract,
     make_standard_r0_contract,
 )
+from .mace_les_schema import (
+    MACE_LES_SCHEMA,
+    MACE_LES_SCHEMA_VERSION,
+    validate_mace_les_parameters,
+)
 from .prediction_heads import PREDICTION_HEADS_SCHEMA_VERSION
-
 
 _MACE_FIELD_MODULE = "mace.modules.extensions"
 _MACE_MODELS_MODULE = "mace.modules.models"
 _OMAT24_AVG_NUM_NEIGHBORS = 61.964672446250916
+
+
+def _is_maceles(model) -> bool:
+    """Recognize only upstream classes that own an LES payload and readouts."""
+
+    return (
+        type(model).__name__ in {"MACELES", "FoundationMACELES"}
+        and hasattr(model, "les_readouts")
+        and hasattr(model, "les")
+    )
+
+
+def _extract_mace_les_parameters(model, num_channels, l_max, base_contracts):
+    """Serialize scalar MACELES charge heads without a runtime LES dependency."""
+
+    if not _is_maceles(model):
+        raise RuntimeError("LES extraction requires an official MACELES model")
+    unsupported = [
+        name
+        for name in (
+            "use_dipoles",
+            "use_quads",
+            "use_induced_charges",
+            "use_induced_dipoles",
+            "use_anisotropic_polarizability",
+            "compute_bec",
+        )
+        if bool(getattr(model, name, False))
+    ]
+    les = model.les
+    for name in (
+        "use_atomwise",
+        "use_fixed_atomic_charges",
+        "use_atomic_alpha",
+        "use_epsilon_r_scaling",
+    ):
+        if bool(getattr(les, name, False)):
+            unsupported.append(f"les.{name}")
+    if unsupported:
+        raise RuntimeError(
+            "MACELES scalar-monopole extraction does not support "
+            + ", ".join(unsupported)
+        )
+    if len(model.interactions) != 2 or len(model.les_readouts) != 2:
+        raise RuntimeError(
+            "MACELES scalar-monopole extraction requires exactly two interactions "
+            "and two LES readouts."
+        )
+
+    fuse = np.reshape(
+        model.interactions[1].linear_up.weight.numpy(force=True)
+        / np.sqrt(num_channels),
+        [l_max + 1, num_channels, num_channels],
+    )[0]
+    linear = model.les_readouts[0]
+    linear_weights = linear.linear.weight.numpy(force=True) / np.sqrt(num_channels)
+    linear_weights = np.linalg.inv(fuse) @ linear_weights
+
+    nonlinear = model.les_readouts[1]
+    nonlinear_weights_1 = nonlinear.linear_1.weight
+    nonlinear_weights_2 = nonlinear.linear_2.weight
+    if nonlinear_weights_1.numel() % num_channels != 0:
+        raise RuntimeError(
+            "The second LES readout is incompatible with model channels."
+        )
+    hidden = nonlinear_weights_1.numel() // num_channels
+    if nonlinear_weights_2.numel() != hidden:
+        raise RuntimeError("The second LES readout has inconsistent hidden dimensions.")
+
+    remove_self_interaction = getattr(
+        getattr(les, "ewald", None),
+        "remove_self_interaction",
+        getattr(les, "remove_self_interaction", True),
+    )
+    payload = {
+        "schema": MACE_LES_SCHEMA,
+        "version": MACE_LES_SCHEMA_VERSION,
+        "kind": "monopole",
+        "periodicity": "geometry",
+        "ewald": {
+            "sigma": float(les.sigma),
+            "dl": float(les.dl),
+            "remove_self_interaction": bool(remove_self_interaction),
+        },
+        "output_scale": float(getattr(model, "les_output_scale", 1.0)),
+        "mace_num_interactions": len(model.interactions),
+        "mace_num_channels": num_channels,
+        "mace_contract_fingerprints": {
+            "R0": base_contracts["R0"]["fingerprint"],
+            "M0": base_contracts["M0"]["semantic_fingerprint"],
+            "R1": base_contracts["R1"]["fingerprint"],
+        },
+        "readout_1_weights": linear_weights.tolist(),
+        "readout_2_hidden_size": hidden,
+        "readout_2_weights_1": (
+            torch.reshape(nonlinear_weights_1, (num_channels, hidden))
+            .T.numpy(force=True)
+            .flatten()
+            / np.sqrt(num_channels)
+        ).tolist(),
+        "readout_2_weights_2": (
+            nonlinear_weights_2.numpy(force=True).flatten() / np.sqrt(hidden)
+        ).tolist(),
+        "readout_2_scale_factor": float(nonlinear.non_linearity.acts[0].cst),
+    }
+    return validate_mace_les_parameters(payload)
 
 
 def _is_single_layer_training_checkpoint(value):
@@ -180,6 +291,18 @@ def _missing_mace_field_extension(exc):
     return False
 
 
+def _missing_les_conversion_dependency(exc):
+    return isinstance(exc, ModuleNotFoundError) and exc.name == "les"
+
+
+def _les_conversion_dependency_error():
+    return RuntimeError(
+        "MACELES conversion requires its training-time LES dependency; "
+        "install the 'les' package in the conversion "
+        "environment, extract the JSON model, then deploy that JSON without LES."
+    )
+
+
 def _mace_field_dependency_error():
     return RuntimeError(
         "This checkpoint is field-aware and requires "
@@ -235,6 +358,8 @@ def _load_mace_checkpoint(model_path, device):
             )
         return loaded
     except Exception as exc:
+        if _missing_les_conversion_dependency(exc):
+            raise _les_conversion_dependency_error() from exc
         if _requires_legacy_mace_field_alias(exc):
             return _load_legacy_mace_field_checkpoint(model_path, device)
         if _missing_mace_field_extension(exc):
@@ -371,7 +496,13 @@ def _extract_single_head_data(
                 "pair-splines is only available for standard MACE interactions."
             )
         from .extract_mace_nonlinear import extract_mace_nonlinear_data
+        from .extract_mace_polar import extract_mace_polar_data, is_polar_mace_model
 
+        # A PolarMACE checkpoint is the same nonlinear backbone plus the polar
+        # deltas; the family's own extractor stamps its model type and validates
+        # the polar schema, so the two families' files are never confused.
+        if is_polar_mace_model(model):
+            return extract_mace_polar_data(model, num_spline_points=num_spline_points)
         return extract_mace_nonlinear_data(model, num_spline_points=num_spline_points)
 
     if num_spline_points is None:
@@ -746,7 +877,12 @@ def _extract_single_head_data(
     output["l_max"] = l_max
     output["L_max"] = L_max
     output["num_interactions"] = num_interactions
-    output["model_type"] = "MACEField" if is_macefield else "MACE"
+    if is_macefield:
+        output["model_type"] = "MACEField"
+    elif _is_maceles(model):
+        output["model_type"] = "MACELES"
+    else:
+        output["model_type"] = "MACE"
     output["has_field_coupling"] = is_macefield
     output["first_interaction_residual"] = first_interaction_residual
     output["field_couplings"] = []
@@ -1264,6 +1400,13 @@ def _extract_single_head_data(
                     correlation=correlation,
                     monomials=M,
                 ),
+                "M1": make_generated_m1_contract(
+                    channels=num_channels,
+                    type_count=len(atomic_numbers),
+                    input_l_max=L_max,
+                    correlation=readout_correlation,
+                    monomials=output["M1_monomials"],
+                ),
                 "R0": make_standard_r0_contract(
                     channels=num_channels,
                     radial_embedding=output["compact_radial"]["networks"]["R0"][
@@ -1551,6 +1694,14 @@ def _extract_single_head_data(
             M = [list(key) for key in P_ik.keys()]
     output["M1_weights"] = C
     output["M1_monomials"] = M
+    if radial_format == "compact":
+        output["execution_contracts"]["M1"] = make_generated_m1_contract(
+            channels=num_channels,
+            type_count=len(atomic_numbers),
+            input_l_max=l_max,
+            correlation=correlation,
+            monomials=M,
+        )
 
     ### ----- H2 -----
 
@@ -1625,6 +1776,11 @@ def _extract_single_head_data(
     ).tolist()
     output["readout_2_scale_factor"] = model.readouts[1].non_linearity.acts[0].cst
 
+    if _is_maceles(model):
+        output["les"] = _extract_mace_les_parameters(
+            model, num_channels, L_max, output["execution_contracts"]
+        )
+
     return output
 
 
@@ -1640,10 +1796,12 @@ def _prediction_head_payload(data):
         )
         if data.get("has_zbl", False):
             fields += ("zbl_c",)
+        if data.get("model_type") == "MACELES":
+            fields += ("les",)
     return {name: data[name] for name in fields}
 
 
-def _extract_mh0_head_payload(model, atomic_numbers):
+def _extract_mh0_head_payload(model, atomic_numbers, base_contracts):
     num_channels = model.node_embedding.linear.irreps_out.count("0e")
     L_max = model.products[0].linear.irreps_out.lmax
     atomic_energies = [
@@ -1683,6 +1841,10 @@ def _extract_mh0_head_payload(model, atomic_numbers):
         payload["zbl_c"] = (
             model.scale_shift.scale.item() * model.pair_repulsion_fn.c.numpy(force=True)
         ).tolist()
+    if _is_maceles(model):
+        payload["les"] = _extract_mace_les_parameters(
+            model, num_channels, L_max, base_contracts
+        )
     return payload
 
 
@@ -1769,7 +1931,9 @@ def extract_mace_data(
 
             payload = extract_mace_nonlinear_head_payload(single_model)
         else:
-            payload = _extract_mh0_head_payload(single_model, atomic_numbers)
+            payload = _extract_mh0_head_payload(
+                single_model, atomic_numbers, default_data["execution_contracts"]
+            )
         if _prediction_head_payload_layout(payload, nonlinear) != expected_layout:
             raise ValueError(
                 f"Prediction head {name!r} changes the shared model topology; "

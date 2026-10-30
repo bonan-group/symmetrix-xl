@@ -15,7 +15,37 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SCHEMA = "symmetrix.rocprof-kernel-summary"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LES_CATEGORY_ORDER = (
+    "preparation",
+    "structure_factors",
+    "atom_outputs",
+    "strain",
+    "readout",
+    "assemble_maceles",
+)
+LES_CATEGORY_PATTERNS = {
+    "preparation": re.compile(
+        r"(?:LES reciprocal table|Count LES reciprocal vectors|LES periodic preparation)",
+        re.IGNORECASE,
+    ),
+    "structure_factors": re.compile(r"LES structure factors", re.IGNORECASE),
+    "atom_outputs": re.compile(r"LES (?:periodic )?atom outputs", re.IGNORECASE),
+    "strain": re.compile(r"LES .*strain", re.IGNORECASE),
+    "readout": re.compile(r"LES .*readout", re.IGNORECASE),
+    "assemble_maceles": re.compile(
+        r"(?:Compose LES|LES (?:compose|composition))", re.IGNORECASE
+    ),
+}
+DISPERSION_PATTERN = re.compile(r"(?:d3|dispersion)", re.IGNORECASE)
+
+
+def _les_display_name(category):
+    if category == "assemble_maceles":
+        return "assemble MACELES"
+    return "LES stage: " + category.replace("_", " ")
+
+
 CATEGORY_ORDER = (
     "common_geometry_harmonics",
     "common_zbl",
@@ -479,7 +509,56 @@ def read_mh1_stage_correlations(path):
     return correlations
 
 
-def summarize(path, marker_trace=None):
+def _les_summary(kernel_records, evaluation_count):
+    if evaluation_count is None:
+        return None
+    if (
+        isinstance(evaluation_count, bool)
+        or not isinstance(evaluation_count, int)
+        or evaluation_count <= 0
+    ):
+        raise AnalysisError("selected evaluation count must be a positive integer")
+    dispersion = [
+        record["name"]
+        for record in kernel_records
+        if DISPERSION_PATTERN.search(record["name"])
+    ]
+    if dispersion:
+        raise AnalysisError("selected LES-stage region contains D3/dispersion kernels")
+    result = []
+    for category in LES_CATEGORY_ORDER:
+        matches = [
+            record
+            for record in kernel_records
+            if LES_CATEGORY_PATTERNS[category].search(record["name"])
+        ]
+        calls = sum(record["calls"] for record in matches)
+        duration = sum(record["duration_ns"] for record in matches)
+        result.append(
+            {
+                "category": category,
+                "display_name": _les_display_name(category),
+                "calls": calls,
+                "duration_ns": duration,
+                "calls_per_evaluation": calls / evaluation_count,
+                "duration_ns_per_evaluation": duration / evaluation_count,
+            }
+        )
+    required = {"structure_factors", "atom_outputs", "strain"}
+    missing = [
+        record["category"]
+        for record in result
+        if record["category"] in required and record["calls"] <= 0
+    ]
+    if missing:
+        raise AnalysisError(
+            "selected region is missing steady-state LES categories: "
+            + ", ".join(missing)
+        )
+    return result
+
+
+def summarize(path, marker_trace=None, evaluation_count=None):
     """Return a JSON-serializable summary for a rocprofv3 CSV."""
     kind, rows = read_rocprof_csv(path)
     stage_correlations = (
@@ -567,7 +646,7 @@ def summarize(path, marker_trace=None):
                 ),
             }
         )
-    return {
+    result = {
         "schema": SCHEMA,
         "version": SCHEMA_VERSION,
         "source": str(Path(path).resolve()),
@@ -597,6 +676,10 @@ def summarize(path, marker_trace=None):
         },
         "kernels": kernel_records,
     }
+    if evaluation_count is not None:
+        result["selected_evaluation_count"] = evaluation_count
+        result["les_stage_categories"] = _les_summary(kernel_records, evaluation_count)
+    return result
 
 
 def format_table(summary):
@@ -670,9 +753,16 @@ def main(argv=None):
         type=Path,
         help="write the machine-readable summary to this path; use '-' for stdout",
     )
+    parser.add_argument(
+        "--evaluations",
+        type=int,
+        help="selected MACELES evaluation count used for LES-stage rates",
+    )
     arguments = parser.parse_args(argv)
     try:
-        summary = summarize(arguments.csv, arguments.marker_trace)
+        summary = summarize(
+            arguments.csv, arguments.marker_trace, arguments.evaluations
+        )
     except AnalysisError as error:
         parser.error(str(error))
     if arguments.json_output == Path("-"):

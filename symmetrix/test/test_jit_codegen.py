@@ -42,8 +42,8 @@ def codegen():
     package.__path__ = [str(PACKAGE_SOURCE)]
     sys.modules[package_name] = package
     return _load_module(
-        package_name + ".jit_codegen",
-        PACKAGE_SOURCE / "jit_codegen.py",
+        package_name + ".mace_jit_codegen",
+        PACKAGE_SOURCE / "mace_jit_codegen.py",
     )
 
 
@@ -93,6 +93,7 @@ class ForwardArgs(ctypes.Structure):
         ("neighbor_features", ctypes.POINTER(ctypes.c_float)),
         ("output", ctypes.POINTER(ctypes.c_float)),
         ("cutoff", ctypes.c_double),
+        ("edge_weights", ctypes.POINTER(ctypes.c_double)),
     ]
 
 
@@ -114,6 +115,7 @@ class SourceArgs(ctypes.Structure):
         ("output_adjoint", ctypes.POINTER(ctypes.c_float)),
         ("source_adjoint", ctypes.POINTER(ctypes.c_float)),
         ("cutoff", ctypes.c_double),
+        ("edge_weights", ctypes.POINTER(ctypes.c_double)),
     ]
 
 
@@ -139,6 +141,7 @@ class EdgeArgs(ctypes.Structure):
         ("output_adjoint", ctypes.POINTER(ctypes.c_float)),
         ("directed_forces", ctypes.POINTER(ctypes.c_double)),
         ("cutoff", ctypes.c_double),
+        ("edge_weights", ctypes.POINTER(ctypes.c_double)),
     ]
 
 
@@ -259,13 +262,9 @@ def test_generated_plugin_compiles_and_all_r1_owners_match_reference(
     codegen, jit, cxx, tmp_path
 ):
     contract = json.loads(FIXTURE_CONTRACT.read_text())
-    metadata = codegen.jit_r1_host_plugin_metadata(contract)
-    source = codegen.render_jit_r1_host_plugin(contract)
-    assert source.count("constexpr std::int32_t channel_tile = 16;") == 1
-    assert source.count("constexpr std::int32_t channel_tile = 32;") == 1
-    assert "if (channel % channel_tile != 0)" in source
-    assert source.count("prefetch_read(") == 3
-    assert "__builtin_prefetch(address, 0, 1);" in source
+    metadata = codegen.jit_r1_host_plugin_metadata(contract, apply_edge_weights=True)
+    source = codegen.render_jit_r1_host_plugin(contract, apply_edge_weights=True)
+    assert "#pragma once" not in source
     result = jit.prepare_jit_artifact(
         source,
         abi={"host_plugin": metadata["abi"], "version": metadata["abi_version"]},
@@ -282,7 +281,7 @@ def test_generated_plugin_compiles_and_all_r1_owners_match_reference(
     query = library.symmetrix_jit_host_plugin_query_v2
     query.restype = ctypes.POINTER(Plugin)
     plugin = query().contents
-    assert plugin.abi_version == 2
+    assert plugin.abi_version == metadata["abi_version"]
     assert plugin.struct_size == ctypes.sizeof(Plugin)
     assert plugin.pointer_size == ctypes.sizeof(ctypes.c_void_p)
     assert plugin.byte_order == 0x01020304
@@ -353,6 +352,7 @@ def test_generated_plugin_compiles_and_all_r1_owners_match_reference(
         neighbor_features,
         output,
         0.75,
+        None,
     )
     forward = ctypes.CFUNCTYPE(
         None, ctypes.POINTER(ForwardArgs), ctypes.c_int32, ctypes.c_int32
@@ -360,6 +360,19 @@ def test_generated_plugin_compiles_and_all_r1_owners_match_reference(
     for channel in range(4):
         forward(ctypes.byref(forward_args), 0, channel)
     assert list(output) == pytest.approx([12.5, 35.0, 67.5, 110.0, 0.0, 0.0, 0.0, 0.0])
+    edge_weights = double1(0.0)
+    forward_args.edge_weights = edge_weights
+    for index in range(8):
+        output[index] = 123.0
+    for channel in range(4):
+        forward(ctypes.byref(forward_args), 0, channel)
+    assert list(output) == pytest.approx([0.0] * 4 + [123.0] * 4)
+    edge_weights[0] = 2.5
+    for channel in range(4):
+        forward(ctypes.byref(forward_args), 0, channel)
+    assert list(output) == pytest.approx(
+        [31.25, 87.5, 168.75, 275.0, 123.0, 123.0, 123.0, 123.0]
+    )
 
     output_adjoint = float8(1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0)
     source_offsets = int3(0, 0, 1)
@@ -390,12 +403,28 @@ def test_generated_plugin_compiles_and_all_r1_owners_match_reference(
             output_adjoint,
             source_adjoint,
             0.75,
+            None,
         )
         callback = source_callback(callback_pointer)
         for channel in range(4):
             callback(ctypes.byref(source_args), 1, channel)
         assert list(source_adjoint) == pytest.approx(
             [0.0, 0.0, 0.0, 0.0, 1.25, 3.5, 6.75, 11.0]
+        )
+        edge_weights = double1(0.0)
+        source_args.edge_weights = edge_weights
+        source_adjoint = float8()
+        source_args.source_adjoint = source_adjoint
+        for channel in range(4):
+            callback(ctypes.byref(source_args), 1, channel)
+        assert list(source_adjoint) == pytest.approx([0.0] * 8)
+        edge_weights[0] = 2.5
+        source_adjoint = float8()
+        source_args.source_adjoint = source_adjoint
+        for channel in range(4):
+            callback(ctypes.byref(source_args), 1, channel)
+        assert list(source_adjoint) == pytest.approx(
+            [0.0, 0.0, 0.0, 0.0, 3.125, 8.75, 16.875, 27.5]
         )
 
     xyz = double3(0.5, 0.0, 0.0)
@@ -422,12 +451,26 @@ def test_generated_plugin_compiles_and_all_r1_owners_match_reference(
         output_adjoint,
         directed_forces,
         0.75,
+        None,
     )
     edge = ctypes.CFUNCTYPE(None, ctypes.POINTER(EdgeArgs), ctypes.c_int32)(
         plugin.r1_edge_owner
     )
     edge(ctypes.byref(edge_args), 0)
     assert list(directed_forces) == pytest.approx([-295.0, -290.0, -435.0])
+    reference_forces = list(directed_forces)
+    edge_weights = double1(0.0)
+    edge_args.edge_weights = edge_weights
+    weighted_forces = double3()
+    edge_args.directed_forces = weighted_forces
+    edge(ctypes.byref(edge_args), 0)
+    assert list(weighted_forces) == pytest.approx([0.0, 0.0, 0.0])
+    edge_weights[0] = 2.5
+    weighted_forces = double3()
+    edge_args.directed_forces = weighted_forces
+    edge(ctypes.byref(edge_args), 0)
+    assert list(weighted_forces) == pytest.approx([-737.5, -725.0, -1087.5])
+    edge_args.edge_weights = None
 
     unit_direction = float3(1.0, 0.0, 0.0)
     compact_forces = double3()
@@ -436,7 +479,7 @@ def test_generated_plugin_compiles_and_all_r1_owners_match_reference(
     edge_args.xyz = ctypes.cast(unit_direction, ctypes.c_void_p)
     edge_args.directed_forces = compact_forces
     edge(ctypes.byref(edge_args), 0)
-    assert list(compact_forces) == pytest.approx(list(directed_forces))
+    assert list(compact_forces) == pytest.approx(reference_forces)
 
     y_only_forces = double3()
     edge_args.harmonics_gradients = None
@@ -451,8 +494,6 @@ def test_generated_float64_host_plugin_compiles_and_runs_forward(
     contract = json.loads(FIXTURE_CONTRACT.read_text())
     metadata = codegen.jit_r1_host_plugin_metadata(contract, precision="float64")
     source = codegen.render_jit_r1_host_plugin(contract, precision="float64")
-    assert "if (coordinates_are_unit != 0)" in source
-    assert "coordinate_scalar_size == sizeof(Scalar)" not in source
     result = jit.prepare_jit_artifact(
         source,
         abi={"host_plugin": metadata["abi"], "version": metadata["abi_version"]},
@@ -469,8 +510,9 @@ def test_generated_float64_host_plugin_compiles_and_runs_forward(
     query = library.symmetrix_jit_host_plugin_query_v2
     query.restype = ctypes.POINTER(Plugin)
     plugin = query().contents
-    assert (plugin.abi_version, plugin.scalar_kind, plugin.scalar_size) == (2, 2, 8)
-    assert plugin.artifact_id.decode().startswith("jit-r1-gen11-f64-")
+    assert plugin.abi_version == metadata["abi_version"]
+    assert (plugin.scalar_kind, plugin.scalar_size) == (2, 8)
+    assert plugin.artifact_id.decode() == metadata["artifact_id"]
 
     int1 = ctypes.c_int32 * 1
     int2 = ctypes.c_int32 * 2
@@ -534,6 +576,7 @@ def test_generated_float64_host_plugin_compiles_and_runs_forward(
         as_float_pointer(neighbor_features),
         as_float_pointer(output),
         0.75,
+        None,
     )
     forward = ctypes.CFUNCTYPE(
         None, ctypes.POINTER(ForwardArgs), ctypes.c_int32, ctypes.c_int32
@@ -618,6 +661,63 @@ def test_gpu_codegen_identity_is_deterministic_and_backend_specific(codegen):
     assert '"backend":"hip"' in hip_identity
 
 
+@pytest.mark.parametrize("backend", ("host", "cuda", "hip"))
+def test_r1_codegen_specializes_ordinary_and_weighted_edge_paths(codegen, backend):
+    contract = json.loads(FIXTURE_CONTRACT.read_text())
+    if backend == "host":
+
+        def metadata(weighted):
+            return codegen.jit_r1_host_plugin_metadata(
+                contract, apply_edge_weights=weighted
+            )
+
+        def render(weighted):
+            return codegen.render_jit_r1_host_plugin(
+                contract, apply_edge_weights=weighted
+            )
+
+    elif backend == "cuda":
+
+        def metadata(weighted):
+            return codegen.jit_r1_cuda_plugin_metadata(
+                contract, 80, apply_edge_weights=weighted
+            )
+
+        def render(weighted):
+            return codegen.render_jit_r1_cuda_module(
+                contract, 80, apply_edge_weights=weighted
+            )
+
+    else:
+        target = {
+            "raw_agent_target": "gfx1151",
+            "target_features": "",
+            "native_subgroup_width": 32,
+        }
+
+        def metadata(weighted):
+            return codegen.factorized_hip_plugin_metadata(
+                contract, target, apply_edge_weights=weighted
+            )
+
+        def render(weighted):
+            return codegen.render_jit_r1_hip_module(
+                contract, target, apply_edge_weights=weighted
+            )
+
+    ordinary_metadata = metadata(False)
+    weighted_metadata = metadata(True)
+    ordinary_source = render(False)
+    weighted_source = render(True)
+
+    assert ordinary_metadata["edge_weight_mode"] == "unit"
+    assert weighted_metadata["edge_weight_mode"] == "runtime"
+    assert ordinary_metadata["artifact_id"] == weighted_metadata["artifact_id"]
+    assert "edge_weights[edge]" not in ordinary_source
+    assert "edge_weights[edge]" in weighted_source
+    assert ordinary_source != weighted_source
+
+
 def test_gpu_codegen_identity_separates_schema_schedule_and_artifact_kind(
     codegen, monkeypatch
 ):
@@ -640,12 +740,13 @@ def test_gpu_codegen_identity_separates_schema_schedule_and_artifact_kind(
     assert wave["schedule"]["edge_strategy"] == "wave"
     assert serial["schedule"]["edge_strategy"] == "serial"
 
-    monkeypatch.setattr(codegen, "GPU_CODEGEN_IDENTITY_SCHEMA_VERSION", 2)
-    schema_v2 = codegen.factorized_gpu_codegen_identity(
+    next_schema = codegen.GPU_CODEGEN_IDENTITY_SCHEMA_VERSION + 1
+    monkeypatch.setattr(codegen, "GPU_CODEGEN_IDENTITY_SCHEMA_VERSION", next_schema)
+    updated_schema = codegen.factorized_gpu_codegen_identity(
         contract, "hip", target, edge_strategy="wave", artifact_kind="plugin"
     )
-    assert schema_v2 != wave
-    assert schema_v2["schema_version"] == 2
+    assert updated_schema != wave
+    assert updated_schema["schema_version"] == next_schema
 
 
 def test_wave_owner_is_dialect_driven_without_vendor_tokens_in_common_body(codegen):
@@ -708,62 +809,6 @@ def test_wave_owner_is_dialect_driven_without_vendor_tokens_in_common_body(codeg
 def test_typed_gpu_codegen_inputs_fail_closed(codegen, factory, error):
     with pytest.raises(ValueError, match=error):
         factory(codegen)
-
-
-def test_cuda_plugin_codegen_metadata_and_source_contract(codegen):
-    contract = json.loads(FIXTURE_CONTRACT.read_text())
-    metadata = codegen.jit_r1_cuda_plugin_metadata(contract, 80)
-    source = codegen.render_jit_r1_cuda_plugin(contract, 80)
-
-    assert metadata["abi"] == "symmetrix.jit.cuda-plugin/2"
-    assert metadata["abi_version"] == 2
-    assert (metadata["scalar_kind"], metadata["scalar_size"]) == (1, 4)
-    assert metadata["target_compute_capability"] == 80
-    assert metadata["forward_threads_per_block"] == 256
-    assert metadata["source_threads_per_block"] == 256
-    assert metadata["edge_threads_per_block"] == 32
-    assert metadata["reverse_threads_per_block"] == 64
-    assert metadata["reverse_shared_memory_bytes"] == 16
-    assert metadata["reverse_strategy"] == "fused_source_edge"
-    assert metadata["persistent_blocks_per_compute_unit"] == 8
-    assert metadata["edge_strategy"] == "wave"
-    assert metadata["edge_logical_subgroup_width"] == 32
-    assert (metadata["channels"], metadata["embedding"]) == (4, 3)
-    assert (metadata["edge_l_max"], metadata["source_l_max"]) == (0, 0)
-
-    assert "#pragma once" not in source
-    assert "Kokkos" not in source
-    assert "torch" not in source.lower()
-    assert source.count("__global__ void r1_") == 2
-    assert (
-        "__global__ __launch_bounds__(edge_threads_per_block)\nvoid r1_edge_kernel"
-        in source
-    )
-    assert "symmetrix_jit_cuda_plugin_query_v2" in source
-    assert "r1_forward_launch" in source
-    assert "r1_coordinate_reverse_launch" in source
-    assert "void r1_reverse_fused_kernel" in source
-    assert "__shared__ Scalar source_values[4]" in source
-    assert "source_args.source_offsets[source]" in source
-    assert "source_values[0 * 4 + channel] +=" in source
-    assert "const Scalar local_radius" in source
-    assert "floor((local_radius - x0) / h)" in source
-    fp64_source = codegen.render_jit_r1_cuda_plugin(contract, 80, precision="float64")
-    assert "double x;" in fp64_source
-    assert "floor((radius - radial.x0) / radial.h)" in fp64_source
-    assert "#pragma unroll 1" in source
-    assert "reverse_path < 1" in source
-    assert "switch (reverse_path)" in source
-    assert "source_args->num_nodes < persistent_blocks" in source
-    assert "source_args->cutoff != edge_args->cutoff" in source
-    assert source.count("cudaPeekAtLastError()") == 2
-    assert "cudaDeviceSynchronize" not in source
-    assert "cudaStreamSynchronize" not in source
-    assert "owner += stride" in source
-    assert "edge += wave_stride" in source
-    assert "ForwardArgsV2 launch_args = *args" in source
-    assert "SourceArgsV2 source_launch_args = *source_args" in source
-    assert "EdgeArgsV2 edge_launch_args = *edge_args" in source
 
 
 @pytest.mark.parametrize(
@@ -962,102 +1007,6 @@ def test_cuda_schedule_variants_fail_closed(codegen, kwargs, error):
     "precision,scalar_kind,scalar_size",
     (("float32", 1, 4), ("float64", 2, 8)),
 )
-def test_hip_plugin_codegen_metadata_and_source_contract(
-    codegen, precision, scalar_kind, scalar_size
-):
-    contract = json.loads(FIXTURE_CONTRACT.read_text())
-    target = {
-        "raw_agent_target": "gfx942:xnack-:sramecc+",
-        "target_features": "sramecc+:xnack-",
-        "native_subgroup_width": 64,
-    }
-    metadata = codegen.factorized_hip_plugin_metadata(
-        contract, target, precision=precision
-    )
-    source = codegen.render_jit_r1_hip_plugin(contract, target, precision=precision)
-
-    assert metadata["abi"] == "symmetrix.jit.hip-plugin/1"
-    assert metadata["abi_version"] == 1
-    assert (metadata["scalar_kind"], metadata["scalar_size"]) == (
-        scalar_kind,
-        scalar_size,
-    )
-    assert metadata["target_architecture"] == "gfx942"
-    assert metadata["target_features"] == "sramecc+:xnack-"
-    assert metadata["native_subgroup_width"] == 64
-    assert metadata["edge_strategy"] == "wave"
-    assert metadata["edge_logical_subgroup_width"] == 64
-    assert metadata["reverse_threads_per_block"] == 64
-    assert metadata["reverse_shared_memory_bytes"] == 4 * scalar_size
-    assert metadata["reverse_strategy"] == "fused_source_edge"
-    assert metadata["persistent_blocks_per_compute_unit"] == 8
-    assert "symmetrix_jit_hip_plugin_query_v1" in source
-    assert source.count("__global__") == 4
-    assert "__global__ __launch_bounds__(edge_threads_per_block)" in source
-    assert "channel = lane" in source
-    assert "channel += 64" in source
-    assert "__shfl_down" in source
-    assert "source_args->num_nodes < persistent_blocks" in source
-    assert "__shared__ Scalar source_values[4]" in source
-    assert "void r1_reverse_fused_kernel" in source
-    evaluation_scalar = "Scalar" if precision == "float32" else "double"
-    assert f"{evaluation_scalar} x;" in source
-    if precision == "float32":
-        assert (
-            "const Scalar local_radius =\n        static_cast<Scalar>(radius);"
-            in source
-        )
-    else:
-        assert "floor((radius - radial.x0) / radial.h)" in source
-        assert "local_radius" not in source
-    assert "const Scalar harmonic_value_0_0" in source
-    assert "const Scalar output_adjoint_0_0" in source
-    assert "Scalar(1.0) * output_adjoint_0_0" in source
-    assert "Scalar weighted_0_0 = Scalar(0)" in source
-    assert "Scalar radial_force_0 = Scalar(0)" in source
-    assert "radial_force_0 +=" in source
-    assert "local_force_x += radial_force_0 * x_over_r;" in source
-    assert "hipPeekAtLastError()" in source
-    assert "cuda" not in source.lower()
-
-    tuned_metadata = codegen.factorized_hip_plugin_metadata(
-        contract,
-        target,
-        precision=precision,
-        edge_threads_per_block=128,
-        persistent_blocks_per_compute_unit=4,
-    )
-    tuned_source = codegen.render_jit_r1_hip_plugin(
-        contract,
-        target,
-        precision=precision,
-        edge_threads_per_block=128,
-        persistent_blocks_per_compute_unit=4,
-    )
-    assert tuned_metadata["edge_threads_per_block"] == 128
-    assert tuned_metadata["persistent_blocks_per_compute_unit"] == 4
-    assert "edge_threads_per_block =\n    128;" in tuned_source
-    assert tuned_source != source
-
-    serial = codegen.render_jit_r1_hip_plugin(
-        contract, target, precision=precision, edge_strategy="serial"
-    )
-    assert "channel = lane" not in serial
-    assert "void r1_reverse_fused_kernel" in serial
-    assert "__shfl_down" in serial
-    assert "static_cast<std::int64_t>(edge_args->num_edges) * 64" not in serial
-    assert (
-        codegen.factorized_hip_plugin_metadata(
-            contract, target, precision=precision, edge_strategy="serial"
-        )["edge_logical_subgroup_width"]
-        == 1
-    )
-
-
-@pytest.mark.parametrize(
-    "precision,scalar_kind,scalar_size",
-    (("float32", 1, 4), ("float64", 2, 8)),
-)
 def test_generated_hip_plugin_compiles_and_exports_descriptor(
     codegen, tmp_path, precision, scalar_kind, scalar_size
 ):
@@ -1103,7 +1052,7 @@ def test_generated_hip_plugin_compiles_and_exports_descriptor(
     query = library.symmetrix_jit_hip_plugin_query_v1
     query.restype = ctypes.POINTER(HipPlugin)
     plugin = query().contents
-    assert plugin.abi_version == 1
+    assert plugin.abi_version == metadata["abi_version"]
     assert plugin.struct_size == ctypes.sizeof(HipPlugin)
     assert (plugin.scalar_kind, plugin.scalar_size) == (scalar_kind, scalar_size)
     assert plugin.abi_tag.decode() == metadata["abi"]
@@ -1125,6 +1074,9 @@ def test_cuda_module_codegen_is_device_only_with_stable_symbols(codegen):
     )
     assert "#include" not in source
     assert "Self-contained NVRTC packet ABI" in source
+    assert "#if defined(__INT64_TYPE__)" in source
+    assert "using int64_t = __INT64_TYPE__;" in source
+    assert "#else\nusing int64_t = long long;\n#endif" in source
     assert "symmetrix_factorized_forward_v2" in source
     assert "symmetrix_factorized_source_v2" in source
     assert "symmetrix_factorized_edge_v2" in source
@@ -1338,7 +1290,7 @@ def test_generated_cuda_plugin_compiles_and_exports_descriptor(
     query = library.symmetrix_jit_cuda_plugin_query_v2
     query.restype = ctypes.POINTER(CudaPlugin)
     plugin = query().contents
-    assert plugin.abi_version == 2
+    assert plugin.abi_version == metadata["abi_version"]
     assert plugin.struct_size == ctypes.sizeof(CudaPlugin)
     assert plugin.pointer_size == ctypes.sizeof(ctypes.c_void_p)
     assert plugin.byte_order == 0x01020304

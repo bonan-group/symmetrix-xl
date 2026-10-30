@@ -1,0 +1,146 @@
+{
+  "schema": "symmetrix.fourier-d3-correctness-matrix",
+  "version": 1,
+  "axes": {
+    "precisions": [
+      "float32",
+      "float64"
+    ],
+    "cell_shapes": [
+      "orthogonal",
+      "strongly_triclinic"
+    ],
+    "spline_orders": [
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "mesh_policies": [
+      "explicit",
+      "automatic_spacing"
+    ],
+    "rank_chunks": [
+      1,
+      2,
+      3,
+      5,
+      512
+    ],
+    "updates": [
+      "atom_reorder",
+      "cell_change",
+      "species_change"
+    ],
+    "reuse_domains": [
+      "graph",
+      "decomposition",
+      "reciprocal_kernel",
+      "mesh",
+      "fft_plan"
+    ]
+  },
+  "backends": {
+    "cpu": {
+      "provider": "fftw3",
+      "qualification_status": "qualified"
+    },
+    "cuda": {
+      "provider": "cufft",
+      "qualification_status": "qualified",
+      "selector": "cuda13-sm120",
+      "device": "NVIDIA GeForce RTX 5090",
+      "driver": "610.43.02",
+      "compute_capability": "12.0",
+      "architecture": "sm120",
+      "toolkit": "13.3.73",
+      "focused_tests": {
+        "passed": 612,
+        "skipped_host_only": 7
+      },
+      "backend_fallback_count": 0
+    },
+    "hip": {
+      "provider": "hipfft",
+      "qualification_status": "unqualified_no_accessible_amd_device",
+      "reason": "rocminfo cannot open /dev/kfd in the qualification environment"
+    }
+  },
+  "thresholds": {
+    "float64": {
+      "energy_ev_per_atom": 1e-08,
+      "force_ev_per_angstrom": 1e-07,
+      "stress_ev_per_angstrom3": 1e-08,
+      "atomic_sum_ev": 1e-12
+    },
+    "float32": {
+      "energy_ev_per_atom": 0.0001,
+      "force_ev_per_angstrom": 0.001,
+      "stress_ev_per_angstrom3": 1e-05,
+      "atomic_sum_ev": 1e-06
+    }
+  },
+  "oracle_acceptance": {
+    "mesh_selection": "The smallest tested common cubic mesh that satisfies the original FP64 force target for both frozen cell shapes.",
+    "cases": [
+      {
+        "case": "orthogonal-mixed-species",
+        "cell_shape": "orthogonal",
+        "precision": "float64",
+        "mesh": [
+          72,
+          72,
+          72
+        ],
+        "spline_order": 4,
+        "rank_chunk": 512
+      },
+      {
+        "case": "triclinic-mixed-species",
+        "cell_shape": "strongly_triclinic",
+        "precision": "float64",
+        "mesh": [
+          72,
+          72,
+          72
+        ],
+        "spline_order": 4,
+        "rank_chunk": 512
+      },
+      {
+        "case": "orthogonal-mixed-species",
+        "cell_shape": "orthogonal",
+        "precision": "float32",
+        "mesh": [
+          72,
+          72,
+          72
+        ],
+        "spline_order": 4,
+        "rank_chunk": 512
+      },
+      {
+        "case": "triclinic-mixed-species",
+        "cell_shape": "strongly_triclinic",
+        "precision": "float32",
+        "mesh": [
+          72,
+          72,
+          72
+        ],
+        "spline_order": 4,
+        "rank_chunk": 512
+      }
+    ]
+  },
+  "coverage_suites": {
+    "oracle_and_fixtures": "symmetrix/test/test_fourier_d3_reference.py",
+    "decomposition": "symmetrix/test/test_fourier_d3_factors.py",
+    "coordination_endpoints": "symmetrix/test/test_fourier_d3_coordination.py",
+    "spline_normalization_self_k0_and_mesh": "symmetrix/test/test_fourier_d3_reciprocal.py",
+    "finite_difference_force_stress_and_force_sum": "symmetrix/test/test_fourier_d3_reverse.py",
+    "chunk_updates_reuse_ordering_and_lifecycle": "symmetrix/test/test_fourier_d3_evaluator.py",
+    "capability_and_provider_failures": "symmetrix/test/test_fourier_d3_capability.py"
+  }
+}

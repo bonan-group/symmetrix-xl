@@ -1,4 +1,5 @@
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -51,6 +52,70 @@ def _runtime(expected_path, loaded_path, libraries=None):
             "openblas_openmp_enabled": True,
             "openblas_openmp_runtime_compatible": True,
         },
+    }
+
+
+def _installed_operator_fixture(tmp_path):
+    from symmetrix.generated_operator_core import (
+        generated_operator_catalog,
+        generated_r0_identity,
+    )
+
+    package = tmp_path / "symmetrix"
+    artifact = package / "_operator_artifacts/r0/operator.so"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"operator")
+    identity = generated_r0_identity(
+        generation_revision=14,
+        compatibility_version=2,
+        contract_fingerprint="sha256:" + "1" * 64,
+        structure_fingerprint="sha256:" + "2" * 64,
+        precision="float64",
+        backend="host",
+        target="x86-64-v3",
+        channels=96,
+        l_max=3,
+        edge_weight_mode="weighted",
+        schedule="host-owner",
+        schedule_revision=1,
+    )
+    payload = generated_operator_catalog(
+        [
+            {
+                "operator": "R0",
+                "identity": identity,
+                "binary_format": "shared-library",
+                "installed_relative_path": "r0/operator.so",
+                "checksum": "sha256:"
+                + hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                "abi": {"tag": "symmetrix.jit.r0-host-plugin/2", "version": 2},
+                "capabilities": 1,
+                "build_provenance": {
+                    "source_content_sha256": "sha256:" + "a" * 64,
+                    "compiler_id": "GNU",
+                    "compiler_version": "12.3.0",
+                    "floating_point_policy": identity["floating_point_policy"],
+                },
+            }
+        ]
+    )
+    catalog = package / "_operator_artifacts/catalog.json"
+    catalog.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    native = package / "_native_cpu.so"
+    native.write_bytes(b"native")
+    return native, {
+        "mode": "r0",
+        "backend": "host",
+        "target": "x86-64-v3",
+        "catalog_relative_path": "_operator_artifacts/catalog.json",
+        "catalog_sha256": hashlib.sha256(catalog.read_bytes()).hexdigest(),
+        "artifact_count": 1,
+        "installed_bytes": catalog.stat().st_size + artifact.stat().st_size,
+        "source_content_sha256": "a" * 64,
+        "native_source_content_sha256": "b" * 64,
+        "compiler_id": "GNU",
+        "compiler_version": "12.3.0",
+        "build_duration_seconds": 1.25,
     }
 
 
@@ -463,7 +528,105 @@ def test_doctor_json_exit_status(monkeypatch, capsys):
     )
 
     assert cli.main(["doctor", "--json"]) == 1
-    assert json.loads(capsys.readouterr().out)["strict"] is True
+    report = json.loads(capsys.readouterr().out)
+    assert report["strict"] is True
+    assert report["r0_reporting"]["implementation"] == ["generic", "generated"]
+
+
+def test_doctor_rejects_tampered_installed_operator(monkeypatch, capsys, tmp_path):
+    import symmetrix
+
+    native_path, prebuilt = _installed_operator_fixture(tmp_path)
+    (native_path.parent / "_operator_artifacts/r0/operator.so").unlink()
+    native = SimpleNamespace(
+        __file__=str(native_path),
+        _backend_build_info=lambda: {"prebuilt_operator_artifacts": prebuilt},
+    )
+    monkeypatch.setattr(symmetrix, "load_backend", lambda *_args: native)
+    monkeypatch.setattr(symmetrix, "selected_backend", lambda: {"backend": "cpu"})
+    monkeypatch.setattr(
+        cli,
+        "openmp_runtime_diagnostics",
+        lambda strict: {
+            "status": "ok",
+            "ok": True,
+            "strict": strict,
+            "python_executable": "/python",
+            "checks": [],
+            "runtime": {},
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "fourier_d3_capability",
+        lambda _native: SimpleNamespace(to_dict=lambda: {}),
+    )
+
+    assert cli.main(["doctor", "--json"]) == 1
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "error"
+    check = next(
+        item
+        for item in report["checks"]
+        if item["name"] == "prebuilt_operator_artifacts"
+    )
+    assert check["status"] == "error"
+    assert "missing" in check["message"]
+
+
+def test_version_and_doctor_reject_symlinked_operator_data_root(
+    monkeypatch, capsys, tmp_path
+):
+    import symmetrix
+    from symmetrix import backend_loader
+
+    native_path, prebuilt = _installed_operator_fixture(tmp_path)
+    data_root = native_path.parent / "_operator_artifacts"
+    relocated_data = tmp_path / "relocated-operator-data"
+    data_root.rename(relocated_data)
+    data_root.symlink_to(relocated_data, target_is_directory=True)
+    native = SimpleNamespace(
+        __file__=str(native_path),
+        _backend_build_info=lambda: {"prebuilt_operator_artifacts": prebuilt},
+    )
+    monkeypatch.setattr(cli.importlib.metadata, "version", lambda _: "0.1.1")
+    monkeypatch.setattr(backend_loader, "available_backends", lambda _: [])
+    monkeypatch.setattr(symmetrix, "load_backend", lambda *_args: native)
+    monkeypatch.setattr(symmetrix, "selected_backend", lambda: {"backend": "cpu"})
+    monkeypatch.setattr(
+        cli,
+        "openmp_runtime_diagnostics",
+        lambda strict: {
+            "status": "ok",
+            "ok": True,
+            "strict": strict,
+            "python_executable": "/python",
+            "checks": [],
+            "runtime": {},
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "fourier_d3_capability",
+        lambda _native: SimpleNamespace(to_dict=lambda: {}),
+    )
+
+    assert cli.main(["version", "--probe", "--json"]) == 0
+    version = json.loads(capsys.readouterr().out)
+    assert version["probe_status"] == "unavailable"
+    assert "contained real path" in version["probe_error"]
+
+    assert cli.main(["doctor", "--json"]) == 1
+    doctor = json.loads(capsys.readouterr().out)
+    assert doctor["ok"] is False
+    check = next(
+        item
+        for item in doctor["checks"]
+        if item["name"] == "prebuilt_operator_artifacts"
+    )
+    assert check["status"] == "error"
+    assert "contained real path" in check["message"]
 
 
 def test_version_reports_installed_backend_provenance(monkeypatch, capsys):
@@ -494,6 +657,12 @@ def test_version_reports_installed_backend_provenance(monkeypatch, capsys):
 
     report = json.loads(capsys.readouterr().out)
     assert report["distribution_version"] == "0.1.1"
+    assert report["r0_reporting"]["implementation"] == ["generic", "generated"]
+    assert report["r0_reporting"]["artifact_origin"] == [
+        "prebuilt",
+        "cache",
+        "runtime",
+    ]
     assert report["package"].endswith("symmetrix/__init__.py")
     assert report["backends"][0]["source_commit"] == "4e080a5"
     assert report["backends"][0]["source_content_sha256"] == source_hash
@@ -524,18 +693,20 @@ def test_version_probe_falls_back_to_metadata(monkeypatch, capsys):
     assert "probe" not in report
 
 
-def test_version_probe_reports_native_runtime(monkeypatch, capsys):
+def test_version_probe_reports_native_runtime(monkeypatch, capsys, tmp_path):
     import symmetrix
     from symmetrix import backend_loader
 
+    native_path, prebuilt = _installed_operator_fixture(tmp_path)
     native = SimpleNamespace(
-        __file__="/site-packages/symmetrix/_native_cpu.so",
+        __file__=str(native_path),
         _backend_build_info=lambda: {
             "source_commit": "4e080a5",
             "source_content_sha256": "a" * 64,
             "native_source_content_sha256": "b" * 64,
             "compiler_id": "GNU",
             "compiler_version": "12.3.0",
+            "prebuilt_operator_artifacts": prebuilt,
         },
         _openmp_runtime_info=lambda: {
             "loaded_runtime_path": "/usr/lib/libgomp.so.1",
@@ -564,13 +735,43 @@ def test_version_probe_reports_native_runtime(monkeypatch, capsys):
     assert cli.main(["version", "--probe", "--json"]) == 0
 
     probe = json.loads(capsys.readouterr().out)["probe"]
-    assert probe["extension"] == "/site-packages/symmetrix/_native_cpu.so"
+    assert probe["extension"] == str(native_path)
     assert probe["build_info"]["source_commit"] == "4e080a5"
+    assert probe["build_info"]["prebuilt_operator_artifacts"]["mode"] == "r0"
+    assert (
+        probe["build_info"]["prebuilt_operator_artifacts"]["catalog_sha256"]
+        == prebuilt["catalog_sha256"]
+    )
+    assert probe["installed_operator_artifacts"]["status"] == "ok"
     assert probe["linked_libraries"] == [
         "/usr/lib/libgomp.so.1",
         "/usr/lib/libopenblas.so",
     ]
     assert probe["runtime"]["kokkos_execution_space"] == "OpenMP"
+
+
+def test_version_probe_rejects_tampered_installed_operator(
+    monkeypatch, capsys, tmp_path
+):
+    import symmetrix
+    from symmetrix import backend_loader
+
+    native_path, prebuilt = _installed_operator_fixture(tmp_path)
+    (native_path.parent / "_operator_artifacts/r0/operator.so").write_bytes(b"tampered")
+    native = SimpleNamespace(
+        __file__=str(native_path),
+        _backend_build_info=lambda: {"prebuilt_operator_artifacts": prebuilt},
+    )
+    monkeypatch.setattr(cli.importlib.metadata, "version", lambda _: "0.1.1")
+    monkeypatch.setattr(backend_loader, "available_backends", lambda _: [])
+    monkeypatch.setattr(symmetrix, "load_backend", lambda: native)
+    monkeypatch.setattr(symmetrix, "selected_backend", lambda: {"backend": "cpu"})
+
+    assert cli.main(["version", "--probe", "--json"]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["probe_status"] == "unavailable"
+    assert "checksum" in report["probe_error"] or "byte count" in report["probe_error"]
 
 
 def test_version_probe_initializes_device_backend(monkeypatch, capsys):
@@ -947,7 +1148,17 @@ def test_accelerator_doctor_human_report_is_readable(capsys):
             },
             "native": {
                 "extension": "/package/_native_cuda13_sm120.so",
-                "build_info": {"compiler_id": "GNU", "compiler_version": "15"},
+                "build_info": {
+                    "compiler_id": "GNU",
+                    "compiler_version": "15",
+                    "prebuilt_operator_artifacts": {
+                        "mode": "r0",
+                        "target": "sm_120",
+                        "artifact_count": 6,
+                        "installed_bytes": 4096,
+                        "catalog_sha256": "c" * 64,
+                    },
+                },
             },
             "runtime": {
                 "execution_space": "Cuda",
@@ -959,6 +1170,7 @@ def test_accelerator_doctor_human_report_is_readable(capsys):
     output = capsys.readouterr().out
     assert "Symmetrix accelerator diagnostic: ok" in output
     assert "Device: cuda sm120" in output
+    assert "Prebuilt operators: r0, 6 artifacts, 4096 bytes, target sm_120" in output
     assert "[OK] device_sentinel: done" in output
 
 

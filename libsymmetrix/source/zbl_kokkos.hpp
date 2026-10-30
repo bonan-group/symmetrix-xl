@@ -51,7 +51,9 @@ void compute_ZBL(
     Kokkos::View<const double*> xyz,
     Kokkos::View<double*> node_energies,
     Kokkos::View<double*> node_forces,
-    int workspace_edge_begin = 0);
+    int workspace_edge_begin = 0,
+    Kokkos::View<const double*> node_weights = {},
+    Kokkos::View<const double*> edge_weights = {});
 
 void compute_ZBL(
     const Kokkos::DefaultExecutionSpace& execution_space,
@@ -65,7 +67,9 @@ void compute_ZBL(
     Kokkos::View<const float*> unit_direction,
     Kokkos::View<double*> node_energies,
     Kokkos::View<double*> node_forces,
-    int workspace_edge_begin = 0);
+    int workspace_edge_begin = 0,
+    Kokkos::View<const double*> node_weights = {},
+    Kokkos::View<const double*> edge_weights = {});
 
 private:
 
@@ -95,7 +99,7 @@ Kokkos::View<double*, Kokkos::HostSpace> host_pair_prefactor;
 Kokkos::View<double*, Kokkos::HostSpace> host_pair_cutoff;
 int p = 1;
 
-// values taken from mace/modules/radial.py
+// values taken from the reference implementation's radial module
 static constexpr double c_exps_0 = -3.2;
 static constexpr double c_exps_1 = -0.9423;
 static constexpr double c_exps_2 = -0.4028;

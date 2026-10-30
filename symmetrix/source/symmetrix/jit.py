@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -22,6 +23,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import warnings
@@ -31,6 +33,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .generated_operator_version import JIT_GENERATION_VERSION
+else:
+    _version_spec = importlib.util.spec_from_file_location(
+        "_symmetrix_generated_operator_version",
+        Path(__file__).with_name("generated_operator_version.py"),
+    )
+    if _version_spec is None or _version_spec.loader is None:
+        raise ImportError("cannot load generated operator version")
+    _version_module = importlib.util.module_from_spec(_version_spec)
+    _version_spec.loader.exec_module(_version_module)
+    JIT_GENERATION_VERSION = _version_module.JIT_GENERATION_VERSION
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms
@@ -38,10 +53,12 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms
 
 
 CACHE_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_CACHE"
-TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_TRUST_SHARED_CACHE"
 HOST_TARGET_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_HOST_TARGET"
 HOST_FLAGS_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_HOST_FLAGS"
 HOST_FP_MODE_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_HOST_FP_MODE"
+JIT_POLICY_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_POLICY"
+JIT_REQUIRED_POLICY = "required"
+JIT_DISABLED_POLICY = "none"
 CUDA_COMPILER_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_NVCC"
 CUDA_JIT_BACKEND_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_CUDA_JIT_BACKEND"
 CUDA_R1_EDGE_STRATEGY_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_CUDA_R1_EDGE_STRATEGY"
@@ -79,13 +96,14 @@ DEFAULT_STALE_LOCK_AGE = 600.0
 DEFAULT_COMPILE_TIMEOUT = 600.0
 DEFAULT_HOST_PROBE_TIMEOUT = 30.0
 
-# Increment with libsymmetrix/source/jit_generation_version.hpp whenever
-# generated code or its native consumer changes. This is not a Git revision.
-JIT_GENERATION_VERSION = 11
+# The generation revision lives in generated_operator_version.py so the pure
+# build adapter and runtime use one value. Keep the native C++ constant in
+# libsymmetrix/source/jit_generation_version.hpp synchronized with it.
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _PUBLICATION_ID = re.compile(r"^[0-9a-f]{32}$")
 _ARTIFACT_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+_NVRTC_PRELOAD_HANDLES: dict[Path, ctypes.CDLL] = {}
 _DOTTED_COMPUTE_CAPABILITY = re.compile(r"^([1-9][0-9]*)\.([0-9])$")
 _CUDA_ARCHITECTURE = re.compile(r"^(?:sm|compute)_([1-9][0-9]*)$")
 _HIP_ARCHITECTURE = re.compile(r"^(gfx[0-9a-f]+)(?::(.*))?$", re.IGNORECASE)
@@ -104,7 +122,7 @@ _X86_64_V3_FEATURES = {
     "cmpxchg16b": frozenset(("cx16", "cmpxchg16b")),
     "f16c": frozenset(("f16c",)),
     "fma": frozenset(("fma",)),
-    "lahf/sahf": frozenset(("lahf_lm", "lahf_sahf")),
+    "lahf_sahf": frozenset(("lahf_lm", "lahf_sahf")),
     "lzcnt": frozenset(("lzcnt", "abm")),
     "movbe": frozenset(("movbe",)),
     "popcnt": frozenset(("popcnt",)),
@@ -114,6 +132,109 @@ _X86_64_V3_FEATURES = {
     "sse4.2": frozenset(("sse4_2", "sse4.2")),
     "xsave": frozenset(("xsave",)),
 }
+_X86_64_V2_FEATURES = {
+    name: _X86_64_V3_FEATURES[name]
+    for name in (
+        "cmpxchg16b",
+        "lahf_sahf",
+        "popcnt",
+        "sse3",
+        "ssse3",
+        "sse4.1",
+        "sse4.2",
+    )
+}
+
+
+def resolve_host_floating_point_policy(flags: tuple[str, ...]) -> str:
+    """Resolve the effective canonical host floating-point mode in flag order."""
+
+    policy = "strict"
+    partial_prefixes = (
+        "-fassociative-math",
+        "-fcx-limited-range",
+        "-fexcess-precision",
+        "-ffinite-math-only",
+        "-ffp-contract",
+        "-freciprocal-math",
+        "-frounding-math",
+        "-fsigned-zeros",
+        "-ftrapping-math",
+        "-funsafe-math-optimizations",
+        "-fno-associative-math",
+        "-fno-cx-limited-range",
+        "-fno-finite-math-only",
+        "-fno-reciprocal-math",
+        "-fno-rounding-math",
+        "-fno-signed-zeros",
+        "-fno-trapping-math",
+        "-fno-unsafe-math-optimizations",
+        "/fp:",
+    )
+    strict_selector_seen = False
+    for flag in flags:
+        if flag in {"-ffast-math", "-Ofast"}:
+            policy = "fast"
+            strict_selector_seen = False
+        elif flag == "-fno-fast-math":
+            policy = "strict"
+            strict_selector_seen = True
+        elif flag == "-ffp-contract=off":
+            if policy != "strict" or not strict_selector_seen:
+                raise JitError(
+                    "partial host floating-point flag '-ffp-contract=off' is only "
+                    "supported after the canonical -fno-fast-math strict selector"
+                )
+        elif flag.startswith(("-ffast-math=", "-fno-fast-math=", "-Ofast=")):
+            raise JitError(
+                f"unsupported host floating-point flag {flag!r}; use the exact "
+                "canonical -ffast-math, -fno-fast-math, or -Ofast option"
+            )
+        elif flag.startswith(partial_prefixes):
+            raise JitError(
+                f"partial host floating-point flag {flag!r} is unsupported; "
+                "select the canonical strict or fast policy with "
+                "-fno-fast-math or -ffast-math/-Ofast"
+            )
+    return policy
+
+
+_X86_64_V4_FEATURES = {
+    **_X86_64_V3_FEATURES,
+    "avx512bw": frozenset(("avx512bw",)),
+    "avx512cd": frozenset(("avx512cd",)),
+    "avx512dq": frozenset(("avx512dq",)),
+    "avx512f": frozenset(("avx512f",)),
+    "avx512vl": frozenset(("avx512vl",)),
+}
+_X86_64_LEVEL_FEATURES = {
+    "x86-64": {},
+    "x86-64-v2": _X86_64_V2_FEATURES,
+    "x86-64-v3": _X86_64_V3_FEATURES,
+    "x86-64-v4": _X86_64_V4_FEATURES,
+}
+_X86_64_COMPILER_FEATURES = {
+    alias: name
+    for name, aliases in _X86_64_V4_FEATURES.items()
+    for alias in aliases | frozenset((name,))
+}
+_X86_64_COMPILER_FEATURES.update(
+    {
+        "bmi": "bmi1",
+        "lahf-sahf": "lahf_sahf",
+        "lahf_sahf": "lahf_sahf",
+    }
+)
+_HOST_X86_FLAG_TARGET = re.compile(
+    r"^(host-isa-x86-64(?:-v[234])?)"
+    r"(?:-requires-([a-z0-9_.]+(?:\+[a-z0-9_.]+)*))?"
+    r"-flags-sha256-([0-9a-f]{64})$"
+)
+_HOST_NATIVE_FLAG_TARGET = re.compile(
+    r"^(host-native-sha256-[0-9a-f]{64})"
+    r"(?:-requires-([a-z0-9_.]+(?:\+[a-z0-9_.]+)*))?"
+    r"-flags-sha256-([0-9a-f]{64})$"
+)
 _LINUX_RENAMEAT2_SYSCALLS = {
     "x86_64": 316,
     "amd64": 316,
@@ -152,6 +273,7 @@ _KEY_INPUT_FIELDS = {
     "jit_generation_version",
     "artifact",
 }
+_TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_TRUST_SHARED_CACHE"
 
 
 class JitError(RuntimeError):
@@ -215,15 +337,17 @@ class HostJitPolicy:
 
     requested: str
     selected: str
+    effective_target: str
     flags: tuple[str, ...]
     diagnostics: tuple[str, ...]
 
     @property
     def identity(self) -> dict[str, Any]:
         return {
-            "schema": "symmetrix.jit.host-policy/1",
+            "schema": "symmetrix.jit.host-policy/2",
             "requested": self.requested,
             "selected": self.selected,
+            "effective_target": self.effective_target,
             "flags": list(self.flags),
         }
 
@@ -359,12 +483,116 @@ def jit_cache_root(
     return Path.home() / ".cache" / "symmetrix" / "execution-jit"
 
 
-def _trust_shared_cache_root() -> bool:
-    """Report whether the caller accepted artifacts owned by another user."""
+# The four observable signals of one failed direct-artifact preparation, and the
+# single cause each combination names.  Direct execution does not fall back to a
+# slower implementation, so a request without a qualified artifact fails where
+# the artifact is prepared and reports which of the four causes applies.  The
+# classification lives here, beside the cache and compiler queries it reads, so
+# every family's frontend reports the same four-way diagnostic instead of
+# re-deriving it.
+def direct_artifact_cache_entry_present(cache_key: str | None) -> bool:
+    """Report whether a preparation attempt's cache entry exists on disk."""
 
-    return os.environ.get(TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, "") not in (
-        "",
-        "0",
+    if cache_key is None:
+        return False
+    return (jit_cache_root() / "artifacts" / cache_key).is_dir()
+
+
+def direct_artifact_compiler_available(backend: str) -> bool:
+    """Report whether the artifact compiler for ``backend`` can build one."""
+
+    try:
+        if backend == "cuda":
+            return bool(jit_nvrtc_information().get("available"))
+        if backend == "hip":
+            return bool(jit_hiprtc_information().get("available"))
+        probe_compiler_identity()
+    except (JitError, OSError, ValueError):
+        return False
+    return True
+
+
+def direct_artifact_failure_cause(
+    *,
+    artifact_rejected: bool,
+    cache_entry_present: bool,
+    artifact_present: bool,
+    compiler_available: bool,
+    backend: str = "host",
+) -> tuple[str, str]:
+    """Classify a direct-mode artifact failure into its four documented causes.
+
+    The four causes are an empty artifact cache with a working compiler, an
+    unavailable compiler, a missing prebuilt artifact, and a rejected stale
+    artifact.  The inputs are the observable signals of one preparation
+    attempt; the returned code names the single applicable cause.
+    """
+
+    if artifact_rejected:
+        return (
+            "rejected-stale-artifact",
+            "the cached R1 artifact was rejected as stale",
+        )
+    if cache_entry_present and not artifact_present:
+        return (
+            "missing-artifact",
+            "the cached R1 artifact is missing from its cache entry",
+        )
+    if not compiler_available:
+        return (
+            "compilation-unavailable",
+            f"no working {backend} compiler is available in this environment",
+        )
+    return (
+        "empty-cache",
+        "the R1 artifact cache is empty and a working "
+        f"{backend} compiler is available; prepare the R1 artifact before "
+        "requesting direct execution",
+    )
+
+
+def direct_artifact_diagnostic_text(cause: tuple[str, str]) -> str:
+    """Return the diagnostic a failed direct-artifact preparation reports.
+
+    The text names the single applicable cause and enumerates all four, so a
+    reader sees both the classification and the alternatives it was chosen
+    over.
+    """
+
+    code, description = cause
+    return (
+        f"\nDirect R1 artifact diagnostic ({code}): {description}"
+        "\nDirect R1 artifact causes: (a) the R1 artifact cache is empty while a "
+        "working compiler is available; (b) no compiler is available for this "
+        "backend; (c) the requested prebuilt R1 artifact is missing; (d) a "
+        "cached R1 artifact was rejected as stale."
+    )
+
+
+def direct_artifact_diagnostic(
+    *,
+    artifact_rejected: bool,
+    cache_key: str | None,
+    artifact_path: Any | None,
+    backend: str = "host",
+) -> str:
+    """Return the four-way diagnostic of one failed artifact preparation.
+
+    The arguments are the attempt's own observable result: whether a cached
+    artifact was rejected, the cache key and artifact path it published, and
+    the backend whose compiler would have built one.  The cache and compiler
+    queries are made here, so a caller that has the result does not re-derive
+    them and every family reports the same cause for the same signals.
+    """
+
+    return direct_artifact_diagnostic_text(
+        direct_artifact_failure_cause(
+            artifact_rejected=artifact_rejected,
+            cache_entry_present=direct_artifact_cache_entry_present(cache_key),
+            artifact_present=artifact_path is not None,
+            compiler_available=direct_artifact_compiler_available(backend),
+            backend=backend,
+        )
     )
 
 
@@ -387,8 +615,7 @@ def _cache_root_metadata(path: Path) -> os.stat_result | None:
 def _artifacts_directory_metadata(path: Path) -> os.stat_result | None:
     """Return resolved artifacts-directory metadata, or None when it is absent.
 
-    Symbolic links are followed, matching the cache-root rule, so a link to a
-    directory writable by other users is rejected like that directory itself.
+    Symbolic links are followed, matching the cache-root rule.
     """
 
     try:
@@ -396,100 +623,81 @@ def _artifacts_directory_metadata(path: Path) -> os.stat_result | None:
     except FileNotFoundError:
         return None
     if not stat.S_ISDIR(metadata.st_mode):
-        raise JitError(
-            "Execution JIT artifacts path must be a private directory: it is not "
-            "a directory"
-        )
+        raise JitError("Execution JIT artifacts path is not a directory")
     return metadata
 
 
-def _ensure_private_ancestors(path: Path) -> None:
-    """Reject ancestors another user could rename or replace.
+def _trust_shared_cache() -> bool:
+    return os.environ.get(_TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE) == "1"
 
-    Sticky ancestors such as ``/tmp`` are admitted: only the owner of an entry
-    may rename it there, so the resolved root cannot be swapped between manifest
-    validation and loading.
-    """
+
+def _validate_cache_path_trust(
+    path: Path, metadata: os.stat_result, *, label: str
+) -> None:
+    """Reject cache paths that another local user can replace or modify."""
 
     if os.name != "posix":
         return
-    for ancestor in path.resolve().parents:
-        mode = stat.S_IMODE(ancestor.stat().st_mode)
-        if mode & 0o022 and not mode & 0o1000:
-            raise JitError(
-                f"Execution JIT cache ancestor {ancestor} is writable by other "
-                "users and is not sticky; cached artifacts could be replaced "
-                "before they are loaded"
-            )
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise JitError(
+            f"Execution JIT {label} {path.resolve()} is writable by group or other"
+        )
+    if metadata.st_uid != os.getuid() and not _trust_shared_cache():
+        raise JitError(
+            f"Execution JIT {label} {path.resolve()} is owned by uid "
+            f"{metadata.st_uid}; set {_TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE}=1 "
+            "to trust a read-only shared cache"
+        )
+
+
+def _validate_existing_cache_path(
+    path: Path, *, label: str, directory: bool, follow_symlink: bool = False
+) -> None:
+    try:
+        metadata = path.stat()
+    except FileNotFoundError as error:
+        raise JitError(f"Execution JIT {label} is missing") from error
+    expected = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected(metadata.st_mode):
+        raise JitError(
+            f"Execution JIT {label} is not a regular "
+            f"{'directory' if directory else 'file'}"
+        )
+    if path.is_symlink() and not follow_symlink:
+        raise JitError(f"Execution JIT {label} must not be a symbolic link")
+    _validate_cache_path_trust(path, metadata, label=label)
 
 
 def _ensure_reusable_cache_root(path: Path) -> bool:
     """Validate an existing cache root for artifact reuse.
 
-    Returns False when the root does not exist yet. Cached artifacts are
-    executable code, so a root or artifacts directory writable by other users
-    cannot be reused; reading them cannot be made safe by digest validation
-    alone. A root or artifacts directory owned by another user is reused only
-    when the caller opts in explicitly, since it means trusting code compiled by
-    that user. Ancestors of the resolved root must not be writable by others
-    unless they are sticky, because a writable ancestor could rename the root
-    away before it is loaded.
+    Returns False when the root does not exist yet. Existing executable-cache
+    directories must be owner-controlled. A foreign-owned read-only cache is
+    admitted only with the explicit shared-cache trust opt-in.
     """
 
     metadata = _cache_root_metadata(path)
     if metadata is None:
         return False
-    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o022:
-        raise JitError(
-            "Execution JIT cache root must be private: it must not be writable "
-            "by other users"
-        )
-    if (
-        hasattr(os, "getuid")
-        and metadata.st_uid != os.getuid()
-        and not _trust_shared_cache_root()
-    ):
-        raise JitError(
-            "Execution JIT cache root is owned by another user; set "
-            f"{TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE}=1 to reuse prebuilt "
-            "artifacts from a shared cache"
-        )
+    _validate_cache_path_trust(path, metadata, label="cache root")
     artifacts = _artifacts_directory_metadata(path / "artifacts")
     if artifacts is not None:
-        if os.name == "posix" and stat.S_IMODE(artifacts.st_mode) & 0o022:
-            raise JitError(
-                "Execution JIT artifacts directory must be private: it must not "
-                "be writable by other users"
-            )
-        if (
-            hasattr(os, "getuid")
-            and artifacts.st_uid != os.getuid()
-            and not _trust_shared_cache_root()
-        ):
-            raise JitError(
-                "Execution JIT artifacts directory is owned by another user; set "
-                f"{TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE}=1 to reuse prebuilt "
-                "artifacts from a shared cache"
-            )
-    _ensure_private_ancestors(path)
+        _validate_cache_path_trust(
+            path / "artifacts", artifacts, label="artifacts directory"
+        )
     return True
 
 
-def _ensure_private_cache_root(path: Path) -> None:
-    """Create or validate the same-UID trust boundary for publishing artifacts."""
+def _ensure_cache_root(path: Path, *, warn: bool = True) -> None:
+    """Create the cache root and require owner-controlled permissions."""
 
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     metadata = _cache_root_metadata(path)
     if metadata is None:  # pragma: no cover - mkdir created the directory
         raise JitError("Execution JIT cache root is unavailable")
-    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
-        raise JitError("Execution JIT cache root must be owned by the current user")
-    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o022:
-        raise JitError(
-            "Execution JIT cache root must be private: it must not be writable "
-            "by other users"
-        )
-    _ensure_private_ancestors(path)
+    if warn:
+        _validate_cache_path_trust(path, metadata, label="cache root")
 
 
 def _json_value(value: Any, path: str = "value") -> Any:
@@ -639,32 +847,43 @@ def _probe_host_compiler_flags(
     return completed.returncode == 0, diagnostic
 
 
-def _require_x86_64_v3_host() -> None:
+def _require_x86_64_host(isa: str, extra_features: Sequence[str] = ()) -> None:
+    level_features = _X86_64_LEVEL_FEATURES.get(isa)
+    if level_features is None:
+        raise JitError(f"active host cannot verify unknown required ISA {isa!r}")
     identity = detect_cpu_identity()
     machine = str(identity.get("machine", "")).lower()
     if machine not in _X86_64_MACHINE_NAMES:
         raise JitError(
-            "host JIT portable policy requires an x86-64-v3 CPU; "
+            f"host JIT target requires an {isa} CPU; "
             f"detected architecture {machine or 'unknown'!r}"
         )
 
     cpuinfo = identity.get("cpuinfo")
     raw_features = cpuinfo.get("flags", ()) if isinstance(cpuinfo, Mapping) else ()
     features = {str(feature).lower() for feature in raw_features}
-    if not features:
-        raise JitError(
-            "host JIT portable policy could not verify x86-64-v3 CPU features"
-        )
+    required = dict(level_features)
+    for feature in extra_features:
+        aliases = _X86_64_V4_FEATURES.get(feature)
+        if aliases is None:
+            raise JitError(
+                f"active host cannot verify unknown required ISA feature {feature!r}"
+            )
+        required[feature] = aliases
+    if required and not features:
+        raise JitError(f"host JIT target could not verify {isa} CPU features")
     missing = [
-        name
-        for name, aliases in _X86_64_V3_FEATURES.items()
-        if features.isdisjoint(aliases)
+        name for name, aliases in required.items() if features.isdisjoint(aliases)
     ]
     if missing:
         raise JitError(
-            "host JIT portable policy requires x86-64-v3; missing CPU features: "
+            f"host JIT target requires {isa}; missing CPU features: "
             + ", ".join(missing)
         )
+
+
+def _require_x86_64_v3_host() -> None:
+    _require_x86_64_host("x86-64-v3")
 
 
 def _host_fp_flags() -> tuple[str, tuple[str, ...]]:
@@ -674,6 +893,24 @@ def _host_fp_flags() -> tuple[str, tuple[str, ...]]:
     if mode == "ieee":
         return mode, ("-fno-fast-math", "-ffp-contract=off")
     raise JitError(f"{HOST_FP_MODE_ENVIRONMENT_VARIABLE} must be 'fast' or 'ieee'")
+
+
+def resolve_jit_policy() -> str:
+    """Return the validated ``SYMMETRIX_JIT_POLICY`` selection.
+
+    Every generated-artifact path shares this one resolver: direct execution
+    requires RTC specialization and never falls back to a compiled-free
+    strategy, so ``none`` is only a debug selector that makes the requirement
+    failure explicit.
+    """
+
+    selected = os.environ.get(JIT_POLICY_ENVIRONMENT_VARIABLE, JIT_REQUIRED_POLICY)
+    if selected not in (JIT_REQUIRED_POLICY, JIT_DISABLED_POLICY):
+        raise ValueError(
+            f"{JIT_POLICY_ENVIRONMENT_VARIABLE} must be "
+            f"'{JIT_REQUIRED_POLICY}' or '{JIT_DISABLED_POLICY}'"
+        )
+    return selected
 
 
 def resolve_host_jit_policy(
@@ -707,9 +944,14 @@ def resolve_host_jit_policy(
                 raise JitError("host JIT flags must not contain empty arguments")
         else:
             raise TypeError("host JIT flags must be a string or argument sequence")
+        if _has_host_target_arguments(selected_flags) and not _has_host_arch_argument(
+            selected_flags
+        ):
+            selected_flags = ("-march=x86-64", *selected_flags)
         return HostJitPolicy(
             requested=requested,
             selected="explicit-flags",
+            effective_target=_host_jit_effective_target(selected_flags),
             flags=selected_flags,
             diagnostics=(
                 f"host JIT policy: explicit-flags (target request: {requested})",
@@ -784,8 +1026,241 @@ def resolve_host_jit_policy(
     return HostJitPolicy(
         requested=requested,
         selected=selected,
+        effective_target=_host_jit_effective_target(selected_flags),
         flags=selected_flags,
         diagnostics=tuple(diagnostics),
+    )
+
+
+def _has_host_arch_argument(flags: Sequence[str]) -> bool:
+    lowered = tuple(str(flag).lower() for flag in flags)
+    return any(flag.startswith("-march=") for flag in lowered) or any(
+        lowered[index] in ("-target-cpu", "-xclang=-target-cpu")
+        or (
+            lowered[index] == "-xclang"
+            and index + 1 < len(lowered)
+            and lowered[index + 1] == "-target-cpu"
+        )
+        for index in range(len(lowered))
+    )
+
+
+def _has_host_target_arguments(flags: Sequence[str]) -> bool:
+    lowered = tuple(str(flag).lower() for flag in flags)
+    return any(
+        flag.startswith(("-m", "--target=")) or flag in ("--target", "-target", "-arch")
+        for flag in lowered
+    ) or any(
+        flag in ("-target-feature", "-target-cpu")
+        or flag.startswith(("-xclang=-target-feature", "-xclang=-target-cpu"))
+        or (
+            flag == "-xclang"
+            and index + 1 < len(lowered)
+            and lowered[index + 1] in ("-target-feature", "-target-cpu")
+        )
+        for index, flag in enumerate(lowered)
+    )
+
+
+def _canonical_x86_compiler_feature(value: str, *, argument: str) -> str:
+    feature = _X86_64_COMPILER_FEATURES.get(value.replace("_", "-"))
+    if feature is None:
+        raise JitError(
+            f"host JIT flag {argument!r} has an unknown or unverifiable required ISA"
+        )
+    return feature
+
+
+def _host_target_options(
+    flags: Sequence[str],
+) -> tuple[str | None, str | None, dict[str, bool]]:
+    lowered = tuple(str(flag).lower() for flag in flags)
+    march: str | None = None
+    mtune: str | None = None
+    features: dict[str, bool] = {}
+
+    def apply_clang_option(option: str, value: str) -> None:
+        nonlocal march
+        if option == "-target-cpu":
+            march = value
+            return
+        if not value.startswith(("+", "-")) or len(value) == 1:
+            raise JitError(f"host JIT Clang target feature {value!r} is malformed")
+        feature = _canonical_x86_compiler_feature(value[1:], argument=value)
+        features[feature] = value[0] == "+"
+
+    index = 0
+    while index < len(lowered):
+        flag = lowered[index]
+        if flag.startswith("-march="):
+            march = flag.removeprefix("-march=")
+        elif flag.startswith("-mtune="):
+            mtune = flag.removeprefix("-mtune=")
+        elif flag.startswith("-m"):
+            disabled = flag.startswith("-mno-")
+            spelling = flag.removeprefix("-mno-" if disabled else "-m")
+            feature = _canonical_x86_compiler_feature(spelling, argument=flag)
+            features[feature] = not disabled
+        elif flag.startswith("--target=") or flag in ("--target", "-target", "-arch"):
+            raise JitError(
+                f"host JIT flag {flag!r} has an unknown or unverifiable target architecture"
+            )
+        elif flag == "-xclang" and index + 1 < len(lowered):
+            option = lowered[index + 1]
+            if option in ("-target-feature", "-target-cpu"):
+                if index + 3 >= len(lowered) or lowered[index + 2] != "-xclang":
+                    raise JitError(f"host JIT Clang option {option!r} is incomplete")
+                value = lowered[index + 3]
+                apply_clang_option(option, value)
+                index += 3
+            elif option.startswith("-target-"):
+                raise JitError(
+                    f"host JIT Clang option {option!r} has an unknown or "
+                    "unverifiable target architecture"
+                )
+        elif flag in ("-xclang=-target-feature", "-xclang=-target-cpu"):
+            if index + 1 >= len(lowered) or not lowered[index + 1].startswith(
+                "-xclang="
+            ):
+                raise JitError(f"host JIT Clang option {flag!r} is incomplete")
+            apply_clang_option(
+                flag.removeprefix("-xclang="),
+                lowered[index + 1].removeprefix("-xclang="),
+            )
+            index += 1
+        elif flag in ("-target-feature", "-target-cpu"):
+            if index + 1 >= len(lowered):
+                raise JitError(f"host JIT Clang option {flag!r} is incomplete")
+            apply_clang_option(flag, lowered[index + 1])
+            index += 1
+        elif flag.startswith("-xclang=-target-"):
+            raise JitError(
+                f"host JIT Clang option {flag!r} has an unknown or "
+                "unverifiable target architecture"
+            )
+        index += 1
+    return march, mtune, features
+
+
+def _host_jit_effective_target(flags: Sequence[str]) -> str:
+    march, mtune, feature_states = _host_target_options(flags)
+    positive_features = {
+        feature for feature, enabled in feature_states.items() if enabled
+    }
+
+    if march not in (None, "native", *_X86_64_LEVEL_FEATURES):
+        raise JitError(f"host JIT target {march!r} has an unknown or unverifiable ISA")
+
+    canonical_options = {
+        "features": {
+            feature: feature_states[feature] for feature in sorted(feature_states)
+        },
+        "march": march,
+        "mtune": mtune,
+    }
+    encoded_flags = json.dumps(
+        canonical_options, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("ascii")
+    flags_digest = hashlib.sha256(encoded_flags).hexdigest()
+    if march == "native" or mtune == "native":
+        encoded = json.dumps(
+            detect_cpu_identity(),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        base = f"host-native-sha256-{hashlib.sha256(encoded).hexdigest()}"
+        if march == "native" and mtune is None and not feature_states:
+            return base
+        requirements = (
+            "-requires-" + "+".join(sorted(positive_features))
+            if positive_features
+            else ""
+        )
+        return f"{base}{requirements}-flags-sha256-{flags_digest}"
+    if march is not None:
+        base = f"host-isa-{march}"
+        if mtune is None and not feature_states:
+            return base
+        base_features = set(_X86_64_LEVEL_FEATURES[march])
+        extra_features = sorted(positive_features - base_features)
+        requirements = "-requires-" + "+".join(extra_features) if extra_features else ""
+        return f"{base}{requirements}-flags-sha256-{flags_digest}"
+    if mtune is not None or feature_states:
+        requirements = (
+            "-requires-" + "+".join(sorted(positive_features))
+            if positive_features
+            else ""
+        )
+        return f"host-isa-x86-64{requirements}-flags-sha256-{flags_digest}"
+    payload: dict[str, Any] = {
+        "flags": list(flags),
+    }
+    native_flags = {"-march=native", "-mcpu=native", "-mtune=native"}
+    if any(flag in native_flags for flag in flags):
+        payload["cpu"] = detect_cpu_identity()
+    encoded = json.dumps(
+        payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("ascii")
+    return f"host-sha256-{hashlib.sha256(encoded).hexdigest()}"
+
+
+def canonical_host_artifact_target(target: str) -> str:
+    """Return the canonical required-ISA namespace for a host artifact."""
+
+    value = str(target)
+    if value.startswith(("host-isa-", "host-native-sha256-", "host-sha256-")):
+        return value
+    if value == "portable":
+        return "host-isa-x86-64-v3"
+    if value in ("automatic", "native"):
+        return _host_jit_effective_target(("-march=native",))
+    if value in _X86_64_LEVEL_FEATURES:
+        return f"host-isa-{value}"
+    if _HOST_TARGET.fullmatch(value):
+        raise JitError(
+            f"host artifact target {value!r} has an unknown or unverifiable ISA"
+        )
+    raise JitError(f"invalid host artifact target {value!r}")
+
+
+def active_host_target_for(required_target: str) -> str:
+    """Independently prove the active host satisfies one canonical target."""
+
+    required = canonical_host_artifact_target(required_target)
+    simple_isa = required.removeprefix("host-isa-")
+    if simple_isa in _X86_64_LEVEL_FEATURES:
+        _require_x86_64_host(simple_isa)
+        return required
+    flag_target = _HOST_X86_FLAG_TARGET.fullmatch(required)
+    if flag_target is not None:
+        isa = flag_target.group(1).removeprefix("host-isa-")
+        extra_features = tuple(filter(None, (flag_target.group(2) or "").split("+")))
+        _require_x86_64_host(isa, extra_features)
+        return required
+    native_flag_target = _HOST_NATIVE_FLAG_TARGET.fullmatch(required)
+    if native_flag_target is not None:
+        active_native = canonical_host_artifact_target("native")
+        if active_native != native_flag_target.group(1):
+            raise JitError(
+                "active host does not match the CPU identity required by native target"
+            )
+        extra_features = tuple(
+            filter(None, (native_flag_target.group(2) or "").split("+"))
+        )
+        if extra_features:
+            _require_x86_64_host("x86-64", extra_features)
+        return required
+    if required.startswith("host-native-sha256-"):
+        active_native = canonical_host_artifact_target("native")
+        if active_native != required:
+            raise JitError(
+                "active host does not match the CPU identity required by native target"
+            )
+        return required
+    raise JitError(
+        f"active host compatibility cannot be proven for target {required!r}; "
+        "regenerate with an explicit ISA or native target"
     )
 
 
@@ -1121,6 +1596,157 @@ def detect_cpu_identity() -> dict[str, Any]:
         if first_processor:
             identity["cpuinfo"] = first_processor
     return identity
+
+
+# Every generated artifact publishes an identity envelope: the ABI tag and
+# version its compiled descriptor announces, the codegen artifact id, and the
+# fingerprint triple the native loader checks.  The envelope is the only part of
+# a family's ``*_metadata`` mapping that leaves the family -- model extents,
+# device schedules, and interaction tables stay family payload.
+#
+# The ABI layout members a descriptor also carries (``struct_size``,
+# ``pointer_size``, ``byte_order``) are emitted by the renderers and validated
+# by the native loader against the loading process, so they are not part of the
+# published envelope.
+_ABI_TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_DIGEST_PREFIX = "sha256:"
+
+# Every fingerprint member an envelope may publish.  Each one that is present
+# must be a canonical digest string.
+_ENVELOPE_FINGERPRINTS = (
+    "contract_fingerprint",
+    "generation_fingerprint",
+    "semantic_fingerprint",
+    "structure_fingerprint",
+    "runtime_layout_fingerprint",
+)
+
+
+class JitEnvelopeError(JitError):
+    """Raised when a published artifact identity envelope is incomplete."""
+
+
+@dataclass(frozen=True)
+class ArtifactEnvelope:
+    """The identity members one family's ``*_metadata`` builder publishes.
+
+    ``abi_key`` names the key the ABI tag is published under,
+    ``identity_fingerprint`` the family's own name for the fingerprint that
+    identifies the generated revision (``contract_fingerprint`` for the R1
+    families, ``generation_fingerprint`` for the non-linear and OAM families, and
+    ``None`` for the operator modules, whose ABI publishes only a structure
+    fingerprint), and ``capabilities_key`` the capability word when the family
+    publishes one.
+    """
+
+    family: str
+    abi_key: str = "abi"
+    identity_fingerprint: str | None = "contract_fingerprint"
+    semantic_fingerprint: bool = True
+    capabilities_key: str | None = None
+
+
+def validate_artifact_envelope(
+    metadata: Mapping[str, Any],
+    envelope: ArtifactEnvelope,
+) -> dict[str, Any]:
+    """Validate one published artifact identity envelope and return it.
+
+    Every ``*_metadata`` builder satisfies this validator through the
+    :class:`ArtifactEnvelope` its family declares, so the identity a cache entry
+    records, the descriptor a loader validates, and the block an operator reads
+    cannot drift apart.  The returned mapping is the envelope view: the ABI tag
+    and version, the artifact id, and the fingerprint triple, under the neutral
+    spellings every consumer shares.
+    """
+
+    if not isinstance(metadata, Mapping):
+        raise JitEnvelopeError(f"{envelope.family} artifact metadata is not a mapping")
+    abi = metadata.get(envelope.abi_key)
+    if not isinstance(abi, str) or not _ABI_TAG.fullmatch(abi):
+        raise JitEnvelopeError(
+            f"{envelope.family} artifact envelope {envelope.abi_key} is not an ABI tag"
+        )
+    abi_version = metadata.get("abi_version")
+    if (
+        isinstance(abi_version, bool)
+        or not isinstance(abi_version, int)
+        or abi_version <= 0
+    ):
+        raise JitEnvelopeError(
+            f"{envelope.family} artifact envelope abi_version is not a positive integer"
+        )
+    artifact_id = metadata.get("artifact_id")
+    if not isinstance(artifact_id, str) or not _ARTIFACT_NAME.fullmatch(artifact_id):
+        raise JitEnvelopeError(
+            f"{envelope.family} artifact envelope artifact_id is not a safe "
+            "artifact name"
+        )
+    view: dict[str, Any] = {
+        "abi": abi,
+        "abi_version": abi_version,
+        "artifact_id": artifact_id,
+    }
+    for key in _ENVELOPE_FINGERPRINTS:
+        if key not in metadata:
+            continue
+        value = metadata[key]
+        if (
+            not isinstance(value, str)
+            or not value.startswith(_DIGEST_PREFIX)
+            or len(value) == len(_DIGEST_PREFIX)
+        ):
+            raise JitEnvelopeError(
+                f"{envelope.family} artifact envelope {key} is not a canonical digest"
+            )
+        view[key] = value
+    if "structure_fingerprint" not in view:
+        raise JitEnvelopeError(
+            f"{envelope.family} artifact envelope is missing structure_fingerprint"
+        )
+    if envelope.identity_fingerprint is not None:
+        if envelope.identity_fingerprint not in _ENVELOPE_FINGERPRINTS:
+            raise JitEnvelopeError(
+                f"{envelope.family} artifact envelope names an unknown identity "
+                f"fingerprint {envelope.identity_fingerprint!r}"
+            )
+        if envelope.identity_fingerprint not in view:
+            raise JitEnvelopeError(
+                f"{envelope.family} artifact envelope is missing "
+                f"{envelope.identity_fingerprint}"
+            )
+    if envelope.semantic_fingerprint and "semantic_fingerprint" not in view:
+        raise JitEnvelopeError(
+            f"{envelope.family} artifact envelope is missing semantic_fingerprint"
+        )
+    if envelope.capabilities_key is not None:
+        capabilities = metadata.get(envelope.capabilities_key)
+        if (
+            isinstance(capabilities, bool)
+            or not isinstance(capabilities, int)
+            or capabilities <= 0
+        ):
+            raise JitEnvelopeError(
+                f"{envelope.family} artifact envelope {envelope.capabilities_key} "
+                "is not a positive capability word"
+            )
+        view[envelope.capabilities_key] = capabilities
+    return view
+
+
+def artifact_cache_inputs(
+    metadata: Mapping[str, Any],
+    envelope: ArtifactEnvelope,
+) -> dict[str, Any]:
+    """Return the ``abi`` cache-input block one published envelope maps to.
+
+    Every generated artifact reaches the cache with this block, so the ABI the
+    cache key was computed over is read from the same envelope the native loader
+    validates instead of being restated beside it.
+    """
+
+    view = validate_artifact_envelope(metadata, envelope)
+    return {"tag": view["abi"], "version": view["abi_version"]}
 
 
 def _key_inputs(
@@ -1520,6 +2146,8 @@ def _cache_key_lock(
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as stream:
+        if os.name == "posix":
+            os.fchmod(stream.fileno(), 0o600)
         json.dump(value, stream, indent=2, sort_keys=True)
         stream.write("\n")
         stream.flush()
@@ -1528,6 +2156,8 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
 
 def _write_text(path: Path, value: str) -> None:
     with path.open("w", encoding="utf-8") as stream:
+        if os.name == "posix":
+            os.fchmod(stream.fileno(), 0o600)
         stream.write(value)
         stream.flush()
         os.fsync(stream.fileno())
@@ -1535,9 +2165,92 @@ def _write_text(path: Path, value: str) -> None:
 
 def _write_bytes(path: Path, value: bytes) -> None:
     with path.open("wb") as stream:
+        if os.name == "posix":
+            os.fchmod(stream.fileno(), 0o600)
         stream.write(value)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+@contextmanager
+def _jit_compile_progress(
+    artifact_name: str,
+    compiler_label: str,
+    *,
+    enabled: bool,
+) -> Iterator[None]:
+    """Report a JIT compile on stderr without corrupting machine-readable stdout."""
+
+    if not enabled:
+        yield
+        return
+
+    stream = sys.stderr
+    message = (
+        f"Symmetrix: compiling JIT artifact {artifact_name!r} with {compiler_label}"
+    )
+    try:
+        interactive = bool(stream.isatty())
+    except (AttributeError, OSError):
+        interactive = False
+
+    if not interactive:
+        print(
+            f"{message}; this may take a few minutes on first use...",
+            file=stream,
+            flush=True,
+        )
+        try:
+            yield
+        except BaseException:
+            print(
+                f"Symmetrix: JIT compilation failed for {artifact_name!r}.",
+                file=stream,
+                flush=True,
+            )
+            raise
+        else:
+            print(
+                f"Symmetrix: finished compiling JIT artifact {artifact_name!r}.",
+                file=stream,
+                flush=True,
+            )
+        return
+
+    stop = threading.Event()
+    started = time.monotonic()
+    frames = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+    rendered_width = 0
+
+    def spin() -> None:
+        nonlocal rendered_width
+        frame_index = 0
+        while not stop.is_set():
+            line = (
+                f"{message} {frames[frame_index % len(frames)]} "
+                f"{time.monotonic() - started:.1f}s"
+            )
+            rendered_width = max(rendered_width, len(line))
+            stream.write("\r" + line)
+            stream.flush()
+            frame_index += 1
+            stop.wait(0.1)
+
+    worker = threading.Thread(target=spin, name="symmetrix-jit-progress", daemon=True)
+    worker.start()
+    succeeded = False
+    try:
+        yield
+        succeeded = True
+    finally:
+        stop.set()
+        worker.join()
+        stream.write("\r" + " " * rendered_width + "\r")
+        outcome = "finished" if succeeded else "failed"
+        stream.write(
+            f"Symmetrix: {outcome} compiling JIT artifact {artifact_name!r}.\n"
+        )
+        stream.flush()
 
 
 def _fsync_path(path: Path) -> None:
@@ -1718,10 +2431,31 @@ def _validated_entry(
     cache_key: str,
     inputs: Mapping[str, Any],
 ) -> tuple[dict[str, Any], Path, Path]:
+    if not entry.exists() and not entry.is_symlink():
+        # Preserve the cache-miss control flow: callers distinguish an absent
+        # entry from an unsafe existing entry through JitManifestError.
+        validate_jit_manifest(entry, expected_key=cache_key, expected_inputs=inputs)
+        raise AssertionError("unreachable")
+    cache_root = entry.parent.parent
+    _validate_existing_cache_path(
+        cache_root, label="cache root", directory=True, follow_symlink=True
+    )
+    _validate_existing_cache_path(
+        entry.parent, label="artifacts directory", directory=True
+    )
+    _validate_existing_cache_path(entry, label="artifact entry", directory=True)
     manifest = validate_jit_manifest(
         entry, expected_key=cache_key, expected_inputs=inputs
     )
-    return manifest, entry / manifest["artifact"], entry / "manifest.json"
+    manifest_path = entry / "manifest.json"
+    source_path = entry / manifest["source"]
+    artifact_path = entry / manifest["artifact"]
+    _validate_existing_cache_path(manifest_path, label="manifest", directory=False)
+    _validate_existing_cache_path(source_path, label="cached source", directory=False)
+    _validate_existing_cache_path(
+        artifact_path, label="compiled artifact", directory=False
+    )
+    return manifest, artifact_path, manifest_path
 
 
 def _quarantine_invalid_entry(
@@ -1781,7 +2515,7 @@ def quarantine_jit_artifact(
     if entry.name != result.cache_key or entry.parent.name != "artifacts":
         raise ValueError("JIT artifact path is outside its content-addressed entry")
     cache_root = entry.parent.parent
-    _ensure_private_cache_root(cache_root)
+    _ensure_cache_root(cache_root)
     lock_path = cache_root / "locks" / f"{result.cache_key}.lock"
     diagnostics = [f"artifact load validation failed: {reason}"]
     if result.manifest is None:
@@ -1844,6 +2578,95 @@ def remove_jit_quarantine(
     return ()
 
 
+@dataclass(frozen=True)
+class JitLoadAttempt:
+    """Terminal state of one prepare-load-quarantine retry cycle."""
+
+    status: str
+    result: JitResult | None
+    diagnostics: tuple[str, ...]
+    quarantines: tuple[JitQuarantine, ...]
+    error: BaseException | None = None
+
+    @property
+    def loaded(self) -> bool:
+        return self.status == "loaded"
+
+    @property
+    def cache_key(self) -> str | None:
+        return None if self.result is None else self.result.cache_key
+
+
+def load_validated_jit_artifact(
+    prepare,
+    load,
+    *,
+    artifact_key,
+    attempts: int = 4,
+) -> JitLoadAttempt:
+    """Prepare a generated artifact, load it, and quarantine a load-broken entry.
+
+    The cache publishes content-addressed entries atomically, so a *load*
+    failure -- a plugin whose descriptor disagrees with the manifest that
+    followed it into the cache -- is the one failure a caller can still repair:
+    the broken entry is quarantined and the artifact prepared again.  The loop
+    stops early when the same ``artifact_key`` fails twice, because re-preparing
+    a still-cached entry cannot produce a different artifact.
+
+    ``prepare`` returns one :class:`JitResult`; ``load`` receives the artifact
+    path as a string and either returns or raises.  ``artifact_key`` derives the
+    identity used to detect a repeated failure.  The caller owns the terminal
+    policy: this function never raises for an unavailable, load-broken, or
+    exhausted artifact, it reports the state and lets the caller keep its own
+    error type, diagnostics sink, and cache-key bookkeeping.
+    """
+
+    if attempts < 1:
+        raise ValueError("attempts must be a positive integer")
+
+    diagnostics: list[str] = []
+    quarantines: list[JitQuarantine] = []
+    failed: set[Any] = set()
+    result: JitResult | None = None
+    for _ in range(attempts):
+        result = prepare()
+        diagnostics.extend(result.diagnostics)
+        if not result.available or result.artifact_path is None:
+            return JitLoadAttempt(
+                "unavailable", result, tuple(diagnostics), tuple(quarantines)
+            )
+        try:
+            if result.cache_key is None or result.manifest is None:
+                raise JitError("available JIT artifact lacks validated cache metadata")
+            _validated_entry(
+                result.artifact_path.parent,
+                result.cache_key,
+                result.manifest["key_inputs"],
+            )
+            load(str(result.artifact_path))
+        except Exception as error:  # noqa: BLE001 - the caller owns the policy
+            key = artifact_key(result)
+            if key in failed:
+                return JitLoadAttempt(
+                    "load-failed",
+                    result,
+                    tuple(diagnostics),
+                    tuple(quarantines),
+                    error,
+                )
+            failed.add(key)
+            quarantine = quarantine_jit_artifact(
+                result, f"{type(error).__name__}: {error}"
+            )
+            quarantines.append(quarantine)
+            diagnostics.extend(quarantine.diagnostics)
+        else:
+            return JitLoadAttempt(
+                "loaded", result, tuple(diagnostics), tuple(quarantines)
+            )
+    return JitLoadAttempt("exhausted", result, tuple(diagnostics), tuple(quarantines))
+
+
 def _prepare_compiled_artifact(
     source: str,
     *,
@@ -1855,6 +2678,7 @@ def _prepare_compiled_artifact(
     lock_timeout: float,
     stale_lock_age: float,
     compile_timeout: float,
+    show_progress: bool,
 ) -> JitResult:
     diagnostics: list[str] = []
     command: tuple[str, ...] = ()
@@ -1888,8 +2712,8 @@ def _prepare_compiled_artifact(
         root = jit_cache_root(cache_root)
         entry, _, lock_path = _entry_paths(root, cache_key)
 
-        # Reuse only reads artifacts, so an existing shared root is admitted
-        # here; publishing below needs the same-UID trust boundary.
+        # Validate the shape of an existing shared root and surface its
+        # world-writable warning before either reuse or publication.
         _ensure_reusable_cache_root(root)
         try:
             return _result_from_entry(
@@ -1899,7 +2723,9 @@ def _prepare_compiled_artifact(
             if entry.exists() or entry.is_symlink():
                 diagnostics.append(f"invalid cached JIT entry: {exc}")
 
-        _ensure_private_cache_root(root)
+        # Existing roots were checked (and warned about) above. Avoid emitting
+        # the same world-writable warning again on the cache-miss path.
+        _ensure_cache_root(root, warn=False)
         (root / "artifacts").mkdir(parents=True, exist_ok=True, mode=0o700)
         staging_root = root / ".staging"
         staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1956,68 +2782,79 @@ def _prepare_compiled_artifact(
                 "standalone Execution JIT builds are not supported on Windows"
             )
         options = list(configuration.options)
-        if configuration.compile_source is None:
-            command = (
-                *compiler_command,
-                *options,
-                str(source_path),
-                "-o",
-                str(artifact_path),
-            )
-            diagnostics.append("compiler command: " + shlex.join(command))
-            try:
-                completed = subprocess.run(
-                    command,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=compile_timeout,
-                    env=(
-                        None
-                        if configuration.environment is None
-                        else dict(configuration.environment)
-                    ),
+        with _jit_compile_progress(
+            artifact_name,
+            configuration.compiler_label,
+            enabled=show_progress,
+        ):
+            if configuration.compile_source is None:
+                command = (
+                    *compiler_command,
+                    *options,
+                    str(source_path),
+                    "-o",
+                    str(artifact_path),
                 )
-            except subprocess.TimeoutExpired as exc:
-                for label, value in (("stdout", exc.stdout), ("stderr", exc.stderr)):
-                    if value:
-                        if isinstance(value, bytes):
-                            value = value.decode(errors="replace")
-                        diagnostics.append(f"compiler {label}:\n{value.rstrip()}")
+                diagnostics.append("compiler command: " + shlex.join(command))
+                try:
+                    completed = subprocess.run(
+                        command,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=compile_timeout,
+                        env=(
+                            None
+                            if configuration.environment is None
+                            else dict(configuration.environment)
+                        ),
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    for label, value in (
+                        ("stdout", exc.stdout),
+                        ("stderr", exc.stderr),
+                    ):
+                        if value:
+                            if isinstance(value, bytes):
+                                value = value.decode(errors="replace")
+                            diagnostics.append(f"compiler {label}:\n{value.rstrip()}")
+                    raise JitError(
+                        f"{configuration.compiler_label} compilation timed out after "
+                        f"{compile_timeout:g} seconds"
+                    ) from exc
+                if completed.stdout:
+                    diagnostics.append("compiler stdout:\n" + completed.stdout.rstrip())
+                if completed.stderr:
+                    diagnostics.append("compiler stderr:\n" + completed.stderr.rstrip())
+                if completed.returncode != 0:
+                    raise JitError(
+                        f"{configuration.compiler_label} compilation exited with "
+                        f"status {completed.returncode}"
+                    )
+            else:
+                command = (*compiler_command, *options)
+                diagnostics.append("compiler invocation: " + shlex.join(command))
+                compiled = configuration.compile_source(source, options)
+                if (
+                    not isinstance(compiled, tuple)
+                    or len(compiled) != 2
+                    or not isinstance(compiled[0], bytes)
+                    or not isinstance(compiled[1], str)
+                ):
+                    raise JitError(
+                        f"{configuration.compiler_label} returned an invalid result"
+                    )
+                _write_bytes(artifact_path, compiled[0])
+                if compiled[1]:
+                    diagnostics.append("compiler log:\n" + compiled[1].rstrip())
+            if not artifact_path.is_file() or artifact_path.stat().st_size <= 0:
                 raise JitError(
-                    f"{configuration.compiler_label} compilation timed out after "
-                    f"{compile_timeout:g} seconds"
-                ) from exc
-            if completed.stdout:
-                diagnostics.append("compiler stdout:\n" + completed.stdout.rstrip())
-            if completed.stderr:
-                diagnostics.append("compiler stderr:\n" + completed.stderr.rstrip())
-            if completed.returncode != 0:
-                raise JitError(
-                    f"{configuration.compiler_label} compilation exited with "
-                    f"status {completed.returncode}"
+                    f"{configuration.compiler_label} did not produce a non-empty "
+                    "artifact"
                 )
-        else:
-            command = (*compiler_command, *options)
-            diagnostics.append("compiler invocation: " + shlex.join(command))
-            compiled = configuration.compile_source(source, options)
-            if (
-                not isinstance(compiled, tuple)
-                or len(compiled) != 2
-                or not isinstance(compiled[0], bytes)
-                or not isinstance(compiled[1], str)
-            ):
-                raise JitError(
-                    f"{configuration.compiler_label} returned an invalid result"
-                )
-            _write_bytes(artifact_path, compiled[0])
-            if compiled[1]:
-                diagnostics.append("compiler log:\n" + compiled[1].rstrip())
-        if not artifact_path.is_file() or artifact_path.stat().st_size <= 0:
-            raise JitError(
-                f"{configuration.compiler_label} did not produce a non-empty artifact"
-            )
-        _fsync_path(artifact_path)
+            if os.name == "posix":
+                artifact_path.chmod(0o600)
+            _fsync_path(artifact_path)
 
         manifest = {
             "schema": MANIFEST_SCHEMA,
@@ -2419,6 +3256,7 @@ def prepare_execution_compiler_artifact(
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
     stale_lock_age: float = DEFAULT_STALE_LOCK_AGE,
     compile_timeout: float = DEFAULT_COMPILE_TIMEOUT,
+    show_progress: bool = False,
 ) -> JitResult:
     """Compile through a registered adapter and the common cache engine."""
 
@@ -2444,6 +3282,7 @@ def prepare_execution_compiler_artifact(
         lock_timeout=lock_timeout,
         stale_lock_age=stale_lock_age,
         compile_timeout=compile_timeout,
+        show_progress=show_progress,
     )
 
 
@@ -2458,11 +3297,13 @@ def prepare_jit_artifact(
     cxx_flags: Sequence[str] | None = (),
     host_target: str | None = None,
     host_flags: str | Sequence[str] | None = None,
+    host_policy: HostJitPolicy | None = None,
     cpu: Any | None = None,
     artifact_name: str = "execution_plugin",
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
     stale_lock_age: float = DEFAULT_STALE_LOCK_AGE,
     compile_timeout: float = DEFAULT_COMPILE_TIMEOUT,
+    show_progress: bool = False,
 ) -> JitResult:
     """Compile and cache standalone generated C++ source.
 
@@ -2471,13 +3312,35 @@ def prepare_jit_artifact(
     CPU, source, and compile-option identities to the content key. Production
     native-backed callers should pass the loaded extension's full source
     fingerprint; omission is retained for standalone compiler diagnostics.
+    A caller that embeds the effective target in generated metadata may pass a
+    previously resolved ``host_policy`` so metadata and compiler flags share
+    one decision.
     """
 
     def configure(diagnostics: list[str]) -> _CompileConfiguration:
         compiler_command, compiler = probe_compiler_identity(cxx)
         selected_cpu = detect_cpu_identity() if cpu is None else _json_value(cpu, "cpu")
         selected_build = build
-        if cxx_flags is None:
+        if host_policy is not None:
+            if (
+                cxx_flags is not None
+                or host_target is not None
+                or host_flags is not None
+            ):
+                raise ValueError(
+                    "host_policy requires cxx_flags=None and no host_target/host_flags"
+                )
+            if not isinstance(host_policy, HostJitPolicy):
+                raise TypeError("host_policy must be a HostJitPolicy")
+            policy = host_policy
+            flags = policy.flags
+            diagnostics.extend(policy.diagnostics)
+            selected_build = (
+                {**build, "host_jit_policy": policy.identity}
+                if isinstance(build, Mapping)
+                else {"request": build, "host_jit_policy": policy.identity}
+            )
+        elif cxx_flags is None:
             policy = resolve_host_jit_policy(
                 compiler_command,
                 target=host_target,
@@ -2515,6 +3378,7 @@ def prepare_jit_artifact(
         lock_timeout=lock_timeout,
         stale_lock_age=stale_lock_age,
         compile_timeout=compile_timeout,
+        show_progress=show_progress,
     )
 
 
@@ -2527,12 +3391,13 @@ def prepare_execution_cuda_jit_artifact(
     source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
     nvcc: str | os.PathLike[str] | Sequence[str] | None = None,
-    nvcc_flags: Sequence[str] = (),
+    nvcc_flags: Sequence[str] = ("--split-compile=2",),
     target: Any | None = None,
     artifact_name: str = "factorized_cuda_plugin",
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
     stale_lock_age: float = DEFAULT_STALE_LOCK_AGE,
     compile_timeout: float = DEFAULT_COMPILE_TIMEOUT,
+    show_progress: bool = False,
 ) -> JitResult:
     """Compile and cache a standalone CUDA plugin for one exact GPU target.
 
@@ -2566,6 +3431,7 @@ def prepare_execution_cuda_jit_artifact(
         lock_timeout=lock_timeout,
         stale_lock_age=stale_lock_age,
         compile_timeout=compile_timeout,
+        show_progress=show_progress,
     )
 
 
@@ -2583,6 +3449,7 @@ def prepare_execution_hip_jit_artifact(
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
     stale_lock_age: float = DEFAULT_STALE_LOCK_AGE,
     compile_timeout: float = DEFAULT_COMPILE_TIMEOUT,
+    show_progress: bool = False,
 ) -> JitResult:
     """Compile and cache a backend-tagged hipcc shared plugin."""
 
@@ -2605,6 +3472,7 @@ def prepare_execution_hip_jit_artifact(
         lock_timeout=lock_timeout,
         stale_lock_age=stale_lock_age,
         compile_timeout=compile_timeout,
+        show_progress=show_progress,
     )
 
 
@@ -2621,6 +3489,7 @@ def prepare_hiprtc_jit_artifact(
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
     stale_lock_age: float = DEFAULT_STALE_LOCK_AGE,
     compile_timeout: float = DEFAULT_COMPILE_TIMEOUT,
+    show_progress: bool = False,
     hiprtc_information: Mapping[str, Any] | None = None,
     compile_source=None,
 ) -> JitResult:
@@ -2646,6 +3515,7 @@ def prepare_hiprtc_jit_artifact(
         lock_timeout=lock_timeout,
         stale_lock_age=stale_lock_age,
         compile_timeout=compile_timeout,
+        show_progress=show_progress,
     )
 
 
@@ -2687,6 +3557,7 @@ def _discover_packaged_nvrtc_library(toolkit: str | None = None) -> str | None:
 
     configured = os.environ.get(NVRTC_LIBRARY_ENVIRONMENT_VARIABLE)
     if configured:
+        _preload_packaged_nvrtc_builtins(Path(configured))
         return configured
     import importlib.util
 
@@ -2718,7 +3589,32 @@ def _discover_packaged_nvrtc_library(toolkit: str | None = None) -> str | None:
         {candidate.resolve() for candidate in candidates},
         key=lambda path: (path.name != "libnvrtc.so", len(path.name), path.name),
     )
+    _preload_packaged_nvrtc_builtins(selected)
     os.environ[NVRTC_LIBRARY_ENVIRONMENT_VARIABLE] = str(selected)
+    return str(selected)
+
+
+def _preload_packaged_nvrtc_builtins(nvrtc_library: Path) -> str | None:
+    """Keep the wheel's sibling NVRTC builtins visible to NVRTC's own loader."""
+
+    if not nvrtc_library.is_absolute():
+        return None
+    candidates = sorted(
+        {
+            candidate.resolve()
+            for candidate in nvrtc_library.parent.glob("libnvrtc-builtins.so*")
+        },
+        key=lambda path: (len(path.name), path.name),
+    )
+    if not candidates:
+        return None
+    selected = candidates[0]
+    if selected not in _NVRTC_PRELOAD_HANDLES:
+        # NVIDIA's NVRTC wheels do not give libnvrtc a sibling RUNPATH. NVRTC
+        # later opens this library by SONAME, so retain a global handle first.
+        _NVRTC_PRELOAD_HANDLES[selected] = ctypes.CDLL(
+            str(selected), mode=ctypes.RTLD_GLOBAL
+        )
     return str(selected)
 
 
@@ -3002,12 +3898,13 @@ def prepare_nvrtc_jit_artifact(
     compute_capability: Any,
     source_content_sha256: str | None = None,
     cache_root: str | os.PathLike[str] | None = None,
-    nvrtc_options: Sequence[str] = (),
+    nvrtc_options: Sequence[str] = ("--split-compile=2",),
     target: Any | None = None,
     artifact_name: str = "factorized_cuda_module",
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
     stale_lock_age: float = DEFAULT_STALE_LOCK_AGE,
     compile_timeout: float = DEFAULT_COMPILE_TIMEOUT,
+    show_progress: bool = False,
     nvrtc_information: Mapping[str, Any] | None = None,
     compile_source=None,
 ) -> JitResult:
@@ -3017,6 +3914,27 @@ def prepare_nvrtc_jit_artifact(
     consistency but cannot interrupt a compiler call safely. It remains a hard
     deadline only for subprocess compiler backends such as nvcc.
     """
+
+    operator = build.get("operator") if isinstance(build, Mapping) else None
+    if isinstance(operator, Mapping) and operator.get("operator") == "R0":
+        policy = operator.get("floating_point_policy")
+        identity = operator.get("generated_identity")
+        if (
+            isinstance(identity, Mapping)
+            and identity.get("floating_point_policy") != policy
+        ):
+            raise ValueError(
+                "R0 floating_point_policy disagrees with generated identity"
+            )
+        uses_fast_math = "--use_fast_math" in nvrtc_options
+        if policy == "cuda-fast-math" and not uses_fast_math:
+            raise ValueError(
+                "R0 cuda-fast-math floating policy requires --use_fast_math"
+            )
+        if policy == "strict" and uses_fast_math:
+            raise ValueError("R0 strict floating policy forbids --use_fast_math")
+        if policy not in ("cuda-fast-math", "strict"):
+            raise ValueError("R0 CUDA floating_point_policy is unsupported")
 
     request = CompilerRequest(
         kind="nvrtc",
@@ -3041,6 +3959,7 @@ def prepare_nvrtc_jit_artifact(
         lock_timeout=lock_timeout,
         stale_lock_age=stale_lock_age,
         compile_timeout=compile_timeout,
+        show_progress=show_progress,
     )
 
 
@@ -3056,14 +3975,28 @@ __all__ = [
     "HIP_R1_EDGE_THREADS_ENVIRONMENT_VARIABLE",
     "HOST_FLAGS_ENVIRONMENT_VARIABLE",
     "HOST_TARGET_ENVIRONMENT_VARIABLE",
+    "JIT_DISABLED_POLICY",
     "JIT_GENERATION_VERSION",
+    "JIT_POLICY_ENVIRONMENT_VARIABLE",
+    "JIT_REQUIRED_POLICY",
     "NVRTC_LIBRARY_ENVIRONMENT_VARIABLE",
+    "ArtifactEnvelope",
     "CompilerRequest",
     "HostJitPolicy",
+    "JitEnvelopeError",
+    "JitLoadAttempt",
     "JitManifestError",
     "JitQuarantine",
     "JitResult",
+    "active_host_target_for",
+    "artifact_cache_inputs",
+    "canonical_host_artifact_target",
     "detect_cpu_identity",
+    "direct_artifact_cache_entry_present",
+    "direct_artifact_compiler_available",
+    "direct_artifact_diagnostic",
+    "direct_artifact_diagnostic_text",
+    "direct_artifact_failure_cause",
     "execution_compiler_registry",
     "execution_cuda_jit_backend_request",
     "execution_hip_jit_backend_request",
@@ -3073,6 +4006,7 @@ __all__ = [
     "jit_cache_root",
     "jit_hiprtc_information",
     "jit_nvrtc_information",
+    "load_validated_jit_artifact",
     "native_source_content_sha256",
     "normalize_execution_hip_target_identity",
     "prepare_execution_compiler_artifact",
@@ -3084,9 +4018,12 @@ __all__ = [
     "probe_compiler_identity",
     "quarantine_jit_artifact",
     "remove_jit_quarantine",
+    "resolve_host_floating_point_policy",
     "resolve_host_jit_policy",
+    "resolve_jit_policy",
     "select_execution_cuda_jit_backend",
     "select_execution_hip_jit_backend",
+    "validate_artifact_envelope",
     "validate_jit_manifest",
     "versioned_jit_artifact_name",
 ]

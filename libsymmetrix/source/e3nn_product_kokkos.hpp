@@ -19,9 +19,11 @@ public:
     int output_dimension() const { return output_dimension_; }
     bool is_agnostic() const { return agnostic; }
     bool uses_compiled_plan() const { return !compiled_blocks.empty(); }
-    bool uses_standard_host_plan() const {
-        return compiled_host_standard_term_count!=0;
-    }
+    // True when the object carries a compiled host-plan accelerator.  The plan
+    // layout and the term kernels that read it are family-private and held
+    // behind an opaque handle (see the family layer); an object that never
+    // installs one reports false and keeps the generic compiled schedule.
+    bool uses_standard_host_plan() const;
     int compiled_term_count() const { return compiled_terms; }
     Kokkos::View<const Precision***,Kokkos::LayoutRight>
     runtime_compiled_coefficients() const { return compiled_coefficients; }
@@ -86,9 +88,35 @@ private:
     Kokkos::View<int**,Kokkos::LayoutRight> compiled_angular_native_layout;
     Kokkos::View<int**,Kokkos::LayoutRight> compiled_angular_packed_layout;
     Kokkos::View<Precision***,Kokkos::LayoutRight> compiled_coefficients;
-    int compiled_host_standard_term_count=0;
-    Kokkos::View<Precision***,Kokkos::LayoutRight>
-        compiled_host_standard_weights;
+    // Compiled host-plan accelerator.  The layout is family-private and the
+    // shared class stores the handle and the neutral entry points only, so a
+    // default-constructed object and any object that does not install a plan
+    // run the generic compiled schedule.  The constructor hands the parsed plan
+    // mirrors to the family initializer, which recognizes its own frozen
+    // topology and builds the plan weights.  The two entry points stay public:
+    // nvcc rejects an extended __host__ __device__ lambda whose enclosing
+    // member function is private or protected, and the family-owned kernels
+    // these entry points call are such lambdas.
+    struct CompiledHostPlan;
+    void initialize_compiled_host_plan(
+        const Kokkos::View<int**,Kokkos::LayoutRight,Kokkos::HostSpace>&
+            term_data,
+        const Kokkos::View<int**,Kokkos::LayoutRight,Kokkos::HostSpace>&
+            component_data,
+        const Kokkos::View<Precision***,Kokkos::LayoutRight,Kokkos::HostSpace>&
+            coefficients);
+public:
+    void evaluate_compiled_host_plan(
+        std::size_t sample_count,
+        Kokkos::View<const int*> elements,
+        bool reuse_compiled_block_major_input);
+    void reverse_compiled_host_plan(
+        std::size_t sample_count,
+        Kokkos::View<const int*> elements,
+        bool emit_native_input_adjoint,
+        bool reuse_compiled_block_major_input);
+private:
+    std::shared_ptr<CompiledHostPlan> compiled_host_plan_;
     Kokkos::View<Precision***,Kokkos::LayoutRight>
         compiled_host_angular_major_input,
         compiled_host_angular_major_adjoint;

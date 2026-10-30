@@ -1,4 +1,4 @@
-"""Milestone benchmark for current, original-develop, and PyTorch MACE.
+"""Milestone benchmark for the current streamed-edge implementation and PyTorch MACE.
 
 Run one implementation per fresh process. Use ``compare`` to combine records;
 timing runs are intentionally separate from profiler captures.
@@ -202,44 +202,27 @@ def make_calculator(args):
         raise RuntimeError(
             f"Kokkos execution space is {execution_space}, expected {expected_space}"
         )
-    if args.implementation == "develop":
-        calculator = Symmetrix(
-            args.checkpoint,
-            use_kokkos=True,
-            dtype=args.dtype,
-            species=("Al", "N"),
-            head=args.head,
-        )
-        identity = {
-            "implementation": "symmetrix-origin-develop-materialized",
-            "execution_space": execution_space,
-            "execution_space_query_available": callable(execution_space_query),
-            "streamed_edges": "materialized",
-            "low_memory": False,
-        }
-    else:
-        calculator = Symmetrix(
-            args.compact_model,
-            use_kokkos=True,
-            dtype=args.dtype,
-            streamed_edges=args.mode,
-            low_memory=args.low_memory,
-            m1_polynomial_policy=args.m1_polynomial_policy,
-            neighbor_skin=args.skin,
-        )
-        identity = {
-            "implementation": "symmetrix-streamed-edge",
-            "execution_space": execution_space,
-            "streamed_edges_requested": args.mode,
-            "streamed_edges": calculator.streamed_edges,
-            "low_memory": bool(calculator.low_memory),
-            "m1_polynomial_policy_requested": args.m1_polynomial_policy,
-            "m1_polynomial_policy": calculator.m1_polynomial_policy,
-            "jit_status": calculator.jit_status,
-            "jit_compiler_backend": calculator.jit_compiler_backend,
-            "jit_artifact_id": calculator.jit_artifact_id,
-            "jit_variant_id": calculator.jit_variant_id,
-        }
+    calculator = Symmetrix(
+        args.compact_model,
+        dtype=args.dtype,
+        streamed_edges=args.mode,
+        low_memory=args.low_memory,
+        m1_polynomial_policy=args.m1_polynomial_policy,
+        neighbor_skin=args.skin,
+    )
+    identity = {
+        "implementation": "symmetrix-streamed-edge",
+        "execution_space": execution_space,
+        "streamed_edges_requested": args.mode,
+        "streamed_edges": calculator.streamed_edges,
+        "low_memory": bool(calculator.low_memory),
+        "m1_polynomial_policy_requested": args.m1_polynomial_policy,
+        "m1_polynomial_policy": calculator.m1_polynomial_policy,
+        "jit_status": calculator.jit_status,
+        "jit_compiler_backend": calculator.jit_compiler_backend,
+        "jit_artifact_id": calculator.jit_artifact_id,
+        "jit_variant_id": calculator.jit_variant_id,
+    }
     native_path = Path(native.__file__).resolve()
     identity["native_extension"] = str(native_path)
     identity["native_extension_sha256"] = sha256_file(native_path)
@@ -390,7 +373,7 @@ def run(args) -> int:
     rendered = json.dumps(report, indent=2, sort_keys=True)
     args.output.write_text(rendered + "\n")
     print(rendered)
-    if args.implementation in ("current", "develop"):
+    if args.implementation == "current":
         del calculator
         finalize_symmetrix_runtime()
     return 0
@@ -457,7 +440,7 @@ def parser():
     commands = root.add_subparsers(dest="command", required=True)
     run_parser = commands.add_parser("run")
     run_parser.add_argument(
-        "--implementation", choices=("current", "develop", "pytorch"), required=True
+        "--implementation", choices=("current", "pytorch"), required=True
     )
     run_parser.add_argument(
         "--pytorch-backend", choices=("e3nn", "cueq"), default="e3nn"

@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import io
 import json
@@ -6,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import zipfile
 from dataclasses import replace
 from pathlib import Path
@@ -25,11 +27,15 @@ build_lammps = importlib.import_module("_symmetrix_build.lammps_build")
 build_manifest = importlib.import_module("_symmetrix_build.manifest")
 build_matrix = importlib.import_module("_symmetrix_build.matrix")
 build_package_identity = importlib.import_module("_symmetrix_build.package_identity")
+build_prebuilt_operator = importlib.import_module(
+    "_symmetrix_build.prebuilt_operator_artifacts"
+)
 build_python = importlib.import_module("_symmetrix_build.python_build")
 build_sdist = importlib.import_module("_symmetrix_build.sdist_build")
 build_source_provenance = importlib.import_module("_symmetrix_build.source_provenance")
 build_targets = importlib.import_module("_symmetrix_build.targets")
 build_wheel_audit = importlib.import_module("_symmetrix_build.wheel_audit")
+release_check = importlib.import_module("check_release_metadata")
 
 BuildError = build_command.BuildError
 CommandResult = build_command.CommandResult
@@ -491,8 +497,12 @@ def test_matrix_child_commands_forward_openblas_root_for_cpu_targets(tmp_path):
         wheel_directory=tmp_path / "dist",
         build_root=tmp_path / "build",
         openblas_root=Path("/opt/openblas"),
+        prebuilt_operator_artifacts="r0",
+        prebuilt_oam_artifacts="known",
     ):
         assert command[command.index("--openblas-root") + 1] == "/opt/openblas"
+        assert command[command.index("--prebuilt-operator-artifacts") + 1] == "r0"
+        assert command[command.index("--prebuilt-oam-artifacts") + 1] == "known"
 
     for command in build_matrix.child_commands(
         cuda_spec,
@@ -951,6 +961,18 @@ def test_python_cmake_definitions_match_target(backend, target, expected):
     assert cmake_definitions(_manifest(backend, target))[expected[0]] == expected[1]
 
 
+@pytest.mark.parametrize(
+    ("backend", "target", "compiler_target"),
+    (("cuda", "sm120", "sm_120"), ("hip", "gfx1151", "gfx1151")),
+)
+def test_python_cmake_definitions_forward_exact_device_compiler_target(
+    backend, target, compiler_target
+):
+    definitions = cmake_definitions(_manifest(backend, target))
+
+    assert definitions["SYMMETRIX_DEVICE_COMPILER_TARGET"] == compiler_target
+
+
 @pytest.mark.parametrize(("backend", "target"), (("cuda", "sm120"), ("hip", "gfx1151")))
 def test_gpu_definitions_disable_native_host_architecture(backend, target):
     definitions = cmake_definitions(_manifest(backend, target))
@@ -1038,6 +1060,7 @@ def test_lammps_cmake_definitions_select_mkl_sequential(tmp_path):
         _manifest("cpu", "native"),
         blas_policy="mkl_sequential",
         blas_root="/opt/intel/oneapi/mkl/latest",
+        particle_mesh_policy="off",
     )
 
     definitions = lammps_cmake_definitions(
@@ -1052,6 +1075,7 @@ def test_lammps_cmake_definitions_select_mkl_sequential(tmp_path):
     assert definitions["CMAKE_Fortran_COMPILER"] == "/usr/bin/gfortran"
     assert definitions["MKLROOT"] == "/opt/intel/oneapi/mkl/latest"
     assert definitions["CMAKE_INSTALL_RPATH"] == ("/opt/intel/oneapi/mkl/latest/lib")
+    assert definitions["SYMMETRIX_PARTICLE_MESH"] == "OFF"
 
 
 def test_lammps_cmake_definitions_select_explicit_openblas(tmp_path):
@@ -1113,7 +1137,7 @@ def test_gpu_wheel_project_owns_no_frontend_files(tmp_path):
         "Architecture-qualified Symmetrix native backend"
     )
     assert metadata["project"]["dependencies"] == [
-        "symmetrix-xl==0.1.1",
+        f"symmetrix-xl=={build_python._frontend_version(REPOSITORY_ROOT / 'symmetrix')}",
         "nvidia-cuda-runtime>=13,<14",
         "nvidia-cuda-nvrtc>=13,<14",
         "nvidia-cublas>=13,<14",
@@ -1148,13 +1172,161 @@ def test_wheel_build_redacts_private_build_paths(tmp_path):
     )
 
 
+def test_full_operator_prebuild_is_manifest_tracked_and_forwarded(tmp_path):
+    manifest = replace(
+        _manifest("cpu", "x86-64-v3"), prebuilt_operator_artifacts="full"
+    )
+
+    invocation = python_build_invocation(
+        manifest,
+        repo_root=REPOSITORY_ROOT,
+        operation="wheel",
+        build_root=tmp_path / "build",
+        wheel_directory=tmp_path / "dist",
+    )
+
+    assert manifest.to_dict()["prebuilt_operator_artifacts"] == "full"
+    assert (
+        "--config-settings=cmake.define.SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS=full"
+        in invocation.command
+    )
+
+
+def test_known_oam_prebuild_is_manifest_tracked_and_forwarded(tmp_path):
+    manifest = replace(_manifest("cpu", "x86-64-v3"), prebuilt_oam_artifacts="known")
+
+    invocation = python_build_invocation(
+        manifest,
+        repo_root=REPOSITORY_ROOT,
+        operation="wheel",
+        build_root=tmp_path / "build",
+        wheel_directory=tmp_path / "dist",
+    )
+
+    assert manifest.to_dict()["prebuilt_oam_artifacts"] == "known"
+    assert (
+        "--config-settings=cmake.define.SYMMETRIX_PREBUILT_OAM_ARTIFACTS=known"
+        in invocation.command
+    )
+
+
+def test_publication_builds_pin_r0_until_full_budgets_are_accepted():
+    publication_builds = (
+        "tools/build_cpu_manylinux_in_container.sh",
+        "tools/build_cuda_manylinux_in_container.sh",
+        ".github/workflows/release-backend-wheels.yaml",
+    )
+
+    for relative_path in publication_builds:
+        source = (REPOSITORY_ROOT / relative_path).read_text()
+        assert "--prebuilt-operator-artifacts r0" in source, relative_path
+        assert "--prebuilt-oam-artifacts known" in source, relative_path
+        assert "--prebuilt-operator-artifacts full" not in source, relative_path
+
+
+def test_avx512_release_audits_and_probes_repaired_wheel_before_upload():
+    source = (
+        REPOSITORY_ROOT / ".github/workflows/release-backend-wheels.yaml"
+    ).read_text()
+
+    repair = source.index("- name: Repair the wheel to manylinux")
+    audit = source.index("- name: Audit repaired wheel")
+    install = source.index("- name: Install repaired wheel and prove metadata")
+    probe = source.index("- name: Probe AVX-512 runtime")
+    upload = source.index("- name: Upload wheel artifact")
+    assert repair < audit < install < probe < upload
+
+    audit_step = source[audit:install]
+    assert "repaired_wheels=(dist-repaired/*.whl)" in audit_step
+    assert 'tools/check_wheel_contents.py "${repaired_wheels[0]}"' in audit_step
+    assert '-m auditwheel show "${repaired_wheels[0]}"' in audit_step
+
+    install_step = source[install:probe]
+    assert "pip install --no-deps dist-repaired/*.whl" in install_step
+    assert 'dist.locate_file("symmetrix_backend_cpu_avx512")' in install_step
+    assert 'package_root / "_operator_artifacts/catalog.json"' in install_step
+    assert "importlib.import_module" not in install_step
+    assert "_backend_build_info" not in install_step
+    assert "_init_kokkos" not in install_step
+    assert "objdump -d" in install_step
+
+    probe_step = source[probe:upload]
+    for flag in ("avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"):
+        assert flag in probe_step
+    assert "missing_flags" in probe_step
+    assert probe_step.index('if [ "${#missing_flags[@]}" -ne 0 ]') < (
+        probe_step.index("importlib.import_module")
+    )
+    assert "_native_cpu_avx512" in probe_step
+    assert "_backend_build_info" in probe_step
+    assert "_init_kokkos" in probe_step
+
+    upload_step = source[upload:]
+    assert "path: dist-repaired/*.whl" in upload_step
+
+
 def test_wheel_content_audit_accepts_release_payload(tmp_path):
     wheel = tmp_path / "safe.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr("symmetrix/__init__.py", '__version__ = "0.1.1"\n')
+        archive.writestr("symmetrix/__init__.py", '__version__ = "0.2.0"\n')
         archive.writestr("symmetrix/_native.so", b"/usr/src/symmetrix-xl/source.cpp")
+        archive.writestr(
+            "symmetrix/_backend_cpu.json",
+            json.dumps(
+                {
+                    "distribution": "symmetrix-xl",
+                    "frontend_version": "0.2.0",
+                    "source_commit": "a" * 40,
+                    "source_content_sha256": "b" * 64,
+                    "native_source_content_sha256": "c" * 64,
+                    "source_dirty": False,
+                }
+            ),
+        )
+        archive.writestr(
+            "symmetrix_xl-0.2.0.dist-info/METADATA",
+            "Metadata-Version: 2.4\nName: symmetrix-xl\nVersion: 0.2.0\n",
+        )
 
     audit_wheel(wheel)
+
+
+def test_cpu_backend_descriptor_serializes_source_dirty_as_json_boolean():
+    repository = Path(__file__).resolve().parents[2]
+    template = (repository / "symmetrix/source/cpp/backend_cpu.json.in").read_text()
+    cmake = (repository / "symmetrix/CMakeLists.txt").read_text()
+
+    assert '"source_dirty": @SYMMETRIX_BUILD_SOURCE_DIRTY_JSON@' in template
+    assert "set(SYMMETRIX_BUILD_SOURCE_DIRTY_JSON true)" in cmake
+    assert "set(SYMMETRIX_BUILD_SOURCE_DIRTY_JSON false)" in cmake
+
+
+def test_wheel_content_audit_rejects_backend_version_mismatch(tmp_path):
+    wheel = tmp_path / "mismatch.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "symmetrix_backend_cuda13_sm120/backend.json",
+            json.dumps(
+                {
+                    "distribution": "symmetrix-xl-cuda13-sm120",
+                    "frontend_version": "0.1.1",
+                    "source_commit": "a" * 40,
+                    "source_content_sha256": "b" * 64,
+                    "native_source_content_sha256": "c" * 64,
+                    "source_dirty": False,
+                }
+            ),
+        )
+        archive.writestr(
+            "symmetrix_xl_cuda13_sm120-0.2.0.dist-info/METADATA",
+            "Metadata-Version: 2.4\n"
+            "Name: symmetrix-xl-cuda13-sm120\n"
+            "Version: 0.2.0\n"
+            "Requires-Dist: symmetrix-xl==0.2.0\n",
+        )
+
+    with pytest.raises(BuildError, match="frontend_version does not match"):
+        audit_wheel(wheel)
 
 
 @pytest.mark.parametrize(
@@ -1177,6 +1349,280 @@ def test_wheel_content_audit_rejects_private_payload(
         audit_wheel(wheel)
 
 
+def test_wheel_content_audit_rejects_absolute_operator_catalog_paths(tmp_path):
+    wheel = tmp_path / "unsafe.whl"
+    catalog = _valid_host_operator_catalog(b"operator")
+    catalog["artifacts"][0]["installed_relative_path"] = "/build/operator.so"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "symmetrix/_operator_artifacts/catalog.json", json.dumps(catalog)
+        )
+
+    with pytest.raises(BuildError, match="installed_relative_path"):
+        audit_wheel(wheel)
+
+
+def _valid_host_operator_catalog(binary=b"not an ELF shared library"):
+    core = importlib.import_module("symmetrix.generated_operator_core")
+    identity = core.generated_r0_identity(
+        generation_revision=14,
+        compatibility_version=2,
+        contract_fingerprint="sha256:" + "1" * 64,
+        structure_fingerprint="sha256:" + "2" * 64,
+        precision="float64",
+        backend="host",
+        target="x86-64-v3",
+        channels=96,
+        l_max=3,
+        edge_weight_mode="weighted",
+        schedule="host-owner",
+        schedule_revision=1,
+    )
+    return {
+        "schema": "symmetrix.generated-operator-catalog/1",
+        "artifacts": [
+            {
+                "operator": "R0",
+                "identity": identity,
+                "binary_format": "shared-library",
+                "installed_relative_path": "r0/operator.so",
+                "checksum": "sha256:" + hashlib.sha256(binary).hexdigest(),
+                "abi": {"tag": "symmetrix.jit.r0-host-plugin/2", "version": 2},
+                "capabilities": 1,
+                "build_provenance": {
+                    "source_content_sha256": "sha256:" + "a" * 64,
+                    "compiler_id": "GNU",
+                    "compiler_version": "15.2.0",
+                    "floating_point_policy": "strict",
+                },
+            }
+        ],
+    }
+
+
+def _write_cuda_oam_wheel(tmp_path, *, mutate=None):
+    metadata = tmp_path / "oam.json"
+    source = tmp_path / "oam.cu"
+    manifest = tmp_path / "manifest.json"
+    binary = tmp_path / "plugin.cubin"
+    started = tmp_path / "started-ns"
+    catalog_path = tmp_path / "catalog.json"
+    build_prebuilt_operator.render_foundation_oam_artifact(
+        oam_manifest_path=(
+            REPOSITORY_ROOT
+            / "symmetrix/source/symmetrix/foundation_oam_architectures.json"
+        ),
+        architecture_id="oam-s-v0.1",
+        backend="cuda",
+        target="sm_120",
+        precision="float32",
+        source_content_sha256="b" * 64,
+        compiler_id="NVIDIA",
+        compiler_version="13.3",
+        source_path=source,
+        metadata_path=metadata,
+        companion_manifest_path=manifest,
+    )
+    binary.write_bytes(b"precompiled-cubin")
+    started.write_text(f"{time.time_ns()}\n")
+    build_prebuilt_operator.write_installed_operator_catalog(
+        artifacts=[
+            (
+                metadata,
+                binary,
+                "oam/fixture/plugin.cubin",
+                started,
+                manifest,
+                "oam/fixture/manifest.json",
+            )
+        ],
+        catalog_path=catalog_path,
+        header_path=tmp_path / "build_info.hpp",
+        mode="oam",
+        backend="cuda",
+        target="sm_120",
+        source_content_sha256="b" * 64,
+        native_source_content_sha256="c" * 64,
+        compiler_id="NVIDIA",
+        compiler_version="13.3",
+    )
+    members = {
+        "symmetrix_backend_cuda13_sm120/_operator_artifacts/catalog.json": (
+            catalog_path.read_bytes()
+        ),
+        "symmetrix_backend_cuda13_sm120/_operator_artifacts/oam/fixture/plugin.cubin": (
+            binary.read_bytes()
+        ),
+        "symmetrix_backend_cuda13_sm120/_operator_artifacts/oam/fixture/manifest.json": (
+            manifest.read_bytes()
+        ),
+    }
+    if mutate is not None:
+        mutate(members)
+    members.update(
+        {
+            "symmetrix_backend_cuda13_sm120/backend.json": json.dumps(
+                {
+                    "distribution": "symmetrix-xl-cuda13-sm120",
+                    "frontend_version": "0.2.0",
+                    "source_commit": "a" * 40,
+                    "source_content_sha256": "b" * 64,
+                    "native_source_content_sha256": "c" * 64,
+                    "source_dirty": False,
+                }
+            ).encode(),
+            "symmetrix_xl_cuda13_sm120-0.2.0.dist-info/METADATA": (
+                b"Metadata-Version: 2.4\n"
+                b"Name: symmetrix-xl-cuda13-sm120\n"
+                b"Version: 0.2.0\n"
+                b"Requires-Dist: symmetrix-xl==0.2.0\n"
+            ),
+        }
+    )
+    wheel = tmp_path / "oam.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, payload in members.items():
+            archive.writestr(name, payload)
+    return wheel
+
+
+def test_wheel_content_audit_accepts_cataloged_oam_manifest(tmp_path):
+    audit_wheel(_write_cuda_oam_wheel(tmp_path))
+
+
+@pytest.mark.parametrize("failure", ("missing", "tampered", "uncataloged"))
+def test_wheel_content_audit_rejects_invalid_oam_manifest_payload(tmp_path, failure):
+    manifest_name = (
+        "symmetrix_backend_cuda13_sm120/_operator_artifacts/oam/fixture/manifest.json"
+    )
+
+    def mutate(members):
+        if failure == "missing":
+            members.pop(manifest_name)
+        elif failure == "tampered":
+            members[manifest_name] += b"tampered"
+        else:
+            members[
+                "symmetrix_backend_cuda13_sm120/_operator_artifacts/oam/stray.json"
+            ] = b"{}"
+
+    with pytest.raises(BuildError, match="operator (?:catalog|package data)"):
+        audit_wheel(_write_cuda_oam_wheel(tmp_path, mutate=mutate))
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ("identity", "abi", "capabilities", "provenance", "backend_format"),
+)
+def test_wheel_content_audit_uses_canonical_operator_catalog_validation(
+    tmp_path, malformation
+):
+    binary = b"operator"
+    catalog = _valid_host_operator_catalog(binary)
+    artifact = catalog["artifacts"][0]
+    if malformation == "identity":
+        artifact["identity"]["artifact_id"] = "generated-r0-tampered"
+    elif malformation == "abi":
+        artifact["abi"]["version"] = 1
+    elif malformation == "capabilities":
+        artifact["capabilities"] = 0
+    elif malformation == "provenance":
+        artifact["build_provenance"]["compiler_id"] = ""
+    else:
+        artifact["binary_format"] = "cubin"
+    wheel = tmp_path / f"malformed-{malformation}.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "symmetrix/_operator_artifacts/catalog.json", json.dumps(catalog)
+        )
+        archive.writestr("symmetrix/_operator_artifacts/r0/operator.so", binary)
+
+    with pytest.raises(BuildError, match="catalog"):
+        audit_wheel(wheel)
+
+
+def test_wheel_content_audit_does_not_trust_fake_shared_library(tmp_path):
+    binary = b"not an ELF shared library"
+    wheel = tmp_path / "fake-shared-library.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "symmetrix/_operator_artifacts/catalog.json",
+            json.dumps(_valid_host_operator_catalog(binary)),
+        )
+        archive.writestr("symmetrix/_operator_artifacts/r0/operator.so", binary)
+
+    with pytest.raises(BuildError, match="dependencies"):
+        audit_wheel(wheel)
+
+
+def test_cpu_operator_set_rejects_mixed_openmp_owners():
+    with pytest.raises(BuildError, match="multiple OpenMP runtimes"):
+        build_wheel_audit.audit_cpu_openmp_runtime_set(
+            {
+                "symmetrix/_native_cpu.so": ("libgomp.so.1",),
+                "symmetrix/_operator_artifacts/r0/operator.so": ("libomp.so.5",),
+            },
+            native_member="symmetrix/_native_cpu.so",
+        )
+
+
+def test_cpu_operator_set_accepts_auditwheel_vendored_openmp_owner():
+    build_wheel_audit.audit_cpu_openmp_runtime_set(
+        {
+            "symmetrix/_native_cpu.so": ("libgomp-e985bcbb.so.1.0.0",),
+            "symmetrix/_operator_artifacts/r0/operator.so": ("libstdc++.so.6",),
+        },
+        native_member="symmetrix/_native_cpu.so",
+    )
+
+
+def test_cpu_operator_set_rejects_mixed_vendored_openmp_owners():
+    with pytest.raises(BuildError, match="multiple OpenMP runtimes"):
+        build_wheel_audit.audit_cpu_openmp_runtime_set(
+            {
+                "symmetrix/_native_cpu.so": ("libgomp-e985bcbb.so.1.0.0",),
+                "symmetrix/_operator_artifacts/r0/operator.so": (
+                    "libomp-a34b3233.so.5",
+                ),
+            },
+            native_member="symmetrix/_native_cpu.so",
+        )
+
+
+def test_cpu_operator_dependency_audit_rejects_unapproved_library(tmp_path):
+    compiler = shutil.which("cc")
+    if compiler is None:
+        pytest.skip("a C compiler is required")
+    dependency_source = tmp_path / "dependency.c"
+    operator_source = tmp_path / "operator.c"
+    dependency = tmp_path / "libunapproved.so"
+    operator = tmp_path / "operator.so"
+    dependency_source.write_text("int unapproved(void) { return 7; }\n")
+    operator_source.write_text(
+        "extern int unapproved(void); int operator_value(void) { return unapproved(); }\n"
+    )
+    subprocess.run(
+        [compiler, "-shared", "-fPIC", dependency_source, "-o", dependency],
+        check=True,
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-shared",
+            "-fPIC",
+            operator_source,
+            f"-L{tmp_path}",
+            "-lunapproved",
+            "-o",
+            operator,
+        ],
+        check=True,
+    )
+
+    with pytest.raises(BuildError, match="libunapproved"):
+        build_wheel_audit.audit_cpu_operator_dependencies(operator)
+
+
 def test_cuda12_wheel_declares_split_nvidia_dependencies(tmp_path):
     manifest = _manifest("cuda", "sm120")
     manifest = replace(
@@ -1195,7 +1641,7 @@ def test_cuda12_wheel_declares_split_nvidia_dependencies(tmp_path):
     )
 
     assert metadata["project"]["dependencies"] == [
-        "symmetrix-xl==0.1.1",
+        f"symmetrix-xl=={build_python._frontend_version(REPOSITORY_ROOT / 'symmetrix')}",
         "nvidia-cuda-runtime-cu12>=12,<13",
         "nvidia-cuda-nvrtc-cu12>=12,<13",
         "nvidia-cublas-cu12>=12,<13",
@@ -1274,6 +1720,16 @@ def test_python_invocation_uses_fingerprinted_build_directory(tmp_path):
     assert (
         "--config-settings=cmake.define.SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256="
         f"{native_source_sha256}"
+    ) in invocation.command
+    assert any(
+        value.startswith(
+            "--config-settings=cmake.define.SYMMETRIX_BUILD_SOURCE_COMMIT="
+        )
+        for value in invocation.command
+    )
+    expected_dirty = int(bool(invocation.source_provenance["dirty"]))
+    assert (
+        f"--config-settings=cmake.define.SYMMETRIX_BUILD_SOURCE_DIRTY={expected_dirty}"
     ) in invocation.command
 
 
@@ -1613,6 +2069,147 @@ def test_symmetrix_source_identity_changes_with_build_source(tmp_path):
     assert symmetrix_source_fingerprint(tmp_path / "repo") != before
 
 
+def test_declared_submodule_paths_are_discovered_and_deduplicated(
+    tmp_path, monkeypatch
+):
+    gitmodules = tmp_path / ".gitmodules"
+    gitmodules.write_text(
+        '[submodule "first"]\n'
+        "\tpath = libsymmetrix/external/first\n"
+        "\turl = https://example.invalid/first\n"
+        '[submodule "second"]\n'
+        "\tpath = symmetrix/external/second\n"
+        "\turl = https://example.invalid/second\n"
+        '[submodule "first"]\n'
+        "\tpath = libsymmetrix/external/first\n"
+        "\turl = https://example.invalid/first\n"
+    )
+    expected = [
+        Path("libsymmetrix/external/first"),
+        Path("symmetrix/external/second"),
+    ]
+
+    assert build_source_provenance._submodule_paths(tmp_path) == expected
+
+    monkeypatch.setattr(build_source_provenance, "_git_output", lambda *a, **k: None)
+
+    assert build_source_provenance._submodule_paths(tmp_path) == expected
+
+
+def _superproject_with_submodule(tmp_path):
+    """Create a superproject recording one real submodule at revision A."""
+    runner = CommandRunner()
+    submodule_path = "libsymmetrix/external/kokkos-fft"
+    repository = tmp_path / "repo"
+    (repository / "libsymmetrix/source").mkdir(parents=True)
+    (repository / "libsymmetrix/source/kernel.cpp").write_text("int value = 1;\n")
+    _init_git_repo(runner, repository)
+    _commit_all(runner, repository, "base")
+
+    dependency = tmp_path / "dependency"
+    dependency.mkdir()
+    (dependency / "fft.hpp").write_text("// revision A\n")
+    _init_git_repo(runner, dependency)
+    _commit_all(runner, dependency, "revision A")
+
+    runner.run(
+        ("git", "clone", "-q", str(dependency), str(repository / submodule_path)),
+        check=True,
+    )
+    (repository / ".gitmodules").write_text(
+        f'[submodule "{submodule_path}"]\n'
+        f"\tpath = {submodule_path}\n"
+        f"\turl = {dependency.as_uri()}\n"
+    )
+    runner.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{build_sdist.head_commit(dependency, runner)},{submodule_path}",
+        ),
+        check=True,
+    )
+    _commit_all(runner, repository, "pin submodule")
+    return runner, repository, dependency, submodule_path
+
+
+def test_symmetrix_source_identity_changes_with_a_moved_submodule_gitlink(tmp_path):
+    runner, repository, dependency, submodule_path = _superproject_with_submodule(
+        tmp_path
+    )
+    gitmodules = (repository / ".gitmodules").read_text()
+    before_source = symmetrix_source_fingerprint(repository)
+    before_native = build_source_provenance.symmetrix_native_source_fingerprint(
+        repository
+    )
+
+    # The superproject records a different commit while the submodule working
+    # tree stays where it was, so only the recorded gitlink changes.
+    (dependency / "fft.hpp").write_text("// revision B\n")
+    _commit_all(runner, dependency, "revision B")
+    revision_b = build_sdist.head_commit(dependency, runner)
+    runner.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "update-index",
+            "--cacheinfo",
+            f"160000,{revision_b},{submodule_path}",
+        ),
+        check=True,
+    )
+
+    assert (repository / ".gitmodules").read_text() == gitmodules
+    assert build_sdist.head_commit(repository / submodule_path, runner) != revision_b
+    assert symmetrix_source_fingerprint(repository) != before_source
+    assert (
+        build_source_provenance.symmetrix_native_source_fingerprint(repository)
+        != before_native
+    )
+
+
+def test_symmetrix_source_identity_changes_with_submodule_local_edits(tmp_path):
+    runner, repository, dependency, submodule_path = _superproject_with_submodule(
+        tmp_path
+    )
+    checkout = repository / submodule_path
+    before = symmetrix_source_fingerprint(repository)
+
+    (checkout / "fft.hpp").write_text("// local edit\n")
+    edited = symmetrix_source_fingerprint(repository)
+    assert edited != before
+
+    clean_provenance = build_source_provenance.symmetrix_source_provenance(
+        repository, runner
+    )
+    assert clean_provenance["dirty"] is True
+
+    (checkout / "scratch.hpp").write_text("// untracked\n")
+
+    assert symmetrix_source_fingerprint(repository) != edited
+
+
+def test_python_cmake_definitions_share_descriptor_dirty_policy():
+    provenance = {
+        "revision": "a" * 40,
+        "dirty": True,
+        "content_sha256": "b" * 64,
+        "native_content_sha256": "c" * 64,
+    }
+
+    definitions = cmake_definitions(
+        _manifest("cpu", "x86-64-v3"), source_provenance=provenance
+    )
+
+    assert definitions["SYMMETRIX_BUILD_SOURCE_COMMIT"] == "a" * 40
+    assert definitions["SYMMETRIX_BUILD_SOURCE_DIRTY"] == "1"
+
+
 def test_lammps_qualification_is_verified_and_reused(tmp_path):
     source = _lammps_source(tmp_path / "lammps")
     prefix = tmp_path / "prefix"
@@ -1621,7 +2218,7 @@ def test_lammps_qualification_is_verified_and_reused(tmp_path):
         {
             ("lmp", "-help"): (
                 0,
-                "Pair styles: symmetrix/mace symmetrix/mace/kk\n",
+                "Pair styles: symmetrix/mace/kk symmetrix/mace/float32/kk\n",
                 "",
             )
         },
@@ -1659,7 +2256,7 @@ def test_lammps_verification_reports_requested_packages(tmp_path):
         {
             ("lmp", "-help"): (
                 0,
-                "Pair styles: symmetrix/mace symmetrix/mace/kk\n"
+                "Pair styles: symmetrix/mace/kk symmetrix/mace/float32/kk\n"
                 "Installed packages:\n\n"
                 "EXTRA-PAIR KOKKOS KSPACE\n\n",
                 "",
@@ -1695,7 +2292,7 @@ def test_lammps_stale_qualification_is_invalidated(tmp_path):
         {
             ("lmp", "-help"): (
                 0,
-                "Pair styles: symmetrix/mace symmetrix/mace/kk\n",
+                "Pair styles: symmetrix/mace/kk symmetrix/mace/float32/kk\n",
                 "",
             )
         },
@@ -1815,6 +2412,62 @@ def test_release_version_sources_agree():
     assert f'__version__ = "{version}"' in init_source
     assert f'set(SYMMETRIX_FRONTEND_VERSION "{version}" CACHE STRING' in cmake_source
     assert f'release = "{version}"' in docs_source
+
+
+def test_release_metadata_names_the_dated_version_and_tag(tmp_path):
+    prepared = tmp_path / "prepared-release"
+    for relative in (
+        "symmetrix/pyproject.toml",
+        "symmetrix/source/symmetrix/__init__.py",
+        "symmetrix/CMakeLists.txt",
+        "docs/conf.py",
+    ):
+        destination = prepared / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPOSITORY_ROOT / relative, destination)
+    changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text()
+    prepared_changelog = changelog[changelog.index("## 0.2.0") :]
+    (prepared / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## Unreleased\n\n" + prepared_changelog
+    )
+    with pytest.raises(ValueError, match="Unreleased"):
+        release_check.release_metadata(prepared)
+
+    (prepared / "CHANGELOG.md").write_text("# Changelog\n\n" + prepared_changelog)
+
+    assert release_check.release_metadata(prepared) == {
+        "version": "0.2.0",
+        "date": "2026-10-25",
+        "tag": "v0.2.0",
+    }
+    assert release_check.release_metadata(
+        REPOSITORY_ROOT
+    ) == release_check.release_metadata(prepared)
+
+
+def test_publication_ref_must_be_the_matching_version_tag():
+    metadata = {"version": "0.2.0", "date": "2026-10-25", "tag": "v0.2.0"}
+    release_check.validate_publication_ref(metadata, "tag", "v0.2.0")
+    with pytest.raises(ValueError, match="publication requires tag v0.2.0"):
+        release_check.validate_publication_ref(metadata, "branch", "refector")
+
+
+def test_nequip_export_dependencies_are_optional_runtime_dependencies():
+    pyproject = tomllib.loads(
+        (REPOSITORY_ROOT / "symmetrix/pyproject.toml").read_text()
+    )
+    project = pyproject["project"]
+    base_names = {
+        requirement.split(">", 1)[0] for requirement in project["dependencies"]
+    }
+    nequip_extra = project["optional-dependencies"]["nequip"]
+
+    assert {"torch", "nequip", "e3nn"}.isdisjoint(base_names)
+    assert {requirement.split(">", 1)[0] for requirement in nequip_extra} == {
+        "torch",
+        "nequip",
+        "e3nn",
+    }
 
 
 def test_build_isolation_does_not_install_a_different_cmake():
@@ -2109,6 +2762,8 @@ def test_matrix_child_commands_forward_target_selection(tmp_path):
         build_root=tmp_path / "build",
         jobs=4,
         accelerator_blas_root=Path("/opt/openblas-static"),
+        prebuilt_operator_artifacts="r0",
+        prebuilt_oam_artifacts="known",
     )
 
     for command in (detect_command, wheel_command):
@@ -2121,6 +2776,8 @@ def test_matrix_child_commands_forward_target_selection(tmp_path):
         assert command[command.index("--accelerator-blas-root") + 1] == (
             "/opt/openblas-static"
         )
+        assert command[command.index("--prebuilt-operator-artifacts") + 1] == "r0"
+        assert command[command.index("--prebuilt-oam-artifacts") + 1] == "known"
     assert detect_command[detect_command.index("--json") - 1] == "detect"
     assert "--build-root" not in detect_command
     assert "--jobs" not in detect_command
@@ -2342,6 +2999,7 @@ def test_sdist_contents_verification(tmp_path):
 
     assert record["filename"] == "complete.tar.gz"
     assert record["members"] == len(members)
+    assert record["unique_members"] == len(members)
     assert len(record["sha256"]) == 64
 
     incomplete = [
@@ -2359,18 +3017,132 @@ def test_sdist_contents_verification(tmp_path):
     with pytest.raises(BuildError, match="VCS metadata"):
         build_sdist.verify_sdist_contents(polluted, "0.1.1")
 
+    for suffix in (
+        "catalog.json",
+        "r0/operator.cpp",
+        "r0/operator.metadata.json",
+        "r0/operator.so",
+    ):
+        generated_polluted = tmp_path / f"generated-{Path(suffix).name}.tar.gz"
+        _write_sdist(
+            generated_polluted,
+            [*members, f"{root}/source/symmetrix/_operator_artifacts/{suffix}"],
+        )
+        with pytest.raises(BuildError, match="generated operator package data"):
+            build_sdist.verify_sdist_contents(generated_polluted, "0.1.1")
+
+
+def test_sdist_rejects_duplicate_archive_member_paths(tmp_path):
+    root = "symmetrix_xl-0.1.1"
+    members = [
+        *(f"{root}/{member}" for member in build_sdist.REQUIRED_SDIST_MEMBERS),
+        f"{root}/VENDORED_DEPS.json",
+        f"{root}/libsymmetrix/external/cblas-prototypes/include/cblas.h",
+    ]
+    duplicate = f"{root}/libsymmetrix/CMakeLists.txt"
+    archive = tmp_path / "duplicate.tar.gz"
+    _write_sdist(archive, [*members, duplicate])
+
+    with pytest.raises(BuildError, match="duplicate archive member paths"):
+        build_sdist.verify_sdist_contents(archive, "0.1.1")
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        "catalog.json",
+        "r0/operator.cpp",
+        "r0/operator.metadata.json",
+        "r0/operator.cpp.o",
+        "r0/operator.so",
+    ),
+)
+def test_sdist_rejects_generated_operator_build_tree_content(tmp_path, suffix):
+    root = "symmetrix_xl-0.1.1"
+    members = [
+        *(f"{root}/{member}" for member in build_sdist.REQUIRED_SDIST_MEMBERS),
+        f"{root}/VENDORED_DEPS.json",
+        f"{root}/libsymmetrix/external/cblas-prototypes/include/cblas.h",
+        f"{root}/build/generated-operator-artifacts/{suffix}",
+    ]
+    polluted = tmp_path / f"generated-build-{Path(suffix).name}.tar.gz"
+    _write_sdist(polluted, members)
+
+    with pytest.raises(BuildError, match="generated operator build-tree content"):
+        build_sdist.verify_sdist_contents(polluted, "0.1.1")
+
+
+@pytest.mark.parametrize(
+    "member",
+    (
+        "source/symmetrix/__pycache__/module.pyc",
+        "benchmarks/private-results.jsonl",
+        "source/symmetrix/private.model",
+        "source/symmetrix/runtime.cubin",
+    ),
+)
+def test_sdist_rejects_cache_result_model_and_runtime_binary_members(tmp_path, member):
+    root = "symmetrix_xl-0.1.1"
+    members = [
+        *(f"{root}/{required}" for required in build_sdist.REQUIRED_SDIST_MEMBERS),
+        f"{root}/VENDORED_DEPS.json",
+        f"{root}/libsymmetrix/external/cblas-prototypes/include/cblas.h",
+        f"{root}/{member}",
+    ]
+    polluted = tmp_path / f"polluted-{Path(member).name}.tar.gz"
+    _write_sdist(polluted, members)
+
+    with pytest.raises(BuildError, match="cache, benchmark|binary or private-model"):
+        build_sdist.verify_sdist_contents(polluted, "0.1.1")
+
+
+def test_sdist_allows_vendored_source_directories_named_benchmarks(tmp_path):
+    root = "symmetrix_xl-0.1.1"
+    members = [
+        *(f"{root}/{required}" for required in build_sdist.REQUIRED_SDIST_MEMBERS),
+        f"{root}/VENDORED_DEPS.json",
+        f"{root}/libsymmetrix/external/cblas-prototypes/include/cblas.h",
+        f"{root}/libsymmetrix/external/json/tests/benchmarks/CMakeLists.txt",
+    ]
+    archive = tmp_path / "vendored-benchmarks.tar.gz"
+    _write_sdist(archive, members)
+
+    build_sdist.verify_sdist_contents(archive, "0.1.1")
+
 
 def test_sdist_configuration_is_self_contained():
     pyproject = tomllib.loads(
         (REPOSITORY_ROOT / "symmetrix/pyproject.toml").read_text()
     )
-    sdist_options = pyproject["tool"]["scikit-build"]["sdist"]
-    assert sdist_options["force-include"] == {"libsymmetrix": "libsymmetrix"}
+    sdist_options = pyproject["tool"]["scikit-build"].get("sdist", {})
+    assert "force-include" not in sdist_options
     # scikit-build-core rejects underscore option names at build time.
     assert "force_include" not in sdist_options
-    assert pyproject["project"]["license"] == {"file": "LICENSE"}
+    assert (
+        pyproject["tool"]["scikit-build"]["cmake"]["define"][
+            "SYMMETRIX_REDACT_BUILD_PATHS"
+        ]
+        == "ON"
+    )
+    assert pyproject["project"]["license"] == "MIT"
+    assert pyproject["project"]["license-files"] == [
+        "LICENSE",
+        "THIRD_PARTY_LICENSES.md",
+    ]
     assert (REPOSITORY_ROOT / "symmetrix/LICENSE").read_text() == (
         REPOSITORY_ROOT / "LICENSE"
+    ).read_text()
+
+    core_cmake = (REPOSITORY_ROOT / "libsymmetrix/CMakeLists.txt").read_text()
+    assert "../symmetrix/source/symmetrix" in core_cmake
+    assert "../source/symmetrix" in core_cmake
+    for header in (
+        "mace_jit_cuda_plugin_abi.h",
+        "mace_nonlinear_jit_cuda_plugin_abi.h",
+    ):
+        assert f"source/symmetrix/{header}" in build_sdist.REQUIRED_SDIST_MEMBERS
+    assert (REPOSITORY_ROOT / "symmetrix/THIRD_PARTY_LICENSES.md").read_text() == (
+        REPOSITORY_ROOT / "THIRD_PARTY_LICENSES.md"
     ).read_text()
 
     source = (REPOSITORY_ROOT / "symmetrix/CMakeLists.txt").read_text()
@@ -2388,9 +3160,13 @@ def test_sdist_staging_relocates_core_inside_project(tmp_path):
     staged_tree = tmp_path / "tree"
     core = staged_tree / "libsymmetrix"
     project = staged_tree / "symmetrix"
+    build_tools = staged_tree / "tools/_symmetrix_build"
     core.mkdir(parents=True)
     project.mkdir()
+    build_tools.mkdir(parents=True)
     (core / "CMakeLists.txt").write_text("project(libsymmetrix)\n")
+    for filename in build_sdist.SDIST_BUILD_TOOL_FILES:
+        (build_tools / filename).write_text(f"# {filename}\n")
 
     build_sdist.make_sdist_tree_self_contained(staged_tree)
 
@@ -2398,6 +3174,10 @@ def test_sdist_staging_relocates_core_inside_project(tmp_path):
     assert (project / "libsymmetrix/CMakeLists.txt").read_text() == (
         "project(libsymmetrix)\n"
     )
+    for filename in build_sdist.SDIST_BUILD_TOOL_FILES:
+        assert (project / "tools/_symmetrix_build" / filename).read_text() == (
+            f"# {filename}\n"
+        )
 
     with pytest.raises(BuildError, match="missing"):
         build_sdist.make_sdist_tree_self_contained(staged_tree)
@@ -2439,7 +3219,7 @@ def test_sdist_rejects_dirty_worktree(tmp_path):
     build_sdist.verify_clean_worktree(tmp_path, clean)
 
 
-def test_sdist_smoke_check_rebuilds_from_itself(tmp_path):
+def test_sdist_smoke_check_builds_wheel_from_itself(tmp_path):
     root = "symmetrix_xl-0.1.1"
     sdist = tmp_path / f"{root}.tar.gz"
     _write_sdist(sdist, [f"{root}/pyproject.toml", f"{root}/LICENSE"])
@@ -2447,7 +3227,7 @@ def test_sdist_smoke_check_rebuilds_from_itself(tmp_path):
         Path(sys.executable).name,
         "-m",
         "build",
-        "--sdist",
+        "--wheel",
         "--outdir",
         str(tmp_path / "smoke-output"),
         str(tmp_path / "smoke-extracted" / root),
@@ -2462,8 +3242,245 @@ def test_sdist_smoke_check_rebuilds_from_itself(tmp_path):
     broken = FakeRunner(
         {}, {rebuild_args: (1, "", "License file not found ('../LICENSE')\n")}
     )
-    with pytest.raises(BuildError, match="cannot be rebuilt from"):
+    with pytest.raises(BuildError, match="cannot build a wheel from"):
         build_sdist.verify_sdist_rebuilds_from_itself(
             sdist, sys.executable, broken, tmp_path, "0.1.1"
         )
     assert "License file not found" in (tmp_path / "sdist-smoke.log").read_text()
+
+
+KOKKOSFFT_PATH = "libsymmetrix/external/kokkos-fft"
+KOKKOSFFT_URL = "https://github.com/kokkos/kokkos-fft"
+KOKKOSFFT_PINNED_COMMIT = "28cbdc0bb8e5205992c42d82b63716fe56a8f058"
+KOKKOSFFT_PINNED_VERSION = "2.0.0"
+
+
+def test_kokkosfft_submodule_is_pinned_to_the_official_release():
+    pinned = build_sdist.submodule_pinned_commits(REPOSITORY_ROOT, CommandRunner())
+
+    assert pinned[KOKKOSFFT_PATH] == KOKKOSFFT_PINNED_COMMIT
+    assert (
+        f'[submodule "{KOKKOSFFT_PATH}"]'
+        in (REPOSITORY_ROOT / ".gitmodules").read_text()
+    )
+    assert f"url = {KOKKOSFFT_URL}" in (REPOSITORY_ROOT / ".gitmodules").read_text()
+
+    upstream = (REPOSITORY_ROOT / KOKKOSFFT_PATH / "CMakeLists.txt").read_text()
+    assert f"project(KokkosFFT VERSION {KOKKOSFFT_PINNED_VERSION} LANGUAGES CXX)" in (
+        upstream
+    )
+
+    checkout = CommandRunner().run(
+        ("git", "-C", str(REPOSITORY_ROOT / KOKKOSFFT_PATH), "rev-parse", "HEAD")
+    )
+    assert checkout.stdout.strip() == KOKKOSFFT_PINNED_COMMIT
+
+
+def test_sdist_vendors_the_kokkosfft_source_and_its_license_text():
+    assert KOKKOSFFT_PATH in build_sdist.SUBMODULE_PATHS
+    assert f"{KOKKOSFFT_PATH}/CMakeLists.txt" in build_sdist.REQUIRED_SDIST_MEMBERS
+    assert f"{KOKKOSFFT_PATH}/LICENSES/MIT.txt" in build_sdist.REQUIRED_SDIST_MEMBERS
+    assert (
+        f"{KOKKOSFFT_PATH}/LICENSES/Apache-2.0.txt"
+        in build_sdist.REQUIRED_SDIST_MEMBERS
+    )
+
+    tree = REPOSITORY_ROOT / KOKKOSFFT_PATH
+    for member in ("CMakeLists.txt", "COPYRIGHT.md", "LICENSES/MIT.txt"):
+        assert (tree / member).is_file()
+
+
+def test_sdist_license_gate_accepts_the_kokkosfft_reuse_notice(tmp_path):
+    dependency = tmp_path / KOKKOSFFT_PATH
+    dependency.mkdir(parents=True)
+    (dependency / "COPYRIGHT.md").write_text("MIT OR Apache-2.0 WITH LLVM-exception\n")
+
+    assert build_sdist.verify_vendored_licenses(tmp_path, paths=(KOKKOSFFT_PATH,)) == {
+        KOKKOSFFT_PATH: "COPYRIGHT.md"
+    }
+
+
+def test_source_checkout_validation_requires_the_kokkosfft_source(tmp_path):
+    root = tmp_path / "repo"
+    for relative in (
+        "symmetrix/pyproject.toml",
+        "symmetrix/CMakeLists.txt",
+        "libsymmetrix/external/kokkos/CMakeLists.txt",
+        "libsymmetrix/external/kokkos-kernels/CMakeLists.txt",
+        "libsymmetrix/external/sphericart/sphericart/CMakeLists.txt",
+        "libsymmetrix/external/json/CMakeLists.txt",
+        "symmetrix/external/pybind11/CMakeLists.txt",
+    ):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+
+    with pytest.raises(BuildError, match="kokkos-fft"):
+        build_detect.validate_source_checkout(
+            root, FakeRunner({"git": "/usr/bin/git"}, {})
+        )
+
+    (root / KOKKOSFFT_PATH).mkdir(parents=True)
+    (root / KOKKOSFFT_PATH / "CMakeLists.txt").write_text("")
+    build_detect.validate_source_checkout(root, FakeRunner({"git": "/usr/bin/git"}, {}))
+
+
+def _cpu_detection_runner(tmp_path):
+    cmake = _executable(tmp_path / "cmake")
+    cxx = _executable(tmp_path / "g++")
+    gfortran = _executable(tmp_path / "gfortran")
+    return FakeRunner(
+        {"cmake": cmake, "g++": cxx, "gfortran": gfortran},
+        {
+            ("cmake", "--version"): (0, "cmake version 4.2.0\n", ""),
+            ("g++", "--version"): (0, "g++ test compiler\n", ""),
+        },
+    )
+
+
+@pytest.mark.parametrize("policy", ("auto", "on", "off"))
+def test_cpu_manifest_records_the_particle_mesh_policy(tmp_path, monkeypatch, policy):
+    monkeypatch.setattr(
+        build_detect.ctypes.util,
+        "find_library",
+        lambda name: "libopenblas.so" if name == "openblas" else None,
+    )
+
+    manifest = detect_target(
+        DetectionRequest(backend="cpu", cpu_target="native", particle_mesh=policy),
+        repo_root=REPOSITORY_ROOT,
+        runner=_cpu_detection_runner(tmp_path),
+        devices=DeviceProbe((), ()),
+    )
+
+    assert manifest.particle_mesh_policy == policy
+
+
+def test_detection_rejects_an_invalid_particle_mesh_policy():
+    with pytest.raises(BuildError, match="particle-mesh"):
+        detect_target(
+            DetectionRequest(backend="cpu", particle_mesh="sometimes"),
+            repo_root=REPOSITORY_ROOT,
+            runner=FakeRunner({}, {}),
+            devices=DeviceProbe((), ()),
+        )
+
+
+def test_manifest_round_trip_preserves_the_particle_mesh_policy(tmp_path):
+    manifest = replace(_manifest("cpu", "x86-64-v3"), particle_mesh_policy="off")
+    path = tmp_path / "target.json"
+
+    manifest.write(path)
+    loaded = TargetManifest.read(path)
+
+    assert loaded.particle_mesh_policy == "off"
+    assert "particle_mesh_policy" in loaded.to_dict()
+    assert "fourier_d3_policy" not in loaded.to_dict()
+    assert loaded == manifest
+    assert loaded.fingerprint == manifest.fingerprint
+
+
+def test_manifest_defaults_the_particle_mesh_policy_to_auto(tmp_path):
+    path = tmp_path / "target.json"
+    value = _manifest("cpu", "x86-64-v3").to_dict()
+    value.pop("particle_mesh_policy")
+    path.write_text(json.dumps(value))
+
+    assert TargetManifest.read(path).particle_mesh_policy == "auto"
+
+
+def test_manifest_reads_the_legacy_fourier_d3_policy(tmp_path):
+    path = tmp_path / "target.json"
+    value = _manifest("cpu", "x86-64-v3").to_dict()
+    value["fourier_d3_policy"] = value.pop("particle_mesh_policy")
+    value["fourier_d3_policy"] = "off"
+    path.write_text(json.dumps(value))
+
+    loaded = TargetManifest.read(path)
+
+    assert loaded.particle_mesh_policy == "off"
+    assert "fourier_d3_policy" not in loaded.to_dict()
+
+
+def test_manifest_rejects_conflicting_particle_mesh_policy_names(tmp_path):
+    path = tmp_path / "target.json"
+    value = _manifest("cpu", "x86-64-v3").to_dict()
+    value["particle_mesh_policy"] = "on"
+    value["fourier_d3_policy"] = "off"
+    path.write_text(json.dumps(value))
+
+    with pytest.raises(BuildError, match="conflicting particle_mesh_policy"):
+        TargetManifest.read(path)
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected"), (("auto", "AUTO"), ("on", "ON"), ("off", "OFF"))
+)
+def test_cmake_definitions_request_the_particle_mesh_policy(policy, expected):
+    manifest = replace(_manifest("cpu", "native"), particle_mesh_policy=policy)
+
+    definitions = cmake_definitions(manifest)
+
+    assert definitions["SYMMETRIX_PARTICLE_MESH"] == expected
+    assert "SYMMETRIX_FOURIER_D3" not in definitions
+
+
+def test_cross_backend_manifest_replay_preserves_the_particle_mesh_policy(tmp_path):
+    manifest = replace(_manifest("cpu", "x86-64-v3"), particle_mesh_policy="off")
+    path = tmp_path / "target.json"
+    manifest.write(path)
+    args = SimpleNamespace(
+        target_manifest=path,
+        backend="cuda",
+        arch=None,
+        cpu_target=None,
+        cuda_root=None,
+        rocm_root=None,
+        cxx=None,
+        host_cxx=None,
+        generator=None,
+        blas=None,
+        mkl_root=None,
+    )
+
+    request, _ = build_cli._base_request(args)
+
+    assert request.particle_mesh == "off"
+
+
+def test_particle_mesh_cli_flag_sets_the_shared_policy():
+    args = build_cli._parser().parse_args(
+        ["detect", "--backend", "cpu", "--particle-mesh", "off"]
+    )
+
+    request, _ = build_cli._base_request(args)
+
+    assert request.particle_mesh == "off"
+
+
+def test_legacy_fourier_d3_cli_flag_sets_the_shared_policy():
+    args = build_cli._parser().parse_args(
+        ["detect", "--backend", "cpu", "--fourier-d3", "off"]
+    )
+
+    with pytest.warns(FutureWarning, match="--fourier-d3"):
+        request, _ = build_cli._base_request(args)
+
+    assert request.particle_mesh == "off"
+
+
+def test_conflicting_particle_mesh_cli_flags_are_rejected():
+    args = build_cli._parser().parse_args(
+        [
+            "detect",
+            "--backend",
+            "cpu",
+            "--particle-mesh",
+            "on",
+            "--fourier-d3",
+            "off",
+        ]
+    )
+
+    with pytest.raises(BuildError, match="conflicting particle-mesh policies"):
+        build_cli._base_request(args)

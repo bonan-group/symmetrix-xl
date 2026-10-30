@@ -140,8 +140,8 @@ def rank2_macefield_json_path(tmp_path_factory):
 @pytest.mark.parametrize(
     "pair_style",
     [
-        "symmetrix/mace electric_field 0.01 0.0 0.0 no_domain_decomposition",
-        "symmetrix/mace electric_field 0.01 0.0 0.0 no_mpi_message_passing",
+        "symmetrix/mace/kk electric_field 0.01 0.0 0.0 no_domain_decomposition",
+        "symmetrix/mace/kk electric_field 0.01 0.0 0.0 no_mpi_message_passing",
     ],
 )
 @pytest.mark.parametrize(
@@ -172,7 +172,12 @@ def test_lammps_kokkos_macefield_energy_forces_match_native(
     atoms.center(vacuum=6.0)
     electric_field = np.array([0.01, 0.0, 0.0], dtype=np.float64)
 
-    native = native_symmetrix.MACE(str(macefield_json_path))
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    native = native_symmetrix.MACEKokkos(str(macefield_json_path))
+    # The Kokkos evaluator defaults to the materialized edge representation;
+    # the compiler-free generic path is the reference implementation.
+    native.set_streamed_edges("generic")
     atomic_numbers = atoms.get_atomic_numbers().tolist()
     mace_atomic_numbers = native.atomic_numbers
     i_list, j_list, r, xyz = neighbor_list("ijdD", atoms, native.r_cut)
@@ -252,7 +257,7 @@ def test_lammps_kokkos_rank2_macefield_energy_forces_match_native(
 ):
     test_lammps_kokkos_macefield_energy_forces_match_native(
         rank2_macefield_json_path,
-        "symmetrix/mace electric_field 0.01 0.0 0.0 no_mpi_message_passing",
+        "symmetrix/mace/kk electric_field 0.01 0.0 0.0 no_mpi_message_passing",
         "AlN",
         "wurtzite",
         {"a": 3.112, "c": 4.982},
@@ -386,7 +391,7 @@ def test_lammps_kokkos_non_compiled_handles_periodic_ghost_receivers(
                 mass            1 24.305
                 mass            2 15.999
 
-                pair_style      symmetrix/mace electric_field 0.01 0.0 0.0 no_mpi_message_passing streamed_edges {streamed_edges}
+                pair_style      symmetrix/mace/kk electric_field 0.01 0.0 0.0 no_mpi_message_passing streamed_edges {streamed_edges}
                 pair_coeff      * * {macefield_json_path} Mg O
 
                 run 0

@@ -30,18 +30,16 @@ PROFILES = {
         "dtype": "float64",
         "execution_space": "CPU",
     },
-    "serial_f64": {
+    "reference_f64": {
         "kind": "symmetrix",
         "dtype": "float64",
         "extension": "cuda",
-        "use_kokkos": False,
-        "streamed_edges": "materialized",
+        "streamed_edges": "reference",
     },
     "openmp_all_f64": {
         "kind": "symmetrix",
         "dtype": "float64",
         "extension": "openmp",
-        "use_kokkos": True,
         "streamed_edges": "all_interactions",
         "m0": "runtime",
         "m1": "retained",
@@ -50,7 +48,6 @@ PROFILES = {
         "kind": "symmetrix",
         "dtype": "float32",
         "extension": "cuda",
-        "use_kokkos": True,
         "streamed_edges": "all_interactions",
         "m0": "runtime",
         "m1": "retained",
@@ -59,7 +56,6 @@ PROFILES = {
         "kind": "symmetrix",
         "dtype": "float32",
         "extension": "cuda",
-        "use_kokkos": True,
         "streamed_edges": "all_interactions",
         "m0": "standard",
         "m1": "retained",
@@ -68,7 +64,6 @@ PROFILES = {
         "kind": "symmetrix",
         "dtype": "float32",
         "extension": "cuda",
-        "use_kokkos": True,
         "streamed_edges": "all_interactions",
         "m0": "standard",
         "m1": "recompute",
@@ -77,7 +72,6 @@ PROFILES = {
         "kind": "symmetrix",
         "dtype": "float32",
         "extension": "cuda",
-        "use_kokkos": True,
         "streamed_edges": "factorized",
         "jit": "required",
         "m0": "automatic",
@@ -314,11 +308,10 @@ def _worker(args):
         from symmetrix import Symmetrix
         from symmetrix import symmetrix as native
 
-        if profile["use_kokkos"] and not native._kokkos_is_initialized():
+        if not native._kokkos_is_initialized():
             native._init_kokkos()
         calculator = Symmetrix(
             args.model_json.resolve(),
-            use_kokkos=profile["use_kokkos"],
             dtype=profile["dtype"],
             streamed_edges=profile["streamed_edges"],
             jit=profile.get("jit", "off"),
@@ -330,10 +323,12 @@ def _worker(args):
 
         runtime = {
             "extension": _provenance(args.extension),
+            # The reference routing executes single-thread on the host; every
+            # other routing runs on the build's default execution space.
             "execution_space": (
                 native._kokkos_default_execution_space()
-                if profile["use_kokkos"]
-                else "Serial evaluator"
+                if calculator.streamed_edges == "direct"
+                else "host single-thread generic (reference routing)"
             ),
         }
 

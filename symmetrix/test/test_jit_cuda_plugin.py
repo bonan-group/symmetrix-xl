@@ -35,7 +35,7 @@ def cuda_plugin_fixture(tmp_path_factory):
     plugin_source = directory / "fixture_plugin.cpp"
     plugin_source.write_text(
         r"""
-#include "jit_cuda_plugin_abi.h"
+#include "mace_jit_cuda_plugin_abi.h"
 
 extern "C" int32_t fixture_forward(
     const SymmetrixJitCudaR1ForwardArgsV1* args,
@@ -120,7 +120,7 @@ symmetrix_jit_cuda_plugin_query_v1()
     harness_source = directory / "loader_harness.cpp"
     harness_source.write_text(
         r"""
-#include "jit_cuda_plugin.hpp"
+#include "mace_jit_cuda_plugin.hpp"
 
 #include <array>
 #include <cstdint>
@@ -289,7 +289,7 @@ int main(int argc, char** argv)
         compiler,
         *common,
         harness_source,
-        SOURCE / "jit_cuda_plugin.cpp",
+        SOURCE / "mace_jit_cuda_plugin.cpp",
         "-ldl",
         "-o",
         harness,

@@ -85,6 +85,7 @@ class _LaunchEvaluator:
 def _calculator(policy="automatic"):
     result = object.__new__(Symmetrix)
     result.evaluator = _LaunchEvaluator()
+    result.mace_les_evaluator_fingerprint = "contract-a"
     result.kernel_launch_policy = policy
     result.kernel_launch_tuning_status = "unresolved"
     result.kernel_launch_tuning_cache_key = None

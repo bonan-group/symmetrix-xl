@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 
@@ -86,6 +87,19 @@ def macefield_full_json_path(tmp_path_factory, macefield_model_path):
         species=[7, 13],
         head="mp-dielectric",
     )
+    output_path.write_text(json.dumps(data))
+    return output_path
+
+
+@pytest.fixture(scope="module")
+def standard_full_json_path(tmp_path_factory, macefield_full_json_path):
+    """Expose the same two-layer compact weights through the weighted MACE ABI."""
+
+    data = copy.deepcopy(json.loads(macefield_full_json_path.read_text()))
+    data["model_type"] = "MACE"
+    data["has_field_coupling"] = False
+    data.pop("field_couplings", None)
+    output_path = tmp_path_factory.mktemp("standard-full-json") / "standard.json"
     output_path.write_text(json.dumps(data))
     return output_path
 
@@ -256,19 +270,19 @@ def rank2_macefield_artifacts(tmp_path_factory):
     }
 
 
-@pytest.mark.parametrize("evaluator_name", ["MACE", "MACEKokkos"])
-def test_macefield_loads_non_128_channel_model(
-    small_channel_macefield_json_path,
-    evaluator_name,
-):
-    if not hasattr(native_symmetrix, evaluator_name):
-        pytest.skip(f"Symmetrix was built without {evaluator_name}.")
-    if evaluator_name == "MACEKokkos" and not native_symmetrix._kokkos_is_initialized():
+def _skip_without_kokkos():
+    if not hasattr(native_symmetrix, "MACEKokkos"):
+        pytest.skip("Symmetrix was built without Kokkos bindings.")
+    if not native_symmetrix._kokkos_is_initialized():
         native_symmetrix._init_kokkos()
 
-    evaluator = getattr(native_symmetrix, evaluator_name)(
-        str(small_channel_macefield_json_path)
-    )
+
+def test_macefield_loads_non_128_channel_model(
+    small_channel_macefield_json_path,
+):
+    _skip_without_kokkos()
+
+    evaluator = native_symmetrix.MACEKokkos(str(small_channel_macefield_json_path))
 
     assert evaluator.has_field_coupling is True
 
@@ -327,45 +341,35 @@ def test_residual_first_schema_matches_upstream_skip(
     )
 
 
-@pytest.mark.parametrize("evaluator_name", ["MACE", "MACEKokkos"])
 def test_loader_accepts_nonstandard_readout_hidden_size(
     residual_first_macefield_artifacts,
     tmp_path,
-    evaluator_name,
 ):
-    if not hasattr(native_symmetrix, evaluator_name):
-        pytest.skip(f"Symmetrix was built without {evaluator_name}.")
-    if evaluator_name == "MACEKokkos" and not native_symmetrix._kokkos_is_initialized():
-        native_symmetrix._init_kokkos()
+    _skip_without_kokkos()
 
     data = dict(residual_first_macefield_artifacts["data"])
     hidden_size = 7
     data["readout_2_hidden_size"] = hidden_size
     data["readout_2_weights_1"] = [0.0] * (data["num_channels"] * hidden_size)
     data["readout_2_weights_2"] = [0.0] * hidden_size
-    model_path = tmp_path / f"readout-hidden-{evaluator_name}.json"
+    model_path = tmp_path / "readout-hidden.json"
     model_path.write_text(json.dumps(data))
 
-    getattr(native_symmetrix, evaluator_name)(str(model_path))
+    native_symmetrix.MACEKokkos(str(model_path))
 
 
-@pytest.mark.parametrize("evaluator_name", ["MACE", "MACEKokkos"])
 def test_residual_first_loader_rejects_missing_weights(
     residual_first_macefield_artifacts,
     tmp_path,
-    evaluator_name,
 ):
-    if not hasattr(native_symmetrix, evaluator_name):
-        pytest.skip(f"Symmetrix was built without {evaluator_name}.")
-    if evaluator_name == "MACEKokkos" and not native_symmetrix._kokkos_is_initialized():
-        native_symmetrix._init_kokkos()
+    _skip_without_kokkos()
     data = dict(residual_first_macefield_artifacts["data"])
     data.pop("H1_first_residual_weights")
     path = tmp_path / "missing-first-residual.json"
     path.write_text(json.dumps(data))
 
     with pytest.raises(ValueError, match="invalid H1 residual extent"):
-        getattr(native_symmetrix, evaluator_name)(str(path))
+        native_symmetrix.MACEKokkos(str(path))
 
 
 def _rank2_upstream_transform(model, h1_pre, electric_field):
@@ -391,16 +395,11 @@ def test_rank2_field_schema_contains_all_angular_paths(rank2_macefield_artifacts
         assert len(instruction["wigner_3j"]) == (2 * l_in + 1) * 3 * (2 * l_out + 1)
 
 
-@pytest.mark.parametrize("evaluator_name", ["MACE", "MACEKokkos"])
 def test_field_loader_rejects_L_max_above_two(
     rank2_macefield_artifacts,
     tmp_path,
-    evaluator_name,
 ):
-    if not hasattr(native_symmetrix, evaluator_name):
-        pytest.skip(f"Symmetrix was built without {evaluator_name}.")
-    if evaluator_name == "MACEKokkos" and not native_symmetrix._kokkos_is_initialized():
-        native_symmetrix._init_kokkos()
+    _skip_without_kokkos()
 
     data = dict(rank2_macefield_artifacts["data"])
     data["L_max"] = 3
@@ -408,23 +407,17 @@ def test_field_loader_rejects_L_max_above_two(
     json_path.write_text(json.dumps(data))
 
     with pytest.raises(RuntimeError, match=r"1 <= L_max <= 2"):
-        getattr(native_symmetrix, evaluator_name)(str(json_path))
+        native_symmetrix.MACEKokkos(str(json_path))
 
 
-@pytest.mark.parametrize("evaluator_name", ["MACE", "MACEKokkos"])
 def test_rank2_field_h1_matches_upstream(
     rank2_macefield_artifacts,
-    evaluator_name,
 ):
-    if not hasattr(native_symmetrix, evaluator_name):
-        pytest.skip(f"Symmetrix was built without {evaluator_name}.")
-    if evaluator_name == "MACEKokkos" and not native_symmetrix._kokkos_is_initialized():
-        native_symmetrix._init_kokkos()
+    _skip_without_kokkos()
 
     model = rank2_macefield_artifacts["model"]
-    evaluator = getattr(native_symmetrix, evaluator_name)(
-        str(rank2_macefield_artifacts["json_path"])
-    )
+    evaluator = native_symmetrix.MACEKokkos(str(rank2_macefield_artifacts["json_path"]))
+    evaluator.set_streamed_edges("generic")
     generator = torch.Generator(device="cpu").manual_seed(20260806)
     h1_pre = torch.randn((3, 36), dtype=torch.float64, generator=generator)
     electric_field = torch.randn((3, 3), dtype=torch.float64, generator=generator)
@@ -437,20 +430,14 @@ def test_rank2_field_h1_matches_upstream(
     assert np.allclose(actual, expected.numpy(force=True), atol=1e-12, rtol=1e-12)
 
 
-@pytest.mark.parametrize("evaluator_name", ["MACE", "MACEKokkos"])
 def test_rank2_reverse_field_h1_matches_autograd(
     rank2_macefield_artifacts,
-    evaluator_name,
 ):
-    if not hasattr(native_symmetrix, evaluator_name):
-        pytest.skip(f"Symmetrix was built without {evaluator_name}.")
-    if evaluator_name == "MACEKokkos" and not native_symmetrix._kokkos_is_initialized():
-        native_symmetrix._init_kokkos()
+    _skip_without_kokkos()
 
     model = rank2_macefield_artifacts["model"]
-    evaluator = getattr(native_symmetrix, evaluator_name)(
-        str(rank2_macefield_artifacts["json_path"])
-    )
+    evaluator = native_symmetrix.MACEKokkos(str(rank2_macefield_artifacts["json_path"]))
+    evaluator.set_streamed_edges("generic")
     generator = torch.Generator(device="cpu").manual_seed(20260807)
     h1_pre = torch.randn(
         (2, 36), dtype=torch.float64, generator=generator, requires_grad=True
@@ -481,7 +468,9 @@ def test_rank2_reverse_field_h1_matches_autograd(
 
 
 def test_native_compute_field_h1_matches_standalone_transform(macefield_json_path):
-    evaluator = native_symmetrix.MACE(str(macefield_json_path))
+    _skip_without_kokkos()
+    evaluator = native_symmetrix.MACEKokkos(str(macefield_json_path))
+    evaluator.set_streamed_edges("generic")
 
     assert evaluator.has_field_coupling is True
 
@@ -492,7 +481,7 @@ def test_native_compute_field_h1_matches_standalone_transform(macefield_json_pat
         electric_field,
     ).numpy(force=True)
 
-    evaluator.H1 = _compact_to_native_h1(h1_pre.numpy(force=True)).tolist()
+    evaluator.H1 = _compact_to_native_h1(h1_pre.numpy(force=True))
     evaluator.compute_field_H1(
         h1_pre.shape[0], electric_field.numpy(force=True).reshape(-1)
     )
@@ -505,6 +494,7 @@ def test_legacy_unversioned_rank1_field_json_matches_versioned(
     macefield_json_path,
     tmp_path,
 ):
+    _skip_without_kokkos()
     data = json.loads(macefield_json_path.read_text())
     coupling = data["field_couplings"][0]
     coupling.pop("schema_version")
@@ -515,9 +505,11 @@ def test_legacy_unversioned_rank1_field_json_matches_versioned(
     legacy_path.write_text(json.dumps(data))
 
     h1_pre, electric_field = _frozen_inputs()
-    versioned = native_symmetrix.MACE(str(macefield_json_path))
-    legacy = native_symmetrix.MACE(str(legacy_path))
-    native_h1 = _compact_to_native_h1(h1_pre.numpy(force=True)).tolist()
+    versioned = native_symmetrix.MACEKokkos(str(macefield_json_path))
+    legacy = native_symmetrix.MACEKokkos(str(legacy_path))
+    versioned.set_streamed_edges("generic")
+    legacy.set_streamed_edges("generic")
+    native_h1 = _compact_to_native_h1(h1_pre.numpy(force=True))
     versioned.H1 = native_h1
     legacy.H1 = native_h1
     field = electric_field.numpy(force=True).reshape(-1)
@@ -530,7 +522,9 @@ def test_legacy_unversioned_rank1_field_json_matches_versioned(
 
 
 def test_native_reverse_field_h1_matches_torch_autograd(macefield_json_path):
-    evaluator = native_symmetrix.MACE(str(macefield_json_path))
+    _skip_without_kokkos()
+    evaluator = native_symmetrix.MACEKokkos(str(macefield_json_path))
+    evaluator.set_streamed_edges("generic")
     coupling = _compact_field_coupling_from_json(macefield_json_path)
 
     h1_pre, electric_field = _frozen_inputs()
@@ -542,11 +536,11 @@ def test_native_reverse_field_h1_matches_torch_autograd(macefield_json_path):
     h1_post = _standalone_field_transform(coupling, h1_pre, electric_field)
     torch.sum(h1_post * h1_post_adj).backward()
 
-    evaluator.H1 = _compact_to_native_h1(h1_pre.detach().numpy(force=True)).tolist()
+    evaluator.H1 = _compact_to_native_h1(h1_pre.detach().numpy(force=True))
     evaluator.compute_field_H1(
         h1_pre.shape[0], electric_field.detach().numpy(force=True).reshape(-1)
     )
-    evaluator.H1_adj = _compact_to_native_h1(h1_post_adj.numpy(force=True)).tolist()
+    evaluator.H1_adj = _compact_to_native_h1(h1_post_adj.numpy(force=True))
     evaluator.reverse_field_H1(
         h1_pre.shape[0], electric_field.detach().numpy(force=True).reshape(-1)
     )
@@ -596,38 +590,42 @@ def test_kokkos_compute_field_h1_matches_native_transform(macefield_json_path):
 
 
 def test_kokkos_reverse_field_h1_matches_native_reverse(macefield_json_path):
-    if not hasattr(native_symmetrix, "MACEKokkos"):
-        pytest.skip("Symmetrix was built without Kokkos bindings.")
-    if not native_symmetrix._kokkos_is_initialized():
-        native_symmetrix._init_kokkos()
+    _skip_without_kokkos()
 
     h1_pre, electric_field = _frozen_inputs()
     generator = torch.Generator(device="cpu").manual_seed(20260711)
     h1_post_adj = torch.randn(h1_pre.shape, dtype=torch.float64, generator=generator)
 
-    native = native_symmetrix.MACE(str(macefield_json_path))
-    native.H1 = _compact_to_native_h1(h1_pre.numpy(force=True)).tolist()
-    native.compute_field_H1(
+    # The retired serial evaluator's reference role is the generic routing; the
+    # retained evaluator's other artifact-free host mode is materialized.
+    reference = native_symmetrix.MACEKokkos(str(macefield_json_path))
+    reference.set_streamed_edges("generic")
+    reference.H1 = _compact_to_native_h1(h1_pre.numpy(force=True))
+    reference.compute_field_H1(
         h1_pre.shape[0], electric_field.numpy(force=True).reshape(-1)
     )
-    native.H1_adj = _compact_to_native_h1(h1_post_adj.numpy(force=True)).tolist()
-    native.reverse_field_H1(
-        h1_pre.shape[0], electric_field.numpy(force=True).reshape(-1)
-    )
-
-    kokkos = native_symmetrix.MACEKokkos(str(macefield_json_path))
-    kokkos.H1 = _compact_to_native_h1(h1_pre.numpy(force=True))
-    kokkos.compute_field_H1(
-        h1_pre.shape[0], electric_field.numpy(force=True).reshape(-1)
-    )
-    kokkos.H1_adj = _compact_to_native_h1(h1_post_adj.numpy(force=True))
-    kokkos.reverse_field_H1(
+    reference.H1_adj = _compact_to_native_h1(h1_post_adj.numpy(force=True))
+    reference.reverse_field_H1(
         h1_pre.shape[0], electric_field.numpy(force=True).reshape(-1)
     )
 
-    assert np.allclose(kokkos.H1_adj, native.H1_adj, atol=1e-12, rtol=1e-12)
+    subject = native_symmetrix.MACEKokkos(str(macefield_json_path))
+    subject.set_streamed_edges("materialized")
+    subject.H1 = _compact_to_native_h1(h1_pre.numpy(force=True))
+    subject.compute_field_H1(
+        h1_pre.shape[0], electric_field.numpy(force=True).reshape(-1)
+    )
+    subject.H1_adj = _compact_to_native_h1(h1_post_adj.numpy(force=True))
+    subject.reverse_field_H1(
+        h1_pre.shape[0], electric_field.numpy(force=True).reshape(-1)
+    )
+
+    assert np.allclose(subject.H1_adj, reference.H1_adj, atol=1e-12, rtol=1e-12)
     assert np.allclose(
-        kokkos.electric_field_adj, native.electric_field_adj, atol=1e-12, rtol=1e-12
+        subject.electric_field_adj,
+        reference.electric_field_adj,
+        atol=1e-12,
+        rtol=1e-12,
     )
 
 
@@ -649,7 +647,9 @@ def test_native_field_energy_forces_match_ase_macefield(
     expected_energy = atoms.get_potential_energy()
     expected_forces = atoms.get_forces()
 
-    evaluator = native_symmetrix.MACE(str(macefield_full_json_path))
+    _skip_without_kokkos()
+    evaluator = native_symmetrix.MACEKokkos(str(macefield_full_json_path))
+    evaluator.set_streamed_edges("generic")
     atomic_numbers = atoms.get_atomic_numbers().tolist()
     mace_atomic_numbers = evaluator.atomic_numbers
     i_list, j_list, r, xyz = neighbor_list("ijdD", atoms, evaluator.r_cut)
@@ -684,13 +684,6 @@ def test_native_field_energy_forces_match_ase_macefield(
     assert np.allclose(native_forces, expected_forces, atol=2e-3)
 
 
-def _skip_without_kokkos():
-    if not hasattr(native_symmetrix, "MACEKokkos"):
-        pytest.skip("Symmetrix was built without Kokkos bindings.")
-    if not native_symmetrix._kokkos_is_initialized():
-        native_symmetrix._init_kokkos()
-
-
 def _load_direct_artifact(evaluator, model_path, dtype):
     execution_space = native_symmetrix._kokkos_default_execution_space()
     if execution_space in ("OpenMP", "Serial"):
@@ -711,8 +704,8 @@ def _load_direct_artifact(evaluator, model_path, dtype):
             loader(str(artifact.artifact_path))
 
 
-def _field_backend_inputs(evaluator):
-    atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982)
+def _field_backend_inputs(evaluator, repeat=1):
+    atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982).repeat((repeat,) * 3)
     atomic_numbers = atoms.get_atomic_numbers().tolist()
     mace_atomic_numbers = evaluator.atomic_numbers
     i_list, j_list, r, xyz = neighbor_list("ijdD", atoms, evaluator.r_cut)
@@ -729,24 +722,157 @@ def _field_backend_inputs(evaluator):
     return num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, i_list
 
 
-@pytest.mark.parametrize(
-    "evaluator_name,mode",
-    [
-        ("MACE", "materialized"),
-        ("MACE", "generic"),
-        ("MACEKokkos", "materialized"),
-        ("MACEKokkos", "generic"),
-    ],
+@pytest.fixture(
+    scope="module",
+    params=(
+        ("MACEKokkosFloat", "float32", False, 5e-4),
+        ("MACEKokkosFloat", "float32", True, 5e-4),
+        ("MACEKokkos", "float64", False, 3e-10),
+        ("MACEKokkos", "float64", True, 3e-10),
+    ),
+    ids=("f32-unity", "f32-weighted", "f64-unity", "f64-weighted"),
 )
+def generated_host_r0_artifact(
+    request, macefield_full_json_path, standard_full_json_path, tmp_path_factory
+):
+    _skip_without_kokkos()
+    if native_symmetrix._kokkos_default_execution_space() not in ("OpenMP", "Serial"):
+        pytest.skip(
+            "generated R0 CPU baseline requires Kokkos OpenMP or Serial; "
+            f"active execution space is {native_symmetrix._kokkos_default_execution_space()}"
+        )
+
+    from symmetrix.jit import artifact_cache_inputs, prepare_jit_artifact
+    from symmetrix.mace_jit_operator_codegen import (
+        OPERATOR_ARTIFACT_ENVELOPE,
+        render_jit_r0_host_plugin,
+    )
+
+    kokkos_class, dtype, weighted, atol = request.param
+    model_path = standard_full_json_path if weighted else macefield_full_json_path
+    model_data = json.loads(model_path.read_text())
+    source, metadata = render_jit_r0_host_plugin(
+        model_data["execution_contracts"]["R0"],
+        precision=dtype,
+        target="x86-64-v3",
+        apply_edge_weights=weighted,
+    )
+    artifact = prepare_jit_artifact(
+        source,
+        abi=artifact_cache_inputs(metadata, OPERATOR_ARTIFACT_ENVELOPE),
+        build={"operator": metadata},
+        cxx_flags=None,
+        host_target="x86-64-v3",
+        cache_root=tmp_path_factory.mktemp(f"r0-{dtype}-{weighted}"),
+        artifact_name=f"r0_host_parity_{dtype}_{'weighted' if weighted else 'unity'}",
+    )
+    assert artifact.available, (artifact.reason, artifact.diagnostics)
+    assert metadata["stage"] == "R0"
+    assert metadata["schedule"] == "host-owner"
+    return kokkos_class, dtype, weighted, atol, model_path, artifact, metadata
+
+
+@pytest.mark.parametrize("graph_repeat", (1, 2), ids=("small", "large"))
+def test_generated_host_r0_matches_builtin_execution(
+    generated_host_r0_artifact, graph_repeat
+):
+    (
+        kokkos_class,
+        dtype,
+        weighted,
+        atol,
+        model_path,
+        artifact,
+        metadata,
+    ) = generated_host_r0_artifact
+    control = getattr(native_symmetrix, kokkos_class)(str(model_path))
+    generated = getattr(native_symmetrix, kokkos_class)(str(model_path))
+    _load_direct_artifact(control, model_path, dtype)
+    _load_direct_artifact(generated, model_path, dtype)
+    generated._load_r0_host_plugin(
+        str(artifact.artifact_path),
+        weighted,
+        metadata["generated_identity"]["target"],
+    )
+    assert generated.r0_implementation == "generated"
+    assert generated._r0_loader_implementation == "host_plugin"
+    assert generated.r0_backend == "host"
+    assert generated.r0_schedule == "host-owner"
+    assert generated.r0_profile == "owner-batched"
+    assert generated.r0_host_plugin_ready
+    assert generated.r0_host_plugin_artifact_id == metadata["artifact_id"]
+
+    for evaluator in (control, generated):
+        evaluator.set_streamed_edges("direct")
+        evaluator._set_factorized_source_strategy("jit_plugin")
+        evaluator._set_harmonic_storage_policy("y-only-direct-v1")
+        evaluator._set_standard_m0_executor("standard")
+        evaluator._set_m1_polynomial_policy("recompute")
+        evaluator._set_mh0_state_policy("reuse-adjoints-v1")
+    inputs = _field_backend_inputs(control, repeat=graph_repeat)[:7]
+    electric_field = np.array([0.01, -0.02, 0.03], dtype=np.float64)
+
+    def evaluate(evaluator):
+        graph = evaluator._prepare_factorized_graph(*inputs[:5])
+        if weighted:
+            node_weights = np.linspace(0.8, 1.2, inputs[0], dtype=np.float64)
+            edge_weights = np.linspace(0.7, 1.1, len(inputs[3]), dtype=np.float64)
+            evaluator._set_alchemical_weights(graph, node_weights, edge_weights)
+        positions = np.ascontiguousarray(inputs[5], dtype=np.float64).reshape(-1)
+        distances = np.ascontiguousarray(inputs[6], dtype=np.float64)
+        if weighted:
+            evaluator._compute_prepared_factorized(graph, positions, distances)
+        else:
+            evaluator._compute_prepared_factorized_field(
+                graph,
+                positions,
+                distances,
+                electric_field,
+            )
+        pair_forces = np.asarray(evaluator.node_forces, dtype=np.float64).reshape(-1, 3)
+        xyz = np.asarray(inputs[5], dtype=np.float64)
+        outputs = {
+            "energy": np.sum(evaluator.node_energies, dtype=np.float64),
+            "forces": np.array(pair_forces[: len(xyz)], copy=True),
+            "stress_numerator": -(pair_forces[: len(xyz)].T @ xyz),
+            "A0_adj": np.array(evaluator.A0_adj, copy=True),
+        }
+        if not weighted:
+            outputs["electric_field_adj"] = np.array(
+                evaluator.electric_field_adj, copy=True
+            )
+        return outputs
+
+    control_outputs = evaluate(control)
+    launches = generated.standard_r0_module_launch_count
+    generated_outputs = evaluate(generated)
+
+    assert generated.standard_r0_module_launch_count - launches == 4
+    assert generated.standard_r0_density_scale_fused
+    assert generated.harmonic_gradient_bytes == 0
+    assert generated.execution_direct_harmonic_launch_count > 0
+    assert generated.standard_m0_input_scale_adjoint_launch_count > 0
+    diagnostic = (
+        f"stage=R0 schedule=host-owner precision={dtype} "
+        f"edge_weight_mode={'weighted' if weighted else 'unity'} "
+        f"graph={'large' if graph_repeat == 2 else 'small'}"
+    )
+    for name in control_outputs:
+        np.testing.assert_allclose(
+            generated_outputs[name],
+            control_outputs[name],
+            rtol=0.0,
+            atol=atol,
+            err_msg=f"{diagnostic} path={name}",
+        )
+
+
+@pytest.mark.parametrize("mode", ["materialized", "generic"])
 def test_residual_first_field_energy_forces_match_pytorch(
     residual_first_macefield_artifacts,
-    evaluator_name,
     mode,
 ):
-    if not hasattr(native_symmetrix, evaluator_name):
-        pytest.skip(f"Symmetrix was built without {evaluator_name}.")
-    if evaluator_name == "MACEKokkos":
-        _skip_without_kokkos()
+    _skip_without_kokkos()
 
     atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982)
     electric_field = np.array([0.013, -0.021, 0.008], dtype=np.float64)
@@ -761,7 +887,7 @@ def test_residual_first_field_energy_forces_match_pytorch(
     expected_energy = atoms.get_potential_energy()
     expected_forces = atoms.get_forces()
 
-    evaluator = getattr(native_symmetrix, evaluator_name)(
+    evaluator = native_symmetrix.MACEKokkos(
         str(residual_first_macefield_artifacts["json_path"])
     )
     evaluator.set_streamed_edges(mode)
@@ -809,20 +935,15 @@ def test_residual_first_parameter_gradients_reject(
         evaluator.set_execution_parameter_gradients(True)
 
 
-@pytest.mark.parametrize("evaluator_name", ["MACE", "MACEKokkos"])
 def test_residual_first_legacy_pair_splines_match_compact(
     residual_first_macefield_artifacts,
-    evaluator_name,
 ):
-    if not hasattr(native_symmetrix, evaluator_name):
-        pytest.skip(f"Symmetrix was built without {evaluator_name}.")
-    if evaluator_name == "MACEKokkos":
-        _skip_without_kokkos()
+    _skip_without_kokkos()
 
-    compact = getattr(native_symmetrix, evaluator_name)(
+    compact = native_symmetrix.MACEKokkos(
         str(residual_first_macefield_artifacts["json_path"])
     )
-    legacy = getattr(native_symmetrix, evaluator_name)(
+    legacy = native_symmetrix.MACEKokkos(
         str(residual_first_macefield_artifacts["legacy_json_path"])
     )
     compact.set_streamed_edges("materialized")
@@ -907,7 +1028,9 @@ def test_density_residual_first_field_matches_pytorch(tmp_path):
     expected_energy = atoms.get_potential_energy()
     expected_forces = atoms.get_forces()
 
-    evaluator = native_symmetrix.MACE(str(model_path))
+    _skip_without_kokkos()
+    evaluator = native_symmetrix.MACEKokkos(str(model_path))
+    evaluator.set_streamed_edges("generic")
     num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, i_list = (
         _field_backend_inputs(evaluator)
     )
@@ -940,23 +1063,13 @@ def test_density_residual_first_field_matches_pytorch(tmp_path):
     assert np.allclose(actual_forces, expected_forces, atol=3e-3, rtol=3e-3)
 
 
-@pytest.mark.parametrize(
-    "evaluator_name,mode",
-    [
-        ("MACE", "materialized"),
-        ("MACEKokkos", "generic"),
-    ],
-)
+@pytest.mark.parametrize("mode", ["generic"])
 def test_residual_first_ordinary_fused_path_matches_zero_field(
     residual_first_macefield_artifacts,
     tmp_path,
-    evaluator_name,
     mode,
 ):
-    if not hasattr(native_symmetrix, evaluator_name):
-        pytest.skip(f"Symmetrix was built without {evaluator_name}.")
-    if evaluator_name == "MACEKokkos":
-        _skip_without_kokkos()
+    _skip_without_kokkos()
 
     data = json.loads(json.dumps(residual_first_macefield_artifacts["data"]))
     data["model_type"] = "MACE"
@@ -977,7 +1090,7 @@ def test_residual_first_ordinary_fused_path_matches_zero_field(
     expected_energy = atoms.get_potential_energy()
     expected_forces = atoms.get_forces()
 
-    evaluator = getattr(native_symmetrix, evaluator_name)(str(model_path))
+    evaluator = native_symmetrix.MACEKokkos(str(model_path))
     evaluator.set_streamed_edges(mode)
     num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, i_list = (
         _field_backend_inputs(evaluator)
@@ -1017,12 +1130,14 @@ def test_analytic_field_responses(request, artifact_fixture):
     _skip_without_kokkos()
     artifacts = request.getfixturevalue(artifact_fixture)
     model_path = artifacts["json_path"]
-    native = native_symmetrix.MACE(str(model_path))
-    kokkos = native_symmetrix.MACEKokkos(str(model_path))
-    _load_direct_artifact(kokkos, model_path, "float64")
-    kokkos.set_streamed_edges("direct")
+    # The retired serial evaluator's reference role is the generic routing; the
+    # retained evaluator's other artifact-free host mode is materialized.
+    reference = native_symmetrix.MACEKokkos(str(model_path))
+    reference.set_streamed_edges("generic")
+    subject = native_symmetrix.MACEKokkos(str(model_path))
+    subject.set_streamed_edges("materialized")
     num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, _ = (
-        _field_backend_inputs(native)
+        _field_backend_inputs(reference)
     )
     electric_field = np.array([0.013, -0.021, 0.008], dtype=np.float64)
     args = (
@@ -1035,24 +1150,24 @@ def test_analytic_field_responses(request, artifact_fixture):
         r,
     )
 
-    native.compute_electric_field_hessian(*args, electric_field)
-    native_hessian = np.asarray(native.electric_field_hessian, dtype=np.float64)
-    native.compute_electric_field_force_derivative(*args, electric_field)
-    native_force_derivative = np.asarray(
-        native.electric_field_force_derivative, dtype=np.float64
+    reference.compute_electric_field_hessian(*args, electric_field)
+    reference_hessian = np.asarray(reference.electric_field_hessian, dtype=np.float64)
+    reference.compute_electric_field_force_derivative(*args, electric_field)
+    reference_force_derivative = np.asarray(
+        reference.electric_field_force_derivative, dtype=np.float64
     )
-    kokkos.compute_electric_field_hessian(*args, electric_field)
-    kokkos.compute_electric_field_force_derivative(*args, electric_field)
+    subject.compute_electric_field_hessian(*args, electric_field)
+    subject.compute_electric_field_force_derivative(*args, electric_field)
 
     assert np.allclose(
-        kokkos.electric_field_hessian,
-        native_hessian,
+        subject.electric_field_hessian,
+        reference_hessian,
         atol=2e-8,
         rtol=2e-8,
     )
     assert np.allclose(
-        kokkos.electric_field_force_derivative,
-        native_force_derivative,
+        subject.electric_field_force_derivative,
+        reference_force_derivative,
         atol=2e-8,
         rtol=2e-8,
     )
@@ -1064,14 +1179,14 @@ def test_analytic_field_responses(request, artifact_fixture):
         field_minus = electric_field.copy()
         field_plus[seed] += step
         field_minus[seed] -= step
-        native.compute_node_energies_forces_field(*args, field_plus)
-        adj_plus = np.asarray(native.electric_field_adj, dtype=np.float64)
-        native.compute_node_energies_forces_field(*args, field_minus)
-        adj_minus = np.asarray(native.electric_field_adj, dtype=np.float64)
+        reference.compute_node_energies_forces_field(*args, field_plus)
+        adj_plus = np.asarray(reference.electric_field_adj, dtype=np.float64)
+        reference.compute_node_energies_forces_field(*args, field_minus)
+        adj_minus = np.asarray(reference.electric_field_adj, dtype=np.float64)
         finite_difference[:, seed] = (adj_plus - adj_minus) / (2.0 * step)
 
     assert np.allclose(
-        native_hessian.reshape(3, 3),
+        reference_hessian.reshape(3, 3),
         finite_difference,
         atol=2e-7,
         rtol=2e-5,
@@ -1094,11 +1209,13 @@ def test_rank2_field_energy_forces_match_ase_macefield(
     expected_energy = atoms.get_potential_energy()
     expected_forces = atoms.get_forces()
 
-    native = native_symmetrix.MACE(str(rank2_macefield_artifacts["json_path"]))
+    _skip_without_kokkos()
+    evaluator = native_symmetrix.MACEKokkos(str(rank2_macefield_artifacts["json_path"]))
+    evaluator.set_streamed_edges("generic")
     num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, i_list = (
-        _field_backend_inputs(native)
+        _field_backend_inputs(evaluator)
     )
-    native.compute_node_energies_forces_field(
+    evaluator.compute_node_energies_forces_field(
         num_nodes,
         node_types,
         num_neigh,
@@ -1108,8 +1225,8 @@ def test_rank2_field_energy_forces_match_ase_macefield(
         r,
         electric_field,
     )
-    actual_energy = np.sum(native.node_energies)
-    pair_forces = np.asarray(native.node_forces).reshape((-1, 3))[: len(i_list)]
+    actual_energy = np.sum(evaluator.node_energies)
+    pair_forces = np.asarray(evaluator.node_forces).reshape((-1, 3))[: len(i_list)]
     actual_forces = np.zeros((num_nodes, 3), dtype=np.float64)
     for component in range(3):
         actual_forces[:, component] = np.bincount(
@@ -1131,15 +1248,17 @@ def test_kokkos_field_energy_forces_match_native(macefield_full_json_path):
 
     electric_field = np.array([0.01, 0.0, 0.0], dtype=np.float64)
 
-    native = native_symmetrix.MACE(str(macefield_full_json_path))
-    kokkos = native_symmetrix.MACEKokkos(str(macefield_full_json_path))
-    _load_direct_artifact(kokkos, macefield_full_json_path, "float64")
-    kokkos.set_streamed_edges("direct")
+    # The retired serial evaluator's reference role is the generic routing; the
+    # retained evaluator's other artifact-free host mode is materialized.
+    reference = native_symmetrix.MACEKokkos(str(macefield_full_json_path))
+    reference.set_streamed_edges("generic")
+    subject = native_symmetrix.MACEKokkos(str(macefield_full_json_path))
+    subject.set_streamed_edges("materialized")
     num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, _ = (
-        _field_backend_inputs(native)
+        _field_backend_inputs(reference)
     )
 
-    native.compute_node_energies_forces_field(
+    reference.compute_node_energies_forces_field(
         num_nodes,
         node_types,
         num_neigh,
@@ -1149,7 +1268,7 @@ def test_kokkos_field_energy_forces_match_native(macefield_full_json_path):
         r,
         electric_field,
     )
-    kokkos.compute_node_energies_forces_field(
+    subject.compute_node_energies_forces_field(
         num_nodes,
         node_types,
         num_neigh,
@@ -1160,10 +1279,10 @@ def test_kokkos_field_energy_forces_match_native(macefield_full_json_path):
         electric_field,
     )
 
-    assert np.sum(kokkos.node_energies) == pytest.approx(
-        np.sum(native.node_energies), abs=1e-8
+    assert np.sum(subject.node_energies) == pytest.approx(
+        np.sum(reference.node_energies), abs=1e-8
     )
-    assert np.allclose(kokkos.node_forces, native.node_forces, atol=1e-8, rtol=1e-8)
+    assert np.allclose(subject.node_forces, reference.node_forces, atol=1e-8, rtol=1e-8)
 
 
 @pytest.mark.parametrize("mode", ["generic"])
@@ -1215,8 +1334,6 @@ def test_kokkos_execution_field_standard_m0_r0_v2_lifecycle(
     _load_direct_artifact(evaluator, macefield_full_json_path, dtype)
     evaluator.set_streamed_edges("direct")
     evaluator._set_factorized_source_strategy("jit_plugin")
-    evaluator._set_factorized_direct_forward_executor("jit_all")
-    evaluator._set_factorized_direct_reverse_executor("jit")
     inputs = _field_backend_inputs(evaluator)[:7]
     electric_field = np.array([0.01, -0.02, 0.03], dtype=np.float64)
 
@@ -1653,8 +1770,6 @@ def _configured_low_memory_field_evaluator(
         _load_direct_artifact(evaluator, model_path, dtype)
         evaluator.set_streamed_edges("direct")
         evaluator._set_factorized_source_strategy("jit_plugin")
-        evaluator._set_factorized_direct_forward_executor("jit_all")
-        evaluator._set_factorized_direct_reverse_executor("jit")
         evaluator._set_standard_r0_executor("v2_edge16")
         evaluator._set_standard_m0_executor("standard")
         evaluator._set_m1_polynomial_policy("recompute")
@@ -2128,7 +2243,6 @@ def test_kokkos_low_memory_field_calculator_matches_full_retention(
     def calculator(low_memory):
         return Symmetrix(
             macefield_full_json_path,
-            use_kokkos=True,
             dtype=dtype,
             streamed_edges="direct",
             m1_polynomial_policy="retained",
@@ -2360,18 +2474,17 @@ def test_kokkos_electric_field_hessian_matches_native(
 
     electric_field = np.array([0.01, -0.02, 0.03], dtype=np.float64)
 
-    native = native_symmetrix.MACE(str(macefield_full_json_path))
-    kokkos = getattr(native_symmetrix, kokkos_class)(str(macefield_full_json_path))
-    _load_direct_artifact(
-        kokkos,
-        macefield_full_json_path,
-        "float32" if kokkos_class == "MACEKokkosFloat" else "float64",
-    )
+    # The retired serial evaluator's reference role is the generic routing; the
+    # subject keeps the retained evaluator's other artifact-free host mode.
+    reference = native_symmetrix.MACEKokkos(str(macefield_full_json_path))
+    reference.set_streamed_edges("generic")
+    subject = getattr(native_symmetrix, kokkos_class)(str(macefield_full_json_path))
+    subject.set_streamed_edges("materialized")
     num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, _ = (
-        _field_backend_inputs(native)
+        _field_backend_inputs(reference)
     )
 
-    native.compute_electric_field_hessian(
+    reference.compute_electric_field_hessian(
         num_nodes,
         node_types,
         num_neigh,
@@ -2381,7 +2494,7 @@ def test_kokkos_electric_field_hessian_matches_native(
         r,
         electric_field,
     )
-    kokkos.compute_electric_field_hessian(
+    subject.compute_electric_field_hessian(
         num_nodes,
         node_types,
         num_neigh,
@@ -2393,8 +2506,8 @@ def test_kokkos_electric_field_hessian_matches_native(
     )
 
     assert np.allclose(
-        kokkos.electric_field_hessian,
-        native.electric_field_hessian,
+        subject.electric_field_hessian,
+        reference.electric_field_hessian,
         atol=atol,
         rtol=rtol,
     )
@@ -2417,18 +2530,17 @@ def test_kokkos_electric_field_force_derivative_matches_native(
 
     electric_field = np.array([0.01, -0.02, 0.03], dtype=np.float64)
 
-    native = native_symmetrix.MACE(str(macefield_full_json_path))
-    kokkos = getattr(native_symmetrix, kokkos_class)(str(macefield_full_json_path))
-    _load_direct_artifact(
-        kokkos,
-        macefield_full_json_path,
-        "float32" if kokkos_class == "MACEKokkosFloat" else "float64",
-    )
+    # The retired serial evaluator's reference role is the generic routing; the
+    # subject keeps the retained evaluator's other artifact-free host mode.
+    reference = native_symmetrix.MACEKokkos(str(macefield_full_json_path))
+    reference.set_streamed_edges("generic")
+    subject = getattr(native_symmetrix, kokkos_class)(str(macefield_full_json_path))
+    subject.set_streamed_edges("materialized")
     num_nodes, node_types, num_neigh, neigh_indices, neigh_types, xyz, r, i_list = (
-        _field_backend_inputs(native)
+        _field_backend_inputs(reference)
     )
 
-    native.compute_electric_field_force_derivative(
+    reference.compute_electric_field_force_derivative(
         num_nodes,
         node_types,
         num_neigh,
@@ -2438,7 +2550,7 @@ def test_kokkos_electric_field_force_derivative_matches_native(
         r,
         electric_field,
     )
-    kokkos.compute_electric_field_force_derivative(
+    subject.compute_electric_field_force_derivative(
         num_nodes,
         node_types,
         num_neigh,
@@ -2449,22 +2561,23 @@ def test_kokkos_electric_field_force_derivative_matches_native(
         electric_field,
     )
 
-    native_deriv = np.asarray(
-        native.electric_field_force_derivative, dtype=np.float64
+    reference_deriv = np.asarray(
+        reference.electric_field_force_derivative, dtype=np.float64
     ).reshape(3, -1, 3)
-    kokkos_deriv = np.asarray(
-        kokkos.electric_field_force_derivative, dtype=np.float64
+    subject_deriv = np.asarray(
+        subject.electric_field_force_derivative, dtype=np.float64
     ).reshape(3, -1, 3)
     assert np.allclose(
-        kokkos_deriv[:, : len(i_list)],
-        native_deriv[:, : len(i_list)],
+        subject_deriv[:, : len(i_list)],
+        reference_deriv[:, : len(i_list)],
         atol=atol,
         rtol=rtol,
     )
 
 
 def test_native_exposes_atomic_energies_for_node_energy(macefield_full_json_path):
-    evaluator = native_symmetrix.MACE(str(macefield_full_json_path))
+    _skip_without_kokkos()
+    evaluator = native_symmetrix.MACEKokkos(str(macefield_full_json_path))
 
     atomic_energies = np.asarray(evaluator.atomic_energies, dtype=np.float64)
 
@@ -2478,7 +2591,9 @@ def test_native_electric_field_hessian_matches_field_adjoint_finite_difference(
     atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982)
     electric_field = np.array([0.01, -0.02, 0.03], dtype=np.float64)
 
-    evaluator = native_symmetrix.MACE(str(macefield_full_json_path))
+    _skip_without_kokkos()
+    evaluator = native_symmetrix.MACEKokkos(str(macefield_full_json_path))
+    evaluator.set_streamed_edges("generic")
     atomic_numbers = atoms.get_atomic_numbers().tolist()
     mace_atomic_numbers = evaluator.atomic_numbers
     i_list, j_list, r, xyz = neighbor_list("ijdD", atoms, evaluator.r_cut)
@@ -2547,7 +2662,9 @@ def test_native_electric_field_force_derivative_matches_force_finite_difference(
     atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982)
     electric_field = np.array([0.01, -0.02, 0.03], dtype=np.float64)
 
-    evaluator = native_symmetrix.MACE(str(macefield_full_json_path))
+    _skip_without_kokkos()
+    evaluator = native_symmetrix.MACEKokkos(str(macefield_full_json_path))
+    evaluator.set_streamed_edges("generic")
     atomic_numbers = atoms.get_atomic_numbers().tolist()
     mace_atomic_numbers = evaluator.atomic_numbers
     i_list, j_list, r, xyz = neighbor_list("ijdD", atoms, evaluator.r_cut)

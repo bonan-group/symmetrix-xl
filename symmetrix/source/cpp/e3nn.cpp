@@ -27,8 +27,19 @@ void bind_float_e3_primitives(py::module_& module)
         .def_property_readonly("output_dimension",&Linear::output_dimension)
         .def_property_readonly("backend",&Linear::backend)
         .def_property_readonly("workspace_bytes",&Linear::workspace_bytes)
+        .def_property_readonly(
+            "specialization_family",&Linear::specialization_family)
+        .def_property_readonly(
+            "specialization_role",&Linear::specialization_role)
+        .def_property_readonly(
+            "specialized_forward_count",&Linear::specialized_forward_count)
+        .def_property_readonly(
+            "specialized_reverse_count",&Linear::specialized_reverse_count)
+        .def_property_readonly("specialization_fallback_count",
+            &Linear::specialization_fallback_count)
         .def("set_backend",&Linear::set_backend)
         .def("selected_backend",&Linear::selected_backend)
+        .def("selected_family",&Linear::selected_family)
         .def("evaluate_batch",[](
             const Linear& self,const std::vector<float>& values,int samples) {
             if(samples<0||values.size()!=static_cast<std::size_t>(samples)
@@ -39,6 +50,18 @@ void bind_float_e3_primitives(py::module_& module)
             set_kokkos_view(input,values,samples,self.input_dimension());
             Kokkos::realloc(output,samples,self.output_dimension());
             self.evaluate(input,output);
+            return view2vector(output);
+        })
+        .def("evaluate_generic_batch",[](
+            const Linear& self,const std::vector<float>& values,int samples) {
+            if(samples<0||values.size()!=static_cast<std::size_t>(samples)
+                    *self.input_dimension())
+                throw std::invalid_argument(
+                    "Float generic e3 linear input dimensions are inconsistent.");
+            Kokkos::View<float**,Kokkos::LayoutRight> input,output;
+            set_kokkos_view(input,values,samples,self.input_dimension());
+            Kokkos::realloc(output,samples,self.output_dimension());
+            self.evaluate_generic(input,output);
             return view2vector(output);
         })
         .def("evaluate_ir_mul_batch",[](
@@ -66,6 +89,20 @@ void bind_float_e3_primitives(py::module_& module)
             self.reverse(output_adjoint,input_adjoint);
             return view2vector(input_adjoint);
         })
+        .def("reverse_generic_batch",[](
+            const Linear& self,const std::vector<float>& seed,int samples) {
+            if(samples<0||seed.size()!=static_cast<std::size_t>(samples)
+                    *self.output_dimension())
+                throw std::invalid_argument(
+                    "Float generic e3 linear adjoint dimensions are inconsistent.");
+            Kokkos::View<float**,Kokkos::LayoutRight>
+                output_adjoint,input_adjoint;
+            set_kokkos_view(
+                output_adjoint,seed,samples,self.output_dimension());
+            Kokkos::realloc(input_adjoint,samples,self.input_dimension());
+            self.reverse_generic(output_adjoint,input_adjoint);
+            return view2vector(input_adjoint);
+        })
         .def("reverse_ir_mul_batch",[](
             const Linear& self,const std::vector<float>& seed,int samples) {
             if(samples<0||seed.size()!=static_cast<std::size_t>(samples)
@@ -78,6 +115,32 @@ void bind_float_e3_primitives(py::module_& module)
                 output_adjoint,seed,samples,self.output_dimension());
             Kokkos::realloc(input_adjoint,samples,self.input_dimension());
             self.reverse_ir_mul(output_adjoint,input_adjoint);
+            return view2vector(input_adjoint);
+        })
+        .def("evaluate_lane_batch",[](
+            const Linear& self,const std::vector<float>& values,int samples) {
+            if(samples<0||values.size()!=static_cast<std::size_t>(samples)
+                    *self.input_dimension())
+                throw std::invalid_argument(
+                    "Float Kokkos lane e3 linear input dimensions are inconsistent.");
+            Kokkos::View<float**,Kokkos::LayoutRight> input,output;
+            set_kokkos_view(input,values,samples,self.input_dimension());
+            Kokkos::realloc(output,samples,self.output_dimension());
+            self.evaluate_lane(input,output);
+            return view2vector(output);
+        })
+        .def("reverse_lane_batch",[](
+            const Linear& self,const std::vector<float>& seed,int samples) {
+            if(samples<0||seed.size()!=static_cast<std::size_t>(samples)
+                    *self.output_dimension())
+                throw std::invalid_argument(
+                    "Float Kokkos lane e3 linear adjoint dimensions are inconsistent.");
+            Kokkos::View<float**,Kokkos::LayoutRight>
+                output_adjoint,input_adjoint;
+            set_kokkos_view(
+                output_adjoint,seed,samples,self.output_dimension());
+            Kokkos::realloc(input_adjoint,samples,self.input_dimension());
+            self.reverse_lane(output_adjoint,input_adjoint);
             return view2vector(input_adjoint);
         });
 
@@ -93,7 +156,9 @@ void bind_float_e3_primitives(py::module_& module)
         .def_property_readonly(
             "has_internal_weights",&Tensor::has_internal_weights)
         .def_property_readonly(
-            "uses_mh1_fast_path",&Tensor::uses_mh1_fast_path)
+            "uses_mh1_fast_path",[](const Tensor& self) {
+                return self.uses_direct_execution_plan();
+            })
         .def_property_readonly("backend",&Tensor::backend)
         .def_property_readonly("execution_backend",&Tensor::execution_backend)
         .def_property_readonly("channel_team_size",&Tensor::channel_team_size)
@@ -428,6 +493,17 @@ void bind_e3nn(py::module_& module)
         }))
         .def_property_readonly("input_dimension", &E3LinearKokkos::input_dimension)
         .def_property_readonly("output_dimension", &E3LinearKokkos::output_dimension)
+        .def_property_readonly("specialization_family",
+            &E3LinearKokkos::specialization_family)
+        .def_property_readonly("specialization_role",
+            &E3LinearKokkos::specialization_role)
+        .def_property_readonly("specialized_forward_count",
+            &E3LinearKokkos::specialized_forward_count)
+        .def_property_readonly("specialized_reverse_count",
+            &E3LinearKokkos::specialized_reverse_count)
+        .def_property_readonly("specialization_fallback_count",
+            &E3LinearKokkos::specialization_fallback_count)
+        .def("selected_family", &E3LinearKokkos::selected_family)
         .def("evaluate_batch", [](
             const E3LinearKokkos& self,
             const std::vector<double>& input_values,
@@ -439,6 +515,47 @@ void bind_e3nn(py::module_& module)
             set_kokkos_view(input,input_values,samples,self.input_dimension());
             Kokkos::realloc(output,samples,self.output_dimension());
             self.evaluate(input,output);
+            return view2vector(output);
+        })
+        .def("_evaluate_with_output_width_for_testing", [](
+            const E3LinearKokkos& self,
+            const std::vector<double>& input_values,int samples,
+            int output_width) {
+            if(samples<0||output_width<0||input_values.size()
+                !=static_cast<std::size_t>(samples)*self.input_dimension())
+                throw std::invalid_argument(
+                    "Kokkos e3 linear diagnostic dimensions are inconsistent.");
+            Kokkos::View<double**,Kokkos::LayoutRight> input,output;
+            set_kokkos_view(input,input_values,samples,self.input_dimension());
+            Kokkos::realloc(output,samples,output_width);
+            self.evaluate(input,output);
+        })
+        .def("evaluate_generic_batch", [](
+            const E3LinearKokkos& self,
+            const std::vector<double>& input_values,
+            int samples) {
+            if(samples<0||input_values.size()
+                !=static_cast<std::size_t>(samples)*self.input_dimension())
+                throw std::invalid_argument(
+                    "Generic Kokkos e3 linear input dimensions are inconsistent.");
+            Kokkos::View<double**,Kokkos::LayoutRight> input,output;
+            set_kokkos_view(input,input_values,samples,self.input_dimension());
+            Kokkos::realloc(output,samples,self.output_dimension());
+            self.evaluate_generic(input,output);
+            return view2vector(output);
+        })
+        .def("evaluate_lane_batch", [](
+            const E3LinearKokkos& self,
+            const std::vector<double>& input_values,
+            int samples) {
+            if(samples<0||input_values.size()
+                !=static_cast<std::size_t>(samples)*self.input_dimension())
+                throw std::invalid_argument(
+                    "Kokkos lane e3 linear input dimensions are inconsistent.");
+            Kokkos::View<double**,Kokkos::LayoutRight> input,output;
+            set_kokkos_view(input,input_values,samples,self.input_dimension());
+            Kokkos::realloc(output,samples,self.output_dimension());
+            self.evaluate_lane(input,output);
             return view2vector(output);
         })
         .def("evaluate_to_packed_batch", [](
@@ -466,6 +583,48 @@ void bind_e3nn(py::module_& module)
             set_kokkos_view(seed,output_adjoint,samples,self.output_dimension());
             Kokkos::realloc(input_adjoint,samples,self.input_dimension());
             self.reverse(seed,input_adjoint);
+            return view2vector(input_adjoint);
+        })
+        .def("_reverse_with_input_width_for_testing", [](
+            const E3LinearKokkos& self,
+            const std::vector<double>& output_adjoint,int samples,
+            int input_width) {
+            if(samples<0||input_width<0||output_adjoint.size()
+                !=static_cast<std::size_t>(samples)*self.output_dimension())
+                throw std::invalid_argument(
+                    "Kokkos e3 linear diagnostic dimensions are inconsistent.");
+            Kokkos::View<double**,Kokkos::LayoutRight> seed,input_adjoint;
+            set_kokkos_view(
+                seed,output_adjoint,samples,self.output_dimension());
+            Kokkos::realloc(input_adjoint,samples,input_width);
+            self.reverse(seed,input_adjoint);
+        })
+        .def("reverse_generic_batch", [](
+            const E3LinearKokkos& self,
+            const std::vector<double>& output_adjoint,
+            int samples) {
+            if(samples<0||output_adjoint.size()
+                !=static_cast<std::size_t>(samples)*self.output_dimension())
+                throw std::invalid_argument(
+                    "Generic Kokkos e3 linear adjoint dimensions are inconsistent.");
+            Kokkos::View<double**,Kokkos::LayoutRight> seed,input_adjoint;
+            set_kokkos_view(seed,output_adjoint,samples,self.output_dimension());
+            Kokkos::realloc(input_adjoint,samples,self.input_dimension());
+            self.reverse_generic(seed,input_adjoint);
+            return view2vector(input_adjoint);
+        })
+        .def("reverse_lane_batch", [](
+            const E3LinearKokkos& self,
+            const std::vector<double>& output_adjoint,
+            int samples) {
+            if(samples<0||output_adjoint.size()
+                !=static_cast<std::size_t>(samples)*self.output_dimension())
+                throw std::invalid_argument(
+                    "Kokkos lane e3 linear adjoint dimensions are inconsistent.");
+            Kokkos::View<double**,Kokkos::LayoutRight> seed,input_adjoint;
+            set_kokkos_view(seed,output_adjoint,samples,self.output_dimension());
+            Kokkos::realloc(input_adjoint,samples,self.input_dimension());
+            self.reverse_lane(seed,input_adjoint);
             return view2vector(input_adjoint);
         })
         .def("reverse_packed_to_packed_batch", [](
@@ -513,7 +672,9 @@ void bind_e3nn(py::module_& module)
         .def_property_readonly(
             "has_internal_weights", &E3TensorProductKokkos::has_internal_weights)
         .def_property_readonly(
-            "uses_mh1_fast_path", &E3TensorProductKokkos::uses_mh1_fast_path)
+            "uses_mh1_fast_path",[](const E3TensorProductKokkos& self) {
+                return self.uses_direct_execution_plan();
+            })
         .def_property_readonly(
             "execution_backend", &E3TensorProductKokkos::execution_backend)
         .def_property_readonly(
@@ -586,7 +747,152 @@ void bind_e3nn(py::module_& module)
                 view2vector(input_1_adjoint),
                 view2vector(input_2_adjoint),
                 view2vector(weights_adjoint));
-        });
+        })
+        .def_property_readonly(
+            "supports_node_bilinear_uvw",
+            &E3TensorProductKokkos::supports_node_bilinear_uvw)
+        .def("evaluate_node_bilinear_uvw", [](
+            const E3TensorProductKokkos& self,
+            const std::vector<double>& input_1,
+            const std::vector<double>& input_2,
+            int samples) {
+            if(samples<1
+                ||input_1.size()
+                    !=static_cast<std::size_t>(samples)
+                        *static_cast<std::size_t>(self.input_1_dimension())
+                ||input_2.size()
+                    !=static_cast<std::size_t>(samples)
+                        *static_cast<std::size_t>(self.input_2_dimension()))
+                throw std::invalid_argument(
+                    "Kokkos node bilinear input dimensions are inconsistent.");
+            Kokkos::View<double**,Kokkos::LayoutRight> input_1_view;
+            Kokkos::View<double**,Kokkos::LayoutRight> input_2_view;
+            set_kokkos_view(input_1_view, input_1, samples,
+                self.input_1_dimension());
+            set_kokkos_view(input_2_view, input_2, samples,
+                self.input_2_dimension());
+            Kokkos::View<double**,Kokkos::LayoutRight> output(
+                "bound node bilinear output", samples,
+                self.output_dimension());
+            self.evaluate_node_bilinear_uvw(input_1_view, input_2_view, output);
+            return view2vector(output);
+        },
+            py::arg("input_1"), py::arg("input_2"), py::arg("samples") = 1)
+        .def("reverse_node_bilinear_uvw", [](
+            const E3TensorProductKokkos& self,
+            const std::vector<double>& input_1,
+            const std::vector<double>& input_2,
+            const std::vector<double>& output_adjoint,
+            int samples) {
+            if(samples<1
+                ||input_1.size()
+                    !=static_cast<std::size_t>(samples)
+                        *static_cast<std::size_t>(self.input_1_dimension())
+                ||input_2.size()
+                    !=static_cast<std::size_t>(samples)
+                        *static_cast<std::size_t>(self.input_2_dimension())
+                ||output_adjoint.size()
+                    !=static_cast<std::size_t>(samples)
+                        *static_cast<std::size_t>(self.output_dimension()))
+                throw std::invalid_argument(
+                    "Kokkos node bilinear reverse dimensions are inconsistent.");
+            Kokkos::View<double**,Kokkos::LayoutRight> input_1_view;
+            Kokkos::View<double**,Kokkos::LayoutRight> input_2_view;
+            Kokkos::View<double**,Kokkos::LayoutRight> output_adjoint_view;
+            set_kokkos_view(input_1_view, input_1, samples,
+                self.input_1_dimension());
+            set_kokkos_view(input_2_view, input_2, samples,
+                self.input_2_dimension());
+            set_kokkos_view(output_adjoint_view, output_adjoint, samples,
+                self.output_dimension());
+            Kokkos::View<double**,Kokkos::LayoutRight> input_1_adjoint(
+                "bound node bilinear input 1 adjoint", samples,
+                self.input_1_dimension());
+            Kokkos::View<double**,Kokkos::LayoutRight> input_2_adjoint(
+                "bound node bilinear input 2 adjoint", samples,
+                self.input_2_dimension());
+            self.reverse_node_bilinear_uvw(input_1_view, input_2_view,
+                output_adjoint_view, input_1_adjoint, input_2_adjoint);
+            return py::make_tuple(
+                view2vector(input_1_adjoint),
+                view2vector(input_2_adjoint));
+        },
+            py::arg("input_1"), py::arg("input_2"), py::arg("output_adjoint"),
+            py::arg("samples") = 1)
+        .def_property_readonly(
+            "supports_node_bilinear_uvw_lane",
+            &E3TensorProductKokkos::supports_node_bilinear_uvw_lane)
+        .def("evaluate_node_bilinear_uvw_lane", [](
+            const E3TensorProductKokkos& self,
+            const std::vector<double>& input_1,
+            const std::vector<double>& input_2,
+            int samples) {
+            if(samples<1
+                ||input_1.size()
+                    !=static_cast<std::size_t>(samples)
+                        *static_cast<std::size_t>(self.input_1_dimension())
+                ||input_2.size()
+                    !=static_cast<std::size_t>(samples)
+                        *static_cast<std::size_t>(self.input_2_dimension()))
+                throw std::invalid_argument(
+                    "Kokkos node bilinear lane input dimensions are "
+                    "inconsistent.");
+            Kokkos::View<double**,Kokkos::LayoutRight> input_1_view;
+            Kokkos::View<double**,Kokkos::LayoutRight> input_2_view;
+            set_kokkos_view(input_1_view, input_1, samples,
+                self.input_1_dimension());
+            set_kokkos_view(input_2_view, input_2, samples,
+                self.input_2_dimension());
+            Kokkos::View<double**,Kokkos::LayoutRight> output(
+                "bound node bilinear lane output", samples,
+                self.output_dimension());
+            self.evaluate_node_bilinear_uvw_lane(
+                input_1_view, input_2_view, output);
+            return view2vector(output);
+        },
+            py::arg("input_1"), py::arg("input_2"), py::arg("samples") = 1)
+        .def("reverse_node_bilinear_uvw_lane", [](
+            const E3TensorProductKokkos& self,
+            const std::vector<double>& input_1,
+            const std::vector<double>& input_2,
+            const std::vector<double>& output_adjoint,
+            int samples) {
+            if(samples<1
+                ||input_1.size()
+                    !=static_cast<std::size_t>(samples)
+                        *static_cast<std::size_t>(self.input_1_dimension())
+                ||input_2.size()
+                    !=static_cast<std::size_t>(samples)
+                        *static_cast<std::size_t>(self.input_2_dimension())
+                ||output_adjoint.size()
+                    !=static_cast<std::size_t>(samples)
+                        *static_cast<std::size_t>(self.output_dimension()))
+                throw std::invalid_argument(
+                    "Kokkos node bilinear lane reverse dimensions are "
+                    "inconsistent.");
+            Kokkos::View<double**,Kokkos::LayoutRight> input_1_view;
+            Kokkos::View<double**,Kokkos::LayoutRight> input_2_view;
+            Kokkos::View<double**,Kokkos::LayoutRight> output_adjoint_view;
+            set_kokkos_view(input_1_view, input_1, samples,
+                self.input_1_dimension());
+            set_kokkos_view(input_2_view, input_2, samples,
+                self.input_2_dimension());
+            set_kokkos_view(output_adjoint_view, output_adjoint, samples,
+                self.output_dimension());
+            Kokkos::View<double**,Kokkos::LayoutRight> input_1_adjoint(
+                "bound node bilinear lane input 1 adjoint", samples,
+                self.input_1_dimension());
+            Kokkos::View<double**,Kokkos::LayoutRight> input_2_adjoint(
+                "bound node bilinear lane input 2 adjoint", samples,
+                self.input_2_dimension());
+            self.reverse_node_bilinear_uvw_lane(input_1_view, input_2_view,
+                output_adjoint_view, input_1_adjoint, input_2_adjoint);
+            return py::make_tuple(
+                view2vector(input_1_adjoint),
+                view2vector(input_2_adjoint));
+        },
+            py::arg("input_1"), py::arg("input_2"), py::arg("output_adjoint"),
+            py::arg("samples") = 1);
 
     py::class_<E3ProductBasisKokkos>(module, "E3ProductBasisKokkos")
         .def(py::init([](const std::string& definition) {

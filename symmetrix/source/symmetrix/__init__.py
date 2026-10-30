@@ -10,22 +10,34 @@ from .backend_loader import available_backends as _available_backends
 from .backend_loader import load_backend as _load_backend
 from .backend_loader import selected_backend as selected_backend
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 _FRONTEND_EXPORTS = {
+    "AlchemicalConfig": (".mace_alchemical", "AlchemicalConfig"),
+    "AlchemicalPair": (".mace_alchemical", "AlchemicalPair"),
+    "ElementMixture": (".mace_alchemical", "ElementMixture"),
+    "D2Correction": (".corrections", "D2Correction"),
+    "D3Correction": (".corrections", "D3Correction"),
+    "FourierD3Correction": (".corrections", "FourierD3Correction"),
     "Symmetrix": (".calculator", "Symmetrix"),
     "FieldAwareCalculator": (".calculator", "FieldAwareCalculator"),
     "FieldContributionCalculator": (".calculator", "FieldContributionCalculator"),
     "SymmetrixEnsemble": (".ensemble", "SymmetrixEnsemble"),
-    "JitDeviceArtifactError": (".jit_device_artifact", "JitDeviceArtifactError"),
-    "JitDeviceArtifactResult": (".jit_device_artifact", "JitDeviceArtifactResult"),
+    "JitDeviceArtifactError": (".mace_jit_device_artifact", "JitDeviceArtifactError"),
+    "JitDeviceArtifactResult": (".mace_jit_device_artifact", "JitDeviceArtifactResult"),
     "prepare_jit_device_artifact": (
-        ".jit_device_artifact",
+        ".mace_jit_device_artifact",
         "prepare_jit_device_artifact",
     ),
-    "JitHostArtifactError": (".jit_host_artifact", "JitHostArtifactError"),
-    "JitHostArtifactResult": (".jit_host_artifact", "JitHostArtifactResult"),
-    "prepare_jit_host_artifact": (".jit_host_artifact", "prepare_jit_host_artifact"),
+    "JitHostArtifactError": (".mace_jit_host_artifact", "JitHostArtifactError"),
+    "JitHostArtifactResult": (".mace_jit_host_artifact", "JitHostArtifactResult"),
+    "prepare_jit_host_artifact": (
+        ".mace_jit_host_artifact",
+        "prepare_jit_host_artifact",
+    ),
+    "extract_nequip_data": (".extract_nequip_data", "extract_nequip_data"),
+    "export_nequip_model": (".extract_nequip_data", "export_nequip_model"),
+    "NequIPCalculator": (".nequip_calculator", "NequIPCalculator"),
 }
 
 # Stable native surface retained for direct imports and ``from symmetrix import *``.
@@ -44,11 +56,8 @@ _NATIVE_EXPORTS = (
     "E3TensorProduct",
     "E3TensorProductKokkos",
     "E3TensorProductKokkosFloat",
-    "MACE",
-    "MACEFloat",
     "MACEKokkos",
     "MACEKokkosFloat",
-    "MACENonlinear",
     "MACENonlinearKokkos",
     "MACENonlinearKokkosFloat",
     "MultilayerPerceptron",
@@ -105,12 +114,21 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
+    "AlchemicalConfig",
+    "AlchemicalPair",
     "BackendError",
+    "D2Correction",
+    "D3Correction",
+    "ElementMixture",
     "FieldAwareCalculator",
     "FieldContributionCalculator",
+    "FourierD3Correction",
+    "NequIPCalculator",
     "Symmetrix",
     "SymmetrixEnsemble",
     "available_backends",
+    "export_nequip_model",
+    "extract_nequip_data",
     "load_backend",
     "selected_backend",
 ]

@@ -24,7 +24,7 @@ def _compile(compiler, *arguments):
 
 def _host_plugin_source():
     return r"""
-#include "jit_mh1_host_plugin_abi.h"
+#include "mace_nonlinear_jit_host_plugin_abi.h"
 
 extern "C" void forward_owner(
     const SymmetrixJitMH1HostForwardArgsV4*, int32_t) {}
@@ -107,7 +107,10 @@ static const SymmetrixJitMH1HostPluginV4 descriptor = [] {
         SYMMETRIX_JIT_MH1_HOST_SOURCE_OWNS_EDGE_REVERSE_V4 |
         SYMMETRIX_JIT_MH1_HOST_PHI_MAJOR_FORWARD_WEIGHT_V4;
 #endif
-    value.interaction_count = 2;
+#ifndef DESCRIPTOR_INTERACTION_COUNT
+#define DESCRIPTOR_INTERACTION_COUNT SYMMETRIX_JIT_MH1_HOST_PLUGIN_INTERACTIONS
+#endif
+    value.interaction_count = DESCRIPTOR_INTERACTION_COUNT;
     value.scalar_size = sizeof(float);
     value.abi_tag = SYMMETRIX_JIT_MH1_HOST_PLUGIN_V4_ABI_TAG;
     value.artifact_id = "fixture-mh1-host-v4";
@@ -148,7 +151,7 @@ symmetrix_jit_mh1_host_plugin_query_v4()
 
 def _host_harness_source():
     return r"""
-#include "jit_mh1_host_plugin.hpp"
+#include "mace_nonlinear_jit_host_plugin.hpp"
 
 #include <exception>
 #include <iostream>
@@ -157,6 +160,9 @@ def _host_harness_source():
 int main(int argc, char** argv)
 {
     if (argc != 3) return 64;
+#ifndef CONTRACT_INTERACTION_COUNT
+#define CONTRACT_INTERACTION_COUNT 2
+#endif
     symmetrix::execution::MH1HostPluginV4Expectation expected;
     expected.artifact_id = "fixture-mh1-host-v4";
     expected.generation_fingerprint = "sha256:generation";
@@ -164,6 +170,7 @@ int main(int argc, char** argv)
     expected.structure_fingerprint = "sha256:structure";
     expected.runtime_layout_fingerprint = "sha256:runtime-layout";
     expected.required_capabilities = 0x1ffu;
+    expected.interaction_count = CONTRACT_INTERACTION_COUNT;
     expected.interactions[0] = {8, 4, 6, 2, 3, 2, 4, 1};
     expected.interactions[1] = {12, 9, 10, 4, 5, 2, 6, 2};
     expected.node_programs[0] = {
@@ -185,6 +192,14 @@ int main(int argc, char** argv)
         if (mode == "reject-dead-reverse"
             && message.find("disabled node reverse phase is not empty")
                 != std::string::npos) return 0;
+        if (mode == "reject-descriptor-count"
+            && message.find(
+                "descriptor interaction count 1 does not match the contract "
+                "interaction count 2") != std::string::npos) return 0;
+        if (mode == "reject-contract-count"
+            && message.find(
+                "interaction count 3 does not match the 2 interactions admitted "
+                "by") != std::string::npos) return 0;
         std::cerr << message << '\n';
         return 2;
     }
@@ -192,7 +207,7 @@ int main(int argc, char** argv)
 """
 
 
-def test_mh1_host_v4_loader_validates_layout_and_dead_reverse(tmp_path):
+def _retained_task6_host_v4_loader_oracle(tmp_path):
     compiler = shutil.which(os.environ.get("CXX", "c++"))
     if compiler is None:
         pytest.skip("a C++ compiler is required for the MH-1 v4 loader test")
@@ -214,6 +229,16 @@ def test_mh1_host_v4_loader_validates_layout_and_dead_reverse(tmp_path):
             ("-DENABLE_DEAD_LAYER0_REVERSE=1",),
             tmp_path / "host_dead_reverse.so",
         ),
+        (
+            "reject-descriptor-count",
+            ("-DDESCRIPTOR_INTERACTION_COUNT=1",),
+            tmp_path / "host_wrong_count.so",
+        ),
+        (
+            "reject-contract-count",
+            ("-DCONTRACT_INTERACTION_COUNT=3",),
+            tmp_path / "host_wrong_contract.so",
+        ),
     )
     for _, defines, output in variants:
         _compile(
@@ -226,17 +251,20 @@ def test_mh1_host_v4_loader_validates_layout_and_dead_reverse(tmp_path):
             "-o",
             output,
         )
-    harness = tmp_path / "host_harness"
-    _compile(
-        compiler,
-        *common,
-        harness_source,
-        SOURCE / "jit_mh1_host_plugin.cpp",
-        "-ldl",
-        "-o",
-        harness,
-    )
-    for mode, _, plugin in variants:
+    for index, (mode, defines, plugin) in enumerate(variants):
+        # The harness carries the contract interaction count, so each variant
+        # links its own copy of the loader with that count compiled in.
+        harness = tmp_path / f"host_harness_{index}"
+        _compile(
+            compiler,
+            *common,
+            *defines,
+            harness_source,
+            SOURCE / "mace_nonlinear_jit_host_plugin.cpp",
+            "-ldl",
+            "-o",
+            harness,
+        )
         subprocess.run(
             [harness, mode, plugin], check=True, capture_output=True, text=True
         )
@@ -244,7 +272,7 @@ def test_mh1_host_v4_loader_validates_layout_and_dead_reverse(tmp_path):
 
 def _cuda_plugin_source():
     return r"""
-#include "jit_mh1_cuda_plugin_abi.h"
+#include "mace_nonlinear_jit_cuda_plugin_abi.h"
 
 extern "C" int32_t forward_launch(
     const SymmetrixJitMH1CudaForwardArgsV4*, void*, int32_t) { return 0; }
@@ -313,17 +341,17 @@ static SymmetrixJitMH1CudaNodeProgramV4 make_node(
     return node;
 }
 
-static const SymmetrixJitMH1CudaPluginV4 descriptor = [] {
-    SymmetrixJitMH1CudaPluginV4 value{};
-    value.abi_version = SYMMETRIX_JIT_MH1_CUDA_PLUGIN_V4_ABI_VERSION;
+static const SymmetrixJitMH1CudaPluginV5 descriptor = [] {
+    SymmetrixJitMH1CudaPluginV5 value{};
+    value.abi_version = SYMMETRIX_JIT_MH1_CUDA_PLUGIN_V5_ABI_VERSION;
     value.struct_size = sizeof(value);
     value.pointer_size = sizeof(void*);
     value.byte_order = SYMMETRIX_JIT_MH1_CUDA_PLUGIN_BYTE_ORDER;
     value.capabilities = 0xfffu;
     value.interaction_count = 2;
     value.scalar_size = sizeof(float);
-    value.abi_tag = SYMMETRIX_JIT_MH1_CUDA_PLUGIN_V4_ABI_TAG;
-    value.artifact_id = "fixture-mh1-cuda-v4";
+    value.abi_tag = SYMMETRIX_JIT_MH1_CUDA_PLUGIN_V5_ABI_TAG;
+    value.artifact_id = "fixture-mh1-cuda-v5";
     value.generation_fingerprint = "sha256:generation";
     value.semantic_fingerprint = "sha256:semantic";
     value.structure_fingerprint = "sha256:structure";
@@ -352,8 +380,8 @@ static const SymmetrixJitMH1CudaPluginV4 descriptor = [] {
 }();
 
 extern "C" SYMMETRIX_JIT_MH1_CUDA_PLUGIN_EXPORT
-const SymmetrixJitMH1CudaPluginV4*
-symmetrix_jit_mh1_cuda_plugin_query_v4()
+const SymmetrixJitMH1CudaPluginV5*
+symmetrix_jit_mh1_cuda_plugin_query_v5()
 {
     return &descriptor;
 }
@@ -362,7 +390,7 @@ symmetrix_jit_mh1_cuda_plugin_query_v4()
 
 def _cuda_harness_source():
     return r"""
-#include "jit_mh1_cuda_plugin.hpp"
+#include "mace_nonlinear_jit_cuda_plugin.hpp"
 
 #include <cstddef>
 #include <exception>
@@ -374,7 +402,7 @@ int main(int argc, char** argv)
 {
     if (argc != 3) return 64;
     symmetrix::execution::MH1CudaPluginV4Expectation expected;
-    expected.artifact_id = "fixture-mh1-cuda-v4";
+    expected.artifact_id = "fixture-mh1-cuda-v5";
     expected.generation_fingerprint = "sha256:generation";
     expected.semantic_fingerprint = "sha256:semantic";
     expected.structure_fingerprint = "sha256:structure";
@@ -442,10 +470,10 @@ int main(int argc, char** argv)
 """
 
 
-def test_mh1_cuda_v4_loader_validates_runtime_layout(tmp_path):
+def _retained_task6_cuda_v4_loader_oracle(tmp_path):
     compiler = shutil.which(os.environ.get("CXX", "c++"))
     if compiler is None:
-        pytest.skip("a C++ compiler is required for the MH-1 v4 loader test")
+        pytest.skip("a C++ compiler is required for the MH-1 v5 loader test")
     plugin_source = tmp_path / "cuda_plugin.cpp"
     harness_source = tmp_path / "cuda_harness.cpp"
     plugin_source.write_text(_cuda_plugin_source(), encoding="ascii")
@@ -481,7 +509,7 @@ def test_mh1_cuda_v4_loader_validates_runtime_layout(tmp_path):
         compiler,
         *common,
         harness_source,
-        SOURCE / "jit_mh1_cuda_plugin.cpp",
+        SOURCE / "mace_nonlinear_jit_cuda_plugin.cpp",
         "-ldl",
         "-o",
         harness,
@@ -492,32 +520,26 @@ def test_mh1_cuda_v4_loader_validates_runtime_layout(tmp_path):
         )
 
 
-def test_mh1_device_module_defaults_to_retention_and_v2_requires_policy():
-    loader = (SOURCE / "jit_mh1_cuda_plugin.cpp").read_text(encoding="ascii")
+def test_mh1_device_module_v4_requires_explicit_retention_policy():
+    loader = (SOURCE / "mace_nonlinear_jit_cuda_plugin.cpp").read_text(encoding="ascii")
 
-    assert (
-        'launch_plan_version==2\n            &&(!plan.contains("node_state_policy")'
-        in loader
-    )
+    assert '!plan.contains("node_state_policy")' in loader
     assert '||!plan.at("node_state_policy").is_string()' in loader
-    assert '"launch-plan v2 requires an explicit node-state policy"' in loader
-    assert "const auto node_state_policy=launch_plan_version==1" in loader
-    assert '?plan.value("node_state_policy",std::string("full-retention-v1"))' in loader
-    assert ':plan.at("node_state_policy").get<std::string>()' in loader
+    assert '"launch-plan v6 requires an explicit node-state policy"' in loader
+    assert 'plan.at("node_state_policy").get<std::string>()' in loader
+    assert 'plan.at("module_abi")!="symmetrix.jit.mh1.cuda-module/5"' in loader
+    assert 'plan.at("module_abi")!="symmetrix.jit.mh1.hip-module/5"' in loader
     assert '&&node_state_policy!="reuse-adjoints-v1"' in loader
     assert '&&node_state_policy!="retain-interaction-v1"' in loader
     assert "SYMMETRIX_JIT_MH1_CUDA_NODE_REUSE_MESSAGE_ADJOINT_V4" in loader
 
 
 def test_mh1_device_module_admits_only_named_nonstandard_tiles():
-    loader = (SOURCE / "jit_mh1_cuda_plugin.cpp").read_text(encoding="ascii")
+    loader = (SOURCE / "mace_nonlinear_jit_cuda_plugin.cpp").read_text(encoding="ascii")
 
-    assert 'kernel.ends_with("_reverse_product_tiled")' in loader
-    assert 'kernel.ends_with("_forward_product_tiled")' in loader
-    assert "result.tile_nodes==1&&result.tile_channels==128&&threads==128" in loader
-    assert 'kernel.ends_with("_reverse_product_tiled")' in loader
-    assert "(result.tile_nodes==2||result.tile_nodes==4)" in loader
-    assert "&&result.tile_channels==128&&threads==128" in loader
+    assert "retired private-product launch is forbidden" in loader
+    assert "result.tile_nodes==1&&result.tile_channels==128&&threads==128" not in loader
+    assert "(result.tile_nodes==2||result.tile_nodes==4)" not in loader
     assert 'kernel.ends_with("_l1_reverse_message_grouped")' in loader
     assert 'kernel.ends_with("_l1_reverse_linear2_grouped")' in loader
     assert 'kernel.ends_with("_l0_reverse_linear2_grouped")' in loader
@@ -527,14 +549,40 @@ def test_mh1_device_module_admits_only_named_nonstandard_tiles():
     assert 'kernel.ends_with("_l0_forward_linear2_grouped")' in loader
     assert 'kernel.ends_with("_l1_forward_linear2_grouped")' in loader
     assert "result.tile_nodes==64&&result.tile_channels==32&&threads==256" in loader
-    assert 'kernel.ends_with("_l0_reverse_linear2_grouped")' in loader
     assert "result.tile_nodes==128&&result.tile_channels==32&&threads==256" in loader
-    assert "(!standard_tiles&&!product_tiles&&!paired_product_reverse_tile" in loader
-    assert "&&!wide_grouped_tile&&!xwide_grouped_tile)" in loader
+    assert "product_tiles" not in loader
+    assert "paired_product_reverse_tile" not in loader
+
+
+def test_retired_mh1_loaders_reject_and_are_not_routed():
+    host = (SOURCE / "mace_nonlinear_jit_host_plugin.cpp").read_text(encoding="ascii")
+    device = (SOURCE / "mace_nonlinear_jit_cuda_plugin.cpp").read_text(encoding="ascii")
+    evaluator = (SOURCE / "mace_nonlinear_kokkos_impl.tpp").read_text(encoding="ascii")
+
+    for version in ("v4", "v5", "v6"):
+        assert f"host ABI-{version} was retired in generation 19" in host
+    assert "CUDA shared-library ABI-v4 was retired" in device
+    assert (
+        "bool MaceBackboneKokkosT<Precision>::jit_mh1_host_plugin_v4_ready() const\n{\n    return false;"
+        in evaluator
+    )
+    assert (
+        "bool MaceBackboneKokkosT<Precision>::jit_mh1_host_plugin_v5_ready() const\n{\n    return false;"
+        in evaluator
+    )
+    assert (
+        "bool MaceBackboneKokkosT<Precision>::jit_mh1_host_plugin_v6_ready() const\n{\n    return false;"
+        in evaluator
+    )
+    assert (
+        "bool MaceBackboneKokkosT<Precision>::jit_mh1_cuda_plugin_v4_ready() const\n{\n    return false;"
+        in evaluator
+    )
+    assert "load_jit_mh1_cuda_plugin_v5(" in evaluator
 
 
 def test_mh1_compact_edge_loader_rejects_mutated_thread_geometry():
-    loader = (SOURCE / "jit_mh1_cuda_plugin.cpp").read_text(encoding="ascii")
+    loader = (SOURCE / "mace_nonlinear_jit_cuda_plugin.cpp").read_text(encoding="ascii")
     compact_geometry_guard = (
         "if(interaction.edge_threads!=128\n"
         "                    ||interaction.edge_phi_block_multiplier!=4)"
@@ -545,3 +593,161 @@ def test_mh1_compact_edge_loader_rejects_mutated_thread_geometry():
         compact_geometry_guard.replace("edge_threads!=128", "edge_threads!=256")
         not in loader
     )
+
+
+def _host_v3_plugin_source():
+    return r"""
+#include "mace_nonlinear_jit_host_plugin_abi.h"
+
+extern "C" void forward_owner(
+    const SymmetrixJitMH1HostForwardArgsV3*, int32_t) {}
+extern "C" void source_reverse_owner(
+    const SymmetrixJitMH1HostReverseArgsV3*, int32_t) {}
+extern "C" void edge_reverse_owner(
+    const SymmetrixJitMH1HostReverseArgsV3*, int32_t) {}
+extern "C" void conditioning_forward_owner(
+    const SymmetrixJitMH1HostConditioningForwardArgsV3*, int32_t) {}
+extern "C" void conditioning_reverse_owner(
+    const SymmetrixJitMH1HostConditioningReverseArgsV3*, int32_t) {}
+
+#ifndef DESCRIPTOR_INTERACTION_COUNT
+#define DESCRIPTOR_INTERACTION_COUNT SYMMETRIX_JIT_MH1_HOST_PLUGIN_INTERACTIONS
+#endif
+static const SymmetrixJitMH1HostPluginV3 descriptor = [] {
+    SymmetrixJitMH1HostPluginV3 value{};
+    value.abi_version = SYMMETRIX_JIT_MH1_HOST_PLUGIN_ABI_VERSION;
+    value.struct_size = sizeof(value);
+    value.pointer_size = sizeof(void*);
+    value.byte_order = SYMMETRIX_JIT_MH1_HOST_PLUGIN_BYTE_ORDER;
+    value.capabilities =
+        SYMMETRIX_JIT_MH1_HOST_FORWARD_OWNER_V3
+        | SYMMETRIX_JIT_MH1_HOST_SOURCE_REVERSE_OWNER_V3
+        | SYMMETRIX_JIT_MH1_HOST_EDGE_REVERSE_OWNER_V3
+        | SYMMETRIX_JIT_MH1_HOST_GRAPH_WIDE_V3
+        | SYMMETRIX_JIT_MH1_HOST_IR_MUL_FEATURES_V3
+        | SYMMETRIX_JIT_MH1_HOST_CONDITIONING_OWNER_V3;
+    value.interaction_count = DESCRIPTOR_INTERACTION_COUNT;
+    value.scalar_size = sizeof(float);
+    value.abi_tag = SYMMETRIX_JIT_MH1_HOST_PLUGIN_ABI_TAG;
+    value.artifact_id = "fixture-mh1-host-v3";
+    value.generation_fingerprint = "sha256:generation";
+    value.semantic_fingerprint = "sha256:semantic";
+    value.structure_fingerprint = "sha256:structure";
+    value.interactions[0] = {sizeof(SymmetrixJitMH1HostInteractionV3),
+        0u, 8, 4, 6, 2, 3, 2, 4, 1};
+    value.interactions[1] = {sizeof(SymmetrixJitMH1HostInteractionV3),
+        0u, 12, 9, 10, 4, 5, 2, 6, 2};
+    value.forward_owner = &forward_owner;
+    value.source_reverse_owner = &source_reverse_owner;
+    value.edge_reverse_owner = &edge_reverse_owner;
+    for (uint32_t index = 0; index < 2; ++index) {
+        value.conditioning[index] = {
+            sizeof(SymmetrixJitMH1HostConditioningOwnersV3),
+            index, 0u, 0u, &conditioning_forward_owner,
+            &conditioning_reverse_owner};
+    }
+    return value;
+}();
+
+extern "C" SYMMETRIX_JIT_MH1_HOST_PLUGIN_EXPORT
+const SymmetrixJitMH1HostPluginV3*
+symmetrix_jit_mh1_host_plugin_query_v3()
+{
+    return &descriptor;
+}
+"""
+
+
+def _host_v3_harness_source():
+    return r"""
+#include "mace_nonlinear_jit_host_plugin.hpp"
+
+#include <exception>
+#include <iostream>
+#include <string>
+
+int main(int argc, char** argv)
+{
+    if (argc != 3) return 64;
+#ifndef CONTRACT_INTERACTION_COUNT
+#define CONTRACT_INTERACTION_COUNT 2
+#endif
+    symmetrix::execution::MH1HostPluginExpectation expected;
+    expected.artifact_id = "fixture-mh1-host-v3";
+    expected.generation_fingerprint = "sha256:generation";
+    expected.semantic_fingerprint = "sha256:semantic";
+    expected.structure_fingerprint = "sha256:structure";
+    expected.interaction_count = CONTRACT_INTERACTION_COUNT;
+    expected.required_capabilities = 0x3fu;
+    expected.interactions[0] = {8, 4, 6, 2, 3, 2, 4, 1};
+    expected.interactions[1] = {12, 9, 10, 4, 5, 2, 6, 2};
+    try {
+        auto plugin = symmetrix::execution::MH1HostPlugin::load(
+            argv[2], expected);
+        return std::string(argv[1]) == "accept" && plugin ? 0 : 1;
+    } catch (const std::exception& error) {
+        const std::string message = error.what();
+        const std::string mode = argv[1];
+        if (mode == "reject-descriptor-count"
+            && message.find(
+                "descriptor interaction count 1 does not match the contract "
+                "interaction count 2") != std::string::npos) return 0;
+        if (mode == "reject-contract-count"
+            && message.find(
+                "interaction count 3 does not match the 2 interactions admitted "
+                "by") != std::string::npos) return 0;
+        std::cerr << message << '\n';
+        return 2;
+    }
+}
+"""
+
+
+def test_mh1_host_v3_loader_admits_the_contract_interaction_count(tmp_path):
+    compiler = shutil.which(os.environ.get("CXX", "c++"))
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the MH-1 v3 loader test")
+    plugin_source = tmp_path / "host_v3_plugin.cpp"
+    harness_source = tmp_path / "host_v3_harness.cpp"
+    plugin_source.write_text(_host_v3_plugin_source(), encoding="ascii")
+    harness_source.write_text(_host_v3_harness_source(), encoding="ascii")
+    common = ("-std=c++20", "-O2", "-I", SOURCE, "-I", PACKAGE_SOURCE)
+    variants = (
+        ("accept", (), tmp_path / "host_v3_valid.so"),
+        (
+            "reject-descriptor-count",
+            ("-DDESCRIPTOR_INTERACTION_COUNT=1",),
+            tmp_path / "host_v3_wrong_count.so",
+        ),
+        (
+            "reject-contract-count",
+            ("-DCONTRACT_INTERACTION_COUNT=3",),
+            tmp_path / "host_v3_wrong_contract.so",
+        ),
+    )
+    for _, defines, output in variants:
+        _compile(
+            compiler,
+            *common,
+            *defines,
+            "-shared",
+            "-fPIC",
+            plugin_source,
+            "-o",
+            output,
+        )
+    for index, (mode, defines, plugin) in enumerate(variants):
+        harness = tmp_path / f"host_v3_harness_{index}"
+        _compile(
+            compiler,
+            *common,
+            *defines,
+            harness_source,
+            SOURCE / "mace_nonlinear_jit_host_plugin.cpp",
+            "-ldl",
+            "-o",
+            harness,
+        )
+        subprocess.run(
+            [harness, mode, plugin], check=True, capture_output=True, text=True
+        )

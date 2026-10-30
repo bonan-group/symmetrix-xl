@@ -5,13 +5,13 @@ from datetime import date
 project = "Symmetrix-XL"
 copyright = f"{date.today().year}, Symmetrix-XL contributors"
 author = "Symmetrix-XL contributors"
-release = "0.1.1"
+release = "0.2.0"
 
-extensions = ["myst_parser"]
+extensions = ["myst_parser", "sphinx.ext.mathjax"]
 source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
 master_doc = "index"
 exclude_patterns = ["_build"]
-myst_enable_extensions = ["colon_fence", "deflist", "fieldlist"]
+myst_enable_extensions = ["colon_fence", "deflist", "fieldlist", "dollarmath"]
 myst_heading_anchors = 3
 
 html_theme = "furo"

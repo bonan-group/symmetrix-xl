@@ -18,20 +18,14 @@ constexpr int linear_host_transpose_channel_tile=16;
 // transpose resident together for the wide MH-1 node features.
 constexpr int linear_host_transpose_sample_tile=4;
 constexpr int linear_host_angular_output_sample_tile=8;
+// Keep each lane-major GEMM comfortably within the 32-bit matrix indexing
+// used by vendor BLAS while bounding the shared transpose workspace. The
+// common 5,000-node benchmark remains a single GEMM.
+constexpr std::size_t linear_lane_gemm_sample_tile=8192;
 
 template<typename Precision>
 std::vector<Precision> tensor_values(const nlohmann::json& value) { return value.at("values").get<std::vector<Precision>>(); }
 int shape_product(const std::vector<int>& shape) { return std::accumulate(shape.begin(),shape.end(),1,std::multiplies<int>()); }
-
-int mh1_cuda_team_size(int multiplicity)
-{
-    if(multiplicity<=0) return 0;
-    constexpr int warp_size=32;
-    constexpr int maximum_team_size=128;
-    const int capped=std::min(multiplicity,maximum_team_size);
-    return std::max(
-        warp_size,((capped+warp_size-1)/warp_size)*warp_size);
-}
 
 class ProfileRegion {
 public:
@@ -41,6 +35,75 @@ public:
     }
     ~ProfileRegion() { Kokkos::Profiling::popRegion(); }
 };
+
+struct PolarLinearSignature {
+    const char* role;
+    const char* irreps_in;
+    const char* irreps_out;
+};
+
+bool is_validated_polar_linear_signature(
+    const std::string& role,const std::string& irreps_in,
+    const std::string& irreps_out)
+{
+    // This is deliberately an allow-list rather than a dimensional predicate:
+    // packed GEMM happens to support other widths, but those shapes have not
+    // been inventoried and qualified as production polar roles.
+    static constexpr PolarLinearSignature signatures[]={
+        {"feature_mixer","512x0e","512x0e"},
+        {"feature_mixer","512x0e+512x1o","512x0e+512x1o"},
+        {"feature_mixer","512x0e+512x1o+512x2e",
+            "512x0e+512x1o+512x2e"},
+        {"feature_mixer","512x0e+384x1o","512x0e+384x1o"},
+        {"spin_source","512x0e","1x0e+1x1o+1x0e+1x1o"},
+        {"spin_source","512x0e+512x1o","1x0e+1x1o+1x0e+1x1o"},
+        {"spin_source","512x0e+512x1o+512x2e",
+            "1x0e+1x1o+1x0e+1x1o"},
+        {"fukui_first","512x0e","16x0e"},
+        {"fukui_first","512x0e+512x1o","16x0e"},
+        {"fukui_first","512x0e+512x1o+512x2e","16x0e"},
+        {"fukui_mid","16x0e","16x0e"},
+        {"fukui_final","16x0e","2x0e"},
+        {"potential_embedding","2x0e+2x1o+2x0e+2x1o","512x0e"},
+        {"potential_embedding","2x0e+2x1o+2x0e+2x1o",
+            "512x0e+512x1o"},
+        {"potential_embedding","2x0e+2x1o+2x0e+2x1o",
+            "512x0e+512x1o+512x2e"},
+        {"node_embedding","512x0e","512x0e"},
+        {"node_embedding","512x0e+512x1o","512x0e+512x1o"},
+        {"node_embedding","512x0e+512x1o+512x2e",
+            "512x0e+512x1o+512x2e"},
+        {"charge_embedding","1x0e+1x1o+1x0e+1x1o","512x0e"},
+        {"charge_embedding","1x0e+1x1o+1x0e+1x1o",
+            "512x0e+512x1o"},
+        {"charge_embedding","1x0e+1x1o+1x0e+1x1o",
+            "512x0e+512x1o+512x2e"},
+        {"source_embedding","83x0e","512x0e"},
+        {"update_readout_first","512x0e","64x0e+32x1o"},
+        {"update_readout_first","512x0e+512x1o","64x0e+32x1o"},
+        {"update_readout_first","512x0e+512x1o+512x2e",
+            "64x0e+32x1o"},
+        {"update_readout_mid","32x0e+32x1o","64x0e+32x1o"},
+        {"update_readout_final","512x0e","10x0e"},
+        {"update_readout_final","32x0e+32x1o",
+            "1x0e+1x1o+1x0e+1x1o+2x0e"},
+        {"local_charge_embedding","1x0e+1x1o+1x0e+1x1o","512x0e"},
+        {"local_charge_embedding","1x0e+1x1o+1x0e+1x1o",
+            "512x0e+512x1o"},
+        {"local_charge_embedding","1x0e+1x1o+1x0e+1x1o",
+            "512x0e+512x1o+512x2e"},
+        {"local_potential_embedding","2x0e+2x1o+2x0e+2x1o","512x0e"},
+        {"local_potential_embedding","2x0e+2x1o+2x0e+2x1o",
+            "512x0e+512x1o"},
+        {"local_potential_embedding","2x0e+2x1o+2x0e+2x1o",
+            "512x0e+512x1o+512x2e"},
+    };
+    return std::any_of(std::begin(signatures),std::end(signatures),
+        [&](const PolarLinearSignature& signature) {
+            return role==signature.role&&irreps_in==signature.irreps_in
+                &&irreps_out==signature.irreps_out;
+        });
+}
 
 }
 
@@ -63,6 +126,13 @@ E3LinearKokkosT<Precision>::E3LinearKokkosT(const nlohmann::json& data)
     for(const auto& block:output.blocks)
         runtime_output_blocks.push_back(
             {block.offset,block.multiplicity,2*block.l+1});
+    std::vector<int> output_block_plan;
+    output_block_plan.reserve(3*runtime_output_blocks.size());
+    for(const auto& block:runtime_output_blocks)
+        output_block_plan.insert(output_block_plan.end(),
+            {block.offset,block.multiplicity,block.width});
+    set_kokkos_view(runtime_output_block_plan,std::move(output_block_plan),
+        static_cast<int>(runtime_output_blocks.size()),3);
     for (const auto& value:data.at("instructions")) {
         const auto& in=input.blocks.at(value.at("i_in").get<int>()); const auto& out=output.blocks.at(value.at("i_out").get<int>());
         const auto shape=value.at("path_shape").get<std::vector<int>>();
@@ -71,6 +141,9 @@ E3LinearKokkosT<Precision>::E3LinearKokkosT(const nlohmann::json& data)
             value.at("path_weight").get<Precision>()});
         offset+=shape_product(shape);
     }
+    // Lane-major kernels address each instruction's block independently, so
+    // they must see the unmerged instruction list.
+    lane_instructions=instructions;
     if constexpr(std::is_same_v<Precision,float>
         &&std::is_same_v<typename Kokkos::DefaultExecutionSpace::memory_space,
             Kokkos::HostSpace>) {
@@ -99,30 +172,36 @@ E3LinearKokkosT<Precision>::E3LinearKokkosT(const nlohmann::json& data)
         }
         instructions=std::move(coalesced);
     }
-    for(std::size_t index=0;index<instructions.size();++index) {
-        auto& instruction=instructions[index];
-        instruction.first_input_instruction=std::none_of(
-            instructions.begin(),instructions.begin()+index,
-            [&](const auto& other) {
-                const int first=instruction.input_offset;
-                const int last=first
-                    +instruction.input_multiplicity*instruction.width;
-                const int other_first=other.input_offset;
-                const int other_last=other_first
-                    +other.input_multiplicity*other.width;
-                return first<other_last&&other_first<last;
-            });
-        instruction.first_output_instruction=std::none_of(
-            instructions.begin(),instructions.begin()+index,
-            [&](const auto& other) {
-                return other.output_offset==instruction.output_offset;
-            });
-        instruction.last_output_instruction=std::none_of(
-            instructions.begin()+index+1,instructions.end(),
-            [&](const auto& other) {
-                return other.output_offset==instruction.output_offset;
-            });
-    }
+    const auto assign_instruction_flags=[](std::vector<Instruction>& list) {
+        for(std::size_t index=0;index<list.size();++index) {
+            auto& instruction=list[index];
+            instruction.first_input_instruction=std::none_of(
+                list.begin(),list.begin()+index,
+                [&](const auto& other) {
+                    const int first=instruction.input_offset;
+                    const int last=first
+                        +instruction.input_multiplicity*instruction.width;
+                    const int other_first=other.input_offset;
+                    const int other_last=other_first
+                        +other.input_multiplicity*other.width;
+                    return first<other_last&&other_first<last;
+                });
+            instruction.first_output_instruction=std::none_of(
+                list.begin(),list.begin()+index,
+                [&](const auto& other) {
+                    return other.output_offset==instruction.output_offset;
+                });
+            instruction.last_output_instruction=std::none_of(
+                list.begin()+index+1,list.end(),
+                [&](const auto& other) {
+                    return other.output_offset==instruction.output_offset;
+                });
+        }
+    };
+    assign_instruction_flags(instructions);
+    // The lane list is a separate copy: it needs the same flags whether or not
+    // the node-major schedule was coalesced.
+    assign_instruction_flags(lane_instructions);
     all_output_blocks_covered_=std::all_of(
         runtime_output_blocks.begin(),runtime_output_blocks.end(),
         [&](const auto& block) {
@@ -208,6 +287,17 @@ E3LinearKokkosT<Precision>::E3LinearKokkosT(const nlohmann::json& data)
                     break;
                 }
             }
+    }
+    if(data.contains("execution_specialization")) {
+        const auto& specialization=data.at("execution_specialization");
+        specialization_requested_=specialization.value(
+            "family",std::string())=="polar_e3linear";
+        specialization_role_=specialization.value("role",std::string());
+        const std::string irreps_in=data.at("irreps_in").get<std::string>();
+        const std::string irreps_out=data.at("irreps_out").get<std::string>();
+        if(specialization_requested_)
+            polar_specialization_=is_validated_polar_linear_signature(
+                specialization_role_,irreps_in,irreps_out);
     }
 }
 
@@ -360,6 +450,37 @@ void E3LinearKokkosT<Precision>::replace_block_with_identity(const int width)
 }
 
 template<typename Precision>
+bool E3LinearKokkosT<Precision>::supports_scalar_dense_plan() const
+{
+    if(instructions.size()!=1||runtime_input_blocks.empty()
+        ||runtime_output_blocks.size()!=1)
+        return false;
+    const auto& instruction=instructions.front();
+    return instruction.width==1&&instruction.input_offset==0
+        &&instruction.output_offset==0&&instruction.weight_offset==0
+        &&runtime_input_blocks.front().offset==0
+        &&runtime_input_blocks.front().multiplicity
+            ==instruction.input_multiplicity
+        &&instruction.output_multiplicity==output_dimension_
+        &&runtime_input_blocks.front().width==1
+        &&runtime_output_blocks.front().width==1;
+}
+
+template<typename Precision>
+typename E3LinearKokkosT<Precision>::ScalarDensePlan
+E3LinearKokkosT<Precision>::scalar_dense_plan() const
+{
+    if(!supports_scalar_dense_plan())
+        throw std::invalid_argument(
+            "Kokkos E3 linear does not have a single scalar dense plan.");
+    const auto& instruction=instructions.front();
+    using const_view=Kokkos::View<const Precision*>;
+    return {instruction.input_multiplicity,
+        instruction.output_multiplicity,instruction.path_weight,
+        const_view(weights),const_view(bias),const_view(output_mask)};
+}
+
+template<typename Precision>
 void E3LinearKokkosT<Precision>::set_backend(const std::string& backend)
 {
     if(backend=="auto") backend_=Backend::automatic;
@@ -403,7 +524,62 @@ std::size_t E3LinearKokkosT<Precision>::workspace_bytes() const
 }
 
 template<typename Precision>
-void E3LinearKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,Kokkos::LayoutRight> input,Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
+typename E3LinearKokkosT<Precision>::WorkspaceShape
+E3LinearKokkosT<Precision>::lane_workspace_shape(const std::size_t samples) const
+{
+    WorkspaceShape shape;
+    if(use_scalar_backend(samples)) return shape;
+    for(const auto& instruction:lane_instructions) {
+        const std::size_t columns=std::min(
+            samples,linear_lane_gemm_sample_tile)
+            *static_cast<std::size_t>(instruction.width);
+        shape.input_rows=std::max(shape.input_rows,
+            static_cast<std::size_t>(instruction.input_multiplicity));
+        shape.output_rows=std::max(shape.output_rows,
+            static_cast<std::size_t>(instruction.output_multiplicity));
+        shape.input_columns=std::max(shape.input_columns,columns);
+        shape.output_columns=std::max(shape.output_columns,columns);
+    }
+    return shape;
+}
+
+template<typename Precision>
+void E3LinearKokkosT<Precision>::evaluate(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
+{
+    if(input.extent(1)!=static_cast<std::size_t>(input_dimension_)
+        ||output.extent(0)!=input.extent(0)
+        ||output.extent(1)!=static_cast<std::size_t>(output_dimension_))
+        throw std::invalid_argument(
+            "Kokkos e3 linear batch dimensions are inconsistent.");
+    if(backend_==Backend::automatic&&polar_specialization_) {
+        ++specialized_forward_count_;
+        // CPU keeps its qualified small-batch scalar threshold; the CUDA
+        // specialization is the route that replaces the always-scalar CUDA
+        // schedule with the persistent packed-GEMM workspace.
+#ifdef KOKKOS_ENABLE_CUDA
+        evaluate_impl(input,output,false);
+#else
+        evaluate_impl(input,output,use_scalar_backend(input.extent(0)));
+#endif
+    } else {
+        if(backend_==Backend::automatic&&specialization_requested_)
+            ++specialization_fallback_count_;
+        evaluate_impl(input,output,use_scalar_backend(input.extent(0)));
+    }
+}
+
+template<typename Precision>
+void E3LinearKokkosT<Precision>::evaluate_generic(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
+{
+    evaluate_impl(input,output,true);
+}
+
+template<typename Precision>
+void E3LinearKokkosT<Precision>::evaluate_impl(Kokkos::View<const Precision**,Kokkos::LayoutRight> input,Kokkos::View<Precision**,Kokkos::LayoutRight> output,const bool use_scalar_path) const
 {
     if(input.extent(1)!=static_cast<std::size_t>(input_dimension_)
         ||output.extent(0)!=input.extent(0)
@@ -412,7 +588,6 @@ void E3LinearKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,Kokkos:
     ProfileRegion profile(
         "symmetrix/e3_linear/"+profile_name_+"/forward");
     auto all_weights=weights;
-    const bool use_scalar_path=use_scalar_backend(input.extent(0));
     if(use_scalar_path) {
         ordered_kokkos_deep_copy(output,Precision(0));
         for(const auto instruction:instructions)
@@ -656,6 +831,175 @@ void E3LinearKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,Kokkos:
                     *mask(column);
             });
     }
+}
+
+template<typename Precision>
+void E3LinearKokkosT<Precision>::evaluate_lane(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
+{
+    if(input.extent(1)!=static_cast<std::size_t>(input_dimension_)
+        ||output.extent(0)!=input.extent(0)
+        ||output.extent(1)!=static_cast<std::size_t>(output_dimension_))
+        throw std::invalid_argument(
+            "Kokkos e3 linear lane batch dimensions are inconsistent.");
+    ProfileRegion profile(
+        "symmetrix/e3_linear/"+profile_name_+"/forward_lane");
+    auto all_weights=weights;
+    const std::size_t samples=input.extent(0);
+    if(use_scalar_backend(input.extent(0))) {
+        ordered_kokkos_deep_copy(output,Precision(0));
+        for(const auto instruction:lane_instructions)
+            Kokkos::parallel_for(
+                "e3 linear lane small batch",
+                Kokkos::MDRangePolicy<Kokkos::Rank<3>,
+                    Kokkos::IndexType<std::size_t>>(
+                    {std::size_t(0),std::size_t(0),std::size_t(0)},
+                    {samples,
+                        static_cast<std::size_t>(instruction.output_multiplicity),
+                        static_cast<std::size_t>(instruction.width)}),
+                KOKKOS_LAMBDA(std::size_t sample,std::size_t target,
+                    std::size_t component) {
+                    Precision value=Precision(0);
+                    const int input_base=instruction.input_offset
+                        +component*instruction.input_multiplicity;
+                    for(int source=0;source<instruction.input_multiplicity;++source)
+                        value+=instruction.path_weight
+                            *all_weights(instruction.weight_offset
+                                +source*instruction.output_multiplicity+target)
+                            *input(sample,input_base+source);
+                    output(sample,instruction.output_offset
+                        +component*instruction.output_multiplicity+target)+=value;
+                });
+        finalize_lane_output(output);
+        return;
+    }
+    if(!all_output_blocks_covered_)
+        ordered_kokkos_deep_copy(output,Precision(0));
+    const bool fuse_output_finalization=all_output_blocks_covered_
+        ||uncovered_output_finalization_is_zero_;
+    auto mask=output_mask; auto all_bias=bias;
+    using weight_matrix=Kokkos::View<
+        const Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>;
+    for(const auto& instruction:lane_instructions) {
+        const std::size_t workspace_samples=std::min(
+            samples,linear_lane_gemm_sample_tile);
+        const std::size_t workspace_columns=workspace_samples
+            *static_cast<std::size_t>(instruction.width);
+        if(workspace_->packed_input.extent(0)
+                <static_cast<std::size_t>(instruction.input_multiplicity)
+            ||workspace_->packed_input.extent(1)<workspace_columns) {
+            if(workspace_->fixed_capacity)
+                throw std::logic_error("fixed e3 linear input workspace is too small");
+            Kokkos::realloc(workspace_->packed_input,
+                std::max<std::size_t>(workspace_->packed_input.extent(0),
+                    instruction.input_multiplicity),
+                std::max(workspace_->packed_input.extent(1),workspace_columns));
+        }
+        if(workspace_->packed_output.extent(0)
+                <static_cast<std::size_t>(instruction.output_multiplicity)
+            ||workspace_->packed_output.extent(1)<workspace_columns) {
+            if(workspace_->fixed_capacity)
+                throw std::logic_error("fixed e3 linear output workspace is too small");
+            Kokkos::realloc(workspace_->packed_output,
+                std::max<std::size_t>(workspace_->packed_output.extent(0),
+                    instruction.output_multiplicity),
+                std::max(workspace_->packed_output.extent(1),workspace_columns));
+        }
+        weight_matrix weight(all_weights.data()+instruction.weight_offset,
+            instruction.input_multiplicity,instruction.output_multiplicity);
+        const bool first=instruction.first_output_instruction;
+        const bool last=instruction.last_output_instruction;
+        const bool fuse_finalization=fuse_output_finalization;
+        for(std::size_t sample_begin=0;sample_begin<samples;
+            sample_begin+=linear_lane_gemm_sample_tile) {
+            const std::size_t active_samples=std::min(
+                samples-sample_begin,linear_lane_gemm_sample_tile);
+            const std::size_t columns=active_samples
+                *static_cast<std::size_t>(instruction.width);
+            auto packed_input=Kokkos::subview(workspace_->packed_input,
+                std::make_pair(std::size_t(0),
+                    static_cast<std::size_t>(instruction.input_multiplicity)),
+                std::make_pair(std::size_t(0),columns));
+            auto packed_output=Kokkos::subview(workspace_->packed_output,
+                std::make_pair(std::size_t(0),
+                    static_cast<std::size_t>(instruction.output_multiplicity)),
+                std::make_pair(std::size_t(0),columns));
+            Kokkos::parallel_for(
+                "e3 linear lane pack",
+                Kokkos::MDRangePolicy<Kokkos::Rank<3>,
+                    Kokkos::IndexType<std::size_t>>(
+                    {std::size_t(0),std::size_t(0),std::size_t(0)},
+                    {static_cast<std::size_t>(instruction.input_multiplicity),
+                        active_samples,
+                        static_cast<std::size_t>(instruction.width)}),
+                KOKKOS_LAMBDA(std::size_t channel,std::size_t sample,
+                    std::size_t component) {
+                    packed_input(channel,sample*instruction.width+component)=
+                        input(sample_begin+sample,instruction.input_offset
+                            +component*instruction.input_multiplicity+channel);
+                });
+            KokkosBlas::gemm("T","N",instruction.path_weight,weight,
+                packed_input,Precision(0),packed_output);
+            Kokkos::parallel_for(
+                "e3 linear lane unpack",
+                Kokkos::MDRangePolicy<Kokkos::Rank<3>,
+                    Kokkos::IndexType<std::size_t>>(
+                    {std::size_t(0),std::size_t(0),std::size_t(0)},
+                    {static_cast<std::size_t>(instruction.output_multiplicity),
+                        active_samples,
+                        static_cast<std::size_t>(instruction.width)}),
+                KOKKOS_LAMBDA(std::size_t channel,std::size_t sample,
+                    std::size_t component) {
+                    const std::size_t output_index=instruction.output_offset
+                        +component*instruction.output_multiplicity+channel;
+                    // bias and output_mask keep their definition (node-major)
+                    // order, so they are indexed at the node-major position
+                    // of this lane-major element.
+                    const std::size_t table_index=instruction.output_offset
+                        +channel*instruction.width+component;
+                    Precision value=packed_output(
+                        channel,sample*instruction.width+component);
+                    if(!fuse_finalization||!first)
+                        value+=output(sample_begin+sample,output_index);
+                    if(fuse_finalization&&last)
+                        value=(value+(all_bias.size()
+                            ?all_bias(table_index):Precision(0)))
+                            *mask(table_index);
+                    output(sample_begin+sample,output_index)=value;
+                });
+        }
+    }
+    if(!fuse_output_finalization)
+        finalize_lane_output(output);
+}
+
+template<typename Precision>
+void E3LinearKokkosT<Precision>::finalize_lane_output(
+    Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
+{
+    auto all_bias=bias; auto mask=output_mask;
+    auto plan=runtime_output_block_plan;
+    const std::size_t samples=output.extent(0);
+    const std::size_t blocks=plan.extent(0);
+    Kokkos::parallel_for(
+        "e3 linear lane finalize",
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>,
+            Kokkos::IndexType<std::size_t>>({0,0},{samples,blocks}),
+        KOKKOS_LAMBDA(const std::size_t sample,const std::size_t block) {
+            const int offset=plan(block,0);
+            const int multiplicity=plan(block,1);
+            const int width=plan(block,2);
+            for(int channel=0;channel<multiplicity;++channel)
+                for(int component=0;component<width;++component) {
+                    const int table_index=offset+channel*width+component;
+                    const int lane_index=offset+component*multiplicity
+                        +channel;
+                    output(sample,lane_index)=(output(sample,lane_index)
+                        +(all_bias.size()?all_bias(table_index)
+                            :Precision(0)))*mask(table_index);
+                }
+        });
 }
 
 template<typename Precision>
@@ -1201,13 +1545,48 @@ void E3LinearKokkosT<Precision>::reverse(
     if(output_adjoint.extent(1)!=static_cast<std::size_t>(output_dimension_)
         ||input_adjoint.extent(0)!=output_adjoint.extent(0)
         ||input_adjoint.extent(1)!=static_cast<std::size_t>(input_dimension_))
+        throw std::invalid_argument(
+            "Kokkos e3 linear reverse batch dimensions are inconsistent.");
+    if(backend_==Backend::automatic&&polar_specialization_) {
+        ++specialized_reverse_count_;
+#ifdef KOKKOS_ENABLE_CUDA
+        reverse_impl(output_adjoint,input_adjoint,initialize_input_adjoint,false);
+#else
+        reverse_impl(output_adjoint,input_adjoint,initialize_input_adjoint,
+            use_scalar_backend(output_adjoint.extent(0)));
+#endif
+    } else {
+        if(backend_==Backend::automatic&&specialization_requested_)
+            ++specialization_fallback_count_;
+        reverse_impl(output_adjoint,input_adjoint,initialize_input_adjoint,
+            use_scalar_backend(output_adjoint.extent(0)));
+    }
+}
+
+template<typename Precision>
+void E3LinearKokkosT<Precision>::reverse_generic(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> input_adjoint,
+    const bool initialize_input_adjoint) const
+{
+    reverse_impl(output_adjoint,input_adjoint,initialize_input_adjoint,true);
+}
+
+template<typename Precision>
+void E3LinearKokkosT<Precision>::reverse_impl(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> input_adjoint,
+    const bool initialize_input_adjoint,const bool use_scalar_path) const
+{
+    if(output_adjoint.extent(1)!=static_cast<std::size_t>(output_dimension_)
+        ||input_adjoint.extent(0)!=output_adjoint.extent(0)
+        ||input_adjoint.extent(1)!=static_cast<std::size_t>(input_dimension_))
         throw std::invalid_argument("Kokkos e3 linear reverse batch dimensions are inconsistent.");
     ProfileRegion profile(
         "symmetrix/e3_linear/"+profile_name_+"/reverse");
     if(initialize_input_adjoint)
         ordered_kokkos_deep_copy(input_adjoint,Precision(0));
     auto all_weights=weights; auto mask=output_mask;
-    const bool use_scalar_path=use_scalar_backend(output_adjoint.extent(0));
     if(use_scalar_path) {
         for(const auto instruction:instructions)
             Kokkos::parallel_for(
@@ -1391,6 +1770,138 @@ void E3LinearKokkosT<Precision>::reverse(
                         +=packed_input(
                             channel,sample*instruction.width+component);
                 });
+    }
+}
+
+template<typename Precision>
+void E3LinearKokkosT<Precision>::reverse_lane(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> input_adjoint,
+    const bool initialize_input_adjoint) const
+{
+    if(output_adjoint.extent(1)!=static_cast<std::size_t>(output_dimension_)
+        ||input_adjoint.extent(0)!=output_adjoint.extent(0)
+        ||input_adjoint.extent(1)!=static_cast<std::size_t>(input_dimension_))
+        throw std::invalid_argument(
+            "Kokkos e3 linear lane reverse batch dimensions are inconsistent.");
+    ProfileRegion profile(
+        "symmetrix/e3_linear/"+profile_name_+"/reverse_lane");
+    auto all_weights=weights; auto mask=output_mask;
+    const std::size_t samples=output_adjoint.extent(0);
+    if(initialize_input_adjoint) ordered_kokkos_deep_copy(input_adjoint,Precision(0));
+    if(use_scalar_backend(output_adjoint.extent(0))) {
+        for(const auto instruction:lane_instructions)
+            Kokkos::parallel_for(
+                "e3 reverse linear lane small batch",
+                Kokkos::MDRangePolicy<Kokkos::Rank<3>,
+                    Kokkos::IndexType<std::size_t>>(
+                    {std::size_t(0),std::size_t(0),std::size_t(0)},
+                    {samples,
+                        static_cast<std::size_t>(instruction.input_multiplicity),
+                        static_cast<std::size_t>(instruction.width)}),
+                KOKKOS_LAMBDA(std::size_t sample,std::size_t source,
+                    std::size_t component) {
+                    Precision value=Precision(0);
+                    const int input_base=instruction.input_offset
+                        +component*instruction.input_multiplicity;
+                    for(int target=0;target<instruction.output_multiplicity;
+                        ++target) {
+                        const int output_index=instruction.output_offset
+                            +component*instruction.output_multiplicity+target;
+                        // The mask table keeps its definition (node-major)
+                        // order.
+                        const int table_index=instruction.output_offset
+                            +target*instruction.width+component;
+                        value+=instruction.path_weight
+                            *all_weights(instruction.weight_offset
+                                +source*instruction.output_multiplicity+target)
+                            *mask(table_index)
+                            *output_adjoint(sample,output_index);
+                    }
+                    input_adjoint(sample,input_base+source)+=value;
+                });
+        return;
+    }
+    using weight_matrix=Kokkos::View<
+        const Precision**,Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>;
+    for(const auto& instruction:lane_instructions) {
+        const std::size_t workspace_samples=std::min(
+            samples,linear_lane_gemm_sample_tile);
+        const std::size_t workspace_columns=workspace_samples
+            *static_cast<std::size_t>(instruction.width);
+        if(workspace_->packed_input.extent(0)
+                <static_cast<std::size_t>(instruction.input_multiplicity)
+            ||workspace_->packed_input.extent(1)<workspace_columns) {
+            if(workspace_->fixed_capacity)
+                throw std::logic_error("fixed e3 linear input workspace is too small");
+            Kokkos::realloc(workspace_->packed_input,
+                std::max<std::size_t>(workspace_->packed_input.extent(0),
+                    instruction.input_multiplicity),
+                std::max(workspace_->packed_input.extent(1),workspace_columns));
+        }
+        if(workspace_->packed_output.extent(0)
+                <static_cast<std::size_t>(instruction.output_multiplicity)
+            ||workspace_->packed_output.extent(1)<workspace_columns) {
+            if(workspace_->fixed_capacity)
+                throw std::logic_error("fixed e3 linear output workspace is too small");
+            Kokkos::realloc(workspace_->packed_output,
+                std::max<std::size_t>(workspace_->packed_output.extent(0),
+                    instruction.output_multiplicity),
+                std::max(workspace_->packed_output.extent(1),workspace_columns));
+        }
+        weight_matrix weight(all_weights.data()+instruction.weight_offset,
+            instruction.input_multiplicity,instruction.output_multiplicity);
+        for(std::size_t sample_begin=0;sample_begin<samples;
+            sample_begin+=linear_lane_gemm_sample_tile) {
+            const std::size_t active_samples=std::min(
+                samples-sample_begin,linear_lane_gemm_sample_tile);
+            const std::size_t columns=active_samples
+                *static_cast<std::size_t>(instruction.width);
+            auto packed_input=Kokkos::subview(workspace_->packed_input,
+                std::make_pair(std::size_t(0),
+                    static_cast<std::size_t>(instruction.input_multiplicity)),
+                std::make_pair(std::size_t(0),columns));
+            auto packed_output=Kokkos::subview(workspace_->packed_output,
+                std::make_pair(std::size_t(0),
+                    static_cast<std::size_t>(instruction.output_multiplicity)),
+                std::make_pair(std::size_t(0),columns));
+            Kokkos::parallel_for(
+                "e3 reverse linear lane pack",
+                Kokkos::MDRangePolicy<Kokkos::Rank<3>,
+                    Kokkos::IndexType<std::size_t>>(
+                    {std::size_t(0),std::size_t(0),std::size_t(0)},
+                    {static_cast<std::size_t>(instruction.output_multiplicity),
+                        active_samples,
+                        static_cast<std::size_t>(instruction.width)}),
+                KOKKOS_LAMBDA(std::size_t channel,std::size_t sample,
+                    std::size_t component) {
+                    const std::size_t output_index=instruction.output_offset
+                        +component*instruction.output_multiplicity+channel;
+                    // The mask table keeps its definition (node-major) order.
+                    const std::size_t table_index=instruction.output_offset
+                        +channel*instruction.width+component;
+                    packed_output(channel,sample*instruction.width+component)=
+                        mask(table_index)*output_adjoint(
+                            sample_begin+sample,output_index);
+                });
+            KokkosBlas::gemm("N","N",instruction.path_weight,weight,
+                packed_output,Precision(0),packed_input);
+            Kokkos::parallel_for(
+                "e3 reverse linear lane unpack",
+                Kokkos::MDRangePolicy<Kokkos::Rank<3>,
+                    Kokkos::IndexType<std::size_t>>(
+                    {std::size_t(0),std::size_t(0),std::size_t(0)},
+                    {static_cast<std::size_t>(instruction.input_multiplicity),
+                        active_samples,
+                        static_cast<std::size_t>(instruction.width)}),
+                KOKKOS_LAMBDA(std::size_t channel,std::size_t sample,
+                    std::size_t component) {
+                    input_adjoint(sample_begin+sample,instruction.input_offset
+                        +component*instruction.input_multiplicity+channel)
+                        +=packed_input(
+                            channel,sample*instruction.width+component);
+                });
+        }
     }
 }
 
@@ -1727,84 +2238,13 @@ E3TensorProductKokkosT<Precision>::E3TensorProductKokkosT(const nlohmann::json& 
     E3TensorProduct validated(data);
     Irreps in1(data.at("irreps_in1").get<std::string>()),in2(data.at("irreps_in2").get<std::string>()),out(data.at("irreps_out").get<std::string>());
     input_1_dimension_=in1.dimension(); input_2_dimension_=in2.dimension(); output_dimension_=out.dimension(); int offset=0;
-    bool official_layout=!validated.instructions.empty();
-    std::vector<int> mh1_instruction_data_host;
-    std::vector<Precision> mh1_path_weights_host;
-    std::vector<int> mh1_component_offsets_host;
-    std::vector<int> mh1_sparse_indices_host;
-    std::vector<Precision> mh1_sparse_values_host;
-    struct HarmonicTerm { int instruction,a,c; Precision value; };
-    struct InputTerm { int instruction,b,c; Precision value; };
-    std::vector<std::vector<HarmonicTerm>> mh1_harmonic_terms_host(
-        input_2_dimension_);
-    std::vector<std::pair<int,InputTerm>> mh1_input_terms_unsorted;
-    int instruction_index=0;
     for (const auto& value:data.at("instructions")) {
         const auto& a=in1.blocks.at(value.at("i_in1").get<int>()); const auto& b=in2.blocks.at(value.at("i_in2").get<int>()); const auto& c=out.blocks.at(value.at("i_out").get<int>());
         const bool has=value.at("has_weight").get<bool>(); const auto mode=value.at("connection_mode").get<std::string>();
-        if (mode!="uvu"&&mode!="uuu") throw std::invalid_argument("Unsupported Kokkos tensor-product mode: "+mode);
-        Instruction instruction{a.offset,b.offset,c.offset,a.multiplicity,b.multiplicity,c.multiplicity,2*a.l+1,2*b.l+1,2*c.l+1,offset,has,mode=="uuu",value.at("path_weight").get<Precision>(),toKokkosView("e3 wigner",tensor_values<Precision>(value.at("wigner_3j")))};
+        if (mode!="uvu"&&mode!="uuu"&&mode!="uvw") throw std::invalid_argument("Unsupported Kokkos tensor-product mode: "+mode);
+        Instruction instruction{a.offset,b.offset,c.offset,a.multiplicity,b.multiplicity,c.multiplicity,2*a.l+1,2*b.l+1,2*c.l+1,offset,has,mode=="uuu",mode=="uvw",value.at("path_weight").get<Precision>(),toKokkosView("e3 wigner",tensor_values<Precision>(value.at("wigner_3j")))};
         const auto path_shape=value.at("path_shape").get<std::vector<int>>();
-        const int instruction_multiplicity=a.multiplicity;
-        official_layout=official_layout&&mode=="uvu"&&has
-            &&instruction_multiplicity>0&&b.multiplicity==1
-            &&c.multiplicity==instruction_multiplicity
-            &&(mh1_multiplicity_==0||mh1_multiplicity_==instruction_multiplicity)
-            &&instruction.width_1<=3
-            &&path_shape==std::vector<int>({instruction_multiplicity,1});
-        if(official_layout) {
-            mh1_multiplicity_=instruction_multiplicity;
-            mh1_max_output_width_=std::max(
-                mh1_max_output_width_,instruction.output_width);
-            const auto& entries=validated.instructions.at(instruction_index).nonzero_wigner;
-            std::vector<int> component_offsets(instruction.output_width+1,0);
-            std::vector<int> indices;
-            std::vector<Precision> values;
-            for(int component=0;component<instruction.output_width;++component) {
-                for(const auto& entry:entries)
-                    if(entry.c==component) {
-                        indices.push_back(entry.a);
-                        indices.push_back(entry.b);
-                        indices.push_back(entry.c);
-                        values.push_back(entry.value);
-                    }
-                component_offsets[component+1]=values.size();
-            }
-            set_kokkos_view(
-                instruction.sparse_indices,indices,values.size(),3);
-            instruction.sparse_values=toKokkosView("e3 sparse wigner",values);
-            instruction.component_offsets=toKokkosView(
-                "e3 sparse component offsets",component_offsets);
-            instruction.sparse_count=values.size();
-
-            const int component_base=mh1_component_offsets_host.size();
-            const int sparse_base=mh1_sparse_values_host.size();
-            mh1_instruction_data_host.insert(
-                mh1_instruction_data_host.end(),
-                {instruction.input_1_offset,instruction.input_2_offset,
-                    instruction.output_offset,instruction.width_1,
-                    instruction.output_width,instruction.weight_offset,
-                    component_base});
-            mh1_path_weights_host.push_back(instruction.path_weight);
-            for(const int component_offset:component_offsets)
-                mh1_component_offsets_host.push_back(
-                    sparse_base+component_offset);
-            for(int entry=0;entry<static_cast<int>(values.size());++entry) {
-                const int a=indices[3*entry];
-                const int b=indices[3*entry+1];
-                const int c=indices[3*entry+2];
-                mh1_sparse_indices_host.insert(
-                    mh1_sparse_indices_host.end(),{a,b,c});
-                mh1_sparse_values_host.push_back(values[entry]);
-                mh1_harmonic_terms_host.at(instruction.input_2_offset+b)
-                    .push_back({instruction_index,a,c,values[entry]});
-                mh1_input_terms_unsorted.push_back({
-                    instruction.input_1_offset/instruction_multiplicity+a,
-                    {instruction_index,b,c,values[entry]}});
-            }
-        }
         instructions.push_back(instruction); if(has) offset+=shape_product(value.at("path_shape").get<std::vector<int>>());
-        ++instruction_index;
     }
     weight_size_=offset;
     internal_weights=toKokkosView(
@@ -1815,292 +2255,68 @@ E3TensorProductKokkosT<Precision>::E3TensorProductKokkosT(const nlohmann::json& 
     output_mask_is_identity_=std::all_of(
         output_mask_host.begin(),output_mask_host.end(),
         [](const Precision value) { return value==Precision(1); });
-    const auto make_mul_to_ir=[](const Irreps& irreps) {
-        std::vector<int> mapping(static_cast<std::size_t>(irreps.dimension()));
-        for(const auto& block:irreps.blocks) {
-            const int width=2*block.l+1;
-            for(int channel=0;channel<block.multiplicity;++channel)
-                for(int component=0;component<width;++component) {
-                    const int mul_ir=block.offset+channel*width+component;
-                    const int ir_mul=block.offset
-                        +component*block.multiplicity+channel;
-                    mapping[static_cast<std::size_t>(mul_ir)]=ir_mul;
-                }
-        }
-        return mapping;
-    };
-    const auto input_1_mul_to_ir_host=make_mul_to_ir(in1);
-    const auto output_mul_to_ir_host=make_mul_to_ir(out);
-    mh1_input_1_mul_to_ir=toKokkosView(
-        "e3 mh1 input mul-to-ir",input_1_mul_to_ir_host);
-    mh1_output_mul_to_ir=toKokkosView(
-        "e3 mh1 output mul-to-ir",output_mul_to_ir_host);
-    std::vector<Precision> output_mask_ir_mul_host(output_mask_host.size());
-    for(std::size_t mul_ir=0;mul_ir<output_mask_host.size();++mul_ir)
-        output_mask_ir_mul_host[static_cast<std::size_t>(
-            output_mul_to_ir_host[mul_ir])]=output_mask_host[mul_ir];
-    mh1_output_mask_ir_mul=toKokkosView(
-        "e3 mh1 tensor mask ir-mul",output_mask_ir_mul_host);
-    mh1_fast_path=official_layout&&internal_weights.extent(0)==0;
-    if(mh1_fast_path) {
-        std::vector<int> input_component_data;
-        mh1_direct_node_layout_=true;
-        for(const auto& block:in1.blocks) {
-            if(block.multiplicity!=mh1_multiplicity_) {
-                mh1_direct_node_layout_=false;
-                break;
-            }
-            const int width=2*block.l+1;
-            for(int component=0;component<width;++component) {
-                input_component_data.push_back(block.offset+component);
-                input_component_data.push_back(width);
-            }
-        }
-        mh1_input_1_angular_dimension_=input_component_data.size()/2;
-        mh1_direct_node_layout_=mh1_direct_node_layout_
-            &&mh1_input_1_angular_dimension_>0;
-        if(mh1_direct_node_layout_)
-            set_kokkos_view(
-                mh1_input_component_data,input_component_data,
-                mh1_input_1_angular_dimension_,2);
-        mh1_cuda_channel_team_size_=mh1_cuda_team_size(mh1_multiplicity_);
-        mh1_cuda_harmonic_team_size_=mh1_cuda_team_size(mh1_multiplicity_);
-        mh1_instruction_count_=instructions.size();
-        set_kokkos_view(
-            mh1_instruction_data,mh1_instruction_data_host,
-            mh1_instruction_count_,7);
-        mh1_path_weights=toKokkosView(
-            "e3 mh1 path weights",mh1_path_weights_host);
-        mh1_component_offsets=toKokkosView(
-            "e3 mh1 component offsets",mh1_component_offsets_host);
-        set_kokkos_view(
-            mh1_sparse_indices,mh1_sparse_indices_host,
-            mh1_sparse_values_host.size(),3);
-        mh1_sparse_values=toKokkosView(
-            "e3 mh1 sparse values",mh1_sparse_values_host);
-
-        std::vector<int> harmonic_offsets(input_2_dimension_+1,0);
-        std::vector<int> harmonic_terms;
-        std::vector<Precision> harmonic_values;
-        for(int component=0;component<input_2_dimension_;++component) {
-            for(const auto& term:mh1_harmonic_terms_host[component]) {
-                harmonic_terms.insert(
-                    harmonic_terms.end(),{term.instruction,term.a,term.c});
-                harmonic_values.push_back(term.value);
-            }
-            harmonic_offsets[component+1]=harmonic_values.size();
-        }
-        mh1_harmonic_offsets=toKokkosView(
-            "e3 mh1 harmonic offsets",harmonic_offsets);
-        set_kokkos_view(
-            mh1_harmonic_terms,harmonic_terms,harmonic_values.size(),3);
-        mh1_harmonic_values=toKokkosView(
-            "e3 mh1 harmonic values",harmonic_values);
-
-        std::vector<std::vector<InputTerm>> input_terms(
-            mh1_input_1_angular_dimension_);
-        if(mh1_direct_node_layout_) {
-            for(const auto& item:mh1_input_terms_unsorted) {
-                if(item.first<0
-                    ||item.first>=mh1_input_1_angular_dimension_) {
-                    mh1_direct_node_layout_=false;
-                    break;
-                }
-                input_terms[item.first].push_back(item.second);
-            }
-        }
-        if(mh1_direct_node_layout_) {
-            std::vector<int> input_term_offsets(
-                mh1_input_1_angular_dimension_+1,0);
-            std::vector<int> input_instruction_term_offsets(
-                static_cast<std::size_t>(mh1_input_1_angular_dimension_)
-                    *static_cast<std::size_t>(mh1_instruction_count_+1),
-                0);
-            std::vector<int> packed_input_terms;
-            std::vector<Precision> input_values;
-            for(int component=0;
-                component<mh1_input_1_angular_dimension_;++component) {
-                for(int instruction=0;instruction<mh1_instruction_count_;
-                    ++instruction) {
-                    input_instruction_term_offsets[
-                        static_cast<std::size_t>(component)
-                            *static_cast<std::size_t>(mh1_instruction_count_+1)
-                        +static_cast<std::size_t>(instruction)]
-                        =input_values.size();
-                    for(const auto& term:input_terms[component]) {
-                        if(term.instruction!=instruction) continue;
-                        packed_input_terms.insert(packed_input_terms.end(),
-                            {term.instruction,term.b,term.c});
-                        input_values.push_back(term.value);
-                    }
-                }
-                input_instruction_term_offsets[
-                    static_cast<std::size_t>(component)
-                        *static_cast<std::size_t>(mh1_instruction_count_+1)
-                    +static_cast<std::size_t>(mh1_instruction_count_)]
-                    =input_values.size();
-                input_term_offsets[component+1]=input_values.size();
-            }
-            mh1_input_term_offsets=toKokkosView(
-                "e3 mh1 input term offsets",input_term_offsets);
-            set_kokkos_view(
-                mh1_input_instruction_term_offsets,
-                input_instruction_term_offsets,
-                mh1_input_1_angular_dimension_,mh1_instruction_count_+1);
-            set_kokkos_view(mh1_input_terms,packed_input_terms,
-                input_values.size(),3);
-            mh1_input_values=toKokkosView(
-                "e3 mh1 input values",input_values);
-        }
-
-    }
-}
-
-template<typename Precision>
-std::string E3TensorProductKokkosT<Precision>::execution_backend() const
-{
-    if(!mh1_fast_path) return "generic_kokkos";
-#ifdef KOKKOS_ENABLE_CUDA
-    if constexpr(std::is_same_v<Precision,float>
-        &&std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>)
-        return "official_cuda_team";
-#endif
-    return "official_kokkos_mdrange";
-}
-
-template<typename Precision>
-int E3TensorProductKokkosT<Precision>::channel_team_size() const
-{
-#ifdef KOKKOS_ENABLE_CUDA
-    if constexpr(std::is_same_v<Precision,float>
-        &&std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>)
-        return mh1_fast_path ? mh1_cuda_channel_team_size_ : 0;
-#endif
-    return 0;
-}
-
-template<typename Precision>
-int E3TensorProductKokkosT<Precision>::harmonic_team_size() const
-{
-#ifdef KOKKOS_ENABLE_CUDA
-    if constexpr(std::is_same_v<Precision,float>
-        &&std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>)
-        return mh1_fast_path ? mh1_cuda_harmonic_team_size_ : 0;
-#endif
-    return 0;
-}
-
-template<typename Precision>
-bool E3TensorProductKokkosT<Precision>::supports_direct_node_reverse() const
-{
-#ifdef KOKKOS_ENABLE_CUDA
-    if constexpr(std::is_same_v<Precision,float>
-        &&std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>)
-        return mh1_fast_path&&mh1_direct_node_layout_
-            &&mh1_input_1_angular_dimension_
-                <=max_direct_node_input_components_;
-#endif
-    return false;
+    initialize_direct_execution_plan(data,validated);
 }
 
 template<typename Precision>
 void E3TensorProductKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,Kokkos::LayoutRight> input_1,Kokkos::View<const Precision**,Kokkos::LayoutRight> input_2,Kokkos::View<const Precision**,Kokkos::LayoutRight> dynamic_weights,Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
 {
-    ProfileRegion profile(mh1_fast_path
-        ? "symmetrix/mh1/tensor_product/forward"
-        : "symmetrix/generic/tensor_product/forward");
+    if(try_evaluate_direct_execution(input_1,input_2,dynamic_weights,output))
+        return;
+    ProfileRegion profile("symmetrix/generic/tensor_product/forward");
     ordered_kokkos_deep_copy(output,Precision(0)); auto mask=output_mask; auto fixed=internal_weights;
-    if(mh1_fast_path) {
-        auto plan=mh1_instruction_data;
-        auto paths=mh1_path_weights;
-        auto indices=mh1_sparse_indices;
-        auto values=mh1_sparse_values;
-        auto component_offsets=mh1_component_offsets;
-        const int instruction_count=mh1_instruction_count_;
-        const int multiplicity=mh1_multiplicity_;
-#ifdef KOKKOS_ENABLE_CUDA
-        if constexpr(std::is_same_v<Precision,float>
-            &&std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
-        const int channel_team_size=mh1_cuda_channel_team_size_;
-        using channel_policy=Kokkos::TeamPolicy<>;
-        Kokkos::parallel_for(
-            "e3 tensor product mh1 team channels",
-            channel_policy(input_1.extent(0),channel_team_size),
-            KOKKOS_LAMBDA(const typename channel_policy::member_type& team) {
-                const int sample=team.league_rank();
-                Kokkos::parallel_for(
-                    Kokkos::TeamThreadRange(team,multiplicity),
-                    [&](const int channel) {
-                for(int instruction=0;instruction<instruction_count;
-                    ++instruction) {
-                    const int input_1_offset=plan(instruction,0);
-                    const int input_2_offset=plan(instruction,1);
-                    const int output_offset=plan(instruction,2);
-                    const int input_width=plan(instruction,3);
-                    const int output_width=plan(instruction,4);
-                    const int weight_offset=plan(instruction,5);
-                    const int component_base=plan(instruction,6);
-                    const Precision scale=paths(instruction)
-                        *dynamic_weights(sample,weight_offset+channel);
-                    for(int component=0;component<output_width;++component) {
-                        Precision result=Precision(0);
-                        for(int entry=component_offsets(component_base+component);
-                            entry<component_offsets(
-                                component_base+component+1);++entry)
-                            result+=values(entry)
-                                *input_1(sample,input_1_offset
-                                    +channel*input_width+indices(entry,0))
-                                *input_2(sample,input_2_offset+indices(entry,1));
-                        const int output_index=output_offset
-                            +channel*output_width+component;
-                        output(sample,output_index)+=
-                            scale*result*mask(output_index);
-                    }
-                }
-                });
-            });
-        return;
-        }
-#endif
-        Kokkos::parallel_for(
-            "e3 tensor product mh1 fused",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-                {0,0},{static_cast<int>(input_1.extent(0)),multiplicity}),
-            KOKKOS_LAMBDA(int sample,int channel) {
-                for(int instruction=0;instruction<instruction_count;
-                    ++instruction) {
-                    const int input_1_offset=plan(instruction,0);
-                    const int input_2_offset=plan(instruction,1);
-                    const int output_offset=plan(instruction,2);
-                    const int input_width=plan(instruction,3);
-                    const int output_width=plan(instruction,4);
-                    const int weight_offset=plan(instruction,5);
-                    const int component_base=plan(instruction,6);
-                    const Precision scale=paths(instruction)
-                        *dynamic_weights(sample,weight_offset+channel);
-                    for(int component=0;component<output_width;++component) {
-                        Precision result=Precision(0);
-                        for(int entry=component_offsets(component_base+component);
-                            entry<component_offsets(
-                                component_base+component+1);++entry)
-                            result+=values(entry)
-                                *input_1(sample,input_1_offset
-                                    +channel*input_width+indices(entry,0))
-                                *input_2(sample,input_2_offset+indices(entry,1));
-                        const int output_index=output_offset
-                            +channel*output_width+component;
-                        output(sample,output_index)+=
-                            scale*result*mask(output_index);
-                    }
-                }
-            });
-        return;
-    }
     for (const auto instruction:instructions) { auto wigner=instruction.wigner;
-        Kokkos::parallel_for("e3 tensor product",Kokkos::MDRangePolicy<Kokkos::Rank<3>>({0,0,0},{static_cast<int>(input_1.extent(0)),instruction.output_multiplicity,instruction.output_width}),KOKKOS_LAMBDA(int sample,int u,int c) {
-            Precision result=Precision(0); for(int v=0;v<instruction.multiplicity_2;++v) { if(instruction.uuu&&u!=v) continue; const int wi=instruction.weight_offset+(instruction.uuu?u:u*instruction.multiplicity_2+v); const Precision weight=instruction.has_weight?(dynamic_weights.extent(1)?dynamic_weights(sample,wi):fixed(wi)):Precision(1);
-                for(int a=0;a<instruction.width_1;++a) for(int b=0;b<instruction.width_2;++b) result+=instruction.path_weight*weight*wigner((a*instruction.width_2+b)*instruction.output_width+c)*input_1(sample,instruction.input_1_offset+u*instruction.width_1+a)*input_2(sample,instruction.input_2_offset+v*instruction.width_2+b);
-            } const int index=instruction.output_offset+u*instruction.output_width+c; output(sample,index)+=result*mask(index);
+        if (instruction.uvw) {
+            Kokkos::parallel_for("e3 tensor product uvw",Kokkos::MDRangePolicy<Kokkos::Rank<3>>({0,0,0},{static_cast<int>(input_1.extent(0)),instruction.output_multiplicity,instruction.output_width}),KOKKOS_LAMBDA(int sample,int w,int c) {
+                Precision result=Precision(0);
+                for(int u=0;u<instruction.multiplicity_1;++u)
+                    for(int v=0;v<instruction.multiplicity_2;++v) {
+                        const int wi=instruction.weight_offset
+                            +(u*instruction.multiplicity_2+v)
+                                *instruction.output_multiplicity+w;
+                        const Precision weight=instruction.has_weight
+                            ?(dynamic_weights.extent(1)
+                                ?dynamic_weights(sample,wi):fixed(wi))
+                            :Precision(1);
+                        for(int a=0;a<instruction.width_1;++a)
+                            for(int b=0;b<instruction.width_2;++b)
+                                result+=instruction.path_weight*weight
+                                    *wigner((a*instruction.width_2+b)
+                                        *instruction.output_width+c)
+                                    *input_1(sample,instruction.input_1_offset
+                                        +u*instruction.width_1+a)
+                                    *input_2(sample,instruction.input_2_offset
+                                        +v*instruction.width_2+b);
+                    }
+                const int index=instruction.output_offset
+                    +w*instruction.output_width+c;
+                output(sample,index)+=result*mask(index);
+            });
+            continue;
+        }
+        Kokkos::parallel_for("e3 tensor product",Kokkos::MDRangePolicy<Kokkos::Rank<3>>({0,0,0},{static_cast<int>(input_1.extent(0)),instruction.multiplicity_1,instruction.output_width}),KOKKOS_LAMBDA(int sample,int u,int c) {
+            for(int v=0;v<instruction.multiplicity_2;++v) {
+                if(instruction.uuu&&u!=v) continue;
+                const int w_begin=instruction.uvw?0:u;
+                const int w_end=instruction.uvw?instruction.output_multiplicity:u+1;
+                for(int w=w_begin;w<w_end;++w) {
+                    const int wi=instruction.weight_offset+(instruction.uvw
+                        ?(u*instruction.multiplicity_2+v)*instruction.output_multiplicity+w
+                        :(instruction.uuu?u:u*instruction.multiplicity_2+v));
+                    const Precision weight=instruction.has_weight
+                        ?(dynamic_weights.extent(1)?dynamic_weights(sample,wi):fixed(wi))
+                        :Precision(1);
+                    Precision result=Precision(0);
+                    for(int a=0;a<instruction.width_1;++a)
+                        for(int b=0;b<instruction.width_2;++b)
+                            result+=instruction.path_weight*weight
+                                *wigner((a*instruction.width_2+b)*instruction.output_width+c)
+                                *input_1(sample,instruction.input_1_offset+u*instruction.width_1+a)
+                                *input_2(sample,instruction.input_2_offset+v*instruction.width_2+b);
+                    const int index=instruction.output_offset+w*instruction.output_width+c;
+                    output(sample,index)+=result*mask(index);
+                }
+            }
         });
     }
 }
@@ -2108,1173 +2324,573 @@ void E3TensorProductKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,
 template<typename Precision>
 void E3TensorProductKokkosT<Precision>::reverse(Kokkos::View<const Precision**,Kokkos::LayoutRight> input_1,Kokkos::View<const Precision**,Kokkos::LayoutRight> input_2,Kokkos::View<const Precision**,Kokkos::LayoutRight> dynamic_weights,Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,Kokkos::View<Precision**,Kokkos::LayoutRight> input_1_adjoint,Kokkos::View<Precision**,Kokkos::LayoutRight> input_2_adjoint,Kokkos::View<Precision**,Kokkos::LayoutRight> weights_adjoint) const
 {
-    ProfileRegion profile(mh1_fast_path
-        ? "symmetrix/mh1/tensor_product/reverse"
-        : "symmetrix/generic/tensor_product/reverse");
+    if(try_reverse_direct_execution(input_1,input_2,dynamic_weights,
+            output_adjoint,input_1_adjoint,input_2_adjoint,weights_adjoint))
+        return;
+    ProfileRegion profile("symmetrix/generic/tensor_product/reverse");
     ordered_kokkos_deep_copy(input_1_adjoint,Precision(0));
     ordered_kokkos_deep_copy(input_2_adjoint,Precision(0));
     ordered_kokkos_deep_copy(weights_adjoint,Precision(0));
     auto mask=output_mask; auto fixed=internal_weights;
-    if(mh1_fast_path) {
-        auto plan=mh1_instruction_data;
-        auto paths=mh1_path_weights;
-        auto indices=mh1_sparse_indices;
-        auto values=mh1_sparse_values;
-        auto component_offsets=mh1_component_offsets;
-        auto harmonic_offsets=mh1_harmonic_offsets;
-        auto harmonic_terms=mh1_harmonic_terms;
-        auto harmonic_values=mh1_harmonic_values;
-        const int instruction_count=mh1_instruction_count_;
-        const int multiplicity=mh1_multiplicity_;
-#ifdef KOKKOS_ENABLE_CUDA
-        if constexpr(std::is_same_v<Precision,float>
-            &&std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
-        const int channel_team_size=mh1_cuda_channel_team_size_;
-        const int harmonic_team_size=mh1_cuda_harmonic_team_size_;
-        using channel_policy=Kokkos::TeamPolicy<>;
-        Kokkos::parallel_for(
-            "e3 tensor reverse mh1 team channels",
-            channel_policy(input_1.extent(0),channel_team_size),
-            KOKKOS_LAMBDA(const typename channel_policy::member_type& team) {
-                const int sample=team.league_rank();
-                Kokkos::parallel_for(
-                    Kokkos::TeamThreadRange(team,multiplicity),
-                    [&](const int channel) {
-                for(int instruction=0;instruction<instruction_count;
-                    ++instruction) {
-                        const int input_1_offset=plan(instruction,0);
-                        const int input_2_offset=plan(instruction,1);
-                        const int output_offset=plan(instruction,2);
-                        const int input_width=plan(instruction,3);
-                        const int output_width=plan(instruction,4);
-                        const int weight_offset=plan(instruction,5);
-                        const int component_base=plan(instruction,6);
-                        const int first_entry=component_offsets(component_base);
-                        const int last_entry=component_offsets(
-                            component_base+output_width);
-                        const Precision weight=dynamic_weights(
-                            sample,weight_offset+channel);
-                        Precision weight_value=Precision(0);
-                        for(int entry=first_entry;entry<last_entry;++entry) {
-                            const int a=indices(entry,0);
-                            const int b=indices(entry,1);
-                            const int c=indices(entry,2);
-                            const int output_index=output_offset
-                                +channel*output_width+c;
-                            const Precision common=paths(instruction)*values(entry)
-                                *mask(output_index)*output_adjoint(sample,output_index);
-                            const Precision first=input_1(sample,input_1_offset
-                                +channel*input_width+a);
-                            const Precision second=input_2(sample,input_2_offset+b);
-                            input_1_adjoint(sample,input_1_offset
-                                +channel*input_width+a)+=common*weight*second;
-                            weight_value+=common*first*second;
-                        }
-                        weights_adjoint(sample,weight_offset+channel)=weight_value;
-                }
-                });
-            });
-        using harmonic_policy=Kokkos::TeamPolicy<>;
-        const int harmonic_dimension=input_2_dimension_;
-        Kokkos::parallel_for(
-            "e3 tensor reverse mh1 team harmonics",
-            harmonic_policy(
-                input_1.extent(0)*harmonic_dimension,harmonic_team_size),
-            KOKKOS_LAMBDA(const typename harmonic_policy::member_type& team) {
-                const int sample=team.league_rank()/harmonic_dimension;
-                const int component=team.league_rank()%harmonic_dimension;
-                Precision result=Precision(0);
-                Kokkos::parallel_reduce(
-                    Kokkos::TeamThreadRange(team,multiplicity),
-                    [&](const int channel,Precision& channel_result) {
-                    for(int term=harmonic_offsets(component);
-                        term<harmonic_offsets(component+1);++term) {
-                        const int instruction=harmonic_terms(term,0);
-                        const int a=harmonic_terms(term,1);
-                        const int c=harmonic_terms(term,2);
-                        const int input_1_offset=plan(instruction,0);
-                        const int output_offset=plan(instruction,2);
-                        const int input_width=plan(instruction,3);
-                        const int output_width=plan(instruction,4);
-                        const int weight_offset=plan(instruction,5);
-                        const int output_index=output_offset
-                            +channel*output_width+c;
-                        const Precision common=paths(instruction)
-                            *harmonic_values(term)*mask(output_index)
-                            *output_adjoint(sample,output_index);
-                        channel_result+=common
-                            *dynamic_weights(sample,weight_offset+channel)
-                            *input_1(sample,input_1_offset
-                                +channel*input_width+a);
-                    }},result);
-                Kokkos::single(Kokkos::PerTeam(team),[&]() {
-                    input_2_adjoint(sample,component)=result;
-                });
-            });
-        return;
-        }
-#endif
-        Kokkos::parallel_for(
-            "e3 tensor reverse mh1 fused channels",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-                {0,0},{static_cast<int>(input_1.extent(0)),multiplicity}),
-            KOKKOS_LAMBDA(int sample,int channel) {
-                for(int instruction=0;instruction<instruction_count;
-                    ++instruction) {
-                    const int input_1_offset=plan(instruction,0);
-                    const int input_2_offset=plan(instruction,1);
-                    const int output_offset=plan(instruction,2);
-                    const int input_width=plan(instruction,3);
-                    const int output_width=plan(instruction,4);
-                    const int weight_offset=plan(instruction,5);
-                    const int component_base=plan(instruction,6);
-                    const int first_entry=component_offsets(component_base);
-                    const int last_entry=component_offsets(
-                        component_base+output_width);
-                    const Precision weight=dynamic_weights(
-                        sample,weight_offset+channel);
-                    Precision weight_value=Precision(0);
-                    for(int entry=first_entry;entry<last_entry;++entry) {
-                        const int a=indices(entry,0);
-                        const int b=indices(entry,1);
-                        const int c=indices(entry,2);
-                        const int output_index=output_offset
-                            +channel*output_width+c;
-                        const Precision common=paths(instruction)*values(entry)
-                            *mask(output_index)*output_adjoint(sample,output_index);
-                        const Precision first=input_1(sample,input_1_offset
-                            +channel*input_width+a);
-                        const Precision second=input_2(sample,input_2_offset+b);
-                        input_1_adjoint(sample,input_1_offset
-                            +channel*input_width+a)+=common*weight*second;
-                        weight_value+=common*first*second;
-                    }
-                    weights_adjoint(sample,weight_offset+channel)=weight_value;
-                }
-            });
-        Kokkos::parallel_for(
-            "e3 tensor reverse mh1 fused harmonics",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-                {0,0},{static_cast<int>(input_1.extent(0)),input_2_dimension_}),
-            KOKKOS_LAMBDA(int sample,int component) {
-                Precision result=Precision(0);
-                for(int channel=0;channel<multiplicity;++channel)
-                    for(int term=harmonic_offsets(component);
-                        term<harmonic_offsets(component+1);++term) {
-                        const int instruction=harmonic_terms(term,0);
-                        const int a=harmonic_terms(term,1);
-                        const int c=harmonic_terms(term,2);
-                        const int input_1_offset=plan(instruction,0);
-                        const int output_offset=plan(instruction,2);
-                        const int input_width=plan(instruction,3);
-                        const int output_width=plan(instruction,4);
-                        const int weight_offset=plan(instruction,5);
-                        const int output_index=output_offset
-                            +channel*output_width+c;
-                        const Precision common=paths(instruction)
-                            *harmonic_values(term)*mask(output_index)
-                            *output_adjoint(sample,output_index);
-                        result+=common
-                            *dynamic_weights(sample,weight_offset+channel)
-                            *input_1(sample,input_1_offset
-                                +channel*input_width+a);
-                    }
-                input_2_adjoint(sample,component)=result;
-            });
-        return;
-    }
     for(const auto instruction:instructions) { auto wigner=instruction.wigner;
         Kokkos::parallel_for("e3 tensor reverse",input_1.extent(0),KOKKOS_LAMBDA(int sample) {
-            for(int u=0;u<instruction.multiplicity_1;++u) for(int v=0;v<instruction.multiplicity_2;++v) { if(instruction.uuu&&u!=v) continue; const int wi=instruction.weight_offset+(instruction.uuu?u:u*instruction.multiplicity_2+v); const Precision weight=instruction.has_weight?(dynamic_weights.extent(1)?dynamic_weights(sample,wi):fixed(wi)):Precision(1);
-                for(int a=0;a<instruction.width_1;++a) for(int b=0;b<instruction.width_2;++b) for(int c=0;c<instruction.output_width;++c) { const int oi=instruction.output_offset+u*instruction.output_width+c; const Precision common=instruction.path_weight*wigner((a*instruction.width_2+b)*instruction.output_width+c)*mask(oi)*output_adjoint(sample,oi); input_1_adjoint(sample,instruction.input_1_offset+u*instruction.width_1+a)+=common*weight*input_2(sample,instruction.input_2_offset+v*instruction.width_2+b); input_2_adjoint(sample,instruction.input_2_offset+v*instruction.width_2+b)+=common*weight*input_1(sample,instruction.input_1_offset+u*instruction.width_1+a); if(instruction.has_weight) weights_adjoint(sample,wi)+=common*input_1(sample,instruction.input_1_offset+u*instruction.width_1+a)*input_2(sample,instruction.input_2_offset+v*instruction.width_2+b); }
+            for(int u=0;u<instruction.multiplicity_1;++u) for(int v=0;v<instruction.multiplicity_2;++v) {
+                if(instruction.uuu&&u!=v) continue;
+                const int w_begin=instruction.uvw?0:u;
+                const int w_end=instruction.uvw?instruction.output_multiplicity:u+1;
+                for(int w=w_begin;w<w_end;++w) {
+                    const int wi=instruction.weight_offset+(instruction.uvw
+                        ?(u*instruction.multiplicity_2+v)*instruction.output_multiplicity+w
+                        :(instruction.uuu?u:u*instruction.multiplicity_2+v));
+                    const Precision weight=instruction.has_weight
+                        ?(dynamic_weights.extent(1)?dynamic_weights(sample,wi):fixed(wi))
+                        :Precision(1);
+                    for(int a=0;a<instruction.width_1;++a)
+                        for(int b=0;b<instruction.width_2;++b)
+                            for(int c=0;c<instruction.output_width;++c) {
+                                const int oi=instruction.output_offset+w*instruction.output_width+c;
+                                const Precision common=instruction.path_weight
+                                    *wigner((a*instruction.width_2+b)*instruction.output_width+c)
+                                    *mask(oi)*output_adjoint(sample,oi);
+                                input_1_adjoint(sample,instruction.input_1_offset+u*instruction.width_1+a)
+                                    +=common*weight*input_2(sample,instruction.input_2_offset+v*instruction.width_2+b);
+                                input_2_adjoint(sample,instruction.input_2_offset+v*instruction.width_2+b)
+                                    +=common*weight*input_1(sample,instruction.input_1_offset+u*instruction.width_1+a);
+                                if(instruction.has_weight && dynamic_weights.extent(1))
+                                    weights_adjoint(sample,wi)+=common
+                                        *input_1(sample,instruction.input_1_offset+u*instruction.width_1+a)
+                                        *input_2(sample,instruction.input_2_offset+v*instruction.width_2+b);
+                            }
+                }
             }
         });
     }
 }
 
 template<typename Precision>
-bool E3TensorProductKokkosT<Precision>::try_reverse_from_nodes(
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> source_node_values,
-    Kokkos::View<const int*> source_indices,
-    int first_edge,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> edge_input_2,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> edge_weights,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight>
-        target_node_output_adjoint,
-    Kokkos::View<const int*> target_indices,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> source_node_input_adjoint,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> edge_input_2_adjoint,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> edge_weights_adjoint) const
+int E3TensorProductKokkosT<Precision>::node_tile_capacity(
+    const int remaining,const int k_dimension,const int result_width) const
 {
-    if(!supports_direct_node_reverse()) return false;
+    constexpr std::size_t budget=std::size_t(4)<<20;
+    const std::size_t per_node=(static_cast<std::size_t>(k_dimension)
+        +static_cast<std::size_t>(result_width))*sizeof(Precision);
+    const std::size_t capacity=per_node==0
+        ?1:std::max<std::size_t>(1,budget/per_node);
+    return static_cast<int>(std::min<std::size_t>(
+        static_cast<std::size_t>(std::max(remaining,1)),capacity));
+}
+
+template<typename Precision>
+typename E3TensorProductKokkosT<Precision>::BilinearWorkspaceShape
+E3TensorProductKokkosT<Precision>::bilinear_workspace_shape(
+    const std::size_t samples) const
+{
+    BilinearWorkspaceShape shape;
+    for(const auto& instruction:instructions) {
+        const int k_dimension=instruction.multiplicity_1
+            *instruction.multiplicity_2;
+        const int result_width=instruction.output_multiplicity;
+        const int tile=node_tile_capacity(
+            static_cast<int>(samples),k_dimension,result_width);
+        const std::size_t matrix_values=static_cast<std::size_t>(tile)
+            *static_cast<std::size_t>(k_dimension);
+        const std::size_t result_values=static_cast<std::size_t>(tile)
+            *static_cast<std::size_t>(result_width);
+        shape.matrix_values=std::max(shape.matrix_values,matrix_values);
+        shape.result_values=std::max(shape.result_values,result_values);
+        shape.adjoint_values=std::max(shape.adjoint_values,result_values);
+        shape.k_adjoint_values=std::max(
+            shape.k_adjoint_values,matrix_values);
+    }
+    return shape;
+}
+
+template<typename Precision>
+void E3TensorProductKokkosT<Precision>::ensure_bilinear_workspace(
+    const int tile,const int k_dimension,const int result_width) const
+{
+    const auto wanted_matrix=static_cast<std::size_t>(tile)
+        *static_cast<std::size_t>(k_dimension);
+    const auto wanted_result=static_cast<std::size_t>(tile)
+        *static_cast<std::size_t>(result_width);
+    auto ensure=[this](auto& view,const std::size_t wanted) {
+        if(view.size()>=wanted) return;
+        if(bilinear_workspace_->fixed_capacity)
+            throw std::logic_error(
+                "fixed Kokkos bilinear workspace is smaller than its plan");
+        Kokkos::realloc(view,std::size_t(1),wanted);
+    };
+    ensure(bilinear_workspace_->matrix,wanted_matrix);
+    ensure(bilinear_workspace_->result,wanted_result);
+    ensure(bilinear_workspace_->adjoint,wanted_result);
+    ensure(bilinear_workspace_->k_adjoint,wanted_matrix);
+}
+
+template<typename Precision>
+bool E3TensorProductKokkosT<Precision>::supports_node_bilinear_uvw() const
+{
+    if(instructions.empty()||internal_weights.extent(0)==0)
+        return false;
+    // Any all-uvw definition with internal weights is eligible: per
+    // instruction block offsets and widths are honoured by the tiled GEMM
+    // below.  Verified against the general tensor-product path on the
+    // multi-instruction self connections with differing k dimensions.
+    if(output_mask.extent(0)!=static_cast<std::size_t>(output_dimension_))
+        return false;
+    // The tiled GEMM below is portable across Kokkos execution spaces, but
+    // only the host and CUDA backends are validated; other device backends
+    // (HIP, SYCL, OpenMP-target) stay on the general tensor-product path.
+    if constexpr(!std::is_same_v<
+        typename Kokkos::DefaultExecutionSpace::memory_space,Kokkos::HostSpace>) {
 #ifdef KOKKOS_ENABLE_CUDA
-    if constexpr(std::is_same_v<Precision,float>
-        &&std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
-        const std::size_t samples=edge_input_2.extent(0);
-        const std::size_t last_edge=first_edge<0
-            ?std::size_t(0):static_cast<std::size_t>(first_edge)+samples;
-        if(first_edge<0||source_indices.extent(0)<last_edge
-            ||target_indices.extent(0)<last_edge
-            ||source_node_values.extent(1)
-                !=static_cast<std::size_t>(input_1_dimension_)
-            ||target_node_output_adjoint.extent(1)
-                !=static_cast<std::size_t>(output_dimension_)
-            ||source_node_input_adjoint.extent(0)
-                !=source_node_values.extent(0)
-            ||source_node_input_adjoint.extent(1)
-                !=source_node_values.extent(1)
-            ||edge_input_2.extent(1)
-                !=static_cast<std::size_t>(input_2_dimension_)
-            ||edge_weights.extent(0)!=samples
-            ||edge_weights.extent(1)
-                !=static_cast<std::size_t>(weight_size_)
-            ||edge_input_2_adjoint.extent(0)!=samples
-            ||edge_input_2_adjoint.extent(1)!=edge_input_2.extent(1)
-            ||edge_weights_adjoint.extent(0)!=samples
-            ||edge_weights_adjoint.extent(1)!=edge_weights.extent(1))
-            throw std::invalid_argument(
-                "Kokkos direct-node tensor-product reverse dimensions are inconsistent.");
-
-        ProfileRegion profile("symmetrix/mh1/tensor_product/reverse_direct_nodes");
-        auto plan=mh1_instruction_data;
-        auto paths=mh1_path_weights;
-        auto indices=mh1_sparse_indices;
-        auto values=mh1_sparse_values;
-        auto component_offsets=mh1_component_offsets;
-        auto harmonic_offsets=mh1_harmonic_offsets;
-        auto harmonic_terms=mh1_harmonic_terms;
-        auto harmonic_values=mh1_harmonic_values;
-        auto input_components=mh1_input_component_data;
-        auto mask=output_mask;
-        const int instruction_count=mh1_instruction_count_;
-        const int multiplicity=mh1_multiplicity_;
-        const int angular_dimension=mh1_input_1_angular_dimension_;
-
-        using channel_policy=Kokkos::TeamPolicy<>;
-        Kokkos::parallel_for(
-            "e3 tensor reverse mh1 direct node channels",
-            channel_policy(samples,mh1_cuda_channel_team_size_),
-            KOKKOS_LAMBDA(const typename channel_policy::member_type& team) {
-                const int sample=team.league_rank();
-                const int edge=first_edge+sample;
-                const int source=source_indices(edge);
-                const int target=target_indices(edge);
-                Kokkos::parallel_for(
-                    Kokkos::TeamThreadRange(team,multiplicity),
-                    [&](const int channel) {
-                    Precision input_values[max_direct_node_input_components_];
-                    for(int component=0;component<angular_dimension;++component)
-                        input_values[component]=Precision(0);
-                    for(int instruction=0;instruction<instruction_count;
-                        ++instruction) {
-                        const int input_1_offset=plan(instruction,0);
-                        const int input_2_offset=plan(instruction,1);
-                        const int output_offset=plan(instruction,2);
-                        const int input_width=plan(instruction,3);
-                        const int output_width=plan(instruction,4);
-                        const int weight_offset=plan(instruction,5);
-                        const int component_base=plan(instruction,6);
-                        const int first_entry=component_offsets(component_base);
-                        const int last_entry=component_offsets(
-                            component_base+output_width);
-                        const Precision weight=edge_weights(
-                            sample,weight_offset+channel);
-                        Precision weight_value=Precision(0);
-                        for(int entry=first_entry;entry<last_entry;++entry) {
-                            const int a=indices(entry,0);
-                            const int b=indices(entry,1);
-                            const int c=indices(entry,2);
-                            const int output_index=output_offset
-                                +channel*output_width+c;
-                            const Precision common=paths(instruction)*values(entry)
-                                *mask(output_index)
-                                *target_node_output_adjoint(target,output_index);
-                            const Precision first=source_node_values(
-                                source,input_1_offset+channel*input_width+a);
-                            const Precision second=edge_input_2(
-                                sample,input_2_offset+b);
-                            input_values[input_1_offset/multiplicity+a]
-                                +=common*weight*second;
-                            weight_value+=common*first*second;
-                        }
-                        edge_weights_adjoint(
-                            sample,weight_offset+channel)=weight_value;
-                    }
-                    for(int component=0;component<angular_dimension;++component) {
-                        const Precision value=input_values[component];
-                        if(value!=Precision(0))
-                            Kokkos::atomic_add(
-                                &source_node_input_adjoint(
-                                    source,input_components(component,0)
-                                        +channel*input_components(component,1)),
-                                value);
-                    }
-                });
-            });
-
-        using harmonic_policy=Kokkos::TeamPolicy<>;
-        const int harmonic_dimension=input_2_dimension_;
-        Kokkos::parallel_for(
-            "e3 tensor reverse mh1 direct node harmonics",
-            harmonic_policy(
-                samples*harmonic_dimension,mh1_cuda_harmonic_team_size_),
-            KOKKOS_LAMBDA(const typename harmonic_policy::member_type& team) {
-                const int sample=team.league_rank()/harmonic_dimension;
-                const int component=team.league_rank()%harmonic_dimension;
-                const int edge=first_edge+sample;
-                const int source=source_indices(edge);
-                const int target=target_indices(edge);
-                Precision result=Precision(0);
-                Kokkos::parallel_reduce(
-                    Kokkos::TeamThreadRange(team,multiplicity),
-                    [&](const int channel,Precision& channel_result) {
-                    for(int term=harmonic_offsets(component);
-                        term<harmonic_offsets(component+1);++term) {
-                        const int instruction=harmonic_terms(term,0);
-                        const int a=harmonic_terms(term,1);
-                        const int c=harmonic_terms(term,2);
-                        const int input_1_offset=plan(instruction,0);
-                        const int output_offset=plan(instruction,2);
-                        const int input_width=plan(instruction,3);
-                        const int output_width=plan(instruction,4);
-                        const int weight_offset=plan(instruction,5);
-                        const int output_index=output_offset
-                            +channel*output_width+c;
-                        const Precision common=paths(instruction)
-                            *harmonic_values(term)*mask(output_index)
-                            *target_node_output_adjoint(target,output_index);
-                        channel_result+=common
-                            *edge_weights(sample,weight_offset+channel)
-                            *source_node_values(
-                                source,input_1_offset+channel*input_width+a);
-                    }},result);
-                Kokkos::single(Kokkos::PerTeam(team),[&]() {
-                    edge_input_2_adjoint(sample,component)=result;
-                });
-            });
-        return true;
-    }
+        if constexpr(!std::is_same_v<
+            Kokkos::DefaultExecutionSpace,Kokkos::Cuda>)
+            return false;
+#else
+        return false;
 #endif
-    return false;
-}
-
-template<typename Precision>
-bool E3TensorProductKokkosT<Precision>::try_evaluate_execution_uvu_from_nodes(
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> source_node_values,
-    Kokkos::View<const int*> source_indices,
-    Kokkos::View<const int*> target_indices,
-    Kokkos::View<const int*> active_receivers,
-    Kokkos::View<const int*> receiver_offsets,
-    int first_edge,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> edge_phi,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> linear_weight,
-    Kokkos::View<const Precision*> linear_bias,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight>
-        edge_linear_contribution,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> edge_input_2,
-    Kokkos::View<const Precision*> edge_cutoff_scale,
-    bool apply_edge_cutoff_scale,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> node_messages) const
-{
-    if(!supports_execution_direct_uvu()) return false;
-    const std::size_t samples=edge_phi.extent(0);
-    const std::size_t last_edge=first_edge<0
-        ?std::size_t(0):static_cast<std::size_t>(first_edge)+samples;
-    const bool bias_valid=linear_bias.extent(0)==0
-        ||linear_bias.extent(0)==static_cast<std::size_t>(weight_size_);
-    const bool contribution_valid=edge_linear_contribution.size()==0
-        ||(edge_linear_contribution.extent(0)==samples
-            &&edge_linear_contribution.extent(1)
-                ==static_cast<std::size_t>(weight_size_));
-    if(first_edge<0||source_indices.extent(0)<last_edge
-        ||target_indices.extent(0)<last_edge
-        ||receiver_offsets.extent(0)!=node_messages.extent(0)+1
-        ||source_node_values.extent(1)
-            !=static_cast<std::size_t>(input_1_dimension_)
-        ||node_messages.extent(1)
-            !=static_cast<std::size_t>(output_dimension_)
-        ||edge_input_2.extent(0)!=samples
-        ||edge_input_2.extent(1)
-            !=static_cast<std::size_t>(input_2_dimension_)
-        ||linear_weight.extent(0)
-            !=static_cast<std::size_t>(weight_size_)
-        ||linear_weight.extent(1)!=edge_phi.extent(1)
-        ||!bias_valid
-        ||!contribution_valid
-        ||(apply_edge_cutoff_scale
-            &&edge_cutoff_scale.extent(0)<last_edge))
-        throw std::invalid_argument(
-            "Kokkos Execution direct UVU forward dimensions are inconsistent.");
-
-    ProfileRegion profile("symmetrix/mh1/execution_uvu/forward_direct_nodes");
-    auto plan=mh1_instruction_data;
-    auto paths=mh1_path_weights;
-    auto indices=mh1_sparse_indices;
-    auto values=mh1_sparse_values;
-    auto component_offsets=mh1_component_offsets;
-    auto mask=output_mask;
-    const int instruction_count=mh1_instruction_count_;
-    const int multiplicity=mh1_multiplicity_;
-    const int phi_dimension=edge_phi.extent(1);
-    const int block_end=first_edge+static_cast<int>(samples);
-    const bool has_bias=linear_bias.extent(0)!=0;
-    const bool has_edge_contribution=edge_linear_contribution.size()!=0;
-
-    Kokkos::parallel_for(
-        "e3 tensor execution uvu receiver-owned forward",
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-            {0,0},{static_cast<int>(active_receivers.extent(0)),multiplicity}),
-        KOKKOS_LAMBDA(int owner,int channel) {
-            const int receiver=active_receivers(owner);
-            const int receiver_begin=receiver_offsets(receiver);
-            const int receiver_end=receiver_offsets(receiver+1);
-            const int begin=receiver_begin>first_edge
-                ?receiver_begin:first_edge;
-            const int end=receiver_end<block_end
-                ?receiver_end:block_end;
-            if(begin>=end) return;
-            for(int instruction=0;instruction<instruction_count;
-                ++instruction) {
-                const int input_1_offset=plan(instruction,0);
-                const int input_2_offset=plan(instruction,1);
-                const int output_offset=plan(instruction,2);
-                const int input_width=plan(instruction,3);
-                const int output_width=plan(instruction,4);
-                const int weight_index=plan(instruction,5)+channel;
-                const int component_base=plan(instruction,6);
-                for(int edge=begin;edge<end;++edge) {
-                    if(target_indices(edge)!=receiver) continue;
-                    const int local_edge=edge-first_edge;
-                    const int source=source_indices(edge);
-                    Precision weight=has_bias
-                        ?linear_bias(weight_index):Precision(0);
-                    if(has_edge_contribution)
-                        weight+=edge_linear_contribution(
-                            local_edge,weight_index);
-                    for(int phi=0;phi<phi_dimension;++phi)
-                        weight+=linear_weight(weight_index,phi)
-                            *edge_phi(local_edge,phi);
-                    if(apply_edge_cutoff_scale)
-                        weight*=edge_cutoff_scale(edge);
-                    const Precision scale=paths(instruction)*weight;
-                    for(int component=0;component<output_width;++component) {
-                        const int first_entry=component_offsets(
-                            component_base+component);
-                        const int last_entry=component_offsets(
-                            component_base+component+1);
-                        Precision product=Precision(0);
-                        for(int entry=first_entry;entry<last_entry;++entry)
-                            product+=values(entry)
-                                *source_node_values(source,input_1_offset
-                                    +channel*input_width+indices(entry,0))
-                                *edge_input_2(local_edge,input_2_offset
-                                    +indices(entry,1));
-                        const int output_index=output_offset
-                            +channel*output_width+component;
-                        node_messages(receiver,output_index)+=
-                            scale*mask(output_index)*product;
-                    }
-                }
-            }
-        });
-    return true;
-}
-
-template<typename Precision>
-bool E3TensorProductKokkosT<Precision>::try_reverse_execution_uvu_from_nodes(
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> source_node_values,
-    Kokkos::View<const int*> source_indices,
-    Kokkos::View<const int*> target_indices,
-    int first_edge,
-    Kokkos::View<const int*> source_edge_offsets,
-    Kokkos::View<const int*> source_edge_indices,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> edge_phi,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> linear_weight,
-    Kokkos::View<const Precision*> linear_bias,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight>
-        edge_linear_contribution,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> edge_input_2,
-    Kokkos::View<const Precision*> edge_cutoff_scale,
-    bool apply_edge_cutoff_scale,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight>
-        target_node_output_adjoint,
-    Kokkos::View<Precision**,Kokkos::LayoutRight>
-        source_node_input_adjoint,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> edge_phi_adjoint,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> edge_input_2_adjoint,
-    Kokkos::View<Precision*> edge_cutoff_scale_adjoint) const
-{
-    if(!supports_execution_direct_uvu()) return false;
-    const std::size_t samples=edge_phi.extent(0);
-    const std::size_t last_edge=first_edge<0
-        ?std::size_t(0):static_cast<std::size_t>(first_edge)+samples;
-    const bool bias_valid=linear_bias.extent(0)==0
-        ||linear_bias.extent(0)==static_cast<std::size_t>(weight_size_);
-    const bool contribution_valid=edge_linear_contribution.size()==0
-        ||(edge_linear_contribution.extent(0)==samples
-            &&edge_linear_contribution.extent(1)
-                ==static_cast<std::size_t>(weight_size_));
-    if(first_edge<0||source_indices.extent(0)<last_edge
-        ||target_indices.extent(0)<last_edge
-        ||source_edge_offsets.extent(0)==0
-        ||source_edge_indices.extent(0)<last_edge
-        ||source_node_values.extent(1)
-            !=static_cast<std::size_t>(input_1_dimension_)
-        ||source_node_input_adjoint.extent(0)
-            !=source_node_values.extent(0)
-        ||source_node_input_adjoint.extent(1)
-            !=source_node_values.extent(1)
-        ||target_node_output_adjoint.extent(1)
-            !=static_cast<std::size_t>(output_dimension_)
-        ||edge_input_2.extent(0)!=samples
-        ||edge_input_2.extent(1)
-            !=static_cast<std::size_t>(input_2_dimension_)
-        ||linear_weight.extent(0)
-            !=static_cast<std::size_t>(weight_size_)
-        ||linear_weight.extent(1)!=edge_phi.extent(1)
-        ||!bias_valid
-        ||!contribution_valid
-        ||(apply_edge_cutoff_scale
-            &&edge_cutoff_scale.extent(0)<last_edge)
-        ||edge_phi_adjoint.extent(0)!=samples
-        ||edge_phi_adjoint.extent(1)!=edge_phi.extent(1)
-        ||edge_input_2_adjoint.extent(0)!=samples
-        ||edge_input_2_adjoint.extent(1)!=edge_input_2.extent(1)
-        ||edge_cutoff_scale_adjoint.extent(0)!=samples)
-        throw std::invalid_argument(
-            "Kokkos Execution direct UVU reverse dimensions are inconsistent.");
-
-    ProfileRegion profile("symmetrix/mh1/execution_uvu/reverse_direct_nodes");
-    auto plan=mh1_instruction_data;
-    auto paths=mh1_path_weights;
-    auto indices=mh1_sparse_indices;
-    auto values=mh1_sparse_values;
-    auto component_offsets=mh1_component_offsets;
-    auto harmonic_offsets=mh1_harmonic_offsets;
-    auto harmonic_terms=mh1_harmonic_terms;
-    auto harmonic_values=mh1_harmonic_values;
-    auto input_components=mh1_input_component_data;
-    auto input_term_offsets=mh1_input_term_offsets;
-    auto input_terms=mh1_input_terms;
-    auto input_values=mh1_input_values;
-    auto mask=output_mask;
-    const int instruction_count=mh1_instruction_count_;
-    const int multiplicity=mh1_multiplicity_;
-    const int angular_dimension=mh1_input_1_angular_dimension_;
-    const int harmonic_dimension=input_2_dimension_;
-    const int phi_dimension=edge_phi.extent(1);
-    const bool has_bias=linear_bias.extent(0)!=0;
-    const bool has_edge_contribution=edge_linear_contribution.size()!=0;
-
-    Kokkos::parallel_for(
-        "e3 tensor execution uvu source-owned reverse",
-        Kokkos::MDRangePolicy<Kokkos::Rank<3>>(
-            {0,0,0},{static_cast<int>(source_edge_offsets.extent(0))-1,
-                multiplicity,angular_dimension}),
-        KOKKOS_LAMBDA(int owner,int channel,int input_component) {
-            const int first_position=source_edge_offsets(owner);
-            const int source=source_indices(source_edge_indices(first_position));
-            Precision result=Precision(0);
-            for(int position=source_edge_offsets(owner);
-                position<source_edge_offsets(owner+1);++position) {
-                const int edge=source_edge_indices(position);
-                const int local_edge=edge-first_edge;
-                const int target=target_indices(edge);
-                int previous_instruction=-1;
-                Precision weight=Precision(0);
-                for(int term=input_term_offsets(input_component);
-                    term<input_term_offsets(input_component+1);++term) {
-                    const int instruction=input_terms(term,0);
-                    const int b=input_terms(term,1);
-                    const int c=input_terms(term,2);
-                    const int input_2_offset=plan(instruction,1);
-                    const int output_offset=plan(instruction,2);
-                    const int output_width=plan(instruction,4);
-                    const int weight_index=plan(instruction,5)+channel;
-                    if(instruction!=previous_instruction) {
-                        weight=has_bias
-                            ?linear_bias(weight_index):Precision(0);
-                        if(has_edge_contribution)
-                            weight+=edge_linear_contribution(
-                                local_edge,weight_index);
-                        for(int phi=0;phi<phi_dimension;++phi)
-                            weight+=linear_weight(weight_index,phi)
-                                *edge_phi(local_edge,phi);
-                        if(apply_edge_cutoff_scale)
-                            weight*=edge_cutoff_scale(edge);
-                        previous_instruction=instruction;
-                    }
-                    const int output_index=output_offset
-                        +channel*output_width+c;
-                    result+=paths(instruction)*input_values(term)
-                        *mask(output_index)
-                        *target_node_output_adjoint(target,output_index)
-                        *weight*edge_input_2(local_edge,input_2_offset+b);
-                }
-            }
-            source_node_input_adjoint(
-                source,input_components(input_component,0)
-                    +channel*input_components(input_component,1))+=result;
-        });
-
-    Kokkos::parallel_for(
-        "e3 tensor execution uvu compact prefix reverse",
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-            {0,0},{static_cast<int>(samples),phi_dimension}),
-        KOKKOS_LAMBDA(int local_edge,int phi) {
-            const int edge=first_edge+local_edge;
-            const int source=source_indices(edge);
-            const int target=target_indices(edge);
-            const Precision cutoff=apply_edge_cutoff_scale
-                ?edge_cutoff_scale(edge):Precision(1);
-            Precision result=Precision(0);
-            for(int instruction=0;instruction<instruction_count;
-                ++instruction) {
-                const int input_1_offset=plan(instruction,0);
-                const int input_2_offset=plan(instruction,1);
-                const int output_offset=plan(instruction,2);
-                const int input_width=plan(instruction,3);
-                const int output_width=plan(instruction,4);
-                const int weight_offset=plan(instruction,5);
-                const int component_base=plan(instruction,6);
-                const int first_entry=component_offsets(component_base);
-                const int last_entry=component_offsets(
-                    component_base+output_width);
-                for(int channel=0;channel<multiplicity;++channel) {
-                    Precision weight_adjoint=Precision(0);
-                    for(int entry=first_entry;entry<last_entry;++entry) {
-                        const int output_index=output_offset
-                            +channel*output_width+indices(entry,2);
-                        weight_adjoint+=paths(instruction)*values(entry)
-                            *mask(output_index)
-                            *target_node_output_adjoint(target,output_index)
-                            *source_node_values(source,input_1_offset
-                                +channel*input_width+indices(entry,0))
-                            *edge_input_2(local_edge,input_2_offset
-                                +indices(entry,1));
-                    }
-                    result+=cutoff
-                        *linear_weight(weight_offset+channel,phi)
-                        *weight_adjoint;
-                }
-            }
-            edge_phi_adjoint(local_edge,phi)=result;
-        });
-
-    Kokkos::parallel_for(
-        "e3 tensor execution uvu harmonic reverse",
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-            {0,0},{static_cast<int>(samples),harmonic_dimension}),
-        KOKKOS_LAMBDA(int local_edge,int component) {
-            const int edge=first_edge+local_edge;
-            const int source=source_indices(edge);
-            const int target=target_indices(edge);
-            const Precision cutoff=apply_edge_cutoff_scale
-                ?edge_cutoff_scale(edge):Precision(1);
-            Precision result=Precision(0);
-            for(int channel=0;channel<multiplicity;++channel) {
-                int previous_instruction=-1;
-                Precision weight=Precision(0);
-                for(int term=harmonic_offsets(component);
-                    term<harmonic_offsets(component+1);++term) {
-                    const int instruction=harmonic_terms(term,0);
-                    const int a=harmonic_terms(term,1);
-                    const int c=harmonic_terms(term,2);
-                    const int input_1_offset=plan(instruction,0);
-                    const int output_offset=plan(instruction,2);
-                    const int input_width=plan(instruction,3);
-                    const int output_width=plan(instruction,4);
-                    const int weight_index=plan(instruction,5)+channel;
-                    if(instruction!=previous_instruction) {
-                        weight=has_bias
-                            ?linear_bias(weight_index):Precision(0);
-                        if(has_edge_contribution)
-                            weight+=edge_linear_contribution(
-                                local_edge,weight_index);
-                        for(int phi=0;phi<phi_dimension;++phi)
-                            weight+=linear_weight(weight_index,phi)
-                                *edge_phi(local_edge,phi);
-                        previous_instruction=instruction;
-                    }
-                    const int output_index=output_offset
-                        +channel*output_width+c;
-                    result+=paths(instruction)*harmonic_values(term)
-                        *mask(output_index)
-                        *target_node_output_adjoint(target,output_index)
-                        *source_node_values(source,input_1_offset
-                            +channel*input_width+a)*cutoff*weight;
-                }
-            }
-            edge_input_2_adjoint(local_edge,component)=result;
-        });
-
-    Kokkos::parallel_for(
-        "e3 tensor execution uvu cutoff reverse",samples,
-        KOKKOS_LAMBDA(int local_edge) {
-            if(!apply_edge_cutoff_scale) {
-                edge_cutoff_scale_adjoint(local_edge)=Precision(0);
-                return;
-            }
-            const int edge=first_edge+local_edge;
-            const int source=source_indices(edge);
-            const int target=target_indices(edge);
-            Precision result=Precision(0);
-            for(int instruction=0;instruction<instruction_count;
-                ++instruction) {
-                const int input_1_offset=plan(instruction,0);
-                const int input_2_offset=plan(instruction,1);
-                const int output_offset=plan(instruction,2);
-                const int input_width=plan(instruction,3);
-                const int output_width=plan(instruction,4);
-                const int weight_offset=plan(instruction,5);
-                const int component_base=plan(instruction,6);
-                const int first_entry=component_offsets(component_base);
-                const int last_entry=component_offsets(
-                    component_base+output_width);
-                for(int channel=0;channel<multiplicity;++channel) {
-                    const int weight_index=weight_offset+channel;
-                    Precision weight=has_bias
-                        ?linear_bias(weight_index):Precision(0);
-                    if(has_edge_contribution)
-                        weight+=edge_linear_contribution(
-                            local_edge,weight_index);
-                    for(int phi=0;phi<phi_dimension;++phi)
-                        weight+=linear_weight(weight_index,phi)
-                            *edge_phi(local_edge,phi);
-                    Precision weight_adjoint=Precision(0);
-                    for(int entry=first_entry;entry<last_entry;++entry) {
-                        const int output_index=output_offset
-                            +channel*output_width+indices(entry,2);
-                        weight_adjoint+=paths(instruction)*values(entry)
-                            *mask(output_index)
-                            *target_node_output_adjoint(target,output_index)
-                            *source_node_values(source,input_1_offset
-                                +channel*input_width+indices(entry,0))
-                            *edge_input_2(local_edge,input_2_offset
-                                +indices(entry,1));
-                    }
-                    result+=weight*weight_adjoint;
-                }
-            }
-            edge_cutoff_scale_adjoint(local_edge)=result;
-        });
-    return true;
-}
-
-template<typename Precision>
-bool E3TensorProductKokkosT<Precision>::
-try_evaluate_execution_spline_uvu_from_nodes(
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> source_node_values_ir_mul,
-    Kokkos::View<const int*> source_indices,
-    Kokkos::View<const int*> target_indices,
-    Kokkos::View<const int*> active_receivers,
-    Kokkos::View<const int*> receiver_offsets,
-    Kokkos::View<const int*> source_types,
-    Kokkos::View<const int*> node_types,
-    Kokkos::View<const double*> distances,
-    Kokkos::View<const int*> spline_intervals,
-    Kokkos::View<const Precision*> spline_coordinates,
-    const int type_count,
-    RadialFunctionSetKokkos<Precision> spline,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> edge_input_2,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> node_messages_ir_mul,
-    Kokkos::View<Precision*> node_density) const
-{
-    if(!supports_execution_direct_uvu()
-        ||mh1_max_output_width_>max_direct_node_output_components_) return false;
-    const auto edges=source_indices.extent(0);
-    if(type_count<=0
-        ||target_indices.extent(0)!=edges||source_types.extent(0)!=edges
-        ||distances.extent(0)!=edges||spline_intervals.extent(0)!=edges
-        ||spline_coordinates.extent(0)!=edges||edge_input_2.extent(0)!=edges
-        ||edge_input_2.extent(1)!=static_cast<std::size_t>(input_2_dimension_)
-        ||receiver_offsets.extent(0)!=node_messages_ir_mul.extent(0)+1
-        ||node_types.extent(0)!=node_messages_ir_mul.extent(0)
-        ||node_density.extent(0)!=node_messages_ir_mul.extent(0)
-        ||source_node_values_ir_mul.extent(1)
-            !=static_cast<std::size_t>(input_1_dimension_)
-        ||node_messages_ir_mul.extent(1)
-            !=static_cast<std::size_t>(output_dimension_)
-        ||spline.edge_type_count()!=type_count*type_count
-        ||spline.function_count()!=weight_size_+1)
-        throw std::invalid_argument(
-            "Kokkos Execution direct spline UVU forward dimensions are inconsistent.");
-
-    ProfileRegion profile("symmetrix/mh1/execution_spline_uvu/forward_direct_nodes");
-    auto plan=mh1_instruction_data;
-    auto paths=mh1_path_weights;
-    auto indices=mh1_sparse_indices;
-    auto values=mh1_sparse_values;
-    auto component_offsets=mh1_component_offsets;
-    auto mask=output_mask;
-    const int instruction_count=mh1_instruction_count_;
-    const int multiplicity=mh1_multiplicity_;
-    const int density_function=weight_size_;
-
-    // A 64-channel tile maps to one wave64 or two wave32/CUDA warps while
-    // retaining a backend-neutral Kokkos launch policy.
-    Kokkos::parallel_for(
-        "e3 tensor execution spline uvu receiver-owned forward",
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-            {0,0},{static_cast<int>(active_receivers.extent(0)),multiplicity},
-            {1,direct_channel_tile_}),
-        KOKKOS_LAMBDA(int owner,int channel) {
-            const int receiver=active_receivers(owner);
-            const int begin=receiver_offsets(receiver);
-            const int end=receiver_offsets(receiver+1);
-            if(channel==0) {
-                Precision density=Precision(0);
-                for(int edge=begin;edge<end;++edge) {
-                    const int pair=source_types(edge)*type_count
-                        +node_types(receiver);
-                    const auto point=spline.cached_evaluation_point(
-                        spline_intervals(edge),spline_coordinates(edge));
-                    density+=spline.evaluate_function(
-                        pair,point,density_function);
-                }
-                node_density(receiver)+=density;
-            }
-            for(int instruction=0;instruction<instruction_count;
-                ++instruction) {
-                const int input_1_offset=plan(instruction,0);
-                const int input_2_offset=plan(instruction,1);
-                const int output_offset=plan(instruction,2);
-                const int output_width=plan(instruction,4);
-                const int weight_index=plan(instruction,5)+channel;
-                const int component_base=plan(instruction,6);
-                Precision results[max_direct_node_output_components_]={};
-                for(int edge=begin;edge<end;++edge) {
-                    if(target_indices(edge)!=receiver) continue;
-                    const int source=source_indices(edge);
-                    const int pair=source_types(edge)*type_count
-                        +node_types(receiver);
-                    const auto point=spline.cached_evaluation_point(
-                        spline_intervals(edge),spline_coordinates(edge));
-                    const Precision scale=paths(instruction)
-                        *spline.evaluate_function(pair,point,weight_index);
-                    for(int component=0;component<output_width;++component) {
-                        const int first_entry=component_offsets(
-                            component_base+component);
-                        const int last_entry=component_offsets(
-                            component_base+component+1);
-                        Precision product=Precision(0);
-                        for(int entry=first_entry;entry<last_entry;++entry)
-                            product+=values(entry)
-                                *source_node_values_ir_mul(source,input_1_offset
-                                    +indices(entry,0)*multiplicity+channel)
-                                *edge_input_2(edge,input_2_offset+indices(entry,1));
-                        const int output_index=output_offset
-                            +component*multiplicity+channel;
-                        results[component]+=
-                            scale*mask(output_index)*product;
-                    }
-                }
-                for(int component=0;component<output_width;++component)
-                    node_messages_ir_mul(receiver,output_offset
-                        +component*multiplicity+channel)+=results[component];
-            }
-        });
-    return true;
-}
-
-template<typename Precision>
-bool E3TensorProductKokkosT<Precision>::
-try_reverse_execution_spline_uvu_from_nodes(
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> source_node_values,
-    Kokkos::View<const int*> source_indices,
-    Kokkos::View<const int*> target_indices,
-    Kokkos::View<const int*> source_edge_offsets,
-    Kokkos::View<const int*> source_edge_indices,
-    Kokkos::View<const int*> source_types,
-    Kokkos::View<const int*> node_types,
-    Kokkos::View<const double*> distances,
-    Kokkos::View<const int*> spline_intervals,
-    Kokkos::View<const Precision*> spline_coordinates,
-    const int type_count,
-    RadialFunctionSetKokkos<Precision> spline,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight> edge_input_2,
-    Kokkos::View<const Precision**,Kokkos::LayoutRight>
-        target_node_output_adjoint,
-    Kokkos::View<const Precision*> node_density_adjoint,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> source_node_input_adjoint,
-    Kokkos::View<Precision**,Kokkos::LayoutRight> edge_input_2_adjoint,
-    Kokkos::View<Precision*> distance_adjoint) const
-{
-    if(!supports_execution_direct_uvu()) return false;
-    const auto edges=source_indices.extent(0);
-    if(type_count<=0||source_edge_offsets.extent(0)==0
-        ||source_edge_indices.extent(0)!=edges
-        ||target_indices.extent(0)!=edges||source_types.extent(0)!=edges
-        ||distances.extent(0)!=edges||spline_intervals.extent(0)!=edges
-        ||spline_coordinates.extent(0)!=edges||edge_input_2.extent(0)!=edges
-        ||edge_input_2.extent(1)!=static_cast<std::size_t>(input_2_dimension_)
-        ||edge_input_2_adjoint.extent(0)!=edges
-        ||edge_input_2_adjoint.extent(1)!=edge_input_2.extent(1)
-        ||distance_adjoint.extent(0)!=edges
-        ||node_types.extent(0)!=source_node_values.extent(0)
-        ||node_density_adjoint.extent(0)!=source_node_values.extent(0)
-        ||source_node_input_adjoint.extent(0)!=source_node_values.extent(0)
-        ||source_node_input_adjoint.extent(1)!=source_node_values.extent(1)
-        ||source_node_values.extent(1)
-            !=static_cast<std::size_t>(input_1_dimension_)
-        ||target_node_output_adjoint.extent(0)!=source_node_values.extent(0)
-        ||target_node_output_adjoint.extent(1)
-            !=static_cast<std::size_t>(output_dimension_)
-        ||spline.edge_type_count()!=type_count*type_count
-        ||spline.function_count()!=weight_size_+1)
-        throw std::invalid_argument(
-            "Kokkos Execution direct spline UVU reverse dimensions are inconsistent.");
-
-    ProfileRegion profile("symmetrix/mh1/execution_spline_uvu/reverse_direct_nodes");
-    auto plan=mh1_instruction_data;
-    auto paths=mh1_path_weights;
-    auto indices=mh1_sparse_indices;
-    auto values=mh1_sparse_values;
-    auto component_offsets=mh1_component_offsets;
-    auto harmonic_offsets=mh1_harmonic_offsets;
-    auto harmonic_terms=mh1_harmonic_terms;
-    auto harmonic_values=mh1_harmonic_values;
-    auto input_components=mh1_input_component_data;
-    auto input_instruction_term_offsets=mh1_input_instruction_term_offsets;
-    auto input_terms=mh1_input_terms;
-    auto input_values=mh1_input_values;
-    auto mask=output_mask;
-    const int instruction_count=mh1_instruction_count_;
-    const int multiplicity=mh1_multiplicity_;
-    const int angular_dimension=mh1_input_1_angular_dimension_;
-    const int harmonic_dimension=input_2_dimension_;
-    const int density_function=weight_size_;
-
-    Kokkos::parallel_for(
-        "e3 tensor execution spline uvu source-owned reverse",
-        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-            {0,0},{static_cast<int>(source_edge_offsets.extent(0))-1,multiplicity},
-            {1,direct_channel_tile_}),
-        KOKKOS_LAMBDA(int owner,int channel) {
-            const int first_position=source_edge_offsets(owner);
-            const int end_position=source_edge_offsets(owner+1);
-            if(first_position==end_position) return;
-            const int source=source_indices(source_edge_indices(first_position));
-            Precision results[max_direct_node_input_components_]={};
-            for(int position=first_position;position<end_position;++position) {
-                const int edge=source_edge_indices(position);
-                const int target=target_indices(edge);
-                const int pair=source_types(edge)*type_count+node_types(target);
-                const auto point=spline.cached_evaluation_point(
-                    spline_intervals(edge),spline_coordinates(edge));
-                for(int instruction=0;instruction<instruction_count;
-                    ++instruction) {
-                    const int input_2_offset=plan(instruction,1);
-                    const int output_offset=plan(instruction,2);
-                    const int output_width=plan(instruction,4);
-                    const Precision scale=paths(instruction)
-                        *spline.evaluate_function(
-                            pair,point,plan(instruction,5)+channel);
-                    for(int input_component=0;
-                        input_component<angular_dimension;++input_component) {
-                        Precision result=Precision(0);
-                        for(int term=input_instruction_term_offsets(
-                                input_component,instruction);
-                            term<input_instruction_term_offsets(
-                                input_component,instruction+1);++term) {
-                            const int b=input_terms(term,1);
-                            const int c=input_terms(term,2);
-                            const int output_index=output_offset
-                                +channel*output_width+c;
-                            result+=input_values(term)*mask(output_index)
-                                *target_node_output_adjoint(target,output_index)
-                                *edge_input_2(edge,input_2_offset+b);
-                        }
-                        results[input_component]+=scale*result;
-                    }
-                }
-            }
-            for(int input_component=0;input_component<angular_dimension;
-                ++input_component)
-                source_node_input_adjoint(
-                    source,input_components(input_component,0)
-                        +channel*input_components(input_component,1))
-                    +=results[input_component];
-        });
-
-    if(harmonic_dimension<=max_direct_harmonic_components_) {
-        using team_policy=Kokkos::TeamPolicy<>;
-        using member_type=team_policy::member_type;
-        // Bound both the thread-local accumulator and team scratch. Models
-        // with wider harmonic inputs use the portable fallback below.
-        const int preferred_team_size=
-            instruction_count<=4?direct_light_edge_team_size_
-                                :direct_edge_team_size_;
-        const int team_size=std::min(multiplicity,preferred_team_size);
-        const int scratch_columns=harmonic_dimension+1;
-        const std::size_t scratch_values=static_cast<std::size_t>(team_size)
-            *static_cast<std::size_t>(scratch_columns);
-        const std::size_t scratch_bytes=scratch_values*sizeof(Precision);
-        team_policy policy(static_cast<int>(edges),team_size);
-        policy.set_scratch_size(0,Kokkos::PerTeam(scratch_bytes));
-        Kokkos::parallel_for(
-            "e3 tensor execution spline uvu fused edge reverse",policy,
-            KOKKOS_LAMBDA(const member_type& team) {
-            const int edge=team.league_rank();
-            const int source=source_indices(edge);
-            const int target=target_indices(edge);
-            const int pair=source_types(edge)*type_count+node_types(target);
-            const auto point=spline.cached_evaluation_point(
-                spline_intervals(edge),spline_coordinates(edge));
-            Precision harmonic_result[max_direct_harmonic_components_];
-            for(int component=0;component<harmonic_dimension;++component)
-                harmonic_result[component]=Precision(0);
-            Precision distance_result=Precision(0);
-            for(int channel=team.team_rank();channel<multiplicity;
-                channel+=team.team_size()) {
-                for(int instruction=0;instruction<instruction_count;
-                    ++instruction) {
-                    const int input_1_offset=plan(instruction,0);
-                    const int input_2_offset=plan(instruction,1);
-                    const int output_offset=plan(instruction,2);
-                    const int input_width=plan(instruction,3);
-                    const int output_width=plan(instruction,4);
-                    const int weight_index=plan(instruction,5)+channel;
-                    const int component_base=plan(instruction,6);
-                    const int first_entry=component_offsets(component_base);
-                    const int last_entry=component_offsets(
-                        component_base+output_width);
-                    Precision weight,weight_derivative;
-                    spline.evaluate_function(
-                        pair,point,weight_index,weight,weight_derivative);
-                    Precision weight_adjoint=Precision(0);
-                    for(int entry=first_entry;entry<last_entry;++entry) {
-                        const int a=indices(entry,0);
-                        const int b=indices(entry,1);
-                        const int c=indices(entry,2);
-                        const int output_index=output_offset
-                            +channel*output_width+c;
-                        const Precision common=paths(instruction)*values(entry)
-                            *mask(output_index)
-                            *target_node_output_adjoint(target,output_index)
-                            *source_node_values(source,input_1_offset
-                                +channel*input_width+a);
-                        harmonic_result[input_2_offset+b]+=common*weight;
-                        weight_adjoint+=common
-                            *edge_input_2(edge,input_2_offset+b);
-                    }
-                    distance_result+=weight_derivative*weight_adjoint;
-                }
-            }
-            auto* scratch=static_cast<Precision*>(
-                team.team_shmem().get_shmem(scratch_bytes));
-            const int scratch_offset=team.team_rank()*scratch_columns;
-            for(int component=0;component<harmonic_dimension;++component)
-                scratch[scratch_offset+component]=harmonic_result[component];
-            scratch[scratch_offset+harmonic_dimension]=distance_result;
-            team.team_barrier();
-            Kokkos::parallel_for(
-                Kokkos::TeamThreadRange(team,harmonic_dimension),
-                [&](int component) {
-                    Precision result=Precision(0);
-                    for(int rank=0;rank<team.team_size();++rank)
-                        result+=scratch[rank*scratch_columns+component];
-                    edge_input_2_adjoint(edge,component)+=result;
-                });
-            Kokkos::single(Kokkos::PerTeam(team),[&]() {
-                Precision result=Precision(0);
-                for(int rank=0;rank<team.team_size();++rank)
-                    result+=scratch[rank*scratch_columns+harmonic_dimension];
-                Precision density_value,density_derivative;
-                spline.evaluate_function(
-                    pair,point,density_function,density_value,density_derivative);
-                distance_adjoint(edge)+=result
-                    +node_density_adjoint(target)*density_derivative;
-            });
-        });
-    } else {
-        Kokkos::parallel_for(
-            "e3 tensor execution spline uvu harmonic reverse",
-            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-                {0,0},{static_cast<int>(edges),harmonic_dimension}),
-            KOKKOS_LAMBDA(int edge,int component) {
-                const int source=source_indices(edge);
-                const int target=target_indices(edge);
-                const int pair=source_types(edge)*type_count+node_types(target);
-                const auto point=spline.cached_evaluation_point(
-                    spline_intervals(edge),spline_coordinates(edge));
-                Precision result=Precision(0);
-                for(int channel=0;channel<multiplicity;++channel) {
-                    int previous_instruction=-1;
-                    Precision weight=Precision(0);
-                    for(int term=harmonic_offsets(component);
-                        term<harmonic_offsets(component+1);++term) {
-                        const int instruction=harmonic_terms(term,0);
-                        const int a=harmonic_terms(term,1);
-                        const int c=harmonic_terms(term,2);
-                        const int input_1_offset=plan(instruction,0);
-                        const int output_offset=plan(instruction,2);
-                        const int input_width=plan(instruction,3);
-                        const int output_width=plan(instruction,4);
-                        if(instruction!=previous_instruction) {
-                            weight=spline.evaluate_function(
-                                pair,point,plan(instruction,5)+channel);
-                            previous_instruction=instruction;
-                        }
-                        const int output_index=output_offset
-                            +channel*output_width+c;
-                        result+=paths(instruction)*harmonic_values(term)
-                            *mask(output_index)
-                            *target_node_output_adjoint(target,output_index)
-                            *source_node_values(source,input_1_offset
-                                +channel*input_width+a)*weight;
-                    }
-                }
-                edge_input_2_adjoint(edge,component)+=result;
-            });
-
-        Kokkos::parallel_for(
-            "e3 tensor execution spline uvu distance reverse",edges,
-            KOKKOS_LAMBDA(int edge) {
-                const int source=source_indices(edge);
-                const int target=target_indices(edge);
-                const int pair=source_types(edge)*type_count+node_types(target);
-                const auto point=spline.cached_evaluation_point(
-                    spline_intervals(edge),spline_coordinates(edge));
-                Precision result=Precision(0);
-                for(int instruction=0;instruction<instruction_count;++instruction) {
-                    const int input_1_offset=plan(instruction,0);
-                    const int input_2_offset=plan(instruction,1);
-                    const int output_offset=plan(instruction,2);
-                    const int input_width=plan(instruction,3);
-                    const int output_width=plan(instruction,4);
-                    const int weight_offset=plan(instruction,5);
-                    const int component_base=plan(instruction,6);
-                    const int first_entry=component_offsets(component_base);
-                    const int last_entry=component_offsets(
-                        component_base+output_width);
-                    for(int channel=0;channel<multiplicity;++channel) {
-                        Precision weight_value,weight_derivative;
-                        spline.evaluate_function(
-                            pair,point,weight_offset+channel,
-                            weight_value,weight_derivative);
-                        Precision weight_adjoint=Precision(0);
-                        for(int entry=first_entry;entry<last_entry;++entry) {
-                            const int output_index=output_offset
-                                +channel*output_width+indices(entry,2);
-                            weight_adjoint+=paths(instruction)*values(entry)
-                                *mask(output_index)
-                                *target_node_output_adjoint(target,output_index)
-                                *source_node_values(source,input_1_offset
-                                    +channel*input_width+indices(entry,0))
-                                *edge_input_2(edge,input_2_offset+indices(entry,1));
-                        }
-                        result+=weight_derivative*weight_adjoint;
-                    }
-                }
-                Precision density_value,density_derivative;
-                spline.evaluate_function(
-                    pair,point,density_function,density_value,density_derivative);
-                distance_adjoint(edge)+=
-                    result+node_density_adjoint(target)*density_derivative;
-            });
+    }
+    for(const auto& instruction:instructions) {
+        if(!instruction.uvw||!instruction.has_weight)
+            return false;
+        if(instruction.multiplicity_1*instruction.multiplicity_2<=0
+            ||instruction.output_multiplicity<=0)
+            return false;
+        if(instruction.width_1*instruction.width_2>49)
+            return false;
     }
     return true;
+}
+
+template<typename Precision>
+void E3TensorProductKokkosT<Precision>::evaluate_node_bilinear_uvw(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_1,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_2,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
+{
+    if(!supports_node_bilinear_uvw())
+        throw std::invalid_argument(
+            "Kokkos node bilinear uvw forward is unavailable.");
+    if(input_1.extent(1)!=static_cast<std::size_t>(input_1_dimension_)
+        ||input_2.extent(1)!=static_cast<std::size_t>(input_2_dimension_)
+        ||output.extent(0)!=input_1.extent(0)
+        ||output.extent(1)!=static_cast<std::size_t>(output_dimension_))
+        throw std::invalid_argument(
+            "Kokkos node bilinear uvw forward dimensions are inconsistent.");
+    ProfileRegion profile("symmetrix/node_bilinear_uvw/forward");
+    ordered_kokkos_deep_copy(output,Precision(0));
+    const int samples=static_cast<int>(input_1.extent(0));
+    auto fixed=internal_weights;
+    auto mask=output_mask;
+    for(const auto& instruction:instructions) { auto wigner=instruction.wigner;
+        const int d1=instruction.width_1,d2=instruction.width_2;
+        const int output_width=instruction.output_width;
+        const int k_dimension=instruction.multiplicity_1
+            *instruction.multiplicity_2;
+        const int result_width=instruction.output_multiplicity;
+        for(int a=0;a<d1;++a) for(int b=0;b<d2;++b) {
+            const int wigner_base=(a*d2+b)*output_width;
+            for(int node_begin=0;node_begin<samples;) {
+                const int tile=node_tile_capacity(
+                    samples-node_begin,k_dimension,result_width);
+                ensure_bilinear_workspace(tile,k_dimension,result_width);
+                // The workspace is sized for the widest instruction seen so
+                // far, so a Kokkos::subview of it would carry the parent row
+                // stride while the GEMM below interprets the same buffer as
+                // compact rows.  Interpret the buffer as compact rows of this
+                // instruction's width instead.
+                using node_matrix=Kokkos::View<Precision**,
+                    Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>;
+                node_matrix matrix(bilinear_workspace_->matrix.data(),tile,
+                    k_dimension);
+                node_matrix result(bilinear_workspace_->result.data(),tile,
+                    result_width);
+                const int first=node_begin;
+                const int multiplicity_1=instruction.multiplicity_1;
+                const int multiplicity_2=instruction.multiplicity_2;
+                const int input_1_offset=instruction.input_1_offset+a;
+                const int input_2_offset=instruction.input_2_offset+b;
+                // Row-owner build: the (u,v) decomposition is hoisted out of
+                // the element loop and the inner v run is contiguous, so the
+                // kernel is a plain broadcast-multiply with no per-element
+                // division or strided gather of the packed axis.
+                Kokkos::parallel_for("e3 node bilinear build matrix",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                        Kokkos::IndexType<int>>(0,tile),
+                    KOKKOS_LAMBDA(const int row) {
+                        const int sample=first+row;
+                        for(int u=0;u<multiplicity_1;++u) {
+                            const Precision value=
+                                input_1(sample,input_1_offset+u*d1);
+                            for(int v=0;v<multiplicity_2;++v)
+                                matrix(row,u*multiplicity_2+v)=value
+                                    *input_2(sample,input_2_offset+v*d2);
+                        }
+                    });
+                using const_node_matrix=Kokkos::View<const Precision**,
+                    Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>;
+                const_node_matrix weight(
+                    fixed.data()+instruction.weight_offset,
+                    k_dimension,result_width);
+                KokkosBlas::gemm("N","N",instruction.path_weight,
+                    matrix,weight,Precision(0),result);
+                const int output_offset=instruction.output_offset;
+                auto all_output=output;
+                Kokkos::parallel_for("e3 node bilinear accumulate output",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                        Kokkos::IndexType<int>>(0,tile),
+                    KOKKOS_LAMBDA(const int row) {
+                        const int sample=first+row;
+                        for(int w=0;w<result_width;++w) {
+                            const Precision value=result(row,w);
+                            const int base=output_offset+w*output_width;
+                            for(int c=0;c<output_width;++c)
+                                all_output(sample,base+c)+=
+                                    value*wigner(wigner_base+c)
+                                    *mask(base+c);
+                        }
+                    });
+                node_begin+=tile;
+            }
+        }
+    }
+}
+
+template<typename Precision>
+void E3TensorProductKokkosT<Precision>::reverse_node_bilinear_uvw(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_1,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_2,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> input_1_adjoint,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> input_2_adjoint) const
+{
+    if(!supports_node_bilinear_uvw())
+        throw std::invalid_argument(
+            "Kokkos node bilinear uvw reverse is unavailable.");
+    if(input_1.extent(1)!=static_cast<std::size_t>(input_1_dimension_)
+        ||input_2.extent(1)!=static_cast<std::size_t>(input_2_dimension_)
+        ||output_adjoint.extent(0)!=input_1.extent(0)
+        ||output_adjoint.extent(1)!=static_cast<std::size_t>(output_dimension_)
+        ||input_1_adjoint.extent(0)!=input_1.extent(0)
+        ||input_1_adjoint.extent(1)!=static_cast<std::size_t>(input_1_dimension_)
+        ||input_2_adjoint.extent(0)!=input_1.extent(0)
+        ||input_2_adjoint.extent(1)!=static_cast<std::size_t>(input_2_dimension_))
+        throw std::invalid_argument(
+            "Kokkos node bilinear uvw reverse dimensions are inconsistent.");
+    ProfileRegion profile("symmetrix/node_bilinear_uvw/reverse");
+    ordered_kokkos_deep_copy(input_1_adjoint,Precision(0));
+    ordered_kokkos_deep_copy(input_2_adjoint,Precision(0));
+    const int samples=static_cast<int>(input_1.extent(0));
+    auto fixed=internal_weights;
+    auto mask=output_mask;
+    for(const auto& instruction:instructions) { auto wigner=instruction.wigner;
+        const int d1=instruction.width_1,d2=instruction.width_2;
+        const int output_width=instruction.output_width;
+        const int k_dimension=instruction.multiplicity_1
+            *instruction.multiplicity_2;
+        const int result_width=instruction.output_multiplicity;
+        for(int a=0;a<d1;++a) for(int b=0;b<d2;++b) {
+            const int wigner_base=(a*d2+b)*output_width;
+            for(int node_begin=0;node_begin<samples;) {
+                const int tile=node_tile_capacity(
+                    samples-node_begin,k_dimension,result_width);
+                ensure_bilinear_workspace(tile,k_dimension,result_width);
+                // Compact unmanaged rows of this instruction's width; the
+                // workspace may be wider (see evaluate_node_bilinear_uvw).
+                using node_matrix=Kokkos::View<Precision**,
+                    Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>;
+                node_matrix adjoint(bilinear_workspace_->adjoint.data(),tile,
+                    result_width);
+                node_matrix k_adjoint(bilinear_workspace_->k_adjoint.data(),tile,
+                    k_dimension);
+                const int first=node_begin;
+                const int output_offset=instruction.output_offset;
+                const int multiplicity_2=instruction.multiplicity_2;
+                const int input_1_offset=instruction.input_1_offset+a;
+                const int input_2_offset=instruction.input_2_offset+b;
+                Kokkos::parallel_for("e3 node bilinear build output adjoint",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                        Kokkos::IndexType<int>>(0,tile),
+                    KOKKOS_LAMBDA(const int row) {
+                        const int sample=first+row;
+                        for(int w=0;w<result_width;++w) {
+                            const int base=output_offset+w*output_width;
+                            Precision value=Precision(0);
+                            for(int c=0;c<output_width;++c)
+                                value+=wigner(wigner_base+c)*mask(base+c)
+                                    *output_adjoint(sample,base+c);
+                            adjoint(row,w)=instruction.path_weight*value;
+                        }
+                    });
+                using matrix_view=Kokkos::View<
+                    Precision**,Kokkos::LayoutRight,
+                    Kokkos::MemoryUnmanaged>;
+                using const_matrix_view=Kokkos::View<
+                    const Precision**,Kokkos::LayoutRight,
+                    Kokkos::MemoryUnmanaged>;
+                const_matrix_view weight(
+                    fixed.data()+instruction.weight_offset,
+                    k_dimension,result_width);
+                KokkosBlas::gemm("N","T",Precision(1),
+                    adjoint,weight,Precision(0),k_adjoint);
+                auto input_1_adjoint_view=input_1_adjoint;
+                auto input_2_adjoint_view=input_2_adjoint;
+                const int multiplicity_1=instruction.multiplicity_1;
+                // Row-owner scatter: each output element is reduced in a
+                // register over the contracted axis, giving one read-modify-
+                // write per element instead of one per packed k entry.  The
+                // k_adjoint run is unit-stride; the other operand is the
+                // strided angular component of its row.
+                Kokkos::parallel_for("e3 node bilinear scatter adjoints",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                        Kokkos::IndexType<int>>(0,tile),
+                    KOKKOS_LAMBDA(const int row) {
+                        const int sample=first+row;
+                        for(int u=0;u<multiplicity_1;++u) {
+                            Precision reduced=Precision(0);
+                            const std::size_t k_base=
+                                static_cast<std::size_t>(row)
+                                    * static_cast<std::size_t>(k_dimension)
+                                + static_cast<std::size_t>(u)
+                                    * static_cast<std::size_t>(multiplicity_2);
+                            for(int v=0;v<multiplicity_2;++v)
+                                reduced+=k_adjoint.data()[k_base
+                                        +static_cast<std::size_t>(v)]
+                                    *input_2(sample,input_2_offset+v*d2);
+                            input_1_adjoint_view(sample,input_1_offset+u*d1)+=
+                                reduced;
+                        }
+                        for(int v=0;v<multiplicity_2;++v) {
+                            Precision reduced=Precision(0);
+                            for(int u=0;u<multiplicity_1;++u)
+                                reduced+=k_adjoint(row,u*multiplicity_2+v)
+                                    *input_1(sample,input_1_offset+u*d1);
+                            input_2_adjoint_view(sample,input_2_offset+v*d2)+=
+                                reduced;
+                        }
+                    });
+                node_begin+=tile;
+            }
+        }
+    }
+}
+
+template<typename Precision>
+void E3TensorProductKokkosT<Precision>::evaluate_node_bilinear_uvw_lane(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_1,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_2,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
+{
+    if(!supports_node_bilinear_uvw_lane())
+        throw std::invalid_argument(
+            "Kokkos node bilinear uvw lane forward is unavailable.");
+    if(input_1.extent(1)!=static_cast<std::size_t>(input_1_dimension_)
+        ||input_2.extent(1)!=static_cast<std::size_t>(input_2_dimension_)
+        ||output.extent(0)!=input_1.extent(0)
+        ||output.extent(1)!=static_cast<std::size_t>(output_dimension_))
+        throw std::invalid_argument(
+            "Kokkos node bilinear uvw lane forward dimensions are "
+            "inconsistent.");
+    ProfileRegion profile("symmetrix/node_bilinear_uvw_lane/forward");
+    ordered_kokkos_deep_copy(output,Precision(0));
+    const int samples=static_cast<int>(input_1.extent(0));
+    auto fixed=internal_weights;
+    auto mask=output_mask;
+    for(const auto& instruction:instructions) { auto wigner=instruction.wigner;
+        const int d1=instruction.width_1,d2=instruction.width_2;
+        const int output_width=instruction.output_width;
+        const int k_dimension=instruction.multiplicity_1
+            *instruction.multiplicity_2;
+        const int result_width=instruction.output_multiplicity;
+        for(int a=0;a<d1;++a) for(int b=0;b<d2;++b) {
+            const int wigner_base=(a*d2+b)*output_width;
+            for(int node_begin=0;node_begin<samples;) {
+                const int tile=node_tile_capacity(
+                    samples-node_begin,k_dimension,result_width);
+                ensure_bilinear_workspace(tile,k_dimension,result_width);
+                // Compact unmanaged rows of this instruction's width; the
+                // workspace may be wider (see evaluate_node_bilinear_uvw).
+                using node_matrix=Kokkos::View<Precision**,
+                    Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>;
+                node_matrix matrix(bilinear_workspace_->matrix.data(),tile,
+                    k_dimension);
+                node_matrix result(bilinear_workspace_->result.data(),tile,
+                    result_width);
+                const int first=node_begin;
+                const int multiplicity_1=instruction.multiplicity_1;
+                const int multiplicity_2=instruction.multiplicity_2;
+                // Lane-major: block element (channel a, component x) lives at
+                // offset + x*multiplicity + a, so the a-th component of this
+                // (u,v) slice starts at input_1_offset + a*multiplicity_1.
+                const int input_1_lane=instruction.input_1_offset
+                    +a*multiplicity_1;
+                const int input_2_lane=instruction.input_2_offset
+                    +b*multiplicity_2;
+                // Row-owner build: the (u,v) decomposition is hoisted out of
+                // the element loop and the inner v run is contiguous, so the
+                // kernel is a plain broadcast-multiply.
+                Kokkos::parallel_for("e3 node bilinear lane build matrix",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                        Kokkos::IndexType<int>>(0,tile),
+                    KOKKOS_LAMBDA(const int row) {
+                        const int sample=first+row;
+                        for(int u=0;u<multiplicity_1;++u) {
+                            const Precision value=
+                                input_1(sample,input_1_lane+u);
+                            for(int v=0;v<multiplicity_2;++v)
+                                matrix(row,u*multiplicity_2+v)=value
+                                    *input_2(sample,input_2_lane+v);
+                        }
+                    });
+                using const_node_matrix=Kokkos::View<const Precision**,
+                    Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>;
+                const_node_matrix weight(
+                    fixed.data()+instruction.weight_offset,
+                    k_dimension,result_width);
+                KokkosBlas::gemm("N","N",instruction.path_weight,
+                    matrix,weight,Precision(0),result);
+                const int output_offset=instruction.output_offset;
+                auto all_output=output;
+                Kokkos::parallel_for("e3 node bilinear lane accumulate output",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                        Kokkos::IndexType<int>>(0,tile),
+                    KOKKOS_LAMBDA(const int row) {
+                        const int sample=first+row;
+                        for(int w=0;w<result_width;++w) {
+                            const Precision value=result(row,w);
+                            // The mask is a definition-layout (node-major)
+                            // table, so it keeps the node-major index of the
+                            // (channel w, component c) element; only the
+                            // output view is lane-major.
+                            const int base=output_offset+w*output_width;
+                            for(int c=0;c<output_width;++c)
+                                all_output(sample,
+                                    output_offset+w+c*result_width)+=
+                                    value*wigner(wigner_base+c)
+                                    *mask(base+c);
+                        }
+                    });
+                node_begin+=tile;
+            }
+        }
+    }
+}
+
+template<typename Precision>
+void E3TensorProductKokkosT<Precision>::reverse_node_bilinear_uvw_lane(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_1,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input_2,
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> input_1_adjoint,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> input_2_adjoint) const
+{
+    if(!supports_node_bilinear_uvw_lane())
+        throw std::invalid_argument(
+            "Kokkos node bilinear uvw lane reverse is unavailable.");
+    if(input_1.extent(1)!=static_cast<std::size_t>(input_1_dimension_)
+        ||input_2.extent(1)!=static_cast<std::size_t>(input_2_dimension_)
+        ||output_adjoint.extent(0)!=input_1.extent(0)
+        ||output_adjoint.extent(1)!=static_cast<std::size_t>(output_dimension_)
+        ||input_1_adjoint.extent(0)!=input_1.extent(0)
+        ||input_1_adjoint.extent(1)!=static_cast<std::size_t>(input_1_dimension_)
+        ||input_2_adjoint.extent(0)!=input_1.extent(0)
+        ||input_2_adjoint.extent(1)!=static_cast<std::size_t>(input_2_dimension_))
+        throw std::invalid_argument(
+            "Kokkos node bilinear uvw lane reverse dimensions are "
+            "inconsistent.");
+    ProfileRegion profile("symmetrix/node_bilinear_uvw_lane/reverse");
+    ordered_kokkos_deep_copy(input_1_adjoint,Precision(0));
+    ordered_kokkos_deep_copy(input_2_adjoint,Precision(0));
+    const int samples=static_cast<int>(input_1.extent(0));
+    auto fixed=internal_weights;
+    auto mask=output_mask;
+    for(const auto& instruction:instructions) { auto wigner=instruction.wigner;
+        const int d1=instruction.width_1,d2=instruction.width_2;
+        const int output_width=instruction.output_width;
+        const int k_dimension=instruction.multiplicity_1
+            *instruction.multiplicity_2;
+        const int result_width=instruction.output_multiplicity;
+        for(int a=0;a<d1;++a) for(int b=0;b<d2;++b) {
+            const int wigner_base=(a*d2+b)*output_width;
+            for(int node_begin=0;node_begin<samples;) {
+                const int tile=node_tile_capacity(
+                    samples-node_begin,k_dimension,result_width);
+                ensure_bilinear_workspace(tile,k_dimension,result_width);
+                // Compact unmanaged rows of this instruction's width; the
+                // workspace may be wider (see evaluate_node_bilinear_uvw).
+                using node_matrix=Kokkos::View<Precision**,
+                    Kokkos::LayoutRight,Kokkos::MemoryUnmanaged>;
+                node_matrix adjoint(bilinear_workspace_->adjoint.data(),tile,
+                    result_width);
+                node_matrix k_adjoint(bilinear_workspace_->k_adjoint.data(),tile,
+                    k_dimension);
+                const int first=node_begin;
+                const int output_offset=instruction.output_offset;
+                const int multiplicity_1=instruction.multiplicity_1;
+                const int multiplicity_2=instruction.multiplicity_2;
+                // Lane-major component offsets for this (a,b) pair, matching
+                // the forward kernel's operand addressing.
+                const int input_1_lane=instruction.input_1_offset
+                    +a*multiplicity_1;
+                const int input_2_lane=instruction.input_2_offset
+                    +b*multiplicity_2;
+                Kokkos::parallel_for("e3 node bilinear lane build adjoint",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                        Kokkos::IndexType<int>>(0,tile),
+                    KOKKOS_LAMBDA(const int row) {
+                        const int sample=first+row;
+                        for(int w=0;w<result_width;++w) {
+                            const int base=output_offset+w*output_width;
+                            Precision value=Precision(0);
+                            for(int c=0;c<output_width;++c)
+                                value+=wigner(wigner_base+c)*mask(base+c)
+                                    *output_adjoint(sample,
+                                        output_offset+w+c*result_width);
+                            adjoint(row,w)=instruction.path_weight*value;
+                        }
+                    });
+                using const_matrix_view=Kokkos::View<
+                    const Precision**,Kokkos::LayoutRight,
+                    Kokkos::MemoryUnmanaged>;
+                const_matrix_view weight(
+                    fixed.data()+instruction.weight_offset,
+                    k_dimension,result_width);
+                KokkosBlas::gemm("N","T",Precision(1),
+                    adjoint,weight,Precision(0),k_adjoint);
+                auto input_1_adjoint_view=input_1_adjoint;
+                auto input_2_adjoint_view=input_2_adjoint;
+                Kokkos::parallel_for("e3 node bilinear lane scatter adjoints",
+                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                        Kokkos::IndexType<int>>(0,tile),
+                    KOKKOS_LAMBDA(const int row) {
+                        const int sample=first+row;
+                        for(int u=0;u<multiplicity_1;++u) {
+                            Precision reduced=Precision(0);
+                            const std::size_t k_base=
+                                static_cast<std::size_t>(row)
+                                    * static_cast<std::size_t>(k_dimension)
+                                + static_cast<std::size_t>(u)
+                                    * static_cast<std::size_t>(multiplicity_2);
+                            for(int v=0;v<multiplicity_2;++v)
+                                reduced+=k_adjoint.data()[k_base
+                                        +static_cast<std::size_t>(v)]
+                                    *input_2(sample,input_2_lane+v);
+                            input_1_adjoint_view(sample,input_1_lane+u)+=
+                                reduced;
+                        }
+                        for(int v=0;v<multiplicity_2;++v) {
+                            Precision reduced=Precision(0);
+                            for(int u=0;u<multiplicity_1;++u)
+                                reduced+=k_adjoint(row,u*multiplicity_2+v)
+                                    *input_1(sample,input_1_lane+u);
+                            input_2_adjoint_view(sample,input_2_lane+v)+=
+                                reduced;
+                        }
+                    });
+                node_begin+=tile;
+            }
+        }
+    }
 }
 
 template class E3LinearKokkosT<float>;

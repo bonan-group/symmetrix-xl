@@ -1,11 +1,29 @@
+import hashlib
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from symmetrix import jit_device_artifact as device_artifact
+from symmetrix import generated_operator_core as operator_core
+from symmetrix import installed_operator_artifact as installed_artifact
+from symmetrix import jit as jit_runtime
+from symmetrix import mace_jit_device_artifact as device_artifact
+from symmetrix import mace_jit_operator_codegen as operator_codegen
 from symmetrix.cli import extract_mace as extract_cli
 from symmetrix.cli import prepare_jit_device_artifact as artifact_cli
+
+
+@pytest.fixture(autouse=True)
+def _accept_lightweight_prepared_results(monkeypatch):
+    validate_entry = jit_runtime._validated_entry
+
+    def validate_real_entries(entry, cache_key, inputs):
+        if cache_key.startswith("cache-"):
+            return None
+        return validate_entry(entry, cache_key, inputs)
+
+    monkeypatch.setattr(jit_runtime, "_validated_entry", validate_real_entries)
 
 
 class _Evaluator:
@@ -23,6 +41,13 @@ class _Evaluator:
         }
         setattr(self, f"execution_{backend}_plugin_ready", False)
         setattr(self, f"execution_{backend}_plugin_artifact_id", "")
+        self.m0_implementation = "generic"
+        self.r0_implementation = "generic"
+        self._r0_loader_implementation = "generic"
+        self.m0_device_module_ready = False
+        self.r0_device_module_ready = False
+        self.m0_device_module_artifact_id = ""
+        self.r0_device_module_artifact_id = ""
 
     def set_streamed_edges(self, mode):
         self.events.append(("mode", mode))
@@ -32,6 +57,23 @@ class _Evaluator:
         self.events.append(("load", path, *arguments))
         setattr(self, f"execution_{backend}_plugin_ready", True)
         setattr(self, f"execution_{backend}_plugin_artifact_id", "artifact-a")
+
+    def _load_jit_cuda_plugin(self, path, blocks):
+        self.events.append(("load", path, blocks))
+        self.jit_cuda_plugin_ready = True
+        self.jit_cuda_plugin_artifact_id = "artifact-r1-installed"
+
+    def _load_m0_device_module(self, path, schedule, blocks):
+        self.events.append(("load-M0", path, schedule, blocks))
+        self.m0_device_module_ready = True
+        self.m0_device_module_artifact_id = "artifact-m0"
+
+    def _load_r0_device_module(
+        self, path, blocks, apply_edge_weights=False, schedule="receiver-edge16"
+    ):
+        self.events.append(("load-R0", path, schedule, blocks))
+        self.r0_device_module_ready = True
+        self.r0_device_module_artifact_id = "artifact-r0"
 
 
 def _model(tmp_path, model_type="MACE"):
@@ -48,11 +90,128 @@ def _model(tmp_path, model_type="MACE"):
     return path
 
 
+def _full_cuda_model_data():
+    contracts = Path(__file__).resolve().parent / "data" / "execution_contracts"
+    return {
+        "model_type": "MACE",
+        "execution_contracts": {
+            "R1": json.loads((contracts / "jit_r1_contract.json").read_text()),
+            "M0": json.loads((contracts / "standard_m0_contract.json").read_text()),
+            "R0": json.loads((contracts / "standard_r0_contract.json").read_text()),
+        },
+    }
+
+
+def _install_full_cuda_catalog(monkeypatch, tmp_path, evaluator, model_data):
+    package = tmp_path / "installed_full_backend"
+    data_root = package / "_operator_artifacts"
+    data_root.mkdir(parents=True)
+    environment = evaluator.execution_device_execution_environment
+    contracts = model_data["execution_contracts"]
+    r1_plan = device_artifact._factorized_device_installed_plan(
+        "cuda", environment, contracts["R1"], "float32", evaluator
+    )
+    _, m0_metadata = operator_codegen.render_jit_m0_device_module(
+        contracts["M0"],
+        precision="float32",
+        target="sm_120",
+        schedule="chunk32",
+    )
+    _, r0_metadata = operator_codegen.render_jit_r0_device_module(
+        contracts["R0"],
+        precision="float32",
+        target="sm_120",
+        schedule="receiver-edge16",
+        apply_edge_weights=False,
+    )
+    metadata = {
+        "R1": r1_plan.metadata,
+        "M0": m0_metadata,
+        "R0": r0_metadata,
+    }
+    abis = {
+        "R1": {
+            "tag": r1_plan.metadata["abi"],
+            "version": r1_plan.metadata["abi_version"],
+        },
+        "M0": jit_runtime.artifact_cache_inputs(
+            m0_metadata, operator_codegen.OPERATOR_ARTIFACT_ENVELOPE
+        ),
+        "R0": jit_runtime.artifact_cache_inputs(
+            r0_metadata, operator_codegen.OPERATOR_ARTIFACT_ENVELOPE
+        ),
+    }
+    entries = []
+    paths = {}
+    for operator in ("R1", "M0", "R0"):
+        path = data_root / operator.lower() / f"{operator.lower()}.cubin"
+        path.parent.mkdir()
+        path.write_bytes(f"installed-{operator}".encode())
+        paths[operator] = path
+        entries.append(
+            {
+                "operator": operator,
+                "identity": metadata[operator]["generated_identity"],
+                "binary_format": "cubin",
+                "installed_relative_path": str(path.relative_to(data_root)),
+                "checksum": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+                "abi": abis[operator],
+                "capabilities": metadata[operator]["capabilities"],
+                "build_provenance": {
+                    "source_content_sha256": "sha256:" + "a" * 64,
+                    "compiler_id": "NVRTC",
+                    "compiler_version": "13.3",
+                    **(
+                        {
+                            "floating_point_policy": metadata[operator][
+                                "generated_identity"
+                            ]["floating_point_policy"]
+                        }
+                        if operator == "R0"
+                        else {}
+                    ),
+                },
+            }
+        )
+    catalog = operator_core.generated_operator_catalog(entries)
+    catalog_path = data_root / "catalog.json"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    build_info = {
+        "mode": "full",
+        "backend": "cuda",
+        "target": "sm_120",
+        "catalog_relative_path": "_operator_artifacts/catalog.json",
+        "catalog_sha256": hashlib.sha256(catalog_path.read_bytes()).hexdigest(),
+        "artifact_count": 3,
+        "installed_bytes": catalog_path.stat().st_size
+        + sum(path.stat().st_size for path in paths.values()),
+        "source_content_sha256": "a" * 64,
+        "native_source_content_sha256": "b" * 64,
+        "compiler_id": "NVRTC",
+        "compiler_version": "13.3",
+        "build_duration_seconds": 0.5,
+    }
+    monkeypatch.setattr(
+        device_artifact.symmetrix,
+        "_backend_build_info",
+        lambda: {
+            "source_content_sha256": "a" * 64,
+            "native_source_content_sha256": "b" * 64,
+            "prebuilt_operator_artifacts": build_info,
+        },
+    )
+    monkeypatch.setattr(
+        installed_artifact.resources, "files", lambda package_name: package
+    )
+    return paths
+
+
 @pytest.mark.parametrize(
-    ("backend", "precision", "model_type", "load_arguments"),
+    ("backend", "precision", "model_type", "class_name", "load_arguments"),
     [
-        ("cuda", "float32", "MACE", (8,)),
-        ("hip", "float64", "MACEField", ()),
+        ("cuda", "float32", "MACE", "MACEKokkosFloat", (8,)),
+        ("hip", "float64", "MACEField", "MACEKokkos", ()),
+        ("cuda", "float64", "MACELES", "MACELESKokkos", (8,)),
     ],
 )
 def test_prepare_device_artifact_without_ase_calculator(
@@ -61,6 +220,7 @@ def test_prepare_device_artifact_without_ase_calculator(
     backend,
     precision,
     model_type,
+    class_name,
     load_arguments,
 ):
     evaluator = _Evaluator(backend)
@@ -81,11 +241,7 @@ def test_prepare_device_artifact_without_ase_calculator(
     monkeypatch.setattr(
         device_artifact.symmetrix, "_init_kokkos", lambda: initialized.append(True)
     )
-    monkeypatch.setattr(
-        device_artifact.symmetrix,
-        "MACEKokkosFloat" if precision == "float32" else "MACEKokkos",
-        evaluator_class,
-    )
+    monkeypatch.setattr(device_artifact.symmetrix, class_name, evaluator_class)
 
     def prepare(source, **arguments):
         prepare_calls.append((source, arguments))
@@ -95,6 +251,7 @@ def test_prepare_device_artifact_without_ase_calculator(
             cache_key="cache-a",
             artifact_path=artifact,
             manifest_path=manifest,
+            manifest={"key_inputs": {"fixture": backend}},
             diagnostics=("compiled",),
             reason=None,
         )
@@ -125,6 +282,38 @@ def test_prepare_device_artifact_without_ase_calculator(
         "_factorized_device_backend_plan",
         lambda selected_backend, environment, contract, dtype, selected_evaluator: plan,
     )
+    installed_plan = SimpleNamespace(
+        metadata={
+            "generated_identity": {
+                "operator": "R1",
+                "artifact_id": "generated-r1-request",
+            },
+            "abi": f"symmetrix.jit.{backend}-plugin/4",
+            "abi_version": 4,
+            "capabilities": 0x3,
+            "persistent_blocks_per_compute_unit": 8,
+        },
+        loader=evaluator.load,
+        ready_attribute=f"execution_{backend}_plugin_ready",
+        artifact_attribute=f"execution_{backend}_plugin_artifact_id",
+        variant_id="variant-installed",
+        edge_policy={"persistent_blocks_per_compute_unit": 8},
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "_factorized_device_installed_plan",
+        lambda *args, **kwargs: installed_plan,
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "resolve_installed_operator_artifact",
+        lambda **kwargs: SimpleNamespace(
+            status="absent",
+            diagnostics=(
+                "origin=prebuilt status=absent operator=R1 reason=catalog-absent",
+            ),
+        ),
+    )
     monkeypatch.setattr(
         device_artifact,
         "native_source_content_sha256",
@@ -154,6 +343,11 @@ def test_prepare_device_artifact_without_ase_calculator(
                 },
                 "source_content_sha256": source_content_sha256,
                 "cache_root": tmp_path / "cache",
+                **(
+                    {"nvrtc_options": ("--split-compile=2",)}
+                    if backend == "cuda"
+                    else {}
+                ),
             },
         )
     ]
@@ -162,6 +356,357 @@ def test_prepare_device_artifact_without_ase_calculator(
     assert result.as_dict()["available"] is True
     assert result.as_dict()["backend"] == backend
     assert result.as_dict()["persistent_blocks_per_compute_unit"] == 8
+
+
+def test_installed_device_r1_loads_before_compiler_selection(monkeypatch, tmp_path):
+    evaluator = _Evaluator("cuda")
+    artifact = tmp_path / "installed-r1.cubin"
+    artifact.write_bytes(b"installed-r1")
+    metadata = {
+        "artifact_id": "generated-r1",
+        "generated_identity": {"operator": "R1", "artifact_id": "generated-r1"},
+        "abi": "symmetrix.jit.cuda-plugin/4",
+        "abi_version": 4,
+        "capabilities": 0x3,
+        "persistent_blocks_per_compute_unit": 8,
+    }
+    installed_plan = SimpleNamespace(
+        metadata=metadata,
+        loader=evaluator.load,
+        ready_attribute="execution_cuda_plugin_ready",
+        artifact_attribute="execution_cuda_plugin_artifact_id",
+        variant_id="variant-installed",
+        edge_policy={"persistent_blocks_per_compute_unit": 8},
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "_factorized_device_installed_plan",
+        lambda *args, **kwargs: installed_plan,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "_factorized_device_backend_plan",
+        lambda *args, **kwargs: pytest.fail("compiler selection was attempted"),
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "resolve_installed_operator_artifact",
+        lambda **arguments: (
+            arguments["loader"](str(artifact))
+            or SimpleNamespace(
+                status="resolved",
+                origin="prebuilt",
+                artifact_path=artifact,
+                artifact_id="generated-r1",
+                diagnostics=("origin=prebuilt status=loaded operator=R1",),
+            )
+        ),
+        raising=False,
+    )
+
+    result = device_artifact._prepare_and_validate(
+        evaluator=evaluator,
+        contract={"fixture": "r1"},
+        precision="float32",
+        environment=evaluator.execution_device_execution_environment,
+        model_path=tmp_path / "model.json",
+        model_type="MACE",
+        model_data={"execution_contracts": {"R1": {"fixture": "r1"}}},
+        include_low_memory_operators=False,
+        cache_root=tmp_path / "empty-cache",
+    )
+
+    assert result.status == "loaded"
+    assert result.compiler == "prebuilt"
+    assert result.artifact_path == artifact
+    assert evaluator.events == [("load", str(artifact), 8)]
+    assert not (tmp_path / "empty-cache").exists()
+
+
+@pytest.mark.parametrize("include_low_memory_operators", (False, True))
+def test_full_installed_device_catalog_respects_operator_request_without_compiler(
+    monkeypatch, tmp_path, include_low_memory_operators
+):
+    evaluator = _Evaluator("cuda")
+    model_data = _full_cuda_model_data()
+    paths = _install_full_cuda_catalog(monkeypatch, tmp_path, evaluator, model_data)
+    monkeypatch.setattr(
+        device_artifact,
+        "_factorized_device_backend_plan",
+        lambda *args, **kwargs: pytest.fail("runtime compiler selection was attempted"),
+    )
+    monkeypatch.setattr(
+        jit_runtime,
+        "prepare_nvrtc_jit_artifact",
+        lambda *args, **kwargs: pytest.fail("runtime compilation was attempted"),
+    )
+
+    result = device_artifact._prepare_and_validate(
+        evaluator=evaluator,
+        contract=model_data["execution_contracts"]["R1"],
+        precision="float32",
+        environment=evaluator.execution_device_execution_environment,
+        model_path=tmp_path / "model.json",
+        model_type="MACE",
+        model_data=model_data,
+        include_low_memory_operators=include_low_memory_operators,
+        cache_root=tmp_path / "empty-cache",
+    )
+
+    assert result.origin == "prebuilt"
+    assert result.artifact_path == paths["R1"]
+    assert tuple(result.operator_modules) == (
+        ("M0", "R0") if include_low_memory_operators else ()
+    )
+    expected_loads = [("load", str(paths["R1"]), 8)]
+    if include_low_memory_operators:
+        expected_loads.extend(
+            (
+                ("load-M0", str(paths["M0"]), "chunk32", 8),
+                ("load-R0", str(paths["R0"]), "receiver-edge16", 3),
+            )
+        )
+        assert all(
+            module.get("artifact_origin", module.get("origin")) == "prebuilt"
+            for module in result.operator_modules.values()
+        )
+    assert evaluator.events == expected_loads
+    assert not (tmp_path / "empty-cache").exists()
+
+
+def test_runtime_device_fallback_retains_catalog_absent_diagnostic(
+    monkeypatch, tmp_path
+):
+    evaluator = _Evaluator("cuda")
+    artifact = tmp_path / "runtime-r1.cubin"
+    manifest = tmp_path / "runtime-r1.json"
+    installed_plan = SimpleNamespace(
+        metadata={
+            "generated_identity": {
+                "operator": "R1",
+                "artifact_id": "generated-r1-request",
+            },
+            "abi": "symmetrix.jit.cuda-plugin/4",
+            "abi_version": 4,
+            "capabilities": 0x3,
+            "persistent_blocks_per_compute_unit": 8,
+        },
+        loader=evaluator.load,
+        ready_attribute="execution_cuda_plugin_ready",
+        artifact_attribute="execution_cuda_plugin_artifact_id",
+        variant_id="variant-installed",
+        edge_policy={"persistent_blocks_per_compute_unit": 8},
+    )
+    runtime_plan = SimpleNamespace(
+        selected_compiler="nvrtc",
+        policy="automatic",
+        metadata={
+            "artifact_id": "artifact-runtime",
+            "persistent_blocks_per_compute_unit": 8,
+        },
+        loader=evaluator.load,
+        ready_attribute="execution_cuda_plugin_ready",
+        artifact_attribute="execution_cuda_plugin_artifact_id",
+        variant_id="variant-runtime",
+        edge_policy={"persistent_blocks_per_compute_unit": 8},
+        build_attempt=lambda compiler: SimpleNamespace(
+            source="runtime R1 source",
+            prepare=lambda source, **arguments: SimpleNamespace(
+                status="built",
+                available=True,
+                cache_key="cache-runtime",
+                artifact_path=artifact,
+                manifest_path=manifest,
+                manifest={"key_inputs": {"fixture": "runtime"}},
+                diagnostics=("origin=runtime status=compiled",),
+                reason=None,
+            ),
+            arguments={"build": {"compiler": compiler}},
+        ),
+    )
+    monkeypatch.setattr(
+        device_artifact.symmetrix,
+        "_backend_build_info",
+        lambda: {"prebuilt_operator_artifacts": {"mode": "off"}},
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "_factorized_device_installed_plan",
+        lambda *args, **kwargs: installed_plan,
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "_factorized_device_backend_plan",
+        lambda *args, **kwargs: runtime_plan,
+    )
+    monkeypatch.setattr(
+        device_artifact, "native_source_content_sha256", lambda native: "a" * 64
+    )
+
+    result = device_artifact._prepare_and_validate(
+        evaluator=evaluator,
+        contract={"fixture": "r1"},
+        precision="float32",
+        environment=evaluator.execution_device_execution_environment,
+        model_path=tmp_path / "model.json",
+        model_type="MACE",
+        model_data={"execution_contracts": {"R1": {"fixture": "r1"}}},
+        include_low_memory_operators=False,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert result.origin == "runtime"
+    assert result.diagnostics == (
+        "origin=prebuilt status=absent operator=R1 reason=catalog-absent",
+        "origin=runtime status=compiled",
+    )
+
+
+def test_cuda_r1_m0_r0_compile_concurrently_then_load_in_order(monkeypatch, tmp_path):
+    evaluator = _Evaluator("cuda")
+    compile_barrier = threading.Barrier(3)
+    compile_threads = set()
+    prepare_calls = []
+
+    def prepare(source, **arguments):
+        prepare_calls.append((source, arguments))
+        compile_threads.add(threading.get_ident())
+        compile_barrier.wait(timeout=2)
+        name = source.split("-")[0].lower()
+        return SimpleNamespace(
+            status="built",
+            available=True,
+            cache_key=f"cache-{name}",
+            artifact_path=tmp_path / f"{name}.cubin",
+            manifest_path=tmp_path / f"{name}.json",
+            manifest={"key_inputs": {"fixture": name}},
+            diagnostics=(f"compiled-{name}",),
+            reason=None,
+        )
+
+    plan = SimpleNamespace(
+        selected_compiler="nvrtc",
+        policy="automatic",
+        metadata={
+            "artifact_id": "artifact-r1",
+            "persistent_blocks_per_compute_unit": 8,
+        },
+        loader=evaluator.load,
+        ready_attribute="execution_cuda_plugin_ready",
+        artifact_attribute="execution_cuda_plugin_artifact_id",
+        variant_id="variant-r1",
+        edge_policy={"persistent_blocks_per_compute_unit": 8},
+        build_attempt=lambda compiler: SimpleNamespace(
+            source="R1-source",
+            prepare=prepare,
+            arguments={"build": {"compiler": compiler}},
+        ),
+    )
+    monkeypatch.setattr(
+        device_artifact, "_factorized_device_backend_plan", lambda *args: plan
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "_factorized_device_installed_plan",
+        lambda *args, **kwargs: SimpleNamespace(
+            metadata={
+                "generated_identity": {
+                    "operator": "R1",
+                    "artifact_id": "generated-r1-request",
+                },
+                "abi": "symmetrix.jit.cuda-plugin/4",
+                "abi_version": 4,
+                "capabilities": 0x3,
+                "persistent_blocks_per_compute_unit": 8,
+            },
+            loader=evaluator.load,
+            ready_attribute="execution_cuda_plugin_ready",
+            artifact_attribute="execution_cuda_plugin_artifact_id",
+            variant_id="variant-installed",
+            edge_policy={"persistent_blocks_per_compute_unit": 8},
+        ),
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "resolve_installed_operator_artifact",
+        lambda **kwargs: SimpleNamespace(
+            status="absent",
+            diagnostics=(
+                "origin=prebuilt status=absent operator=R1 reason=catalog-absent",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        device_artifact, "native_source_content_sha256", lambda native: "a" * 64
+    )
+    monkeypatch.setattr(
+        operator_codegen,
+        "render_jit_m0_device_module",
+        lambda contract, **arguments: (
+            "M0-source",
+            {
+                "schema": "symmetrix.jit.operator-module/1",
+                "abi_version": 1,
+                "artifact_id": "artifact-m0",
+                "structure_fingerprint": "sha256:" + "b" * 64,
+                "capabilities": 0x1F,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        operator_codegen,
+        "render_jit_r0_device_module",
+        lambda contract, **arguments: (
+            "R0-source",
+            {
+                "schema": "symmetrix.jit.operator-module/1",
+                "abi_version": 1,
+                "artifact_id": "artifact-r0",
+                "structure_fingerprint": "sha256:" + "c" * 64,
+                "capabilities": 0x1F,
+            },
+        ),
+    )
+    monkeypatch.setattr(jit_runtime, "prepare_nvrtc_jit_artifact", prepare)
+
+    result = device_artifact._prepare_and_validate(
+        evaluator=evaluator,
+        contract={"fixture": "r1"},
+        precision="float32",
+        environment=evaluator.execution_device_execution_environment,
+        model_path=tmp_path / "model.json",
+        model_type="MACE",
+        model_data={
+            "execution_contracts": {
+                "R1": {"fixture": "r1"},
+                "M0": {"fixture": "m0"},
+                "R0": {"fixture": "r0"},
+            }
+        },
+        include_low_memory_operators=True,
+        cache_root=tmp_path / "cache",
+    )
+
+    assert len(compile_threads) == 3
+    assert {source for source, _ in prepare_calls} == {
+        "R1-source",
+        "M0-source",
+        "R0-source",
+    }
+    assert {
+        source: arguments["nvrtc_options"] for source, arguments in prepare_calls
+    } == {
+        "R1-source": ("--split-compile=2",),
+        "M0-source": ("--split-compile=2",),
+        "R0-source": ("--split-compile=2", "--use_fast_math"),
+    }
+    assert [event[0] for event in evaluator.events] == [
+        "load",
+        "load-M0",
+        "load-R0",
+    ]
+    assert tuple(result.operator_modules) == ("M0", "R0")
 
 
 def test_prepare_device_artifact_rejects_available_openmp(monkeypatch, tmp_path):
@@ -228,7 +773,9 @@ def test_prepare_device_artifact_cli_lammps_arguments(monkeypatch, capsys, tmp_p
                 "schedule": "table",
             },
             "R0": {
-                "implementation": "device_module",
+                "implementation": "generated",
+                "backend": "cuda",
+                "artifact_origin": "cache",
                 "artifact_path": str(r0_artifact),
             },
         },
@@ -263,7 +810,11 @@ def test_prepare_device_artifact_cli_lammps_arguments_omits_builtin_operators(
         edge_policy=None,
         operator_modules={
             "M0": {"implementation": "builtin"},
-            "R0": {"implementation": "builtin"},
+            "R0": {
+                "implementation": "generated",
+                "backend": "cuda",
+                "artifact_origin": None,
+            },
         },
     )
     monkeypatch.setattr(

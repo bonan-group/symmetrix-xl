@@ -78,6 +78,12 @@ public:
 
 std::string _kokkos_default_execution_space();
 
+// The Kokkos release this extension was compiled against, as
+// `major.minor.patch`, or an empty string when the vendored headers predate the
+// component version macros.  It is read from the headers the build actually
+// compiled against, so a report can never name a Kokkos the binary does not use.
+std::string _kokkos_build_version();
+
 using view_type = Kokkos::View<double*>;
 
 view_type generate_view(size_t);

@@ -11,19 +11,21 @@ You will need a Python environment with a compatible `mace` module installed.
 
 The appropriate LAMMPS pair style commands are
 ```
-pair_style    symmetrix/mace
+pair_style    symmetrix/mace/kk
 pair_coeff    * * srtio3-mace.json Sr Ti O
 ```
 
 For a multi-head JSON, select one model-wide prediction head in `pair_style`:
 
 ```text
-pair_style    symmetrix/mace head omat_pbe
+pair_style    symmetrix/mace/kk head omat_pbe
 pair_coeff    * * srtio3-mace.json Sr Ti O
 ```
 
-This minimal example uses the serial pair style. For a two-interaction model,
-the first-class Kokkos direct path requires the matching prepared host or
+`pair_symmetrix` provides Kokkos pair styles only, so LAMMPS must be launched
+with Kokkos enabled (`-k on`). Launching with `-sf kk` appends the `/kk` suffix,
+which lets the styles be named without it. For a two-interaction model,
+the first-class direct path requires the matching prepared host or
 device R1 artifact described below. Single-layer models do not require R1
 artifacts.
 
@@ -35,15 +37,49 @@ types `1`, `2`, and `3`, respectively. A compact universal JSON can be reused by
 different input with another element mapping; active radial tables are built
 once during `pair_coeff` for that mapping.
 
-Compact universal files use Symmetrix-XL format version 2 and require an updated
-pair style. The original Symmetrix format (named v1 here), which was
-unversioned, remains supported. When an artifact must also work with an older
-Symmetrix-XL/LAMMPS installation, generate it with `symmetrix_extract_mace
---radial-format pair-splines` and an explicit element subset.
+Compact universal files use Symmetrix-XL format version 2. The original
+Symmetrix pair-spline format (named v1 here) is retired. The Python calculators
+no longer load it at all; the pair styles still admit it, warn about the
+migration, and fall back to `streamed_edges materialized`. Convert an old
+artifact by re-exporting the checkpoint with `radial_format='compact'`, that is,
+without `--radial-format pair-splines`.
 
-Format-version-3 `MACE_Nonlinear` models, including MACE-MH-1, are currently
-supported by the Python ASE calculator and native library only. Both LAMMPS
-pair styles reject these models explicitly at `pair_coeff`.
+Ordinary format-version-3 `MACE_Nonlinear` models, including MACE-MH-1, are
+currently supported by the Python ASE calculator and native library only. The
+ordinary `symmetrix/mace/kk` pair style rejects these models explicitly at
+`pair_coeff`. `MACE_Polar` is a separate model family with its own pair style
+and native whole-model evaluator.
+
+### MACE Polar
+
+Use `symmetrix/mace/polar/kk` for FP64 or
+`symmetrix/mace/polar/float32/kk` for FP32. The current pair style is qualified
+only when exactly one MPI rank owns the complete system. It rejects domain
+decomposition, hybrid use, per-atom energy, and per-atom virial before model
+evaluation; distributed Polar LAMMPS is not implemented.
+The type map must cover every LAMMPS type, the model must be `MACE_Polar`, and
+the complete-system atom count must fit the native flattened-index capacity.
+
+```text
+pair_style symmetrix/mace/polar/float32/kk \
+           total_charge 0.0 total_spin 0.0 fermi_level 0.0 \
+           electric_field 0.0 0.0 0.0 \
+           polar_electrostatics auto \
+           jit_host_artifact /absolute/path/polar-backbone.so
+pair_coeff * * /absolute/path/MACE-POLAR-1-M.json H O
+```
+
+The family JSON is solver-neutral. `polar_electrostatics auto` selects exact
+real space for a fully non-periodic system and direct reciprocal space when any
+cell axis is periodic. PME/PPPM is deferred and an explicit `pme` request is
+rejected. Other optional settings are `head` and the graph-level values shown
+above. Select at most one prepared backbone artifact with
+`jit_host_artifact` or `jit_device_artifact`. With no artifact, the consumer
+uses the portable `pair_spline_v1` backbone; a matching artifact selects the
+generated/direct backbone. Supplying both, or repeating one, is an error.
+Artifact selection does not change `polar_electrostatics`. The pair style
+returns energy, forces, and global virial and does not expose the model dipole
+as a LAMMPS output.
 
 For MACEField JSON models, use the Kokkos pair style with an explicit
 uniform electric field:
@@ -65,10 +101,7 @@ temporary compatibility alias, along with `all_interactions -> generic`,
 `factorized -> direct`, and `direct_streamed -> direct`.
 The default `auto` mode selects `direct` only when a `jit_host_artifact` or
 `jit_device_artifact` is provided; otherwise it selects `generic` for compact
-format-version-2 models and retains `materialized` for original Symmetrix
-pair-spline models (named v1 here). Loading this format prints a migration
-notice; explicit mode selections override `auto`. The serial pair style applies
-the same format-aware default automatically.
+format-version-2 models. Explicit mode selections override `auto`.
 
 `direct` supports both `no_domain_decomposition` and the default
 `mpi_message_passing` domain-decomposition mode. The MPI path computes the
@@ -82,8 +115,16 @@ The qualified Kokkos CUDA launch uses `package kokkos neigh half newton on` to
 override Kokkos's default Newton policy. The pair style itself requests the
 full neighbor list needed by the model, irrespective of that package-level
 neighbor preference.
-`no_mpi_message_passing` is not supported with prepared direct execution. A
-JIT-generated CPU shared library can be selected with
+`mpi_message_passing` can be a sub-style of
+`pair_style hybrid/overlay/kk`; this keeps Symmetrix assigned to every type
+pair and preserves its full many-body neighbor list. Other hybrid wrappers are
+rejected because their coefficient mapping can install a type-filtered
+neighbor list, which is incompatible with the owned-and-ghost hidden-state
+exchange. Host sub-styles such as `dispersion/d3` retain their own independent
+forward and reverse communication inside the overlay.
+`no_mpi_message_passing` is not supported with prepared direct execution.
+Other hybrid wrappers are rejected while parsing, before any workspace exists.
+A JIT-generated CPU shared library can be selected with
 `jit_host_artifact /path/to/plugin.so`; CUDA/HIP modules use
 `jit_device_artifact /path/to/module.cubin` (or `.hsaco`). The native loaders
 verify ABI, model contract, precision, and backend before use; device modules
@@ -98,8 +139,8 @@ low-memory admission. Explicit `direct` requires a matching R1 artifact for
 two-interaction models and never falls back. Single-layer models have no R1
 stage and use the built-in direct executor. `generic` rejects artifacts because
 generic execution is compiler-free.
-The removed `receiver_factorized` selector is rejected by all current
-evaluators, including the LAMMPS pair style.
+The removed `receiver_factorized` selector is rejected by every retained
+evaluator, including the LAMMPS pair style.
 The pair style loads artifacts but never invokes a compiler.
 
 `profile capacity` is the default and activates the same qualified M1
@@ -263,8 +304,7 @@ is shared across the checkpoint's element domain rather than expanded into
 pair-specific spline tables, so the same file can be mapped to different LAMMPS
 type compositions without quadratic pair-table growth. The file still contains
 the checkpoint's element-indexed learned parameters. Use an explicit element
-subset only for a deliberately restricted deployment or an export in the
-original Symmetrix pair-spline format (named v1 here).
+subset only for a deliberately restricted deployment.
 
 This prepares both FP32 and FP64 artifact sets in one Kokkos runtime session.
 Its JSON array labels each result with `precision`, the R1 `artifact_path`, and
@@ -314,6 +354,10 @@ configuration has the narrow same-node qualification described above. On a
 one-GPU CUDA node, request
 the device explicitly with `-k on g 1` in addition to the half-neighbor/Newton
 package policy above.
+The mode can also be a sub-style of `pair_style hybrid/overlay/kk`, including
+an overlay with host-side `dispersion/d3`. Other hybrid wrappers are rejected:
+their coefficient mapping can give Symmetrix a type-filtered neighbor list,
+while hidden-state communication requires one receiver for every owned atom.
 When all GPUs are visible to every rank on a multi-GPU node, pass the visible
 device count, for example `-k on g 4`, and normally launch one local MPI rank
 per GPU. When the scheduler masks one physical GPU into each rank, as in the

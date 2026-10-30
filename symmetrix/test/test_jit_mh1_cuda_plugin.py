@@ -31,7 +31,7 @@ def test_mh1_cuda_loader_rejects_pre_active_receiver_plugin(tmp_path):
     plugin_source = tmp_path / "fixture_plugin.cpp"
     plugin_source.write_text(
         r"""
-#include "jit_mh1_cuda_plugin_abi.h"
+#include "mace_nonlinear_jit_cuda_plugin_abi.h"
 
 #include <cstddef>
 
@@ -132,7 +132,7 @@ symmetrix_jit_mh1_cuda_plugin_query_v3()
     harness_source = tmp_path / "loader_harness.cpp"
     harness_source.write_text(
         r"""
-#include "jit_mh1_cuda_plugin.hpp"
+#include "mace_nonlinear_jit_cuda_plugin.hpp"
 
 #include <exception>
 #include <iostream>
@@ -232,7 +232,7 @@ int main(int argc, char** argv)
         compiler,
         *common,
         harness_source,
-        SOURCE / "jit_mh1_cuda_plugin.cpp",
+        SOURCE / "mace_nonlinear_jit_cuda_plugin.cpp",
         "-ldl",
         "-o",
         harness,

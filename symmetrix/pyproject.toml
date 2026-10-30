@@ -9,9 +9,6 @@ build-dir = "build"
 wheel.exclude = ["lib/", "lib64/", "include/", "bin/"]
 wheel.packages = ["source/symmetrix"]
 
-[tool.scikit-build.sdist.force-include]
-"libsymmetrix" = "libsymmetrix"
-
 [tool.scikit-build.cmake.define]
 SYMMETRIX_DEVICE_BACKEND = "NONE"
 Kokkos_ENABLE_CUDA = "OFF"
@@ -20,6 +17,7 @@ Kokkos_ENABLE_OPENMP = "ON"
 Kokkos_ENABLE_SERIAL = "OFF"
 SYMMETRIX_SPHERICART_CUDA = "OFF"
 SPHERICART_ENABLE_CUDA = "OFF"
+SYMMETRIX_REDACT_BUILD_PATHS = "ON"
 
 # Apple silicon: include the Metal GPU layer and use the Serial host, which
 # avoids loading a second OpenMP runtime next to PyTorch's.
@@ -32,11 +30,12 @@ cmake.define.SYMMETRIX_METAL = "ON"
 
 [project]
 name = "symmetrix-xl"
-version = "0.1.1"
+version = "0.2.0"
 description = "Symmetrix — a package for functions equivariant under: translation, rotation, inversion, and exchange of particles."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES.md"]
 authors = [
     { name = "William C. Witt" },
 ]
@@ -47,7 +46,6 @@ keywords = ["symmetry", "equivariance", "machine-learning", "interatomic-potenti
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
@@ -76,9 +74,17 @@ mace = [
     "torch>=2.5",
     "mace-torch",
 ]
-dispersion = [
-    "torch-dftd",
+nequip = [
+    "torch>=2.5",
+    "nequip",
+    "e3nn",
 ]
+neighbors = [
+    "matscipy>=1.3.1",
+]
+# Deprecated compatibility extra. Native D2/D3 support is included in every
+# installation and has no additional Python dependency.
+dispersion = []
 test = [
     "pytest",
     "torch>=2.5",
@@ -93,6 +99,7 @@ docs = [
 [project.scripts]
 symmetrix = "symmetrix.cli.main:main"
 symmetrix_extract_mace = "symmetrix.cli.extract_mace:main"
+symmetrix_extract_nequip = "symmetrix.cli.extract_nequip:main"
 symmetrix_calibrate_kernel_launch = "symmetrix.cli.calibrate_kernel_launch:main"
 symmetrix_prepare_jit_device_artifact = "symmetrix.cli.prepare_jit_device_artifact:main"
 symmetrix_prepare_jit_host_artifact = "symmetrix.cli.prepare_jit_host_artifact:main"
@@ -109,6 +116,8 @@ markers = [
     "gpu: launches on a real accelerator",
     "cuda: requires the CUDA backend",
     "hip: requires the HIP backend",
+    "host: requires a Serial or OpenMP host backend",
+    "oam_runtime: executes an OAM model on a backend supported by the OAM family",
     "device_compile: compiles accelerator code without claiming a launch",
     "jit: exercises runtime specialization or its cache",
     "lammps: requires a compatible LAMMPS build",

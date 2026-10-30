@@ -214,7 +214,6 @@ def _worker(args) -> int:
     atoms.info["electric_field"] = np.asarray(args.electric_field, dtype=float)
     calculator = Symmetrix(
         args.model,
-        use_kokkos=True,
         dtype=args.dtype,
         streamed_edges=args.worker_mode,
         low_memory=args.worker_mode == "direct",

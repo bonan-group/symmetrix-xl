@@ -198,6 +198,7 @@ def lammps_cmake_definitions(
         "BUILD_MPI": "ON" if mpi_enabled else "OFF",
         "PKG_KOKKOS": "ON",
         "SYMMETRIX_KOKKOS": "ON",
+        "SYMMETRIX_PARTICLE_MESH": manifest.particle_mesh_policy.upper(),
     }
     if mpi_enabled:
         definitions["MPI_CXX_COMPILER"] = mpi_cxx
@@ -358,8 +359,6 @@ def lammps_source_provenance(
 
     digest = hashlib.sha256()
     excluded = {
-        "src/pair_symmetrix_mace.h",
-        "src/pair_symmetrix_mace.cpp",
         "src/KOKKOS/pair_symmetrix_mace_kokkos.h",
         "src/KOKKOS/pair_symmetrix_mace_kokkos.cpp",
     }
@@ -571,7 +570,11 @@ def verify_lammps(
             f"installed LAMMPS executable is missing: {invocation.executable}"
         )
     result = runner.run((str(invocation.executable), "-help"), check=True)
-    for style in ("symmetrix/mace", "symmetrix/mace/kk"):
+    # Only the Kokkos spellings are registered: the bare ``symmetrix/mace``
+    # style is retired, so requiring it would pass as a substring of
+    # ``symmetrix/mace/kk`` and verify nothing.  The two precision entry points
+    # are required instead.
+    for style in ("symmetrix/mace/kk", "symmetrix/mace/float32/kk"):
         if style not in result.output:
             raise BuildError(f"installed LAMMPS does not report pair style {style}")
     installed_packages = _installed_lammps_packages(result.output)

@@ -12,7 +12,10 @@
 
 namespace symmetrix {
 
-inline constexpr double spherical_harmonic_mace_normalization =
+// Converts the orthonormal real spherical harmonics produced by the shared
+// device kernels to the unit-l=0 convention carried by the serialized model
+// definitions: sqrt(4*pi).
+inline constexpr double spherical_harmonic_real_normalization =
     3.5449077018110318;
 
 template<int LMax, class Precision>
@@ -80,7 +83,7 @@ KOKKOS_INLINE_FUNCTION void normalized_spherical_harmonic_values_from_direction(
         LMax, x, y, z, x2, y2, z2, values,
         SYMMETRIX_SPH_IDENTITY_INDEX);
     const Precision normalization = static_cast<Precision>(
-        spherical_harmonic_mace_normalization);
+        spherical_harmonic_real_normalization);
     for (int index = 0; index < size; ++index)
         values[index] *= normalization;
 }
@@ -96,7 +99,7 @@ KOKKOS_INLINE_FUNCTION void normalized_spherical_harmonic_gradients_from_directi
     spherical_harmonic_device_sample<LMax>(
         shuffled, values, shuffled_gradients);
     const Precision scale = static_cast<Precision>(
-        spherical_harmonic_mace_normalization)/radius;
+        spherical_harmonic_real_normalization)/radius;
     for (int index = 0; index < size; ++index) {
         gradients[index] = scale*shuffled_gradients[size+index];
         gradients[size+index] = scale*shuffled_gradients[2*size+index];
@@ -133,6 +136,41 @@ void launch_spherical_harmonic_values_from_directions(
             normalized_spherical_harmonic_values_from_direction<LMax>(
                 direction, output);
         });
+}
+
+template<class ExecutionSpace, class DirectionView, class RadiusView,
+    class ValueView>
+void launch_spherical_harmonic_values_from_directions(
+    const ExecutionSpace& execution_space, const DirectionView& directions,
+    const RadiusView& radii, const double cutoff, const ValueView& values,
+    const int samples, const int l_max)
+{
+    switch (l_max) {
+    case 0:
+        return launch_spherical_harmonic_values_from_directions<0>(
+            execution_space, directions, radii, cutoff, values, samples);
+    case 1:
+        return launch_spherical_harmonic_values_from_directions<1>(
+            execution_space, directions, radii, cutoff, values, samples);
+    case 2:
+        return launch_spherical_harmonic_values_from_directions<2>(
+            execution_space, directions, radii, cutoff, values, samples);
+    case 3:
+        return launch_spherical_harmonic_values_from_directions<3>(
+            execution_space, directions, radii, cutoff, values, samples);
+    case 4:
+        return launch_spherical_harmonic_values_from_directions<4>(
+            execution_space, directions, radii, cutoff, values, samples);
+    case 5:
+        return launch_spherical_harmonic_values_from_directions<5>(
+            execution_space, directions, radii, cutoff, values, samples);
+    case 6:
+        return launch_spherical_harmonic_values_from_directions<6>(
+            execution_space, directions, radii, cutoff, values, samples);
+    default:
+        throw std::invalid_argument(
+            "Spherical harmonic values support l_max values from 0 through 6.");
+    }
 }
 
 template<int LMax, class ExecutionSpace, class CoordinateView,

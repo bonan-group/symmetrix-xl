@@ -19,10 +19,11 @@ def test_macefield_response_uses_widened_edge_offsets():
     assert source.count("const std::size_t harmonic_offset =") == 6
     assert source.count("const std::size_t gradient_offset =") == 4
     assert source.count("Kokkos::IndexType<std::size_t>") == 5
+    # The merge re-indented this admission; the pairing is the subject.
     assert (
         re.search(
-            r"response_mode == MACEStreamedEdgesMode::generic\s*\n\s*"
-            r"\|\| mace_uses_prepared_execution\(response_mode\)",
+            r"response_mode == ExecutionMode::generic\s*\n"
+            r"\s*\|\| uses_prepared_execution\(response_mode\)",
             source,
         )
         is not None

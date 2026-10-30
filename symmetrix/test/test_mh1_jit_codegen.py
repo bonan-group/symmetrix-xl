@@ -9,9 +9,9 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-import symmetrix.mh1_jit_codegen as mh1_codegen
-from symmetrix.execution_mh1_contract import make_execution_mh1_contract
-from symmetrix.mh1_jit_codegen import (
+import symmetrix.mace_nonlinear_jit_codegen as mh1_codegen
+from symmetrix.mace_nonlinear_execution_contract import make_execution_mh1_contract
+from symmetrix.mace_nonlinear_jit_codegen import (
     render_execution_mh1_conditioner_cpp_helpers,
     render_jit_mh1_cuda_plugin,
     render_jit_mh1_host_plugin,
@@ -372,38 +372,6 @@ def test_mh1_neutral_types_own_cuda_compatibility_aliases(contract):
         replace(schedule, node_state_policy="invalid")
 
 
-def test_cuda_module_reverse_schedule_groups_all_retained_node_linears():
-    assert mh1_codegen._cuda_module_node_reverse_schedule("full-retention-v1") == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    assert mh1_codegen._cuda_module_node_reverse_schedule("recompute-v1") == (
-        mh1_codegen._MH1_CUDA_RECOMPUTE_TILED_PRODUCT_REVERSE_SCHEDULE
-    )
-    assert mh1_codegen._cuda_module_node_reverse_schedule("reuse-adjoints-v1") == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    assert (
-        mh1_codegen._cuda_module_node_reverse_schedule("retain-interaction-v1")
-        == mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-
-
-def test_hip_module_reverse_schedule_groups_all_retained_node_linears():
-    assert mh1_codegen._hip_module_node_reverse_schedule("full-retention-v1") == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    assert mh1_codegen._hip_module_node_reverse_schedule("recompute-v1") == (
-        "tiled-8x32-message-linear2-32x32-v7"
-    )
-    assert mh1_codegen._hip_module_node_reverse_schedule("reuse-adjoints-v1") == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    assert (
-        mh1_codegen._hip_module_node_reverse_schedule("retain-interaction-v1")
-        == "tiled-8x32-message-linear2-32x32-v7"
-    )
-
-
 def test_grouped_tiled_reverse_rejects_unsupported_node_tiles():
     with pytest.raises(ValueError, match="requires 32, 64, or 128 node tiles"):
         mh1_codegen._cuda_grouped_tiled_linear_reverse(
@@ -431,23 +399,6 @@ def test_grouped_tiled_forward_rejects_unsupported_node_tiles():
             output_stride=1,
             stem="grouped_forward",
             tile_nodes=16,
-        )
-
-
-def test_tiled_product_reverse_rejects_unsupported_node_tiles():
-    with pytest.raises(ValueError, match="requires 1, 2, or 4 node tiles"):
-        mh1_codegen._cuda_tiled_product_reverse(
-            {},
-            args_type="Args",
-            input_pointer="args.input",
-            input_stride=1,
-            contracted_adjoint_pointer="args.contracted_adjoint",
-            contracted_adjoint_stride=1,
-            coefficient_pointer="args.coefficients",
-            input_adjoint_pointer="args.input_adjoint",
-            input_adjoint_stride=1,
-            stem="product_reverse",
-            tile_nodes=3,
         )
 
 
@@ -1545,6 +1496,34 @@ def test_compact_fused_batches_edge_slot_reductions_behind_one_barrier():
         assert "warp_partial" not in barrier_sections[-1]
 
 
+def test_compact_fused_edge_batch_stays_within_cuda_static_shared_memory():
+    """The 512-channel FP64 polar edge reverse must remain compilable."""
+
+    contract = make_execution_mh1_contract(
+        _grouped_definition(channels=512, phi_dimension=4)
+    )
+    interaction = contract["interactions"][0]
+
+    assert (
+        mh1_codegen._compact_fused_edge_batch(
+            interaction, precision="float32", backend="cuda"
+        )
+        == 4
+    )
+    assert (
+        mh1_codegen._compact_fused_edge_batch(
+            interaction, precision="float64", backend="cuda"
+        )
+        == 2
+    )
+    kernel = mh1_codegen._render_cuda_edge_reverse_compact_fused_path_tiled_kernel(
+        interaction, edge_batch=2
+    )
+    assert "__shared__ float path_weight_adjoint[4][2]\n        [512];" in kernel
+    assert "static_cast<std::int64_t>(blockIdx.x) * 2" in kernel
+    assert "static_cast<std::int64_t>(gridDim.x) * 2" in kernel
+
+
 def test_compact_fused_uses_backend_specific_edge_weight_liveness():
     contract = make_execution_mh1_contract(_grouped_definition())
     interaction = contract["interactions"][0]
@@ -1609,10 +1588,10 @@ def test_mh1_node_arena_policy_decouples_throughput_from_retained_state():
         repository / "libsymmetrix" / "source" / "mace_nonlinear_kokkos_impl.tpp"
     ).read_text(encoding="ascii")
     loader_start = source.index(
-        "void MaceNonlinearKokkosT<Precision>::load_jit_mh1_cuda_plugin_v4("
+        "void MaceBackboneKokkosT<Precision>::load_jit_mh1_cuda_plugin_v4("
     )
     loader_end = source.index(
-        "\nbool MaceNonlinearKokkosT<Precision>::jit_mh1_cuda_plugin_ready() const",
+        "\nbool MaceBackboneKokkosT<Precision>::jit_mh1_cuda_plugin_ready() const",
         loader_start,
     )
     loader = source[loader_start:loader_end]
@@ -1621,7 +1600,7 @@ def test_mh1_node_arena_policy_decouples_throughput_from_retained_state():
     assert "static constexpr int cuda_throughput_tile_rows=1024;" in header
     assert 'execution_mh1_node_arena_policy_="throughput-v1";' in header
     selector_start = source.index(
-        "int MaceNonlinearKokkosT<Precision>::"
+        "int MaceBackboneKokkosT<Precision>::"
         "selected_execution_mh1_node_arena_tile_rows()"
     )
     selector_end = source.index("\n}\n", selector_start)
@@ -1676,7 +1655,7 @@ def test_mh1_module_edge_phi_launch_geometry(
 
     repository = Path(__file__).resolve().parents[2]
     adapter = (
-        repository / "libsymmetrix" / "source" / "jit_mh1_cuda_plugin.cpp"
+        repository / "libsymmetrix" / "source" / "mace_nonlinear_jit_cuda_plugin.cpp"
     ).read_text(encoding="ascii")
     assert 'strategy=="compact_fused"||phi_schedule=="path_tiled"?4:1' in adapter
     assert "args->samples/plan.edge_phi_edge_batch" in adapter

@@ -3,7 +3,6 @@
 #include <cmath>
 #include <cstdlib>
 #include <exception>
-#include <fstream>
 #include <limits>
 #include <numbers>
 #include <numeric>
@@ -30,12 +29,12 @@
 
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
-#include "prediction_heads.hpp"
 #include "device_backend.hpp"
+#include "jit_device_plugin_common.hpp"
 #include "kernel_launch_profile.hpp"
-#include "standard_m0.hpp"
-#include "standard_m1.hpp"
-#include "standard_r0.hpp"
+#include "mace_standard_m0.hpp"
+#include "mace_standard_m1.hpp"
+#include "mace_standard_r0.hpp"
 #include "factorized_blas.hpp"
 
 using Kokkos::ALL;
@@ -143,11 +142,13 @@ std::string validate_factorized_contract_payload(
 }
 
 template <typename Precision>
-void MACEKokkos<Precision>::load_from_json(
-    std::string filename, const std::string& requested_head)
+void MACEKokkos<Precision>::load_mace_backbone(
+    const SelectedMACEModel& selected)
 {
     model_load_phase_names.clear();
     model_load_phase_ms.clear();
+    model_load_phase_names.push_back("json_parse");
+    model_load_phase_ms.push_back(selected.json_parse_ms);
     auto phase_start = std::chrono::steady_clock::now();
     const auto record_phase = [&] (const std::string& name) {
         const auto now = std::chrono::steady_clock::now();
@@ -156,24 +157,24 @@ void MACEKokkos<Precision>::load_from_json(
             std::chrono::duration<double,std::milli>(now-phase_start).count());
         phase_start = now;
     };
-    std::ifstream f(filename);
-    nlohmann::json file = select_prediction_head(
-        nlohmann::json::parse(f), requested_head);
-    selected_head = file.value("selected_head", std::string());
-    available_heads = file.value("available_heads", std::vector<std::string>());
-    record_phase("json_parse");
-    if (file.value("model_type", std::string("MACE")) == "MACE_Nonlinear")
-        throw std::invalid_argument(
-            "MACE_Nonlinear JSON must be loaded through the nonlinear MACE Kokkos evaluator, not legacy MACEKokkos.");
+    const auto& file = selected.data;
+    selected_head = selected.selected_head;
+    available_heads = selected.available_heads;
 
     // Basic model information
     num_elements = file["num_elements"];
     num_channels = file["num_channels"];
+    // The interaction count is contract data: the model contract declares it and
+    // the single-layer readout metadata admits one or two interactions.  Name
+    // both counts when the declared contract and the admitted topology disagree.
     num_interactions = file.value("num_interactions", 2);
     single_layer_readout = file.value("single_layer_readout", false);
-    if (num_interactions != (single_layer_readout ? 1 : 2))
+    const int admitted_interactions = single_layer_readout ? 1 : 2;
+    if (num_interactions != admitted_interactions)
         throw std::invalid_argument(
-            "MACE interaction count and single-layer readout metadata disagree.");
+            symmetrix::execution::detail::admitted_interaction_count_error(
+                num_interactions, admitted_interactions,
+                "the single-layer readout contract"));
     r_cut = file["r_cut"];
     l_max = file["l_max"];
     num_lm = (l_max+1)*(l_max+1);
@@ -201,6 +202,8 @@ void MACEKokkos<Precision>::load_from_json(
     const int format_version = file.value("symmetrix_format_version", 1);
     std::string standard_m0_contract_diagnostic;
     nlohmann::json m0_contract_metadata;
+    std::string m1_contract_diagnostic;
+    nlohmann::json m1_contract_metadata;
     uses_compact_radial = format_version == 2;
     if (uses_compact_radial) {
         if (file.value("radial_representation", std::string()) != "compact")
@@ -295,6 +298,7 @@ void MACEKokkos<Precision>::load_from_json(
                 launch_environment.architecture) != nullptr;
         if (standard_r0_module_ready) {
             selected_r0_implementation = R0Implementation::builtin;
+            selected_r0_artifact_origin.clear();
             standard_r0_module_fallback_reason = "";
         } else if (!standard_r0_has_model_contract) {
             standard_r0_module_fallback_reason =
@@ -358,6 +362,34 @@ void MACEKokkos<Precision>::load_from_json(
                 standard_m0_model_structure_fingerprint.clear();
                 standard_m0_contract_diagnostic =
                     std::string("invalid optional Execution M0 contract metadata: ")
+                    +error.what();
+            }
+        }
+        if (file.contains("execution_contracts")
+            && file.at("execution_contracts").contains("M1")) {
+            const auto& contract = file.at("execution_contracts").at("M1");
+            try {
+                if (!contract.is_object()
+                    || contract.value("schema", std::string())
+                        != "symmetrix.execution.symmetric_contraction"
+                    || contract.value("version", 0) != 1
+                    || contract.value("interaction", std::string()) != "M1")
+                    throw std::invalid_argument("unsupported schema");
+                m1_model_contract_fingerprint =
+                    contract.at("generation_fingerprint").get<std::string>();
+                m1_model_semantic_fingerprint =
+                    contract.at("semantic_fingerprint").get<std::string>();
+                m1_model_structure_fingerprint =
+                    contract.at("structure_fingerprint").get<std::string>();
+                m1_contract_metadata = contract;
+                m1_has_model_contract = true;
+            } catch (const std::exception& error) {
+                m1_has_model_contract = false;
+                m1_model_contract_fingerprint.clear();
+                m1_model_semantic_fingerprint.clear();
+                m1_model_structure_fingerprint.clear();
+                m1_contract_diagnostic =
+                    std::string("invalid optional Execution M1 contract metadata: ")
                     +error.what();
             }
         }
@@ -1107,9 +1139,93 @@ void MACEKokkos<Precision>::load_from_json(
     record_phase("a1_weights");
     // M1 weights and monomials
     auto M1_weights = file["M1_weights"].get<std::map<std::string,std::map<std::string,std::vector<double>>>>();
-    const int num_terms = M1_weights[std::to_string(0)][std::to_string(0)].size();
     auto M1_monomials = file["M1_monomials"].get<std::vector<std::vector<int>>>();
-    Kokkos::resize(this->M1_monomials, num_terms, 3);// TODO: hardcoded 3
+    const int num_terms = static_cast<int>(M1_monomials.size());
+    if (num_terms <= 0)
+        throw std::invalid_argument("M1 payload must contain monomials.");
+    const int m1_input_components = single_layer_readout ? num_LM : num_lm;
+    auto generated_m1_rows = std::vector<int>(num_terms);
+    std::iota(generated_m1_rows.begin(), generated_m1_rows.end(), 0);
+    std::sort(
+        generated_m1_rows.begin(), generated_m1_rows.end(),
+        [&] (const int left, const int right) {
+            const auto& lhs = M1_monomials[left];
+            const auto& rhs = M1_monomials[right];
+            if (lhs.size() != rhs.size())
+                return lhs.size() < rhs.size();
+            return lhs < rhs;
+        });
+    for (const auto& monomial : M1_monomials) {
+        if (monomial.empty() || monomial.size() > 4)
+            throw std::invalid_argument(
+                "M1 monomials must have degree between one and four.");
+        m1_correlation = std::max(
+            m1_correlation, static_cast<int>(monomial.size()));
+        for (const int component : monomial)
+            if (component < 0 || component >= m1_input_components)
+                throw std::invalid_argument(
+                    "M1 monomial component is outside the input component range.");
+    }
+    for (int type=0; type<static_cast<int>(atomic_numbers.size()); ++type) {
+        const auto type_found = M1_weights.find(std::to_string(type));
+        if (type_found == M1_weights.end())
+            throw std::invalid_argument("M1 payload is missing node-type weights.");
+        for (int channel=0; channel<num_channels; ++channel) {
+            const auto channel_found = type_found->second.find(std::to_string(channel));
+            if (channel_found == type_found->second.end()
+                || channel_found->second.size()
+                    != static_cast<std::size_t>(num_terms))
+                throw std::invalid_argument(
+                    "M1 weight row length does not match the monomial count.");
+        }
+    }
+    m1_module_term_count = num_terms;
+    m1_model_payload_verified = m1_has_model_contract;
+    if (m1_model_payload_verified) {
+        try {
+            const auto& groups = m1_contract_metadata.at("monomial_groups");
+            const auto terms = groups.at(0).at("terms")
+                .get<std::vector<std::vector<int>>>();
+            if (m1_contract_metadata.value("channels", 0) != num_channels
+                || m1_contract_metadata.value("type_count", 0)
+                    != static_cast<int>(atomic_numbers.size())
+                || m1_contract_metadata.value("input_components", 0)
+                    != m1_input_components
+                || m1_contract_metadata.value("output_components", 0) != 1
+                || m1_contract_metadata.value("correlation", 0) != m1_correlation
+                || !groups.is_array() || groups.size() != 1
+                || groups.at(0).value("output_component", -1) != 0
+                || terms.size() != generated_m1_rows.size())
+                m1_model_payload_verified = false;
+            for (int term=0; term<num_terms && m1_model_payload_verified; ++term)
+                if (terms[term] != M1_monomials[generated_m1_rows[term]])
+                    m1_model_payload_verified = false;
+        } catch (const std::exception&) {
+            m1_model_payload_verified = false;
+        }
+    }
+    if (m1_model_payload_verified) {
+        generated_m1_module_weights = decltype(generated_m1_module_weights)(
+            Kokkos::view_alloc(
+                "generated_m1_module_weights", Kokkos::WithoutInitializing),
+            atomic_numbers.size(), num_terms, num_channels);
+        auto host_weights = Kokkos::create_mirror_view(generated_m1_module_weights);
+        for (int type=0; type<static_cast<int>(atomic_numbers.size()); ++type)
+            for (int term=0; term<num_terms; ++term)
+                for (int channel=0; channel<num_channels; ++channel)
+                    host_weights(type,term,channel) = M1_weights
+                        .at(std::to_string(type)).at(std::to_string(channel))
+                        [generated_m1_rows[term]];
+        Kokkos::deep_copy(generated_m1_module_weights, host_weights);
+    } else if (!m1_contract_diagnostic.empty()) {
+        m1_module_fallback_reason = m1_contract_diagnostic;
+    } else if (m1_has_model_contract) {
+        m1_module_fallback_reason =
+            "model M1 payload does not match its execution contract";
+    } else {
+        m1_module_fallback_reason = "model does not contain an Execution M1 contract";
+    }
+    Kokkos::resize(this->M1_monomials, num_terms, m1_correlation);
     auto h_M1_monomials = Kokkos::create_mirror_view(this->M1_monomials);
     Kokkos::deep_copy(h_M1_monomials, -1);
     for (int i=0; i<num_terms; ++i)
@@ -1128,6 +1244,8 @@ void MACEKokkos<Precision>::load_from_json(
             && symmetrix::standard_m1::matches_structure(
                 num_lm, M1_monomials, &canonical_m1_rows);
     }
+    if (standard_m1_module_ready && selected_m1_implementation == M1Implementation::generic)
+        selected_m1_implementation = M1Implementation::builtin;
     Kokkos::resize(this->M1_weights, atomic_numbers.size(), num_terms, num_channels);
     auto h_M1_weights = Kokkos::create_mirror_view(this->M1_weights);
     for (int type=0; type<static_cast<int>(atomic_numbers.size()); ++type)
@@ -1147,6 +1265,53 @@ void MACEKokkos<Precision>::load_from_json(
         M1_monomials);
     const auto M1_coefficient_nodes = polynomial_coefficient_nodes(
         P1, M1_monomials);
+    // The per-output-element kernel evaluates each term from its leaves, so it
+    // needs the terms flattened: leaves per represented term plus the
+    // coefficient row that term's product feeds.  Intermediates of the
+    // polynomial graph carry no coefficient of their own -- the model's
+    // coefficient is placed on the term's terminal node -- so evaluating the
+    // products from leaves is the same polynomial.
+    {
+        const int harmonics = single_layer_readout ? num_LM : num_lm;
+        Kokkos::realloc(
+            Kokkos::WithoutInitializing, M1_term_leaves,
+            num_terms, m1_correlation);
+        Kokkos::realloc(Kokkos::WithoutInitializing, M1_term_nodes, num_terms);
+        auto h_leaves = Kokkos::create_mirror_view(M1_term_leaves);
+        auto h_nodes = Kokkos::create_mirror_view(M1_term_nodes);
+        Kokkos::deep_copy(h_leaves, -1);
+        int kept = 0;
+        int max_leaf = -1;
+        int max_degree = 0;
+        bool complete = true;
+        for (int term=0; term<num_terms; ++term) {
+            if (M1_coefficient_nodes[term] < 0) continue;
+            const auto& exponents = M1_monomials[term];
+            if (exponents.empty()
+                || static_cast<int>(exponents.size()) > m1_correlation) {
+                complete = false;
+                break;
+            }
+            for (int j=0; j<static_cast<int>(exponents.size()); ++j) {
+                if (exponents[j] < 0 || exponents[j] >= harmonics) {
+                    complete = false;
+                    break;
+                }
+                max_leaf = std::max(max_leaf, exponents[j]);
+                h_leaves(kept,j) = exponents[j];
+            }
+            if (!complete) break;
+            h_nodes(kept) = M1_coefficient_nodes[term];
+            max_degree = std::max(
+                max_degree, static_cast<int>(exponents.size()));
+            kept += 1;
+        }
+        M1_term_count = kept;
+        m1_terms_ready = complete && kept > 0 && max_leaf < harmonics
+            && max_degree > 0;
+        Kokkos::deep_copy(M1_term_leaves, h_leaves);
+        Kokkos::deep_copy(M1_term_nodes, h_nodes);
+    }
     // M1_poly_spec
     Kokkos::realloc(M1_poly_spec, P1.edges.size(), 2);
     auto h_M1_poly_spec = Kokkos::create_mirror_view(M1_poly_spec);

@@ -32,6 +32,8 @@
 #include "tools_kokkos.hpp"
 #include "device_backend.hpp"
 #include "device_environment.hpp"
+#include "dispersion_parameter_provenance.hpp"
+#include "dispersion_parameters.hpp"
 #include "host_dense_kernels.hpp"
 #include "host_worker_blas.hpp"
 #include "neighbor_graph_kokkos.hpp"
@@ -263,6 +265,88 @@ void warn_non_openmp_openblas()
     std::cerr << ". Prefer an OpenMP-enabled OpenBLAS build." << std::endl;
     warned = true;
 #endif
+}
+
+py::dict dispersion_parameter_summary(
+    const std::string& method,
+    const std::string& damping,
+    const std::string& functional)
+{
+    const symmetrix::dispersion::DampingParameters* parameters = nullptr;
+    py::dict table_shapes;
+    int supported_atomic_number = 0;
+    if (method == "d2" && damping == "zero") {
+        parameters = &symmetrix::dispersion::lookup_d2_parameters(functional).parameters;
+        supported_atomic_number = symmetrix::dispersion::d2_max_atomic_number;
+        table_shapes["r0"] = std::vector<int>{87, 87};
+        table_shapes["c6"] = std::vector<int>{87, 87};
+    } else if (method == "d3") {
+        parameters = &symmetrix::dispersion::lookup_d3_parameters(
+            damping, functional).parameters;
+        supported_atomic_number = symmetrix::dispersion::d3_max_atomic_number;
+        table_shapes["c6"] = std::vector<int>{95, 95, 5, 5, 3};
+        table_shapes["r0"] = std::vector<int>{95, 95};
+        table_shapes["rcov"] = std::vector<int>{95};
+        table_shapes["r2r4"] = std::vector<int>{95};
+    } else {
+        throw std::invalid_argument(
+            "unsupported dispersion parameter combination: method="+method
+            +", damping="+damping+", functional="+functional);
+    }
+
+    py::dict scalar_parameters;
+    scalar_parameters["s6"] = parameters->s6;
+    scalar_parameters["rs6"] = parameters->rs6;
+    scalar_parameters["s18"] = parameters->s18;
+    if (method == "d3")
+        scalar_parameters["rs18"] = parameters->rs18;
+    scalar_parameters["alp"] = parameters->alp;
+
+    py::dict source_hashes;
+    for (const auto& entry : symmetrix::dispersion::provenance::source_hashes)
+        source_hashes[py::str(std::string(entry.path))] =
+            py::str(std::string(entry.sha256));
+
+    py::dict generator;
+    generator["name"] =
+        std::string(symmetrix::dispersion::provenance::generator_name);
+    generator["schema"] =
+        std::string(symmetrix::dispersion::provenance::generator_schema);
+    generator["version"] =
+        std::string(symmetrix::dispersion::provenance::generator_version);
+
+    py::dict conversion_constants;
+    for (const auto& entry : symmetrix::dispersion::provenance::conversion_constants) {
+        py::dict constant;
+        constant["value"] = entry.value;
+        constant["units"] = std::string(entry.units);
+        conversion_constants[py::str(std::string(entry.name))] = std::move(constant);
+    }
+
+    py::dict kernel_constants;
+    kernel_constants["bohr_to_angstrom"] =
+        symmetrix::dispersion::bohr_to_angstrom;
+
+    py::dict result;
+    result["schema"] = std::string(symmetrix::dispersion::provenance::schema);
+    result["upstream_version"] =
+        std::string(symmetrix::dispersion::provenance::upstream_version);
+    result["upstream_tag"] =
+        std::string(symmetrix::dispersion::provenance::upstream_tag);
+    result["upstream_commit"] =
+        std::string(symmetrix::dispersion::provenance::upstream_commit);
+    result["license"] =
+        std::string(symmetrix::dispersion::provenance::license);
+    result["attribution"] =
+        std::string(symmetrix::dispersion::provenance::attribution);
+    result["source_hashes"] = std::move(source_hashes);
+    result["generator"] = std::move(generator);
+    result["conversion_constants"] = std::move(conversion_constants);
+    result["kernel_constants"] = std::move(kernel_constants);
+    result["supported_atomic_number"] = supported_atomic_number;
+    result["table_shapes"] = std::move(table_shapes);
+    result["parameters"] = std::move(scalar_parameters);
+    return result;
 }
 
 py::dict concurrent_host_blas_stress(
@@ -547,6 +631,11 @@ void bind_tools_kokkos(py::module_ &m)
         "_execution_device_execution_environment",
         &execution_device_environment_dict,
         "Return normalized host/CUDA/HIP execution metadata.");
+    m.def(
+        "_dispersion_parameter_summary",
+        &dispersion_parameter_summary,
+        py::arg("method"), py::arg("damping"), py::arg("functional"),
+        "Return private dispersion parameter metadata for qualification tests.");
     m.def(
         "_kokkos_device_sentinel", &kokkos_device_sentinel,
         "Launch and validate a sentinel kernel on the default execution space.");

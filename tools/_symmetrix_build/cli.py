@@ -6,6 +6,8 @@ import argparse
 import json
 import os
 import sys
+import warnings
+from dataclasses import replace
 from pathlib import Path
 
 from . import lammps_build as build_lammps
@@ -16,6 +18,12 @@ from .detect import (
     detect_target,
     validate_cpu_prerequisites,
     validate_source_checkout,
+)
+from .develop_build import (
+    development_build_invocation,
+    development_result,
+    run_development_build,
+    validate_development_runtime,
 )
 from .lammps_build import (
     lammps_build_invocation,
@@ -53,6 +61,20 @@ def _add_target_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--blas", choices=("auto", "openblas", "mkl", "mkl-sequential"))
     parser.add_argument("--mkl-root", type=Path)
     parser.add_argument(
+        "--particle-mesh",
+        choices=("auto", "on", "off"),
+        help=(
+            "Shared particle-mesh provider policy: auto discovers an "
+            "FFTW3/cuFFT/hipFFT provider through KokkosFFT, on requires one, "
+            "off disables particle-mesh algorithms."
+        ),
+    )
+    parser.add_argument(
+        "--fourier-d3",
+        choices=("auto", "on", "off"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--openblas-root",
         type=Path,
         help=(
@@ -66,6 +88,37 @@ def _add_target_arguments(parser: argparse.ArgumentParser) -> None:
         help="Static serial OpenBLAS prefix for a self-contained accelerator wheel.",
     )
     parser.add_argument("--target-manifest", type=Path)
+    parser.add_argument(
+        "--prebuilt-operator-artifacts",
+        choices=("off", "r0", "full"),
+        help="Package no, R0-only, or complete verified operator artifacts.",
+    )
+    parser.add_argument(
+        "--prebuilt-oam-artifacts",
+        choices=("off", "known"),
+        help="Package no OAM artifacts or the known architecture set.",
+    )
+
+
+def _particle_mesh_argument(args: argparse.Namespace, default: str) -> str:
+    particle_mesh = getattr(args, "particle_mesh", None)
+    legacy_fourier_d3 = getattr(args, "fourier_d3", None)
+    if (
+        particle_mesh is not None
+        and legacy_fourier_d3 is not None
+        and particle_mesh != legacy_fourier_d3
+    ):
+        raise BuildError(
+            "conflicting particle-mesh policies from --particle-mesh and "
+            "deprecated --fourier-d3"
+        )
+    if legacy_fourier_d3 is not None:
+        warnings.warn(
+            "--fourier-d3 is deprecated; use --particle-mesh",
+            FutureWarning,
+            stacklevel=2,
+        )
+    return particle_mesh or legacy_fourier_d3 or default
 
 
 def _base_request(
@@ -94,6 +147,7 @@ def _base_request(
                     if getattr(args, "accelerator_blas_root", None)
                     else ""
                 ),
+                particle_mesh=_particle_mesh_argument(args, "auto"),
             ),
             None,
         )
@@ -167,6 +221,7 @@ def _base_request(
                 else ""
             )
         ),
+        particle_mesh=_particle_mesh_argument(args, base.particle_mesh_policy),
     )
     if not same_backend:
         devices = None
@@ -187,7 +242,18 @@ def _resolve_manifest(
     args: argparse.Namespace, root: Path, runner: CommandRunner
 ) -> TargetManifest:
     request, devices = _base_request(args)
-    return detect_target(request, repo_root=root, runner=runner, devices=devices)
+    manifest = detect_target(request, repo_root=root, runner=runner, devices=devices)
+    mode = args.prebuilt_operator_artifacts
+    oam_mode = args.prebuilt_oam_artifacts
+    if mode is None and args.target_manifest is not None:
+        mode = TargetManifest.read(args.target_manifest).prebuilt_operator_artifacts
+    if oam_mode is None and args.target_manifest is not None:
+        oam_mode = TargetManifest.read(args.target_manifest).prebuilt_oam_artifacts
+    return replace(
+        manifest,
+        prebuilt_operator_artifacts=mode or "r0",
+        prebuilt_oam_artifacts=oam_mode or "off",
+    )
 
 
 def _preflight(manifest: TargetManifest, root: Path, runner: CommandRunner) -> None:
@@ -231,6 +297,9 @@ def _human_manifest(manifest: TargetManifest) -> str:
         lines.append(f"BLAS policy: {manifest.blas_policy}")
         if manifest.blas_root:
             lines.append(f"Host BLAS root: {manifest.blas_root}")
+    lines.append(f"Particle-mesh policy: {manifest.particle_mesh_policy}")
+    lines.append(f"Prebuilt operator artifacts: {manifest.prebuilt_operator_artifacts}")
+    lines.append(f"Prebuilt OAM artifacts: {manifest.prebuilt_oam_artifacts}")
     return "\n".join(lines)
 
 
@@ -351,6 +420,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_python_build_arguments(install)
 
+    develop = commands.add_parser(
+        "develop",
+        help="Incrementally rebuild and replace only an installed native runtime.",
+    )
+    _add_python_build_arguments(develop)
+
     wheel = commands.add_parser("wheel", help="Build one backend-specific wheel.")
     _add_python_build_arguments(wheel)
     wheel.add_argument("--wheel-dir", type=Path, required=True)
@@ -375,6 +450,14 @@ def _parser() -> argparse.ArgumentParser:
     matrix.add_argument("--rocm-root", type=Path)
     matrix.add_argument("--accelerator-blas-root", type=Path)
     matrix.add_argument("--openblas-root", type=Path)
+    matrix.add_argument(
+        "--prebuilt-operator-artifacts",
+        choices=("off", "r0", "full"),
+    )
+    matrix.add_argument(
+        "--prebuilt-oam-artifacts",
+        choices=("off", "known"),
+    )
     matrix.add_argument(
         "--jobs",
         type=int,
@@ -439,6 +522,8 @@ def main(argv: list[str] | None = None) -> int:
                 cuda_root=args.cuda_root,
                 rocm_root=args.rocm_root,
                 accelerator_blas_root=args.accelerator_blas_root,
+                prebuilt_operator_artifacts=args.prebuilt_operator_artifacts,
+                prebuilt_oam_artifacts=args.prebuilt_oam_artifacts,
                 openblas_root=args.openblas_root,
                 jobs=args.jobs,
                 dry_run=args.dry_run,
@@ -462,6 +547,37 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not args.json:
                 print()
+            return 0
+
+        if args.command == "develop":
+            jobs = (
+                args.jobs
+                if args.jobs is not None
+                else _default_python_build_jobs(manifest.backend)
+            )
+            invocation = development_build_invocation(
+                manifest,
+                repo_root=root,
+                runner=runner,
+                build_root=args.build_root,
+                jobs=jobs,
+            )
+            if args.dry_run:
+                result = development_result(invocation, validation=None)
+                result["commands"] = [list(command) for command in invocation.commands]
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return 0
+            run_development_build(invocation, runner)
+            build_toolchain = verify_python_cmake_provenance(
+                invocation, manifest, runner
+            )
+            validation = validate_development_runtime(invocation, runner)
+            result = development_result(invocation, validation)
+            result["build_toolchain"] = build_toolchain
+            (invocation.build_directory / "develop-qualification.json").write_text(
+                json.dumps(result, indent=2, sort_keys=True) + "\n"
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
             return 0
 
         if args.command in {"install", "wheel"}:

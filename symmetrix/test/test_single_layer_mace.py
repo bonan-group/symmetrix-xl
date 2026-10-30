@@ -7,10 +7,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import symmetrix.calculator as calculator_module
+import symmetrix.neighbor_graph as neighbor_graph_module
 import torch
 from ase import Atoms
-
 from symmetrix import Symmetrix
 
 MACE_SOURCE = Path(os.environ.get("SYMMETRIX_SINGLE_LAYER_MACE_SOURCE", ""))
@@ -77,7 +76,9 @@ def test_single_v2_l1_layout_is_extracted(single_v2_artifacts):
     assert data["num_interactions"] == 1
     assert data["single_layer_readout"] is True
     assert data["readout_correlation"] == 2
-    assert set(data["execution_contracts"]) == {"M0", "R0"}
+    assert set(data["execution_contracts"]) == {"M0", "M1", "R0"}
+    assert data["execution_contracts"]["M1"]["interaction"] == "M1"
+    assert data["execution_contracts"]["M1"]["output_components"] == 1
     assert set(data["compact_radial"]["networks"]) == {"A0", "R0"}
 
 
@@ -177,7 +178,7 @@ print("SYMMETRIX_MACE_REFERENCE=" + json.dumps(result))
 
     symmetrix_atoms = atoms.copy()
     symmetrix_atoms.calc = Symmetrix(
-        model_json, use_kokkos=True, dtype="float64", streamed_edges="direct"
+        model_json, dtype="float64", streamed_edges="direct"
     )
     assert symmetrix_atoms.get_potential_energy() == pytest.approx(
         reference["energy"], rel=0.0, abs=3.0e-6
@@ -215,7 +216,6 @@ def test_single_v2_native_periodic_graph_avoids_host_connectivity(
     )
     calculator = Symmetrix(
         model_json,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         execution_profile="speed" if plan == "mh0-direct-speed" else "capacity",
@@ -225,7 +225,7 @@ def test_single_v2_native_periodic_graph_avoids_host_connectivity(
     calculator.evaluator._set_single_layer_workspace_receiver_limit_for_testing(4)
     monkeypatch.setenv("SYMMETRIX_NEIGHBOR_BACKEND", "kokkos")
     monkeypatch.setattr(
-        calculator_module,
+        neighbor_graph_module,
         "neighbor_list",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("single-v2 must use native Kokkos connectivity")
@@ -286,7 +286,6 @@ def _single_v2_plan_results(
 ):
     calculator = Symmetrix(
         model_json,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="direct",
         execution_profile="speed" if plan == "mh0-direct-speed" else "capacity",
@@ -332,7 +331,7 @@ def test_single_v2_fixed_workspace_matches_y_only_at_tile_boundaries(
     assert selected_plan == "mh0-single-layer-tiled-v1"
     assert evaluator.single_layer_workspace_active_receivers == capacity
     assert evaluator.single_layer_workspace_planned_receivers == capacity
-    assert evaluator.single_layer_workspace_bytes_per_receiver == 13_836
+    assert evaluator.single_layer_workspace_bytes_per_receiver == 22_028
     assert evaluator.single_layer_workspace_bytes_per_edge == 112
     assert evaluator.single_layer_workspace_active_edges <= len(
         calculator._neighbor_cache.receivers
@@ -342,7 +341,7 @@ def test_single_v2_fixed_workspace_matches_y_only_at_tile_boundaries(
         == evaluator.single_layer_workspace_active_edges
     )
     assert evaluator.single_layer_workspace_bytes == (
-        13_836 * capacity + 112 * evaluator.single_layer_workspace_planned_edges
+        22_028 * capacity + 112 * evaluator.single_layer_workspace_planned_edges
     )
     assert evaluator.compact_edge_geometry_bytes == (
         20 * evaluator.single_layer_workspace_planned_edges
@@ -387,7 +386,6 @@ def test_single_v2_fixed_workspace_reuses_and_grows_only_during_prepare(
     receiver_limit = 8
     calculator = Symmetrix(
         model_json,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         execution_profile="capacity",
@@ -416,7 +414,7 @@ def test_single_v2_fixed_workspace_reuses_and_grows_only_during_prepare(
         )
         assert evaluator.single_layer_workspace_planned_receivers == planned
         assert evaluator.single_layer_workspace_bytes == (
-            13_836 * planned + 112 * evaluator.single_layer_workspace_planned_edges
+            22_028 * planned + 112 * evaluator.single_layer_workspace_planned_edges
         )
         assert evaluator.single_layer_workspace_replacement_count == replacements
         assert evaluator.single_layer_workspace_reuse_count == reuses
@@ -425,8 +423,12 @@ def test_single_v2_fixed_workspace_reuses_and_grows_only_during_prepare(
         assert np.all(np.isfinite(calculator.results["forces"]))
 
 
+@pytest.mark.parametrize(
+    ("dtype", "receiver_bytes", "edge_bytes"),
+    (("float32", 22_028, 112), ("float64", 43_020, 188)),
+)
 def test_single_v2_capacity_fixed_workspace_requires_opt_in_at_memory_boundary(
-    single_v2_artifacts,
+    single_v2_artifacts, dtype, receiver_bytes, edge_bytes
 ):
     _require_cuda_backend()
     _, _, model_json = single_v2_artifacts
@@ -435,8 +437,7 @@ def test_single_v2_capacity_fixed_workspace_requires_opt_in_at_memory_boundary(
 
     probe = Symmetrix(
         model_json,
-        use_kokkos=True,
-        dtype="float32",
+        dtype=dtype,
         streamed_edges="direct",
         execution_profile="capacity",
         neighbor_skin=0.5,
@@ -458,15 +459,14 @@ def test_single_v2_capacity_fixed_workspace_requires_opt_in_at_memory_boundary(
     assert tiled_estimate == (
         16 * edge_count
         + 96 * len(atoms)
-        + 13_836 * len(atoms)
-        + 112 * edge_count
+        + receiver_bytes * len(atoms)
+        + edge_bytes * edge_count
         + 9 * np.dtype(np.float64).itemsize
     )
 
     default_calculator = Symmetrix(
         model_json,
-        use_kokkos=True,
-        dtype="float32",
+        dtype=dtype,
         streamed_edges="direct",
         execution_profile="capacity",
         neighbor_skin=0.5,
@@ -497,8 +497,7 @@ def test_single_v2_capacity_fixed_workspace_requires_opt_in_at_memory_boundary(
 
     calculator = Symmetrix(
         model_json,
-        use_kokkos=True,
-        dtype="float32",
+        dtype=dtype,
         streamed_edges="direct",
         execution_profile="capacity",
         allow_fixed_workspace=True,
@@ -529,6 +528,26 @@ def test_single_v2_capacity_fixed_workspace_requires_opt_in_at_memory_boundary(
     assert evaluator.execution_geometry_workspace_bytes == geometry_bytes_before + 4
     assert evaluator.single_layer_tiled_evaluation_count == 1
     assert evaluator.factorized_fallback_evaluation_count == 0
+
+    for available_bytes, boundary_attempt in (
+        (tiled_estimate, False),
+        (tiled_estimate - 1, True),
+    ):
+        boundary = Symmetrix(
+            model_json,
+            dtype=dtype,
+            streamed_edges="direct",
+            execution_profile="capacity",
+            allow_fixed_workspace=True,
+            neighbor_skin=0.5,
+        )
+        boundary_inputs = boundary._mace_inputs(atoms)
+        boundary.evaluator._set_low_memory_device_memory_info_for_testing(
+            reserve + available_bytes, device_bytes
+        )
+        boundary.evaluator._prepare_factorized_graph(*boundary_inputs[:5])
+        assert boundary.execution_plan["selected_id"] == ("mh0-single-layer-tiled-v1")
+        assert boundary.execution_plan["boundary_attempt"] is boundary_attempt
     with pytest.raises(ValueError, match="current graph and geometry tokens"):
         evaluator._compute_prepared_factorized_positions(
             token, np.asarray(atoms.positions).reshape(-1)
@@ -546,7 +565,6 @@ def test_single_v2_fixed_workspace_explicit_geometry_matches_positions(
     )
     calculator = Symmetrix(
         model_json,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         execution_profile="capacity",
@@ -684,7 +702,9 @@ def test_single_layer_extraction_has_no_r1_contract(single_layer_artifacts):
     assert data["num_interactions"] == 1
     assert data["single_layer_readout"] is True
     assert data["readout_correlation"] == 2
-    assert set(data["execution_contracts"]) == {"M0", "R0"}
+    assert set(data["execution_contracts"]) == {"M0", "M1", "R0"}
+    assert data["execution_contracts"]["M1"]["interaction"] == "M1"
+    assert data["execution_contracts"]["M1"]["output_components"] == 1
     assert set(data["compact_radial"]["networks"]) == {"A0", "R0"}
     assert data["Phi1_l"] == []
     assert data["A1_scaled"] is False
@@ -728,12 +748,10 @@ def test_prepared_direct_matches_cpu_without_r1_plugin(single_layer_artifacts):
 
     reference_atoms = atoms.copy()
     reference_atoms.calc = Symmetrix(
-        model_json, use_kokkos=False, dtype="float64", streamed_edges="generic"
+        model_json, dtype="float64", streamed_edges="generic"
     )
     direct_atoms = atoms.copy()
-    direct_atoms.calc = Symmetrix(
-        model_json, use_kokkos=True, dtype="float64", streamed_edges="direct"
-    )
+    direct_atoms.calc = Symmetrix(model_json, dtype="float64", streamed_edges="direct")
 
     assert direct_atoms.get_potential_energy() == pytest.approx(
         reference_atoms.get_potential_energy(), abs=1.0e-11
@@ -765,7 +783,6 @@ def test_low_memory_fp32_matches_float64(single_layer_artifacts):
     )
     reference = Symmetrix(
         model_json,
-        use_kokkos=False,
         dtype="float64",
         streamed_edges="generic",
     )
@@ -773,7 +790,6 @@ def test_low_memory_fp32_matches_float64(single_layer_artifacts):
 
     calculator = Symmetrix(
         model_json,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         low_memory=True,
@@ -800,6 +816,13 @@ def test_low_memory_fp32_matches_float64(single_layer_artifacts):
     stress = atoms.get_stress()
     graphs_after_first = calculator.evaluator.factorized_prepared_graph_count
     evaluations_after_first = calculator.evaluator.factorized_prepared_evaluation_count
+    adjoint_addresses_after_first = calculator.evaluator._test_mh0_adjoint_addresses()
+    adjoint_allocations_after_first = (
+        calculator.evaluator.mh0_m0_adjoint_allocation_count,
+        calculator.evaluator.mh0_a0_adjoint_allocation_count,
+        calculator.evaluator.mh0_a1_adjoint_allocation_count,
+    )
+    assert adjoint_addresses_after_first[2] != adjoint_addresses_after_first[3]
     if backend in ("OpenMP", "Serial"):
         assert calculator.evaluator.factorized_arena_workspace_bytes == 0
         assert calculator.evaluator.h1_m0_adjoint_ping_pong_active
@@ -857,6 +880,15 @@ def test_low_memory_fp32_matches_float64(single_layer_artifacts):
         calculator.evaluator.factorized_prepared_evaluation_count
         == evaluations_after_first + 1
     )
+    assert (
+        calculator.evaluator._test_mh0_adjoint_addresses()
+        == adjoint_addresses_after_first
+    )
+    assert (
+        calculator.evaluator.mh0_m0_adjoint_allocation_count,
+        calculator.evaluator.mh0_a0_adjoint_allocation_count,
+        calculator.evaluator.mh0_a1_adjoint_allocation_count,
+    ) == adjoint_allocations_after_first
     if backend in ("OpenMP", "Serial"):
         assert calculator.evaluator.factorized_arena_workspace_bytes == 0
         assert calculator.evaluator.h1_m0_adjoint_ping_pong_active

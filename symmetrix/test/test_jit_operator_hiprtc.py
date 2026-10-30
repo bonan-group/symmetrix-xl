@@ -5,12 +5,12 @@ import os
 from pathlib import Path
 
 import pytest
-
-from symmetrix.jit_operator_codegen import (
+from symmetrix.mace_execution_contract import make_generated_m1_contract
+from symmetrix.mace_jit_operator_codegen import (
     render_jit_m0_device_module,
+    render_jit_m1_device_module,
     render_jit_r0_device_module,
 )
-
 
 CONTRACTS = Path(__file__).resolve().parent / "data" / "execution_contracts"
 
@@ -120,7 +120,7 @@ def _contract(name):
 
 @pytest.mark.device_compile
 @pytest.mark.jit
-@pytest.mark.parametrize("schedule", ("chunk32", "table"))
+@pytest.mark.parametrize("schedule", ("chunk32", "table", "tiled128x4-v1"))
 @pytest.mark.parametrize("precision", ("float32", "float64"))
 def test_m0_operator_module_compiles_with_hiprtc(schedule, precision):
     source, _ = render_jit_m0_device_module(
@@ -135,12 +135,36 @@ def test_m0_operator_module_compiles_with_hiprtc(schedule, precision):
 
 @pytest.mark.device_compile
 @pytest.mark.jit
+@pytest.mark.parametrize("schedule", ("chunk32", "table", "tiled128x4-v1"))
 @pytest.mark.parametrize("precision", ("float32", "float64"))
-def test_r0_operator_module_compiles_with_hiprtc(precision):
+def test_m1_operator_module_compiles_with_hiprtc(schedule, precision):
+    contract = make_generated_m1_contract(
+        channels=7,
+        type_count=2,
+        input_l_max=1,
+        correlation=3,
+        monomials=[[0], [1, 1], [0, 2, 3]],
+    )
+    source, _ = render_jit_m1_device_module(
+        contract,
+        precision=precision,
+        target="gfx1100",
+        schedule=schedule,
+    )
+
+    assert _hiprtc_compiler().compile(source, target="gfx1100") > 0
+
+
+@pytest.mark.device_compile
+@pytest.mark.jit
+@pytest.mark.parametrize("precision", ("float32", "float64"))
+@pytest.mark.parametrize("schedule", ("receiver-edge16", "receiver-edge32"))
+def test_r0_operator_module_compiles_with_hiprtc(precision, schedule):
     source, _ = render_jit_r0_device_module(
         _contract("standard_r0_contract.json"),
         precision=precision,
         target="gfx1100",
+        schedule=schedule,
     )
 
     assert _hiprtc_compiler().compile(source, target="gfx1100") > 0

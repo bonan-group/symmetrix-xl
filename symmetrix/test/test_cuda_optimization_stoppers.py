@@ -45,7 +45,7 @@ def test_gpu_global_field_reverse_remains_bounded_and_wave32_reduced():
             ),
         )
     ]
-    assert "mace_uses_prepared_execution(streamed_edges)" in predicate
+    assert "uses_prepared_execution(streamed_edges)" in predicate
     assert "!factorized_observer_enabled" in predicate
     assert "!execution_parameter_gradients_enabled" in predicate
 

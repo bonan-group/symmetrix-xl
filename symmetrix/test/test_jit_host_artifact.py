@@ -3,7 +3,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from symmetrix import jit_host_artifact as host_artifact
+from symmetrix import jit as jit_runtime
+from symmetrix import mace_jit_host_artifact as host_artifact
 from symmetrix.cli import prepare_jit_host_artifact as artifact_cli
 
 
@@ -22,6 +23,18 @@ class _Evaluator:
         self.jit_host_plugin_artifact_id = "artifact-a"
 
 
+@pytest.fixture(autouse=True)
+def _accept_lightweight_prepared_results(monkeypatch):
+    validate_entry = jit_runtime._validated_entry
+
+    def validate_real_entries(entry, cache_key, inputs):
+        if cache_key.startswith("cache-"):
+            return None
+        return validate_entry(entry, cache_key, inputs)
+
+    monkeypatch.setattr(jit_runtime, "_validated_entry", validate_real_entries)
+
+
 def _model(tmp_path, model_type="MACE"):
     path = tmp_path / "model.json"
     path.write_text(
@@ -36,7 +49,16 @@ def _model(tmp_path, model_type="MACE"):
     return path
 
 
-def test_prepare_host_artifact_without_ase_calculator(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("model_type", "class_name"),
+    [
+        ("MACE", "MACEKokkosFloat"),
+        ("MACELES", "MACELESKokkosFloat"),
+    ],
+)
+def test_prepare_host_artifact_without_ase_calculator(
+    monkeypatch, tmp_path, model_type, class_name
+):
     evaluator = _Evaluator()
     initialized = []
     artifact = tmp_path / "plugin.so"
@@ -57,9 +79,7 @@ def test_prepare_host_artifact_without_ase_calculator(monkeypatch, tmp_path):
         "_required_jit_generation_version",
         lambda: host_artifact.JIT_GENERATION_VERSION,
     )
-    monkeypatch.setattr(
-        host_artifact.symmetrix, "MACEKokkosFloat", lambda path: evaluator
-    )
+    monkeypatch.setattr(host_artifact.symmetrix, class_name, lambda path: evaluator)
     monkeypatch.setattr(
         host_artifact,
         "jit_r1_host_plugin_metadata",
@@ -67,6 +87,9 @@ def test_prepare_host_artifact_without_ase_calculator(monkeypatch, tmp_path):
             "abi": "abi-a",
             "abi_version": 2,
             "artifact_id": "artifact-a",
+            "contract_fingerprint": "sha256:" + "1" * 64,
+            "semantic_fingerprint": "sha256:" + "2" * 64,
+            "structure_fingerprint": "sha256:" + "3" * 64,
         },
     )
     monkeypatch.setattr(
@@ -83,6 +106,7 @@ def test_prepare_host_artifact_without_ase_calculator(monkeypatch, tmp_path):
             cache_key="cache-a",
             artifact_path=artifact,
             manifest_path=manifest,
+            manifest={"key_inputs": {"fixture": "host"}},
             diagnostics=("compiled",),
             reason=None,
         )
@@ -90,7 +114,7 @@ def test_prepare_host_artifact_without_ase_calculator(monkeypatch, tmp_path):
     monkeypatch.setattr(host_artifact, "prepare_jit_artifact", prepare)
 
     result = host_artifact.prepare_jit_host_artifact(
-        _model(tmp_path),
+        _model(tmp_path, model_type),
         precision="float32",
         cache_root=tmp_path / "cache",
         host_target="portable",
@@ -103,6 +127,7 @@ def test_prepare_host_artifact_without_ase_calculator(monkeypatch, tmp_path):
     assert prepare_calls[0][1]["host_target"] == "portable"
     assert result.artifact_path == artifact
     assert result.artifact_id == "artifact-a"
+    assert result.model_type == model_type
     assert result.as_dict()["backend"] == "host"
     assert result.as_dict()["environment"]["execution_space"] == "OpenMP"
 

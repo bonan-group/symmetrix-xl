@@ -6,7 +6,7 @@ import sys
 from argparse import ArgumentParser
 
 from .. import symmetrix as native_symmetrix
-from ..jit_host_artifact import JitHostArtifactError, prepare_jit_host_artifact
+from ..mace_jit_host_artifact import JitHostArtifactError, prepare_jit_host_artifact
 
 
 def _finalize_owned_kokkos(initialized_before):

@@ -12,6 +12,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "Kokkos_Sort.hpp"
+
 #ifdef KOKKOS_ENABLE_CUDA
 #include <cuda_runtime_api.h>
 #elif defined(KOKKOS_ENABLE_HIP)
@@ -20,12 +22,38 @@
 
 #include "affine_mlp.hpp"
 #include "device_backend.hpp"
+#include "jit_manifest_identity.hpp"
+#include "mace_device_backend.hpp"
+#include "neighbor_graph_kokkos.hpp"
 #include "sphericart.hpp"
 #include "sphericart_cuda.hpp"
 #include "spherical_harmonic_device.hpp"
 #include "tools_kokkos.hpp"
 
+namespace symmetrix::detail {
+struct MH1ExecutionSourceScheduleEntry {
+    int block;
+    int source;
+    int edge;
+};
+
+struct MH1ExecutionSourceScheduleEntryLess {
+    KOKKOS_FUNCTION
+    bool operator()(
+        const MH1ExecutionSourceScheduleEntry left,
+        const MH1ExecutionSourceScheduleEntry right) const
+    {
+        if(left.block!=right.block)return left.block<right.block;
+        if(left.source!=right.source)return left.source<right.source;
+        return left.edge<right.edge;
+    }
+};
+}
+
 namespace {
+using symmetrix::detail::MH1ExecutionSourceScheduleEntry;
+using symmetrix::detail::MH1ExecutionSourceScheduleEntryLess;
+
 class ScopedKokkosProfileRegion {
 public:
     explicit ScopedKokkosProfileRegion(const char* name)
@@ -46,7 +74,10 @@ template<typename Value>
 std::vector<Value> tensor_values(const nlohmann::json& value){return value.at("values").get<std::vector<Value>>();}
 nlohmann::json load_model_json(const std::string& filename){std::ifstream stream(filename);if(!stream)throw std::runtime_error("Could not open MACE_Nonlinear Kokkos model file: "+filename);return nlohmann::json::parse(stream);}
 const nlohmann::json& checked_interaction(const nlohmann::json& data){if(data.at("class").get<std::string>()!="RealAgnosticResidualNonLinearInteractionBlock")throw std::invalid_argument("MACE_Nonlinear Kokkos interaction class is unsupported.");return data;}
-const nlohmann::json& readout_component(const nlohmann::json& data,int component){const auto readout_class=data.at("class").get<std::string>();if(readout_class=="LinearReadoutBlock")return data.at("linear");if(readout_class=="NonLinearReadoutBlock")return data.at(component==2?"linear_2":"linear_1");throw std::invalid_argument("MACE_Nonlinear Kokkos readout class is unsupported: "+readout_class);}
+const nlohmann::json& readout_component(const nlohmann::json& data,int component){const auto readout_class=data.at("class").get<std::string>();if(readout_class=="LinearReadoutBlock")return data.at("linear");if(readout_class=="NonLinearReadoutBlock"||readout_class=="NonLinearBiasReadoutBlock")return data.at(component==2?"linear_2":"linear_1");throw std::invalid_argument("MACE_Nonlinear Kokkos readout class is unsupported: "+readout_class);}
+// The bias readout's middle linear: a second hidden layer with its own
+// activation between linear_1 and linear_2.
+const nlohmann::json& readout_mid_component(const nlohmann::json& data){if(data.at("class").get<std::string>()!="NonLinearBiasReadoutBlock")throw std::invalid_argument("MACE_Nonlinear Kokkos readout has no middle linear.");return data.at("linear_mid");}
 
 template<class View>
 void ensure_view(View& view,View& storage,std::size_t extent)
@@ -66,32 +97,30 @@ void ensure_view(View& view,View& storage,int first,int second)
     view=Kokkos::subview(storage,std::make_pair(0,first),Kokkos::ALL);
 }
 
-inline SymmetrixJitMH1CudaNodeForwardArgsV4 device_node_forward_args(
+inline SymmetrixJitMH1CudaNodeForwardArgsV5 device_node_forward_args(
     const SymmetrixJitMH1HostNodeForwardArgsV4& host,
     float* retained_pre_gate,float* retained_interaction_output)
 {
-    static_assert(sizeof(host)==offsetof(
-        SymmetrixJitMH1CudaNodeForwardArgsV4,retained_pre_gate));
-    SymmetrixJitMH1CudaNodeForwardArgsV4 result{};
-    std::memcpy(&result,&host,sizeof(host));
-    result.struct_size=sizeof(result);
-    result.retained_pre_gate=retained_pre_gate;
-    result.retained_interaction_output=retained_interaction_output;
-    return result;
+    return {sizeof(SymmetrixJitMH1CudaNodeForwardArgsV5),host.interaction,
+        host.phase,host.flags,host.num_nodes,host.element_indices,
+        host.node_density,host.linear_parameters,host.readout_parameters,
+        host.layer_input,host.up,host.messages,nullptr,host.up_output,
+        host.layer_output,host.readout_contribution,host.node_arena,
+        retained_pre_gate,retained_interaction_output};
 }
 
-inline SymmetrixJitMH1CudaNodeReverseArgsV4 device_node_reverse_args(
+inline SymmetrixJitMH1CudaNodeReverseArgsV5 device_node_reverse_args(
     const SymmetrixJitMH1HostNodeReverseArgsV4& host,
     const float* retained_pre_gate,const float* retained_interaction_output)
 {
-    static_assert(sizeof(host)==offsetof(
-        SymmetrixJitMH1CudaNodeReverseArgsV4,retained_pre_gate));
-    SymmetrixJitMH1CudaNodeReverseArgsV4 result{};
-    std::memcpy(&result,&host,sizeof(host));
-    result.struct_size=sizeof(result);
-    result.retained_pre_gate=retained_pre_gate;
-    result.retained_interaction_output=retained_interaction_output;
-    return result;
+    return {sizeof(SymmetrixJitMH1CudaNodeReverseArgsV5),host.interaction,
+        host.phase,host.flags,static_cast<double>(host.energy_scale),
+        host.num_nodes,host.element_indices,host.node_density,
+        host.linear_parameters,host.readout_parameters,host.layer_input,
+        host.up,host.messages,nullptr,host.layer_output,host.node_arena,
+        host.layer_output_adjoint,nullptr,host.message_adjoint,host.up_adjoint,
+        host.layer_input_adjoint,host.node_density_adjoint,retained_pre_gate,
+        retained_interaction_output};
 }
 
 template<typename Value>
@@ -104,7 +133,7 @@ inline Value* offset_rows(Value* pointer,const int first,const int width,
         +static_cast<std::size_t>(first)*width*scalar_size);
 }
 
-inline SymmetrixJitMH1CudaNodeForwardArgsV4 device_node_forward_tile_args(
+inline SymmetrixJitMH1CudaNodeForwardArgsV5 device_node_forward_tile_args(
     const SymmetrixJitMH1HostNodeForwardArgsV4& host,const int first,
     const int rows,const int input_width,const int up_width,
     const int message_width,const int output_width,
@@ -138,7 +167,7 @@ inline SymmetrixJitMH1CudaNodeForwardArgsV4 device_node_forward_tile_args(
     return result;
 }
 
-inline SymmetrixJitMH1CudaNodeReverseArgsV4 device_node_reverse_tile_args(
+inline SymmetrixJitMH1CudaNodeReverseArgsV5 device_node_reverse_tile_args(
     const SymmetrixJitMH1HostNodeReverseArgsV4& host,const int first,
     const int rows,const int input_width,const int up_width,
     const int message_width,const int output_width,
@@ -227,7 +256,7 @@ int execution_mh1_spline_reverse_persistent_blocks()
 }
 
 template<typename Precision>
-struct MaceNonlinearKokkosT<Precision>::SphericalHarmonicsState {
+struct MaceBackboneKokkosT<Precision>::SphericalHarmonicsState {
 #ifdef SYMMETRIX_SPHERICART_CUDA
     explicit SphericalHarmonicsState(int l_max) : calculator(l_max) {}
     ~SphericalHarmonicsState() noexcept
@@ -248,14 +277,14 @@ struct MaceNonlinearKokkosT<Precision>::SphericalHarmonicsState {
 #if SYMMETRIX_MACE_NONLINEAR_KOKKOS_PART == 1
 
 template<typename Precision>
-MaceNonlinearKokkosT<Precision>::~MaceNonlinearKokkosT()
+MaceBackboneKokkosT<Precision>::~MaceBackboneKokkosT()
 {
-    Kokkos::fence("MaceNonlinearKokkosT teardown");
+    Kokkos::fence("MaceBackboneKokkosT teardown");
     spherical_harmonics_state.reset();
 }
 
 template<typename Precision>
-MaceNonlinearKokkosT<Precision>::Gate::Gate(const nlohmann::json& data)
+MaceBackboneKokkosT<Precision>::Gate::Gate(const nlohmann::json& data)
 {
     if(data.at("scalar_activation").get<std::string>()!="silu"||data.at("gate_activation").get<std::string>()!="sigmoid")throw std::invalid_argument("MACE_Nonlinear Kokkos gate has unsupported activations.");
     Irreps input(data.at("irreps_in").get<std::string>()),scalars(data.at("irreps_scalars").get<std::string>()),gates(data.at("irreps_gates").get<std::string>()),gated(data.at("irreps_gated").get<std::string>()),output(data.at("irreps_out").get<std::string>());
@@ -332,7 +361,7 @@ MaceNonlinearKokkosT<Precision>::Gate::Gate(const nlohmann::json& data)
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::Gate::supports_fused_normalized_reverse() const
+bool MaceBackboneKokkosT<Precision>::Gate::supports_fused_normalized_reverse() const
 {
     return input_size>0&&input_size==scalar_size+gate_size+gated_size
         &&output_size==scalar_size+gated_size
@@ -346,7 +375,7 @@ bool MaceNonlinearKokkosT<Precision>::Gate::supports_fused_normalized_reverse() 
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Gate::evaluate(Kokkos::View<const Precision**,Kokkos::LayoutRight> input,Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
+void MaceBackboneKokkosT<Precision>::Gate::evaluate(Kokkos::View<const Precision**,Kokkos::LayoutRight> input,Kokkos::View<Precision**,Kokkos::LayoutRight> output) const
 {
     for(int block_index=0;block_index<static_cast<int>(scalar_blocks.size());++block_index){const auto block=scalar_blocks[block_index];const Precision constant=scalar_constants[block_index];Kokkos::parallel_for("nonlinear gate scalars",Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{static_cast<int>(input.extent(0)),block.dimension()}),KOKKOS_LAMBDA(int sample,int index){const int offset=block.offset+index;const Precision x=input(sample,offset);output(sample,offset)=constant*x/(Precision(1)+Kokkos::exp(-x));});}
     int gate_offset=scalar_size,gated_offset=scalar_size+gate_size,output_offset=scalar_size;
@@ -356,7 +385,7 @@ void MaceNonlinearKokkosT<Precision>::Gate::evaluate(Kokkos::View<const Precisio
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Gate::evaluate_normalized_to_packed(
+void MaceBackboneKokkosT<Precision>::Gate::evaluate_normalized_to_packed(
     Kokkos::View<const Precision**,Kokkos::LayoutRight> linear_forward,
     Kokkos::View<const Precision**,Kokkos::LayoutRight> residual,
     Kokkos::View<const int*> residual_active,
@@ -507,7 +536,7 @@ void MaceNonlinearKokkosT<Precision>::Gate::evaluate_normalized_to_packed(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Gate::reverse(Kokkos::View<const Precision**,Kokkos::LayoutRight> input,Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,Kokkos::View<Precision**,Kokkos::LayoutRight> input_adjoint) const
+void MaceBackboneKokkosT<Precision>::Gate::reverse(Kokkos::View<const Precision**,Kokkos::LayoutRight> input,Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,Kokkos::View<Precision**,Kokkos::LayoutRight> input_adjoint) const
 {
     ordered_kokkos_deep_copy(input_adjoint,Precision(0));for(int block_index=0;block_index<static_cast<int>(scalar_blocks.size());++block_index){const auto block=scalar_blocks[block_index];const Precision constant=scalar_constants[block_index];Kokkos::parallel_for("reverse gate scalars",Kokkos::MDRangePolicy<Kokkos::Rank<2>>({0,0},{static_cast<int>(input.extent(0)),block.dimension()}),KOKKOS_LAMBDA(int sample,int index){const int offset=block.offset+index;const Precision x=input(sample,offset),probability=Precision(1)/(Precision(1)+Kokkos::exp(-x));input_adjoint(sample,offset)=output_adjoint(sample,offset)*constant*(probability+x*probability*(Precision(1)-probability));});}
     int gate_offset=scalar_size,gated_offset=scalar_size+gate_size,output_offset=scalar_size;
@@ -517,7 +546,7 @@ void MaceNonlinearKokkosT<Precision>::Gate::reverse(Kokkos::View<const Precision
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Gate::reverse_normalized(
+void MaceBackboneKokkosT<Precision>::Gate::reverse_normalized(
     Kokkos::View<const Precision**,Kokkos::LayoutRight> input,
     Kokkos::View<const Precision**,Kokkos::LayoutRight> output_adjoint,
     Kokkos::View<const Precision**,Kokkos::LayoutRight> linear_forward,
@@ -611,7 +640,7 @@ void MaceNonlinearKokkosT<Precision>::Gate::reverse_normalized(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Gate::reverse_normalized_packed(
+void MaceBackboneKokkosT<Precision>::Gate::reverse_normalized_packed(
     Kokkos::View<const Precision**,Kokkos::LayoutRight> input,
     Kokkos::View<const Precision**,Kokkos::LayoutRight> packed_output_adjoint,
     Kokkos::View<const Precision**,Kokkos::LayoutRight> packed_linear_forward,
@@ -775,11 +804,11 @@ void MaceNonlinearKokkosT<Precision>::Gate::reverse_normalized_packed(
 }
 
 template<typename Precision>
-MaceNonlinearKokkosT<Precision>::Interaction::Interaction(const nlohmann::json& data)
+MaceBackboneKokkosT<Precision>::Interaction::Interaction(const nlohmann::json& data)
     :source_embedding(checked_interaction(data).at("source_embedding")),target_embedding(data.at("target_embedding")),linear_up(data.at("linear_up")),skip(data.at("skip_tp")),linear_res(data.at("linear_res")),linear_1(data.at("linear_1")),linear_2(data.at("linear_2")),convolution(data.at("conv_tp")),convolution_weights(data.at("conv_tp_weights")),density(data.at("density_fn")),gate(data.at("gate")),alpha(data.at("alpha").get<Precision>()),beta(data.at("beta").get<Precision>()){}
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Interaction::set_e3_linear_backend(
+void MaceBackboneKokkosT<Precision>::Interaction::set_e3_linear_backend(
     const std::string& backend)
 {
     source_embedding.set_backend(backend);
@@ -792,7 +821,7 @@ void MaceNonlinearKokkosT<Precision>::Interaction::set_e3_linear_backend(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Interaction::set_e3_linear_workspace(
+void MaceBackboneKokkosT<Precision>::Interaction::set_e3_linear_workspace(
     const std::shared_ptr<typename E3LinearKokkosT<Precision>::Workspace>& workspace)
 {
     source_embedding.set_workspace(workspace);
@@ -805,7 +834,7 @@ void MaceNonlinearKokkosT<Precision>::Interaction::set_e3_linear_workspace(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Interaction::set_conditioned_mlp_workspace(
+void MaceBackboneKokkosT<Precision>::Interaction::set_conditioned_mlp_workspace(
     const std::shared_ptr<typename AffineMLPKokkosT<Precision>::Workspace>&
         workspace)
 {
@@ -814,7 +843,7 @@ void MaceNonlinearKokkosT<Precision>::Interaction::set_conditioned_mlp_workspace
 }
 
 template<typename Precision>
-std::size_t MaceNonlinearKokkosT<Precision>::Interaction::linear_workspace_bytes() const
+std::size_t MaceBackboneKokkosT<Precision>::Interaction::linear_workspace_bytes() const
 {
     return source_embedding.workspace_bytes()+target_embedding.workspace_bytes()
         +linear_up.workspace_bytes()+skip.workspace_bytes()
@@ -823,7 +852,7 @@ std::size_t MaceNonlinearKokkosT<Precision>::Interaction::linear_workspace_bytes
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::Interaction::prepare_pair_conditioning(
+bool MaceBackboneKokkosT<Precision>::Interaction::prepare_pair_conditioning(
     const nlohmann::json& data,int radial_size,int model_element_count,
     const std::vector<int>& selected_model_indices)
 {
@@ -884,7 +913,7 @@ bool MaceNonlinearKokkosT<Precision>::Interaction::prepare_pair_conditioning(
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::Interaction::prepare_pair_spline(
+bool MaceBackboneKokkosT<Precision>::Interaction::prepare_pair_spline(
     const nlohmann::json& data,const nlohmann::json& radial_data,
     const double cutoff,const int radial_size,const int model_element_count,
     const std::vector<int>& selected_model_indices,
@@ -1059,16 +1088,23 @@ bool MaceNonlinearKokkosT<Precision>::Interaction::prepare_pair_spline(
 }
 
 template<typename Precision>
-MaceNonlinearKokkosT<Precision>::Readout::Readout(const nlohmann::json& data)
-    :nonlinear(data.at("class").get<std::string>()=="NonLinearReadoutBlock"),linear(readout_component(data,0)),linear_1(readout_component(data,1)),linear_2(readout_component(data,2))
-{if(nonlinear){if(data.at("activation").get<std::string>()!="silu")throw std::invalid_argument("MACE_Nonlinear Kokkos readout activation is unsupported.");activation_constant=data.at("activation_constants").at(0).get<Precision>();}}
+MaceBackboneKokkosT<Precision>::Readout::Readout(const nlohmann::json& data)
+    :nonlinear(data.at("class").get<std::string>()=="NonLinearReadoutBlock"),bias(data.at("class").get<std::string>()=="NonLinearBiasReadoutBlock"),linear(readout_component(data,0)),linear_1(readout_component(data,1)),linear_2(readout_component(data,2))
+{// The middle linear is the bias variant's own; the other variants leave it
+ // default-constructed and never touch it.
+ if(bias)linear_mid=E3LinearKokkosT<Precision>(readout_mid_component(data));
+ if(nonlinear||bias){if(data.at("activation").get<std::string>()!="silu")throw std::invalid_argument("MACE_Nonlinear Kokkos readout activation is unsupported.");if(data.at("activation_constants").size()!=1)throw std::invalid_argument("MACE_Nonlinear Kokkos readout must carry one activation constant.");activation_constant=data.at("activation_constants").at(0).get<Precision>();}}
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::prepare_mh1_pair_spline_for_graph(
+void MaceBackboneKokkosT<Precision>::prepare_mh1_pair_spline_for_graph(
     Kokkos::View<const int*> node_types,
-    Kokkos::View<const int*> neigh_types)
+    Kokkos::View<const int*> neigh_types,
+    const std::uint64_t graph_generation)
 {
     if(!mh1_pair_spline_lazy_)
+        return;
+    if(graph_generation!=0
+        &&graph_generation==mh1_spline_graph_generation_)
         return;
 
     const auto node_types_host=Kokkos::create_mirror_view_and_copy(
@@ -1100,6 +1136,7 @@ void MaceNonlinearKokkosT<Precision>::prepare_mh1_pair_spline_for_graph(
         mh1_spline_neigh_types_=toKokkosView(
             "MH-1 compact spline neighbor types",std::vector<int>());
         mh1_spline_type_count_=0;
+        mh1_spline_graph_generation_=graph_generation;
         return;
     }
 
@@ -1144,6 +1181,7 @@ void MaceNonlinearKokkosT<Precision>::prepare_mh1_pair_spline_for_graph(
     mh1_spline_neigh_types_=toKokkosView(
         "MH-1 compact spline neighbor types",spline_neigh_types);
     mh1_spline_type_count_=static_cast<int>(mh1_spline_global_types_.size());
+    mh1_spline_graph_generation_=graph_generation;
     for(const auto& interaction : interactions)
         if(!interaction.pair_spline_ready)
             throw std::logic_error(
@@ -1151,70 +1189,310 @@ void MaceNonlinearKokkosT<Precision>::prepare_mh1_pair_spline_for_graph(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Readout::set_e3_linear_backend(
+void MaceBackboneKokkosT<Precision>::Readout::set_e3_linear_backend(
     const std::string& backend)
 {
     linear.set_backend(backend);
     linear_1.set_backend(backend);
+    linear_mid.set_backend(backend);
     linear_2.set_backend(backend);
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Readout::set_e3_linear_workspace(
+void MaceBackboneKokkosT<Precision>::Readout::set_e3_linear_workspace(
     const std::shared_ptr<typename E3LinearKokkosT<Precision>::Workspace>& workspace)
 {
     linear.set_workspace(workspace);
     linear_1.set_workspace(workspace);
+    linear_mid.set_workspace(workspace);
     linear_2.set_workspace(workspace);
 }
 
 template<typename Precision>
-std::size_t MaceNonlinearKokkosT<Precision>::Readout::linear_workspace_bytes() const
+std::size_t MaceBackboneKokkosT<Precision>::Readout::linear_workspace_bytes() const
 {
     return linear.workspace_bytes()+linear_1.workspace_bytes()
-        +linear_2.workspace_bytes();
+        +linear_mid.workspace_bytes()+linear_2.workspace_bytes();
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Readout::evaluate(Kokkos::View<const Precision**,Kokkos::LayoutRight> input,Kokkos::View<Precision*> output)
+bool MaceBackboneKokkosT<Precision>::Readout::supports_portable_scalar_schedule()
+    const
+{
+    constexpr int maximum_hidden=8;
+    if(!nonlinear&&!bias)
+        return linear.supports_scalar_dense_plan()
+            &&linear.output_dimension()==1;
+    return linear_1.supports_scalar_dense_plan()
+        &&linear_2.supports_scalar_dense_plan()
+        &&linear_1.output_dimension()>0
+        &&linear_1.output_dimension()<=maximum_hidden
+        &&linear_2.input_dimension()==linear_1.output_dimension()
+        &&linear_2.output_dimension()==1
+        &&(!bias||(linear_mid.supports_scalar_dense_plan()
+            &&linear_mid.input_dimension()==linear_1.output_dimension()
+            &&linear_mid.output_dimension()==linear_1.output_dimension()));
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::Readout::evaluate_portable_scalar(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input,
+    Kokkos::View<Precision*> output)
+{
+    if(!supports_portable_scalar_schedule()
+        ||output.extent(0)!=input.extent(0))
+        throw std::invalid_argument(
+            "Portable scalar readout dimensions are inconsistent.");
+    if(!nonlinear&&!bias) {
+        const auto plan=linear.scalar_dense_plan();
+        Kokkos::parallel_for("mh1 portable scalar readout",input.extent(0),
+            KOKKOS_LAMBDA(const int sample) {
+                Precision value=Precision(0);
+                for(int source=0;source<plan.input_size;++source)
+                    value+=plan.path_weight*plan.weights(source)
+                        *input(sample,source);
+                if(plan.bias.size()) value+=plan.bias(0);
+                output(sample)=value*plan.output_mask(0);
+            });
+        return;
+    }
+
+    const auto first=linear_1.scalar_dense_plan();
+    const auto middle=bias?linear_mid.scalar_dense_plan():
+        typename E3LinearKokkosT<Precision>::ScalarDensePlan{};
+    const auto last=linear_2.scalar_dense_plan();
+    const int hidden_dimension=first.output_size;
+    ensure_view(hidden,hidden_storage,input.extent(0),hidden_dimension);
+    ensure_view(activated,activated_storage,input.extent(0),hidden_dimension);
+    ensure_view(result,result_storage,input.extent(0),1);
+    auto retained_hidden=hidden;
+    auto retained_activated=activated;
+    auto retained_result=result;
+    const Precision constant=activation_constant;
+    const bool use_middle=bias;
+    Kokkos::parallel_for("mh1 portable nonlinear scalar readout",input.extent(0),
+        KOKKOS_LAMBDA(const int sample) {
+            Precision first_hidden[8];
+            Precision first_activated[8];
+            for(int target=0;target<hidden_dimension;++target) {
+                Precision value=Precision(0);
+                for(int source=0;source<first.input_size;++source)
+                    value+=first.path_weight
+                        *first.weights(source*hidden_dimension+target)
+                        *input(sample,source);
+                if(first.bias.size()) value+=first.bias(target);
+                value*=first.output_mask(target);
+                first_hidden[target]=value;
+                first_activated[target]=constant*value
+                    /(Precision(1)+Kokkos::exp(-value));
+            }
+            if(use_middle) {
+                for(int target=0;target<hidden_dimension;++target) {
+                    Precision value=Precision(0);
+                    for(int source=0;source<hidden_dimension;++source)
+                        value+=middle.path_weight
+                            *middle.weights(source*hidden_dimension+target)
+                            *first_activated[source];
+                    if(middle.bias.size()) value+=middle.bias(target);
+                    value*=middle.output_mask(target);
+                    retained_hidden(sample,target)=value;
+                    retained_activated(sample,target)=constant*value
+                        /(Precision(1)+Kokkos::exp(-value));
+                }
+            } else
+                for(int target=0;target<hidden_dimension;++target) {
+                    retained_hidden(sample,target)=first_hidden[target];
+                    retained_activated(sample,target)=first_activated[target];
+                }
+            Precision value=Precision(0);
+            for(int source=0;source<hidden_dimension;++source)
+                value+=last.path_weight*last.weights(source)
+                    *retained_activated(sample,source);
+            if(last.bias.size()) value+=last.bias(0);
+            value*=last.output_mask(0);
+            retained_result(sample,0)=value;
+            output(sample)=value;
+        });
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::Readout::evaluate(Kokkos::View<const Precision**,Kokkos::LayoutRight> input,Kokkos::View<Precision*> output)
 {
     ensure_view(result,result_storage,input.extent(0),1);
-    if(!nonlinear){linear.evaluate(input,result);ordered_kokkos_deep_copy(output,Kokkos::subview(result,Kokkos::ALL,0));return;}
-    ensure_view(hidden,hidden_storage,input.extent(0),linear_1.output_dimension());
-    ensure_view(activated,activated_storage,input.extent(0),linear_1.output_dimension());
+    if(!nonlinear&&!bias){linear.evaluate(input,result);ordered_kokkos_deep_copy(output,Kokkos::subview(result,Kokkos::ALL,0));return;}
+    const int hidden_dimension=linear_1.output_dimension();
+    ensure_view(hidden,hidden_storage,input.extent(0),hidden_dimension);
+    ensure_view(activated,activated_storage,input.extent(0),hidden_dimension);
     auto local_hidden=hidden;auto local_activated=activated;
-    linear_1.evaluate(input,hidden);const Precision constant=activation_constant;Kokkos::parallel_for("readout silu",hidden.size(),KOKKOS_LAMBDA(std::size_t flat){const std::size_t i=flat/local_hidden.extent(1);const int j=flat%local_hidden.extent(1);const Precision x=local_hidden(i,j);local_activated(i,j)=constant*x/(Precision(1)+Kokkos::exp(-x));});linear_2.evaluate(activated,result);ordered_kokkos_deep_copy(output,Kokkos::subview(result,Kokkos::ALL,0));
+    const Precision constant=activation_constant;
+    const auto silu_forward=[&](Kokkos::View<Precision**,Kokkos::LayoutRight> pre_activation,Kokkos::View<Precision**,Kokkos::LayoutRight> output_view) {
+        Kokkos::parallel_for("readout silu",pre_activation.size(),KOKKOS_LAMBDA(std::size_t flat){const std::size_t i=flat/pre_activation.extent(1);const int j=flat%pre_activation.extent(1);const Precision x=pre_activation(i,j);output_view(i,j)=constant*x/(Precision(1)+Kokkos::exp(-x));});
+    };
+    linear_1.evaluate(input,hidden);silu_forward(local_hidden,local_activated);
+    if(bias) {
+        // The bias variant's second hidden layer, over the same scratch pair:
+        // silu(linear_mid(silu(linear_1(x)))).  ``hidden`` then holds h2, the
+        // second activation's pre-activation, which the reverse consumes.
+        linear_mid.evaluate(activated,hidden);silu_forward(local_hidden,local_activated);
+    }
+    linear_2.evaluate(activated,result);ordered_kokkos_deep_copy(output,Kokkos::subview(result,Kokkos::ALL,0));
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::Readout::reverse(Kokkos::View<const Precision**,Kokkos::LayoutRight> input,Precision scale_value,Kokkos::View<Precision**,Kokkos::LayoutRight> input_adjoint)
+void MaceBackboneKokkosT<Precision>::Readout::reverse(Kokkos::View<const Precision**,Kokkos::LayoutRight> input,Precision scale_value,Kokkos::View<Precision**,Kokkos::LayoutRight> input_adjoint)
 {
     ensure_view(seed,seed_storage,input.extent(0),1);ordered_kokkos_deep_copy(seed,scale_value);
-    if(!nonlinear){linear.reverse(seed,input_adjoint);return;}
-    ensure_view(hidden,hidden_storage,input.extent(0),linear_1.output_dimension());
-    ensure_view(activated_adj,activated_adj_storage,input.extent(0),linear_1.output_dimension());
-    ensure_view(hidden_adj,hidden_adj_storage,input.extent(0),linear_1.output_dimension());
-    auto local_hidden=hidden;auto local_activated_adj=activated_adj;auto local_hidden_adj=hidden_adj;
-    linear_2.reverse(seed,activated_adj);const Precision constant=activation_constant;Kokkos::parallel_for("reverse readout silu",hidden.size(),KOKKOS_LAMBDA(std::size_t flat){const std::size_t i=flat/local_hidden.extent(1);const int j=flat%local_hidden.extent(1);const Precision x=local_hidden(i,j),probability=Precision(1)/(Precision(1)+Kokkos::exp(-x));local_hidden_adj(i,j)=local_activated_adj(i,j)*constant*(probability+x*probability*(Precision(1)-probability));});linear_1.reverse(hidden_adj,input_adjoint);
+    if(!nonlinear&&!bias){linear.reverse(seed,input_adjoint);return;}
+    const int hidden_dimension=linear_1.output_dimension();
+    ensure_view(hidden,hidden_storage,input.extent(0),hidden_dimension);
+    ensure_view(activated_adj,activated_adj_storage,input.extent(0),hidden_dimension);
+    ensure_view(hidden_adj,hidden_adj_storage,input.extent(0),hidden_dimension);
+    auto local_activated_adj=activated_adj;auto local_hidden_adj=hidden_adj;
+    const Precision constant=activation_constant;
+    // Each activation's derivative applied to its output's adjoint: the second
+    // activation's into the first activation's adjoint slot, the first's into
+    // the middle linear's input adjoint.
+    const auto silu_reverse=[&](Kokkos::View<Precision**,Kokkos::LayoutRight> pre_activation,Kokkos::View<Precision**,Kokkos::LayoutRight> source,Kokkos::View<Precision**,Kokkos::LayoutRight> output_view) {
+        Kokkos::parallel_for("reverse readout silu",pre_activation.size(),KOKKOS_LAMBDA(std::size_t flat){const std::size_t i=flat/pre_activation.extent(1);const int j=flat%pre_activation.extent(1);const Precision x=pre_activation(i,j),probability=Precision(1)/(Precision(1)+Kokkos::exp(-x));output_view(i,j)=source(i,j)*constant*(probability+x*probability*(Precision(1)-probability));});
+    };
+    linear_2.reverse(seed,activated_adj);
+    if(bias) {
+        // The bias variant's forward reused both scratch views, so its reverse
+        // walks back layer by layer: the second activation consumes the
+        // retained h2 (``hidden``), the middle linear's transpose gives the
+        // first activation's adjoint, and the first activation's
+        // pre-activation h1 is recomputed from the input -- the same linear
+        // forward the retained path skipped, and exact.
+        silu_reverse(hidden,local_activated_adj,local_hidden_adj);   // h2 -> hidden_adj
+        linear_mid.reverse(hidden_adj,activated_adj);                // a1 adjoint
+        linear_1.evaluate(input,hidden);                             // recompute h1
+        silu_reverse(hidden,local_activated_adj,local_hidden_adj);   // h1 -> hidden_adj
+        linear_1.reverse(hidden_adj,input_adjoint);
+        return;
+    }
+    silu_reverse(hidden,local_activated_adj,local_hidden_adj);
+    linear_1.reverse(hidden_adj,input_adjoint);
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::Readout::reverse_portable_scalar(
+    Kokkos::View<const Precision**,Kokkos::LayoutRight> input,
+    const Precision scale_value,
+    Kokkos::View<Precision**,Kokkos::LayoutRight> input_adjoint)
+{
+    if(!supports_portable_scalar_schedule()
+        ||input_adjoint.extent(0)!=input.extent(0)
+        ||input_adjoint.extent(1)!=input.extent(1))
+        throw std::invalid_argument(
+            "Portable scalar readout reverse dimensions are inconsistent.");
+    if(!nonlinear&&!bias) {
+        const auto plan=linear.scalar_dense_plan();
+        const int full_input_size=input.extent(1);
+        Kokkos::parallel_for("mh1 portable scalar readout reverse",
+            input.extent(0),KOKKOS_LAMBDA(const int sample) {
+                for(int source=0;source<full_input_size;++source)
+                    input_adjoint(sample,source)=source<plan.input_size
+                        ?scale_value*plan.output_mask(0)*plan.path_weight
+                            *plan.weights(source)
+                        :Precision(0);
+            });
+        return;
+    }
+
+    const auto first=linear_1.scalar_dense_plan();
+    const auto middle=bias?linear_mid.scalar_dense_plan():
+        typename E3LinearKokkosT<Precision>::ScalarDensePlan{};
+    const auto last=linear_2.scalar_dense_plan();
+    const int hidden_dimension=first.output_size;
+    auto retained_hidden=hidden;
+    const Precision constant=activation_constant;
+    const bool use_middle=bias;
+    Kokkos::parallel_for("mh1 portable nonlinear scalar readout reverse",
+        input.extent(0),KOKKOS_LAMBDA(const int sample) {
+            Precision first_hidden[8];
+            Precision first_activated[8];
+            Precision hidden_adjoint[8];
+            Precision activated_adjoint[8];
+            for(int target=0;target<hidden_dimension;++target) {
+                Precision value=Precision(0);
+                for(int source=0;source<first.input_size;++source)
+                    value+=first.path_weight
+                        *first.weights(source*hidden_dimension+target)
+                        *input(sample,source);
+                if(first.bias.size()) value+=first.bias(target);
+                value*=first.output_mask(target);
+                first_hidden[target]=value;
+                first_activated[target]=constant*value
+                    /(Precision(1)+Kokkos::exp(-value));
+                activated_adjoint[target]=scale_value*last.output_mask(0)
+                    *last.path_weight*last.weights(target);
+            }
+            if(use_middle) {
+                for(int target=0;target<hidden_dimension;++target) {
+                    const Precision value=retained_hidden(sample,target);
+                    const Precision probability=Precision(1)
+                        /(Precision(1)+Kokkos::exp(-value));
+                    hidden_adjoint[target]=activated_adjoint[target]*constant
+                        *(probability+value*probability
+                            *(Precision(1)-probability));
+                }
+                for(int source=0;source<hidden_dimension;++source) {
+                    Precision value=Precision(0);
+                    for(int target=0;target<hidden_dimension;++target)
+                        value+=middle.path_weight
+                            *middle.weights(source*hidden_dimension+target)
+                            *middle.output_mask(target)*hidden_adjoint[target];
+                    activated_adjoint[source]=value;
+                }
+            }
+            for(int target=0;target<hidden_dimension;++target) {
+                const Precision value=first_hidden[target];
+                const Precision probability=Precision(1)
+                    /(Precision(1)+Kokkos::exp(-value));
+                hidden_adjoint[target]=activated_adjoint[target]*constant
+                    *(probability+value*probability
+                        *(Precision(1)-probability));
+            }
+            for(int source=0;source<first.input_size;++source) {
+                Precision value=Precision(0);
+                for(int target=0;target<hidden_dimension;++target)
+                    value+=first.path_weight
+                        *first.weights(source*hidden_dimension+target)
+                        *first.output_mask(target)*hidden_adjoint[target];
+                input_adjoint(sample,source)=value;
+            }
+            for(int source=first.input_size;
+                source<static_cast<int>(input.extent(1));++source)
+                input_adjoint(sample,source)=Precision(0);
+        });
 }
 
 #elif SYMMETRIX_MACE_NONLINEAR_KOKKOS_PART == 2
 
 template<typename Precision>
-MaceNonlinearKokkosT<Precision>::MaceNonlinearKokkosT(
+MaceBackboneKokkosT<Precision>::MaceBackboneKokkosT(
     const std::string& filename, const std::string& requested_head)
-    :MaceNonlinearKokkosT(select_prediction_head(
-        load_model_json(filename), requested_head))
+    :MaceBackboneKokkosT(select_prediction_head(
+        load_model_json(filename), requested_head),MaceBackboneSchema::mh1)
 {}
 
 template<typename Precision>
-std::string MaceNonlinearKokkosT<Precision>::streamed_edges_mode() const
+MaceBackboneKokkosT<Precision>::MaceBackboneKokkosT(
+    const std::string& filename, const std::string& requested_head,
+    const MaceBackboneSchema schema,const bool require_fast_float_path)
+    :MaceBackboneKokkosT(select_prediction_head(
+        load_model_json(filename), requested_head),schema,
+        require_fast_float_path)
+{}
+
+template<typename Precision>
+std::string MaceBackboneKokkosT<Precision>::streamed_edges_mode() const
 {
-    return mace_streamed_edges_mode_name(streamed_edges);
+    return execution_mode_name(streamed_edges);
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::set_mh1_edge_executor(std::string executor)
+void MaceBackboneKokkosT<Precision>::set_mh1_edge_executor(std::string executor)
 {
     if(executor!="mlp_reference"&&executor!="pair_spline_v1")
         throw std::invalid_argument(
@@ -1232,7 +1510,19 @@ void MaceNonlinearKokkosT<Precision>::set_mh1_edge_executor(std::string executor
 }
 
 template<typename Precision>
-int MaceNonlinearKokkosT<Precision>::selected_execution_mh1_node_arena_tile_rows()
+void MaceBackboneKokkosT<Precision>::set_mh1_portable_final_layer(
+    const bool enabled)
+{
+    if(enabled&&!mh1_portable_final_layer_ready_)
+        throw std::invalid_argument(
+            "The block-aware portable MH-1 final-layer schedule is unavailable.");
+    if(enabled==mh1_portable_final_layer_enabled_) return;
+    Kokkos::fence("MACE_Nonlinear portable final-layer transition");
+    mh1_portable_final_layer_enabled_=enabled;
+}
+
+template<typename Precision>
+int MaceBackboneKokkosT<Precision>::selected_execution_mh1_node_arena_tile_rows()
     const
 {
     if(execution_mh1_node_arena_tile_rows_override_>0)
@@ -1247,7 +1537,7 @@ int MaceNonlinearKokkosT<Precision>::selected_execution_mh1_node_arena_tile_rows
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::apply_execution_mh1_node_arena_tile_rows()
+void MaceBackboneKokkosT<Precision>::apply_execution_mh1_node_arena_tile_rows()
 {
     const int rows=selected_execution_mh1_node_arena_tile_rows();
     for(auto& runtime:execution_mh1_node_runtime) {
@@ -1266,7 +1556,7 @@ void MaceNonlinearKokkosT<Precision>::apply_execution_mh1_node_arena_tile_rows()
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::set_execution_mh1_node_arena_policy(
+void MaceBackboneKokkosT<Precision>::set_execution_mh1_node_arena_policy(
     std::string policy)
 {
     if(policy!="throughput-v1"&&policy!="capacity-v1")
@@ -1280,13 +1570,13 @@ void MaceNonlinearKokkosT<Precision>::set_execution_mh1_node_arena_policy(
 }
 
 template<typename Precision>
-int MaceNonlinearKokkosT<Precision>::execution_mh1_node_arena_tile_rows() const
+int MaceBackboneKokkosT<Precision>::execution_mh1_node_arena_tile_rows() const
 {
     return selected_execution_mh1_node_arena_tile_rows();
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>
+void MaceBackboneKokkosT<Precision>
     ::set_execution_mh1_node_arena_tile_rows_for_testing(const int rows)
 {
     if(rows<=0)
@@ -1299,7 +1589,7 @@ void MaceNonlinearKokkosT<Precision>
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::supports_factorized() const
+bool MaceBackboneKokkosT<Precision>::supports_factorized() const
 {
     if(!mh1_fast_path||interactions.empty())return false;
     return std::all_of(
@@ -1320,9 +1610,10 @@ bool MaceNonlinearKokkosT<Precision>::supports_factorized() const
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::set_execution_mh1_contract_identity(
+void MaceBackboneKokkosT<Precision>::set_execution_mh1_contract_identity(
     std::string tag,std::string generation_fingerprint,
-    std::string semantic_fingerprint,std::string structure_fingerprint)
+    std::string semantic_fingerprint,std::string structure_fingerprint,
+    const std::uint32_t interaction_count)
 {
     if(tag!="symmetrix.execution.mh1_uvu/1"
         &&tag!="symmetrix.execution.mh1_uvu/2"
@@ -1344,11 +1635,11 @@ void MaceNonlinearKokkosT<Precision>::set_execution_mh1_contract_identity(
         ||!valid_fingerprint(structure_fingerprint))
         throw std::invalid_argument(
             "Execution MH-1 contract fingerprints are malformed.");
-    if(jit_mh1_host_plugin_ready()||jit_mh1_host_plugin_v4_ready()
-        ||jit_mh1_cuda_plugin_ready()||jit_mh1_cuda_plugin_v4_ready())
+    if(jit_mh1_host_plugin_v7_ready()||jit_mh1_cuda_plugin_v5_ready())
         throw std::logic_error(
             "Execution MH-1 contract identity cannot change after plugin loading.");
     execution_mh1_has_model_contract=true;
+    execution_mh1_contract_interaction_count=interaction_count;
     execution_mh1_model_generation_fingerprint=
         std::move(generation_fingerprint);
     execution_mh1_model_semantic_fingerprint=std::move(semantic_fingerprint);
@@ -1356,10 +1647,11 @@ void MaceNonlinearKokkosT<Precision>::set_execution_mh1_contract_identity(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::set_execution_mh1_v4_contract_identity(
+void MaceBackboneKokkosT<Precision>::set_execution_mh1_v4_contract_identity(
     std::string tag,std::string generation_fingerprint,
     std::string semantic_fingerprint,std::string structure_fingerprint,
-    std::string runtime_layout_fingerprint)
+    std::string runtime_layout_fingerprint,
+    const std::uint32_t interaction_count)
 {
     if(tag!="symmetrix.execution.mh1_uvu/4")
         throw std::invalid_argument("Execution MH-1 v4 contract tag is unsupported.");
@@ -1380,11 +1672,11 @@ void MaceNonlinearKokkosT<Precision>::set_execution_mh1_v4_contract_identity(
         ||!valid_fingerprint(runtime_layout_fingerprint))
         throw std::invalid_argument(
             "Execution MH-1 v4 contract fingerprints are malformed.");
-    if(jit_mh1_host_plugin_ready()||jit_mh1_host_plugin_v4_ready()
-        ||jit_mh1_cuda_plugin_ready()||jit_mh1_cuda_plugin_v4_ready())
+    if(jit_mh1_host_plugin_v7_ready()||jit_mh1_cuda_plugin_v5_ready())
         throw std::logic_error(
             "Execution MH-1 v4 contract identity cannot change after plugin loading.");
     execution_mh1_has_model_contract_v4=true;
+    execution_mh1_contract_interaction_count=interaction_count;
     execution_mh1_model_generation_fingerprint_v4=
         std::move(generation_fingerprint);
     execution_mh1_model_semantic_fingerprint_v4=std::move(semantic_fingerprint);
@@ -1394,7 +1686,7 @@ void MaceNonlinearKokkosT<Precision>::set_execution_mh1_v4_contract_identity(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin(
+void MaceBackboneKokkosT<Precision>::load_jit_mh1_host_plugin(
     std::string path)
 {
     if constexpr(!std::is_same_v<Precision,float>)
@@ -1414,10 +1706,8 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin(
         ||execution_mh1_model_generation_fingerprint.size()<prefix.size()+16)
         throw std::invalid_argument(
             "Execution MH-1 generation fingerprint is malformed.");
-    const std::string artifact_id="jit-mh1-gen"
-        +std::to_string(symmetrix::execution::required_jit_generation_version)
-        +"-v3-"
-        +execution_mh1_model_generation_fingerprint.substr(prefix.size(),16);
+    const std::string artifact_id=
+        symmetrix::execution::jit_manifest_artifact_id(path);
     const std::uint32_t capabilities=
         SYMMETRIX_JIT_MH1_HOST_FORWARD_OWNER_V3
         |SYMMETRIX_JIT_MH1_HOST_SOURCE_REVERSE_OWNER_V3
@@ -1431,8 +1721,9 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin(
         execution_mh1_model_generation_fingerprint;
     expectation.semantic_fingerprint=execution_mh1_model_semantic_fingerprint;
     expectation.structure_fingerprint=execution_mh1_model_structure_fingerprint;
+    expectation.interaction_count=execution_mh1_contract_interaction_count;
     expectation.required_capabilities=capabilities;
-    for(int layer=0;layer<2;++layer) {
+    for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
         const auto& interaction=interactions.at(layer);
         auto& extent=expectation.interactions.at(layer);
         extent.input_1_dimension=interaction.convolution.input_1_dimension();
@@ -1457,38 +1748,30 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin(
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::jit_mh1_host_plugin_ready() const
+bool MaceBackboneKokkosT<Precision>::jit_mh1_host_plugin_ready() const
 {
     return std::is_same_v<Precision,float>
         &&jit_mh1_host_plugin&&static_cast<bool>(*jit_mh1_host_plugin);
 }
 
 template<typename Precision>
-std::string MaceNonlinearKokkosT<Precision>::jit_mh1_host_plugin_path() const
+std::string MaceBackboneKokkosT<Precision>::jit_mh1_host_plugin_path() const
 {
-    if(jit_mh1_host_plugin_v5_ready())
-        return jit_mh1_host_plugin_v5->path();
-    if(jit_mh1_host_plugin_v4_ready())
-        return jit_mh1_host_plugin_v4->path();
-    return jit_mh1_host_plugin_ready()
-        ?jit_mh1_host_plugin->path():std::string();
+    return jit_mh1_host_plugin_v7_ready()
+        ?jit_mh1_host_plugin_v7->path():std::string();
 }
 
 template<typename Precision>
-std::string MaceNonlinearKokkosT<Precision>::jit_mh1_host_plugin_artifact_id() const
+std::string MaceBackboneKokkosT<Precision>::jit_mh1_host_plugin_artifact_id() const
 {
-    if(jit_mh1_host_plugin_v5_ready())
-        return std::string(jit_mh1_host_plugin_v5->descriptor().artifact_id);
-    if(jit_mh1_host_plugin_v4_ready())
-        return std::string(jit_mh1_host_plugin_v4->descriptor().artifact_id);
-    return jit_mh1_host_plugin_ready()
-        ?std::string(jit_mh1_host_plugin->descriptor().artifact_id)
+    return jit_mh1_host_plugin_v7_ready()
+        ?std::string(jit_mh1_host_plugin_v7->descriptor().artifact_id)
         :std::string();
 }
 
 template<typename Precision>
 symmetrix::execution::MH1HostNodeProgramExpectation
-MaceNonlinearKokkosT<Precision>::execution_mh1_host_node_expectation(
+MaceBackboneKokkosT<Precision>::execution_mh1_host_node_expectation(
     int layer) const
 {
     if(layer<0||layer>=static_cast<int>(interactions.size())
@@ -1506,7 +1789,7 @@ MaceNonlinearKokkosT<Precision>::execution_mh1_host_node_expectation(
     const int gated_dimension=interaction.gate.output_size;
     const int interaction_dimension=interaction.linear_2.output_dimension();
     const int output_dimension=product.output_dimension();
-    const int readout_hidden=readout.nonlinear
+    const int readout_hidden=readout.nonlinear||readout.bias
         ?readout.linear_1.output_dimension():0;
     const int arena_dimension=std::max({
         residual_dimension+gated_dimension,
@@ -1539,36 +1822,54 @@ MaceNonlinearKokkosT<Precision>::execution_mh1_host_node_expectation(
 
 template<typename Precision>
 symmetrix::execution::MH1CudaNodeProgramExpectation
-MaceNonlinearKokkosT<Precision>::execution_mh1_cuda_node_expectation(
+MaceBackboneKokkosT<Precision>::execution_mh1_cuda_node_expectation(
     int layer) const
 {
-    const auto host=execution_mh1_host_node_expectation(layer);
+    const auto& interaction=interactions.at(layer);
+    const auto& runtime=execution_mh1_node_runtime.at(layer);
+    const int input_dimension=interaction.linear_up.input_dimension();
+    const int up_dimension=interaction.linear_up.output_dimension();
+    const int residual_dimension=interaction.linear_res.output_dimension();
+    const int interaction_dimension=interaction.linear_2.output_dimension();
+    const int output_dimension=products.at(layer).output_dimension();
+    const int gated_dimension=interaction.gate.output_size;
+    const auto& readout=readouts.at(layer);
+    const int readout_hidden=readout.nonlinear
+        ?readout.linear_1.output_dimension():0;
+    const int arena_dimension=std::max({
+        residual_dimension+gated_dimension,
+        gated_dimension+interaction_dimension,
+        interaction_dimension+output_dimension,
+        2*interaction_dimension+output_dimension,
+        layer==0
+            ?interaction_dimension+input_dimension+2*output_dimension
+            :interaction_dimension+2*output_dimension,
+        2*readout_hidden+output_dimension});
     symmetrix::execution::MH1CudaNodeProgramExpectation expectation;
-    expectation.element_count=host.element_count;
-    expectation.input_dimension=host.input_dimension;
-    expectation.up_dimension=host.up_dimension;
-    expectation.residual_dimension=host.residual_dimension;
-    expectation.skip_dimension=host.skip_dimension;
-    expectation.message_dimension=host.message_dimension;
-    expectation.interaction_output_dimension=
-        host.interaction_output_dimension;
-    expectation.output_dimension=host.output_dimension;
-    expectation.product_term_count=host.product_term_count;
-    expectation.node_arena_dimension=host.node_arena_dimension;
-    expectation.requires_tp_source_state_adjoint=
-        host.requires_tp_source_state_adjoint;
-    expectation.linear_parameter_count=host.linear_parameter_count;
-    expectation.product_parameter_count=host.product_parameter_count;
-    expectation.readout_parameter_count=host.readout_parameter_count;
+    expectation.element_count=node_embedding.input_dimension();
+    expectation.input_dimension=input_dimension;
+    expectation.up_dimension=up_dimension;
+    expectation.residual_dimension=residual_dimension;
+    expectation.skip_dimension=interaction.skip.output_dimension();
+    expectation.message_dimension=interaction.linear_1.input_dimension();
+    expectation.interaction_output_dimension=interaction_dimension;
+    expectation.output_dimension=output_dimension;
+    expectation.node_arena_dimension=arena_dimension;
+    expectation.requires_tp_source_state_adjoint=layer>0;
+    expectation.linear_parameter_count=runtime.linear_parameters.size();
+    expectation.readout_parameter_count=runtime.readout_parameters.size();
     expectation.forward_threads_per_block={128,128};
     expectation.reverse_threads_per_block={128,layer>0?128:0};
     return expectation;
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin_v4(
+void MaceBackboneKokkosT<Precision>::load_jit_mh1_host_plugin_v4(
     std::string path)
 {
+    (void)path;
+    throw std::invalid_argument(
+        "Execution MH-1 host ABI-v4 was retired in generation 19.");
     if constexpr(!std::is_same_v<Precision,float>)
         throw std::invalid_argument(
             "Execution MH-1 v4 host plugins require float32 model execution.");
@@ -1581,11 +1882,8 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin_v4(
         throw std::invalid_argument(
             "Execution MH-1 v4 host plugins require a validated node contract.");
     prepare_execution_mh1_node_runtime_parameters();
-    constexpr std::string_view prefix="sha256:";
-    const std::string artifact_id="jit-mh1-gen"
-        +std::to_string(symmetrix::execution::required_jit_generation_version)
-        +"-v4-"
-        +execution_mh1_model_generation_fingerprint_v4.substr(prefix.size(),16);
+    const std::string artifact_id=
+        symmetrix::execution::jit_manifest_artifact_id(path);
     symmetrix::execution::MH1HostPluginV4Expectation expectation;
     expectation.artifact_id=artifact_id;
     expectation.generation_fingerprint=
@@ -1594,6 +1892,7 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin_v4(
     expectation.structure_fingerprint=execution_mh1_model_structure_fingerprint_v4;
     expectation.runtime_layout_fingerprint=
         execution_mh1_model_runtime_layout_fingerprint_v4;
+    expectation.interaction_count=execution_mh1_contract_interaction_count;
     expectation.required_capabilities=
         SYMMETRIX_JIT_MH1_HOST_FORWARD_OWNER_V4
         |SYMMETRIX_JIT_MH1_HOST_SOURCE_REVERSE_OWNER_V4
@@ -1607,7 +1906,7 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin_v4(
         |SYMMETRIX_JIT_MH1_HOST_NODE_TILE_GATE_V4
         |SYMMETRIX_JIT_MH1_HOST_NODE_TILE_PRODUCT_V4
         |SYMMETRIX_JIT_MH1_HOST_PHI_MAJOR_FORWARD_WEIGHT_V4;
-    for(int layer=0;layer<2;++layer) {
+    for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
         const auto& interaction=interactions.at(layer);
         auto& extent=expectation.interactions.at(layer);
         extent.input_1_dimension=interaction.convolution.input_1_dimension();
@@ -1633,10 +1932,22 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin_v4(
     jit_mh1_host_plugin_v4=
         std::make_unique<symmetrix::execution::MH1HostPluginV4>(
             std::move(loaded));
-    for(int layer=0;layer<2;++layer) {
+    mh1_host_view.node_programs=
+        jit_mh1_host_plugin_v4->descriptor().node_programs;
+    mh1_host_view.composed_node_programs=false;
+    mh1_host_view.conditioning=
+        jit_mh1_host_plugin_v4->descriptor().conditioning;
+    mh1_host_view.forward_owner=
+        jit_mh1_host_plugin_v4->descriptor().forward_owner;
+    mh1_host_view.source_reverse_owner=
+        jit_mh1_host_plugin_v4->descriptor().source_reverse_owner;
+    mh1_host_view.edge_reverse_owner=
+        jit_mh1_host_plugin_v4->descriptor().edge_reverse_owner;
+    mh1_host_view.capabilities=
+        jit_mh1_host_plugin_v4->descriptor().capabilities;
+    for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
         auto& runtime=execution_mh1_node_runtime.at(layer);
-        const auto& node=jit_mh1_host_plugin_v4->descriptor()
-            .node_programs[layer];
+        const auto& node=mh1_host_view.node_programs[layer];
         runtime.arena_dimension=node.node_arena_dimension;
         runtime.retained_pre_gate_dimension=0;
         runtime.retained_interaction_output_dimension=(node.flags
@@ -1653,17 +1964,18 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin_v4(
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::jit_mh1_host_plugin_v4_ready() const
+bool MaceBackboneKokkosT<Precision>::jit_mh1_host_plugin_v4_ready() const
 {
-    return std::is_same_v<Precision,float>
-        &&jit_mh1_host_plugin_v4
-        &&static_cast<bool>(*jit_mh1_host_plugin_v4);
+    return false;
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin_v5(
+void MaceBackboneKokkosT<Precision>::load_jit_mh1_host_plugin_v5(
     std::string path)
 {
+    (void)path;
+    throw std::invalid_argument(
+        "Execution MH-1 host ABI-v5 was retired in generation 19.");
 #ifdef KOKKOS_ENABLE_CUDA
     if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>)
         throw std::invalid_argument(
@@ -1673,11 +1985,8 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin_v5(
         throw std::invalid_argument(
             "Execution MH-1 v5 host plugins require a validated node contract.");
     prepare_execution_mh1_node_runtime_parameters();
-    constexpr std::string_view prefix="sha256:";
-    const std::string artifact_id="jit-mh1-gen"
-        +std::to_string(symmetrix::execution::required_jit_generation_version)
-        +"-v4-"
-        +execution_mh1_model_generation_fingerprint_v4.substr(prefix.size(),16);
+    const std::string artifact_id=
+        symmetrix::execution::jit_manifest_artifact_id(path);
     symmetrix::execution::MH1HostPluginV5Expectation expectation;
     expectation.scalar_size=sizeof(Precision);
     auto& v4=expectation.v4;
@@ -1687,6 +1996,7 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin_v5(
     v4.structure_fingerprint=execution_mh1_model_structure_fingerprint_v4;
     v4.runtime_layout_fingerprint=
         execution_mh1_model_runtime_layout_fingerprint_v4;
+    v4.interaction_count=execution_mh1_contract_interaction_count;
     v4.required_capabilities=
         SYMMETRIX_JIT_MH1_HOST_FORWARD_OWNER_V4
         |SYMMETRIX_JIT_MH1_HOST_SOURCE_REVERSE_OWNER_V4
@@ -1704,7 +2014,7 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin_v5(
     expectation.required_capabilities=v4.required_capabilities
         |SYMMETRIX_JIT_MH1_HOST_SPLINE_R_FORWARD_V5
         |SYMMETRIX_JIT_MH1_HOST_SPLINE_R_SOURCE_REVERSE_V5;
-    for(int layer=0;layer<2;++layer) {
+    for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
         const auto& interaction=interactions.at(layer);
         auto& extent=v4.interactions.at(layer);
         extent.input_1_dimension=interaction.convolution.input_1_dimension();
@@ -1735,18 +2045,230 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_host_plugin_v5(
     jit_mh1_host_plugin_v5=
         std::make_unique<symmetrix::execution::MH1HostPluginV5>(
             std::move(loaded));
+    // The v4 load above populated the view's node-program, conditioning and
+    // owner entries; the spline R table exists only from ABI v5, so it is the
+    // one entry this generation adds.
+    mh1_host_view.spline_r_programs=
+        jit_mh1_host_plugin_v5->descriptor().spline_r_programs;
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::jit_mh1_host_plugin_v5_ready() const
+bool MaceBackboneKokkosT<Precision>::jit_mh1_host_plugin_v5_ready() const
 {
-    return jit_mh1_host_plugin_v5
-        &&static_cast<bool>(*jit_mh1_host_plugin_v5)
-        &&jit_mh1_host_plugin_v5->descriptor().scalar_size==sizeof(Precision);
+    return false;
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::load_jit_mh1_cuda_plugin(
+bool MaceBackboneKokkosT<Precision>::jit_mh1_host_plugin_v6_ready() const
+{
+    return false;
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::jit_mh1_host_plugin_v7_ready() const
+{
+    return jit_mh1_host_plugin_v7
+        &&static_cast<bool>(*jit_mh1_host_plugin_v7)
+        &&jit_mh1_host_plugin_v7->descriptor().scalar_size==sizeof(Precision);
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::load_jit_mh1_host_plugin_v6(
+    std::string path)
+{
+    (void)path;
+    throw std::invalid_argument(
+        "Execution MH-1 host ABI-v6 was retired in generation 19.");
+    if(!execution_mh1_has_model_contract_v4||!supports_factorized())
+        throw std::invalid_argument(
+            "Execution MH-1 host ABI-v6 plugins require a validated staged "
+            "contract.");
+    prepare_execution_mh1_node_runtime_parameters();
+    constexpr std::string_view prefix="sha256:";
+    if(!std::string_view(execution_mh1_model_generation_fingerprint_v4)
+            .starts_with(prefix)
+        ||execution_mh1_model_generation_fingerprint_v4.size()
+            <prefix.size()+16)
+        throw std::invalid_argument(
+            "Execution MH-1 generation fingerprint is malformed.");
+    const std::string artifact_id=
+        symmetrix::execution::jit_manifest_artifact_id(path);
+    symmetrix::execution::MH1HostPluginV6Expectation expectation;
+    expectation.artifact_id=artifact_id;
+    expectation.generation_fingerprint=
+        execution_mh1_model_generation_fingerprint_v4;
+    expectation.semantic_fingerprint=execution_mh1_model_semantic_fingerprint_v4;
+    expectation.structure_fingerprint=execution_mh1_model_structure_fingerprint_v4;
+    expectation.runtime_layout_fingerprint=
+        execution_mh1_model_runtime_layout_fingerprint_v4;
+    expectation.required_capabilities=
+        SYMMETRIX_JIT_MH1_HOST_FORWARD_OWNER_V4
+        |SYMMETRIX_JIT_MH1_HOST_SOURCE_REVERSE_OWNER_V4
+        |SYMMETRIX_JIT_MH1_HOST_EDGE_REVERSE_OWNER_V4
+        |SYMMETRIX_JIT_MH1_HOST_GRAPH_WIDE_V4
+        |SYMMETRIX_JIT_MH1_HOST_IR_MUL_FEATURES_V4
+        |SYMMETRIX_JIT_MH1_HOST_CONDITIONING_OWNER_V4
+        |SYMMETRIX_JIT_MH1_HOST_NODE_PROGRAM_PHASES_V4
+        |SYMMETRIX_JIT_MH1_HOST_PERSISTENT_IR_MUL_NODE_STATE_V4
+        |SYMMETRIX_JIT_MH1_HOST_FIXED_WEIGHT_COORDINATES_V4
+        |SYMMETRIX_JIT_MH1_HOST_NODE_TILE_GATE_V4
+        |SYMMETRIX_JIT_MH1_HOST_NODE_TILE_PRODUCT_V4
+        |SYMMETRIX_JIT_MH1_HOST_SOURCE_OWNS_EDGE_REVERSE_V4
+        |SYMMETRIX_JIT_MH1_HOST_PHI_MAJOR_FORWARD_WEIGHT_V4
+        |SYMMETRIX_JIT_MH1_HOST_SPLINE_R_FORWARD_V5
+        |SYMMETRIX_JIT_MH1_HOST_SPLINE_R_SOURCE_REVERSE_V5;
+    expectation.scalar_size=sizeof(Precision);
+    // ABI v6 admits the contract's interaction count, so every table is sized
+    // from the model's own topology rather than from the compiled-in bound.
+    expectation.interactions.resize(interactions.size());
+    expectation.node_programs.resize(interactions.size());
+    expectation.spline_r_programs.resize(interactions.size());
+    for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
+        const auto& interaction=interactions.at(layer);
+        auto& extent=expectation.interactions.at(layer);
+        extent.input_1_dimension=interaction.convolution.input_1_dimension();
+        extent.input_2_dimension=interaction.convolution.input_2_dimension();
+        extent.output_dimension=interaction.convolution.output_dimension();
+        extent.weight_size=interaction.convolution.weight_size();
+        extent.phi_dimension=
+            interaction.convolution_weights.prefix_output_size(num_bessel);
+        extent.multiplicity=interaction.convolution.execution_multiplicity();
+        extent.input_1_angular_dimension=
+            interaction.convolution.execution_input_1_angular_dimension();
+        extent.instruction_count=
+            interaction.convolution.execution_instruction_count();
+        expectation.node_programs.at(layer)=
+            execution_mh1_host_node_expectation(layer);
+        auto& spline=expectation.spline_r_programs.at(layer);
+        spline.flags=SYMMETRIX_JIT_MH1_HOST_SPLINE_R_PACKED_FORWARD_MESSAGES_V5;
+        spline.weight_function_count=interaction.convolution.weight_size();
+        spline.density_function_index=interaction.convolution.weight_size();
+        spline.coefficient_count=4;
+    }
+    auto loaded=symmetrix::execution::MH1HostPluginV6::load(
+        std::move(path),expectation);
+    for(auto& interaction:interactions)
+        interaction.convolution_weights
+            .prepare_final_linear_weight_phi_major(num_bessel);
+    Kokkos::fence("Replace Execution MH-1 v6 host plugin");
+    jit_mh1_host_plugin_v6=
+        std::make_unique<symmetrix::execution::MH1HostPluginV6>(
+            std::move(loaded));
+    const auto& descriptor=jit_mh1_host_plugin_v6->descriptor();
+    mh1_host_view.node_programs=descriptor.node_programs;
+    mh1_host_view.composed_node_programs=false;
+    mh1_host_view.conditioning=descriptor.conditioning;
+    mh1_host_view.spline_r_programs=descriptor.spline_r_programs;
+    mh1_host_view.forward_owner=descriptor.forward_owner;
+    mh1_host_view.source_reverse_owner=descriptor.source_reverse_owner;
+    mh1_host_view.edge_reverse_owner=descriptor.edge_reverse_owner;
+    mh1_host_view.capabilities=descriptor.capabilities;
+    for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
+        auto& runtime=execution_mh1_node_runtime.at(layer);
+        const auto& node=descriptor.node_programs[layer];
+        runtime.arena_dimension=node.node_arena_dimension;
+        runtime.retained_pre_gate_dimension=0;
+        runtime.retained_interaction_output_dimension=(node.flags
+                &SYMMETRIX_JIT_MH1_HOST_NODE_RETAIN_INTERACTION_OUTPUT_V4)
+            ?node.interaction_output_dimension:0;
+        runtime.reuse_message_adjoint=false;
+        states.at(layer).pre_gate={};
+        states.at(layer).pre_gate_storage={};
+        states.at(layer).interaction_output={};
+        states.at(layer).interaction_output_storage={};
+    }
+    for(int layer=0;layer<static_cast<int>(interactions.size());++layer)
+        release_layer_edge_workspace(layer);
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::load_jit_mh1_host_plugin_v7(
+    std::string path)
+{
+    if(!execution_mh1_has_model_contract_v4||!supports_factorized())
+        throw std::invalid_argument(
+            "Execution MH-1 host ABI-v7 plugins require a validated staged "
+            "contract.");
+    prepare_execution_mh1_node_runtime_parameters();
+    constexpr std::string_view prefix="sha256:";
+    if(!std::string_view(execution_mh1_model_generation_fingerprint_v4)
+            .starts_with(prefix)
+        ||execution_mh1_model_generation_fingerprint_v4.size()
+            <prefix.size()+16)
+        throw std::invalid_argument(
+            "Execution MH-1 generation fingerprint is malformed.");
+    const std::string artifact_id=
+        symmetrix::execution::jit_manifest_artifact_id(path);
+    const symmetrix::execution::MH1SplitPhaseExpectation expectation{
+        artifact_id,
+        execution_mh1_model_generation_fingerprint_v4,
+        execution_mh1_model_semantic_fingerprint_v4,
+        execution_mh1_model_structure_fingerprint_v4,
+        execution_mh1_model_runtime_layout_fingerprint_v4,
+        static_cast<std::uint32_t>(interactions.size()),sizeof(Precision),
+        "host",""};
+    auto loaded=symmetrix::execution::MH1HostPluginV7::load(path,expectation);
+    const auto& split_descriptor=loaded.descriptor();
+    for(int layer=0;layer<static_cast<int>(products.size());++layer) {
+        const auto& node=split_descriptor.node_programs[layer];
+        const auto expected=execution_mh1_cuda_node_expectation(layer);
+        if(node.struct_size!=sizeof(SymmetrixJitMH1HostNodeProgramV7)
+            ||node.interaction!=static_cast<std::uint32_t>(layer)
+            ||node.element_count!=expected.element_count
+            ||node.input_dimension!=expected.input_dimension
+            ||node.up_dimension!=expected.up_dimension
+            ||node.contraction_input_dimension!=expected.interaction_output_dimension
+            ||node.contraction_output_dimension
+                !=products[layer].output_linear().input_dimension()
+            ||node.output_dimension!=expected.output_dimension
+            ||node.node_arena_dimension!=expected.node_arena_dimension
+            ||node.linear_parameter_count!=expected.linear_parameter_count
+            ||node.readout_parameter_count!=expected.readout_parameter_count
+            ||node.pre_forward_owner==nullptr||node.post_forward_owner==nullptr
+            ||node.post_reverse_owner==nullptr||node.pre_reverse_owner==nullptr
+            ||node.initial_forward_owner==nullptr
+            ||node.final_reverse_owner==nullptr)
+            throw std::invalid_argument(
+                "Execution MH-1 host ABI-v7 node program does not match.");
+    }
+    for(auto& interaction:interactions)
+        interaction.convolution_weights
+            .prepare_final_linear_weight_phi_major(num_bessel);
+    auto staged_split=
+        std::make_unique<symmetrix::execution::MH1HostPluginV7>(
+            std::move(loaded));
+    const auto& descriptor=staged_split->descriptor();
+    Kokkos::fence("Replace Execution MH-1 v7 host composition");
+    jit_mh1_host_plugin_v6.reset();
+    jit_mh1_host_plugin_v7=std::move(staged_split);
+    mh1_host_view.node_programs=nullptr;
+    mh1_host_view.composed_node_programs=true;
+    mh1_host_view.conditioning=descriptor.conditioning;
+    mh1_host_view.spline_r_programs=descriptor.spline_r_programs;
+    mh1_host_view.forward_owner=descriptor.forward_owner;
+    mh1_host_view.source_reverse_owner=descriptor.source_reverse_owner;
+    mh1_host_view.edge_reverse_owner=descriptor.edge_reverse_owner;
+    mh1_host_view.capabilities=descriptor.capabilities;
+    for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
+        auto& runtime=execution_mh1_node_runtime.at(layer);
+        const auto& node=split_descriptor.node_programs[layer];
+        runtime.arena_dimension=node.node_arena_dimension;
+        runtime.retained_pre_gate_dimension=0;
+        runtime.retained_interaction_output_dimension=(node.flags
+                &SYMMETRIX_JIT_MH1_HOST_NODE_RETAIN_INTERACTION_OUTPUT_V4)
+            ?node.contraction_input_dimension:0;
+        runtime.reuse_message_adjoint=false;
+        states.at(layer).pre_gate={};
+        states.at(layer).pre_gate_storage={};
+        states.at(layer).interaction_output={};
+        states.at(layer).interaction_output_storage={};
+    }
+    for(int layer=0;layer<static_cast<int>(interactions.size());++layer)
+        release_layer_edge_workspace(layer);
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::load_jit_mh1_cuda_plugin(
     std::string path)
 {
     if constexpr(!std::is_same_v<Precision,float>)
@@ -1770,10 +2292,8 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_cuda_plugin(
         Kokkos::DefaultExecutionSpace execution_space;
         ExecutionMH1CudaDeviceGuard device_guard(execution_space.cuda_device());
         const auto& device=execution_space.cuda_device_prop();
-        const std::string artifact_id="jit-mh1-gen"
-            +std::to_string(symmetrix::execution::required_jit_generation_version)
-            +"-v3-"
-            +execution_mh1_model_generation_fingerprint.substr(prefix.size(),16);
+        const std::string artifact_id=
+            symmetrix::execution::jit_manifest_artifact_id(path);
         const std::uint32_t capabilities=
             SYMMETRIX_JIT_MH1_CUDA_FORWARD_LAUNCH_V3
             |SYMMETRIX_JIT_MH1_CUDA_REVERSE_LAUNCH_V3
@@ -1793,7 +2313,7 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_cuda_plugin(
         expectation.target_compute_capability=10*device.major+device.minor;
         expectation.max_threads_per_block=device.maxThreadsPerBlock;
         expectation.required_capabilities=capabilities;
-        for(int layer=0;layer<2;++layer) {
+        for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
             const auto& interaction=interactions.at(layer);
             auto& extent=expectation.interactions.at(layer);
             extent.input_1_dimension=interaction.convolution.input_1_dimension();
@@ -1828,9 +2348,22 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_cuda_plugin(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::load_jit_mh1_cuda_plugin_v4(
+void MaceBackboneKokkosT<Precision>::load_jit_mh1_cuda_plugin_v4(
     std::string path, std::string launch_plan_json)
 {
+    (void)path;(void)launch_plan_json;
+    throw std::invalid_argument(
+        "Execution MH-1 CUDA shared-library ABI-v4 was retired in "
+        "generation 19.");
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::load_jit_mh1_cuda_plugin_v5(
+    std::string path, std::string launch_plan_json)
+{
+    if(launch_plan_json.empty())
+        throw std::invalid_argument(
+            "Execution MH-1 generation-19 device modules require a launch plan.");
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     if constexpr(!device_execution_space<Kokkos::DefaultExecutionSpace>) {
         throw std::invalid_argument(
@@ -1840,12 +2373,8 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_cuda_plugin_v4(
             throw std::invalid_argument(
                 "Execution MH-1 v4 CUDA plugins require a validated node contract.");
         prepare_execution_mh1_node_runtime_parameters();
-        constexpr std::string_view prefix="sha256:";
-        const std::string artifact_id="jit-mh1-gen"
-            +std::to_string(symmetrix::execution::required_jit_generation_version)
-            +"-v4-"
-            +execution_mh1_model_generation_fingerprint_v4.substr(
-                prefix.size(),16);
+        const std::string artifact_id=
+            symmetrix::execution::jit_manifest_artifact_id(path);
         Kokkos::DefaultExecutionSpace execution_space;
         using Traits=DeviceBackendTraits<Kokkos::DefaultExecutionSpace>;
         ExecutionMH1CudaDeviceGuard device_guard(
@@ -1867,19 +2396,9 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_cuda_plugin_v4(
         expectation.max_threads_per_block=device.max_team_size;
         expectation.scalar_size=sizeof(Precision);
         expectation.required_capabilities=
-            SYMMETRIX_JIT_MH1_CUDA_FORWARD_LAUNCH_V4
-            |SYMMETRIX_JIT_MH1_CUDA_REVERSE_LAUNCH_V4
-            |SYMMETRIX_JIT_MH1_CUDA_PHI_MAJOR_LINEAR_WEIGHT_V4
-            |SYMMETRIX_JIT_MH1_CUDA_ACTIVE_RECEIVERS_V4
-            |SYMMETRIX_JIT_MH1_CUDA_GRAPH_WIDE_V4
-            |SYMMETRIX_JIT_MH1_CUDA_IR_MUL_FEATURES_V4
-            |SYMMETRIX_JIT_MH1_CUDA_GLOBAL_SOURCE_REVERSE_V4
-            |SYMMETRIX_JIT_MH1_CUDA_EDGE_LAUNCH_COUNT_V4
-            |SYMMETRIX_JIT_MH1_CUDA_CONDITIONING_LAUNCH_V4
-            |SYMMETRIX_JIT_MH1_CUDA_NODE_PROGRAM_PHASES_V4
-            |SYMMETRIX_JIT_MH1_CUDA_PERSISTENT_IR_MUL_NODE_STATE_V4
-            |SYMMETRIX_JIT_MH1_CUDA_FIXED_WEIGHT_COORDINATES_V4;
-        for(int layer=0;layer<2;++layer) {
+            SYMMETRIX_JIT_MH1_CUDA_EXTERNAL_PRODUCT_V5
+            |SYMMETRIX_JIT_MH1_CUDA_NODE_PROGRAM_METADATA_V5;
+        for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
             const auto& interaction=interactions.at(layer);
             auto& extent=expectation.interactions.at(layer);
             extent.input_1_dimension=
@@ -1898,27 +2417,25 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_cuda_plugin_v4(
             expectation.node_programs.at(layer)=
                 execution_mh1_cuda_node_expectation(layer);
         }
-        const bool is_module=!launch_plan_json.empty();
-        auto loaded=is_module
-            ?symmetrix::execution::MH1CudaPluginV4::load_module(
-                std::move(path),expectation,std::move(launch_plan_json))
-            :symmetrix::execution::MH1CudaPluginV4::load(
-                std::move(path),expectation);
+        auto loaded=symmetrix::execution::MH1CudaPluginV4::load_module(
+            std::move(path),expectation,std::move(launch_plan_json));
         for(auto& interaction:interactions)
             interaction.convolution_weights
                 .prepare_final_linear_weight_phi_major(num_bessel);
         execution_space.fence("Replace Execution MH-1 v4 CUDA plugin");
         const auto& descriptor=loaded.descriptor();
-        for(int layer=0;layer<2;++layer) {
+        for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
             const auto& node=descriptor.node_programs[layer];
             auto& runtime=execution_mh1_node_runtime.at(layer);
             runtime.arena_dimension=node.node_arena_dimension;
-            runtime.retained_pre_gate_dimension=
-                node.retained_pre_gate_dimension;
-            runtime.retained_interaction_output_dimension=
-                static_cast<int>(node.retained_interaction_output_dimension);
+            runtime.retained_pre_gate_dimension=(node.flags
+                    &SYMMETRIX_JIT_MH1_CUDA_NODE_RETAIN_PRE_GATE_V5)
+                ?expectation.node_programs[layer].residual_dimension:0;
+            runtime.retained_interaction_output_dimension=(node.flags
+                    &SYMMETRIX_JIT_MH1_CUDA_NODE_RETAIN_INTERACTION_OUTPUT_V5)
+                ?node.contraction_input_dimension:0;
             runtime.reuse_message_adjoint=(node.flags
-                &SYMMETRIX_JIT_MH1_CUDA_NODE_REUSE_MESSAGE_ADJOINT_V4)!=0;
+                &SYMMETRIX_JIT_MH1_CUDA_NODE_REUSE_MESSAGE_ADJOINT_V5)!=0;
             runtime.tile_rows=selected_execution_mh1_node_arena_tile_rows();
             if(runtime.retained_pre_gate_dimension==0) {
                 states.at(layer).pre_gate={};
@@ -1943,7 +2460,7 @@ void MaceNonlinearKokkosT<Precision>::load_jit_mh1_cuda_plugin_v4(
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::jit_mh1_cuda_plugin_ready() const
+bool MaceBackboneKokkosT<Precision>::jit_mh1_cuda_plugin_ready() const
 {
 #ifdef KOKKOS_ENABLE_CUDA
     return std::is_same_v<Precision,float>
@@ -1955,7 +2472,13 @@ bool MaceNonlinearKokkosT<Precision>::jit_mh1_cuda_plugin_ready() const
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::jit_mh1_cuda_plugin_v4_ready() const
+bool MaceBackboneKokkosT<Precision>::jit_mh1_cuda_plugin_v4_ready() const
+{
+    return false;
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::jit_mh1_cuda_plugin_v5_ready() const
 {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     return device_execution_space<Kokkos::DefaultExecutionSpace>
@@ -1968,18 +2491,18 @@ bool MaceNonlinearKokkosT<Precision>::jit_mh1_cuda_plugin_v4_ready() const
 }
 
 template<typename Precision>
-std::string MaceNonlinearKokkosT<Precision>::jit_mh1_cuda_plugin_path() const
+std::string MaceBackboneKokkosT<Precision>::jit_mh1_cuda_plugin_path() const
 {
-    if(jit_mh1_cuda_plugin_v4_ready())
+    if(jit_mh1_cuda_plugin_v5_ready())
         return jit_mh1_cuda_plugin_v4->path();
     return jit_mh1_cuda_plugin_ready()
         ?jit_mh1_cuda_plugin->path():std::string();
 }
 
 template<typename Precision>
-std::string MaceNonlinearKokkosT<Precision>::jit_mh1_cuda_plugin_artifact_id() const
+std::string MaceBackboneKokkosT<Precision>::jit_mh1_cuda_plugin_artifact_id() const
 {
-    if(jit_mh1_cuda_plugin_v4_ready())
+    if(jit_mh1_cuda_plugin_v5_ready())
         return std::string(jit_mh1_cuda_plugin_v4->descriptor().artifact_id);
     return jit_mh1_cuda_plugin_ready()
         ?std::string(jit_mh1_cuda_plugin->descriptor().artifact_id)
@@ -1987,7 +2510,309 @@ std::string MaceNonlinearKokkosT<Precision>::jit_mh1_cuda_plugin_artifact_id() c
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::device_cuda_available() const
+void MaceBackboneKokkosT<Precision>::load_execution_mh1_product_module(
+    const int layer,std::string kind,std::string path,std::string metadata_json,
+    std::string schedule,const int persistent_blocks_per_compute_unit,
+    std::string backend)
+{
+    if(layer<0||layer>=static_cast<int>(products.size()))
+        throw std::invalid_argument("Execution MH-1 product layer is invalid.");
+    const auto& product=products.at(layer);
+    const int product_channels=product.runtime_compiled_coefficients().extent_int(2);
+    if(product_channels<=0
+        ||product.output_linear().input_dimension()%product_channels!=0)
+        throw std::invalid_argument(
+            "Execution MH-1 product output topology is invalid.");
+    const int product_output_components=
+        product.output_linear().input_dimension()/product_channels;
+    const std::string expected_kind=product_output_components==1?"M1":"M0";
+    if(kind!=expected_kind)
+        throw std::invalid_argument(
+            "Execution MH-1 product operator kind does not match its layer.");
+    const auto metadata=nlohmann::json::parse(metadata_json);
+    const auto& contract=metadata.at("contract");
+    const auto require_int=[&](const char* name) {
+        const auto value=metadata.at(name).get<int>();
+        if(value<=0)throw std::invalid_argument(
+            std::string("Execution MH-1 product ")+name+" is invalid.");
+        return value;
+    };
+    const int channels=contract.at("channels").get<int>();
+    if(channels<=0)
+        throw std::invalid_argument(
+            "Execution MH-1 product channels is invalid.");
+    const int input_components=require_int("input_components");
+    const int output_components=require_int("output_components");
+    const int correlation=require_int("correlation");
+    const int term_count=require_int("term_count");
+    const auto coefficients=product.runtime_compiled_coefficients();
+    std::string native_backend;
+    if constexpr (symmetrix::execution::host_execution_space<
+            Kokkos::DefaultExecutionSpace>)
+        native_backend="host";
+#ifdef KOKKOS_ENABLE_CUDA
+    else if constexpr (std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>)
+        native_backend="cuda";
+#endif
+#ifdef KOKKOS_ENABLE_HIP
+    else if constexpr (std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::HIP>)
+        native_backend="hip";
+#endif
+    const auto artifact_id=metadata.at("artifact_id").get<std::string>();
+    const auto structure_fingerprint=
+        metadata.at("structure_fingerprint").get<std::string>();
+    const auto module_target=metadata.at("target").get<std::string>();
+    const symmetrix::execution::MH1ProductModuleCandidate candidate{
+        layer,kind,backend,module_target,artifact_id,structure_fingerprint,
+        metadata.at("scalar_size").get<std::uint32_t>(),channels,
+        input_components,output_components,correlation,term_count};
+    const symmetrix::execution::MH1ProductModuleExpectation expectation{
+        layer,static_cast<int>(products.size()),expected_kind,native_backend,
+        module_target,artifact_id,structure_fingerprint,sizeof(Precision),
+        coefficients.extent_int(2),product.input_dimension()/channels,
+        product.output_linear().input_dimension()/channels,3,
+        product.compiled_term_count()};
+    symmetrix::execution::validate_mh1_product_module_candidate(
+        candidate,expectation);
+    if(contract.at("type_count").get<int>()!=1||!product.is_agnostic()
+        ||product.input_dimension()!=channels*input_components
+        ||product.output_linear().input_dimension()!=channels*output_components
+        ||product.compiled_term_count()!=term_count
+        // The native Kokkos view is term/type/channel LayoutRight.  The
+        // admitted agnostic projection has one type, so its flat storage is
+        // exactly the common ABI's type/term/channel payload.
+        ||coefficients.extent_int(0)!=term_count
+        ||coefficients.extent_int(1)!=1
+        ||coefficients.extent_int(2)!=channels
+        ||correlation!=3)
+        throw std::invalid_argument(
+            "Execution MH-1 product module dimensions do not match native product data.");
+    if(metadata.at("operator").get<std::string>()!=kind
+        ||metadata.at("schedule").get<std::string>()!=schedule)
+        throw std::invalid_argument(
+            "Execution MH-1 product module identity or schedule does not match.");
+    if(backend!="host"&&schedule!="chunk32"&&schedule!="tiled128x4-v1")
+        throw std::invalid_argument(
+            "Execution MH-1 device product module schedule is unsupported.");
+
+    ExecutionMH1ProductArtifact loaded;
+    loaded.kind=kind;
+    loaded.schedule=schedule;
+    loaded.target=module_target;
+    loaded.artifact_id=artifact_id;
+    loaded.structure_fingerprint=structure_fingerprint;
+    if(backend=="host") {
+        const auto generated_artifact_id=metadata.at("generated_identity")
+            .at("artifact_id").get<std::string>();
+        symmetrix::execution::M0HostPluginExpectation expectation{
+            loaded.artifact_id,loaded.structure_fingerprint,
+            metadata.at("scalar_kind").get<std::uint32_t>(),
+            metadata.at("scalar_size").get<std::uint32_t>(),channels,
+            input_components,output_components,correlation,term_count,
+            generated_artifact_id,loaded.target};
+        auto plugin=kind=="M0"
+            ?symmetrix::execution::M0HostPlugin::load(path,expectation)
+            :symmetrix::execution::M0HostPlugin::load_m1(path,expectation);
+        loaded.host_plugin=
+            std::make_unique<symmetrix::execution::M0HostPlugin>(std::move(plugin));
+    } else if(backend=="cuda"||backend=="hip") {
+        symmetrix::execution::OperatorModuleExpectation expectation;
+        expectation.kind=kind=="M0"?SYMMETRIX_JIT_OPERATOR_KIND_M0_V1
+            :SYMMETRIX_JIT_OPERATOR_KIND_M1_V1;
+        expectation.artifact_id=loaded.artifact_id;
+        expectation.structure_fingerprint=loaded.structure_fingerprint;
+        expectation.target=loaded.target;
+        expectation.scalar_kind=metadata.at("scalar_kind").get<std::uint32_t>();
+        expectation.scalar_size=metadata.at("scalar_size").get<std::uint32_t>();
+        expectation.required_capabilities=
+            metadata.at("capabilities").get<std::uint32_t>();
+        expectation.input_components=input_components;
+        expectation.output_components=output_components;
+        expectation.correlation=correlation;
+        expectation.term_count=term_count;
+        expectation.expected_threads_per_block=
+            metadata.at("threads_per_block").get<int>();
+        expectation.max_threads_per_block=expectation.expected_threads_per_block;
+        expectation.schedule_revision=metadata.at("schedule_revision").get<int>();
+        if(schedule=="tiled128x4-v1") {
+            const auto& geometry=metadata.at("launch_geometry");
+            expectation.channel_tile=geometry.at("channel_tile").get<int>();
+            expectation.forward_node_tile=
+                geometry.at("forward_node_tile").get<int>();
+            expectation.forward_component_tile=
+                geometry.at("forward_output_component_tile").get<int>();
+            expectation.reverse_node_tile=
+                geometry.at("reverse_node_tile").get<int>();
+            expectation.reverse_component_tile=
+                geometry.at("reverse_input_component_tile").get<int>();
+            expectation.logical_tiles_per_block=1;
+        } else {
+            expectation.channel_tile=1;
+            expectation.forward_node_tile=1;
+            expectation.forward_component_tile=output_components;
+            expectation.reverse_node_tile=1;
+            expectation.reverse_component_tile=input_components;
+            expectation.logical_tiles_per_block=
+                expectation.expected_threads_per_block;
+        }
+        auto module=symmetrix::execution::OperatorModule::load(path,expectation);
+        loaded.device_module=
+            std::make_unique<symmetrix::execution::OperatorModule>(std::move(module));
+        loaded.channel_tile=expectation.channel_tile;
+        loaded.forward_node_tile=expectation.forward_node_tile;
+        loaded.forward_component_tile=expectation.forward_component_tile;
+        loaded.reverse_node_tile=expectation.reverse_node_tile;
+        loaded.reverse_component_tile=expectation.reverse_component_tile;
+        loaded.logical_tiles_per_block=expectation.logical_tiles_per_block;
+        loaded.channels=channels;
+        loaded.input_components=input_components;
+        loaded.output_components=output_components;
+    } else {
+        throw std::invalid_argument(
+            "Execution MH-1 product module backend is unsupported.");
+    }
+    if(persistent_blocks_per_compute_unit<=0
+        ||persistent_blocks_per_compute_unit>32)
+        throw std::invalid_argument(
+            "Execution MH-1 product blocks-per-compute-unit count is invalid.");
+    loaded.persistent_blocks_per_compute_unit=persistent_blocks_per_compute_unit;
+    loaded.persistent_blocks=std::max(
+        1,persistent_blocks_per_compute_unit
+            *execution_device_execution_environment().compute_unit_count);
+    if(execution_mh1_product_artifacts.size()!=products.size())
+        execution_mh1_product_artifacts.resize(products.size());
+    Kokkos::fence("Replace Execution MH-1 product module");
+    execution_mh1_product_artifacts.at(layer)=std::move(loaded);
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::execution_mh1_product_module_ready(
+    const int layer) const
+{
+    return layer>=0
+        &&layer<static_cast<int>(execution_mh1_product_artifacts.size())
+        &&execution_mh1_product_artifacts.at(layer).ready();
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::execution_mh1_product_modules_ready() const
+{
+    return !products.empty()
+        &&execution_mh1_product_artifacts.size()==products.size()
+        &&std::all_of(
+            execution_mh1_product_artifacts.begin(),
+            execution_mh1_product_artifacts.end(),
+            [](const auto& artifact) { return artifact.ready(); });
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::clear_execution_mh1_product_modules()
+{
+    if(!execution_mh1_product_artifacts.empty())
+        Kokkos::fence("Clear Execution MH-1 product modules");
+    execution_mh1_product_artifacts.clear();
+}
+
+template<typename Precision>
+std::string MaceBackboneKokkosT<Precision>::execution_mh1_product_module_artifact_id(
+    const int layer) const
+{
+    return execution_mh1_product_module_ready(layer)
+        ?execution_mh1_product_artifacts.at(layer).artifact_id:std::string();
+}
+
+template<typename Precision>
+std::size_t
+MaceBackboneKokkosT<Precision>::execution_mh1_product_module_forward_launch_count(
+    const int layer) const
+{
+    return execution_mh1_product_module_ready(layer)
+        ?execution_mh1_product_artifacts.at(layer).forward_launch_count:0;
+}
+
+template<typename Precision>
+std::size_t
+MaceBackboneKokkosT<Precision>::execution_mh1_product_module_reverse_launch_count(
+    const int layer) const
+{
+    return execution_mh1_product_module_ready(layer)
+        ?execution_mh1_product_artifacts.at(layer).reverse_launch_count:0;
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::
+test_execution_mh1_product_module_launch_validation(
+    const int layer,const bool reverse,const int num_nodes,
+    const bool alias_input) const
+{
+    if(num_nodes<0)
+        throw std::invalid_argument("Execution product validation node count is invalid.");
+    if(!execution_mh1_product_module_ready(layer))
+        throw std::logic_error("Execution product validation module is unavailable.");
+    const auto& artifact=execution_mh1_product_artifacts.at(layer);
+    if(!artifact.device_module)
+        throw std::logic_error("Execution product validation requires a device module.");
+    const auto pointer=num_nodes==0?nullptr:reinterpret_cast<void*>(std::uintptr_t{4096});
+    const auto other=num_nodes==0?nullptr:reinterpret_cast<void*>(std::uintptr_t{8192});
+    const SymmetrixJitM0ArgsV1 args{
+        sizeof(SymmetrixJitM0ArgsV1),0,num_nodes,artifact.channels,0,
+        static_cast<const std::int32_t*>(other),pointer,other,other,
+        reverse?other:pointer,
+        reverse?(alias_input?pointer:other):other,nullptr};
+    if(artifact.kind=="M0") {
+        artifact.device_module->validate_m0_launch(
+            args,reverse,artifact.persistent_blocks);
+    } else {
+        artifact.device_module->validate_m1_launch(
+            args,reverse,artifact.persistent_blocks);
+    }
+}
+
+template<typename Precision>
+std::vector<std::string>
+MaceBackboneKokkosT<Precision>::execution_mh1_product_module_diagnostics() const
+{
+    std::vector<std::string> result;
+    result.reserve(products.size());
+    for(std::size_t layer=0;layer<products.size();++layer) {
+        if(layer>=execution_mh1_product_artifacts.size()
+            ||!execution_mh1_product_artifacts[layer].ready()) {
+            result.push_back("product_"+std::to_string(layer)+": missing");
+            continue;
+        }
+        const auto& artifact=execution_mh1_product_artifacts[layer];
+        result.push_back(
+            "product_"+std::to_string(layer)+": kind="+artifact.kind
+            +" schedule="+artifact.schedule+" target="+artifact.target
+            +" artifact_id="+artifact.artifact_id+" forward_launches="
+            +std::to_string(artifact.forward_launch_count)+" reverse_launches="
+            +std::to_string(artifact.reverse_launch_count)
+            +" blocks_per_compute_unit="
+            +std::to_string(artifact.persistent_blocks_per_compute_unit)
+            +" persistent_block_cap="
+            +std::to_string(artifact.persistent_blocks)
+            +" forward_logical_tiles="
+            +std::to_string(artifact.forward_logical_tiles)
+            +" forward_tiles_per_block="
+            +std::to_string(artifact.logical_tiles_per_block)
+            +" forward_required_blocks="
+            +std::to_string(artifact.forward_required_blocks)
+            +" forward_realized_blocks="
+            +std::to_string(artifact.forward_realized_blocks)
+            +" reverse_logical_tiles="
+            +std::to_string(artifact.reverse_logical_tiles)
+            +" reverse_tiles_per_block="
+            +std::to_string(artifact.logical_tiles_per_block)
+            +" reverse_required_blocks="
+            +std::to_string(artifact.reverse_required_blocks)
+            +" reverse_realized_blocks="
+            +std::to_string(artifact.reverse_realized_blocks));
+    }
+    return result;
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::device_cuda_available() const
 {
 #ifdef KOKKOS_ENABLE_CUDA
     return std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>;
@@ -1997,7 +2822,7 @@ bool MaceNonlinearKokkosT<Precision>::device_cuda_available() const
 }
 
 template<typename Precision>
-std::string MaceNonlinearKokkosT<Precision>::execution_cuda_device_name() const
+std::string MaceBackboneKokkosT<Precision>::execution_cuda_device_name() const
 {
 #ifdef KOKKOS_ENABLE_CUDA
     if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
@@ -2009,7 +2834,7 @@ std::string MaceNonlinearKokkosT<Precision>::execution_cuda_device_name() const
 }
 
 template<typename Precision>
-int MaceNonlinearKokkosT<Precision>::execution_cuda_device_ordinal() const
+int MaceBackboneKokkosT<Precision>::execution_cuda_device_ordinal() const
 {
 #ifdef KOKKOS_ENABLE_CUDA
     if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
@@ -2021,7 +2846,7 @@ int MaceNonlinearKokkosT<Precision>::execution_cuda_device_ordinal() const
 }
 
 template<typename Precision>
-int MaceNonlinearKokkosT<Precision>::execution_cuda_compute_capability() const
+int MaceBackboneKokkosT<Precision>::execution_cuda_compute_capability() const
 {
 #ifdef KOKKOS_ENABLE_CUDA
     if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
@@ -2034,7 +2859,7 @@ int MaceNonlinearKokkosT<Precision>::execution_cuda_compute_capability() const
 }
 
 template<typename Precision>
-int MaceNonlinearKokkosT<Precision>::execution_cuda_multiprocessor_count() const
+int MaceBackboneKokkosT<Precision>::execution_cuda_multiprocessor_count() const
 {
 #ifdef KOKKOS_ENABLE_CUDA
     if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
@@ -2046,7 +2871,7 @@ int MaceNonlinearKokkosT<Precision>::execution_cuda_multiprocessor_count() const
 }
 
 template<typename Precision>
-int MaceNonlinearKokkosT<Precision>::execution_cuda_warp_width() const
+int MaceBackboneKokkosT<Precision>::execution_cuda_warp_width() const
 {
 #ifdef KOKKOS_ENABLE_CUDA
     if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
@@ -2058,7 +2883,7 @@ int MaceNonlinearKokkosT<Precision>::execution_cuda_warp_width() const
 }
 
 template<typename Precision>
-int MaceNonlinearKokkosT<Precision>::execution_cuda_runtime_version() const
+int MaceBackboneKokkosT<Precision>::execution_cuda_runtime_version() const
 {
 #ifdef KOKKOS_ENABLE_CUDA
     if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
@@ -2073,7 +2898,7 @@ int MaceNonlinearKokkosT<Precision>::execution_cuda_runtime_version() const
 }
 
 template<typename Precision>
-int MaceNonlinearKokkosT<Precision>::execution_cuda_driver_version() const
+int MaceBackboneKokkosT<Precision>::execution_cuda_driver_version() const
 {
 #ifdef KOKKOS_ENABLE_CUDA
     if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
@@ -2088,40 +2913,37 @@ int MaceNonlinearKokkosT<Precision>::execution_cuda_driver_version() const
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::set_streamed_edges(std::string mode)
+void MaceBackboneKokkosT<Precision>::set_streamed_edges(std::string mode)
 {
-    const auto requested=parse_mace_streamed_edges_mode(mode);
-    if(mh1_fast_path&&requested==MACEStreamedEdgesMode::materialized)
+    const auto requested=parse_execution_mode(mode);
+    if(mh1_fast_path&&requested==ExecutionMode::materialized)
         throw std::invalid_argument(
             "MACE-MH-1 Kokkos execution supports only streamed_edges="
             "'generic' or 'direct'; 'materialized' is disabled "
             "because its shared conditioned-MLP "
             "workspace can invalidate the reverse tape.");
-    if(requested!=MACEStreamedEdgesMode::materialized&&!supports_streamed_edges())
+    if(requested!=ExecutionMode::materialized&&!supports_streamed_edges())
         throw std::invalid_argument(
             "Streamed edges require a compatible MACE-MH-1 family fast path.");
-    if(mace_uses_receiver_factorization(requested))
+    if(uses_prepared_execution(requested)&&!supports_factorized())
         throw std::invalid_argument(
-            "MACE-MH-1 receiver_factorized RTC is not implemented.");
-    if(mace_uses_prepared_execution(requested)&&!supports_factorized())
-        throw std::invalid_argument(
-            "direct and receiver_factorized require a factorable MACE-MH-1 "
+            "direct requires a factorable MACE-MH-1 "
             "edge tensor product.");
     Kokkos::fence("MACE_Nonlinear streamed-mode transition");
     invalidate_factorized_prepared_graph();
     execution_source_schedule_dirty=true;
     streamed_edges=requested;
     factorized_source_owned_reverse_used=false;
-    if(streamed_edges==MACEStreamedEdgesMode::generic
-        ||mace_uses_prepared_execution(streamed_edges))
+    if(streamed_edges==ExecutionMode::generic
+        ||uses_prepared_execution(streamed_edges))
         for(int layer=0;layer<static_cast<int>(states.size());++layer)
             release_layer_edge_workspace(layer);
-    if(!mace_uses_prepared_execution(streamed_edges))
+    if(!uses_prepared_execution(streamed_edges))
         set_execution_mh1_scratch_budget_bytes(execution_mh1_scratch_budget);
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::set_execution_mh1_scratch_budget_bytes(
+void MaceBackboneKokkosT<Precision>::set_execution_mh1_scratch_budget_bytes(
     const std::size_t budget_bytes)
 {
     Kokkos::fence("MACE_Nonlinear Execution MH-1 scratch-budget transition");
@@ -2159,17 +2981,19 @@ void MaceNonlinearKokkosT<Precision>::set_execution_mh1_scratch_budget_bytes(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::invalidate_factorized_prepared_graph()
+void MaceBackboneKokkosT<Precision>::invalidate_factorized_prepared_graph()
 {
     factorized_prepared_graph_generation=0;
     factorized_prepared_geometry_graph_generation=0;
     factorized_prepared_batch_graph_generation=0;
     factorized_completed_evaluation_graph_generation=0;
     execution_prepared_batch_edge_offsets_host.clear();
+    execution_prepared_cell_host.clear();
+    execution_prepared_pbc_host.clear();
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::reserve_execution_geometry_workspace(
+void MaceBackboneKokkosT<Precision>::reserve_execution_geometry_workspace(
     const int edges)
 {
     if(edges<0)
@@ -2286,7 +3110,7 @@ void MaceNonlinearKokkosT<Precision>::reserve_execution_geometry_workspace(
 }
 
 template<typename Precision>
-std::size_t MaceNonlinearKokkosT<Precision>::execution_geometry_workspace_bytes()
+std::size_t MaceBackboneKokkosT<Precision>::execution_geometry_workspace_bytes()
     const
 {
     return sizeof(double)*(execution_prepared_xyz.size()
@@ -2304,13 +3128,31 @@ std::size_t MaceNonlinearKokkosT<Precision>::execution_geometry_workspace_bytes(
 }
 
 template<typename Precision>
-std::uint64_t MaceNonlinearKokkosT<Precision>::prepare_factorized_graph(
+void MaceBackboneKokkosT<Precision>::record_factorized_input_h2d(
+    const std::size_t elements,const std::size_t element_size,const char* what)
+{
+    if(element_size!=0
+        &&elements>std::numeric_limits<std::size_t>::max()/element_size)
+        throw std::overflow_error(
+            std::string("MH-1 Execution ")+what+
+            " host-to-device byte count overflows size_t.");
+    const std::size_t bytes=elements*element_size;
+    if(factorized_input_h2d_bytes_
+        >std::numeric_limits<std::size_t>::max()-bytes)
+        throw std::overflow_error(
+            "MH-1 Execution cumulative host-to-device byte count overflows "
+            "size_t.");
+    factorized_input_h2d_bytes_+=bytes;
+}
+
+template<typename Precision>
+std::uint64_t MaceBackboneKokkosT<Precision>::prepare_factorized_graph(
     const int num_nodes,const std::span<const int> node_types,
     const std::span<const int> num_neigh,
     const std::span<const int> neigh_indices,
     const std::span<const int> neigh_types)
 {
-    if(!mace_uses_prepared_execution(streamed_edges))
+    if(!uses_prepared_execution(streamed_edges))
         throw std::invalid_argument(
             "Prepared Execution R1 graphs require streamed_edges='factorized'.");
     if(num_nodes<0
@@ -2321,6 +3163,19 @@ std::uint64_t MaceNonlinearKokkosT<Precision>::prepare_factorized_graph(
             >static_cast<std::size_t>(std::numeric_limits<int>::max()))
         throw std::invalid_argument(
             "Prepared MH-1 Execution R1 graph extents are inconsistent.");
+
+    if(factorized_prepared_topology_validations
+        ==std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error(
+            "Prepared MH-1 Execution R1 topology validation count "
+            "overflows size_t.");
+    if(factorized_prepared_topology_validated_edges
+        >std::numeric_limits<std::size_t>::max()-neigh_indices.size())
+        throw std::overflow_error(
+            "Prepared MH-1 Execution R1 topology validation edge count "
+            "overflows size_t.");
+    ++factorized_prepared_topology_validations;
+    factorized_prepared_topology_validated_edges+=neigh_indices.size();
 
     const auto prepared_node_types=std::vector<int>(
         node_types.begin(),node_types.end());
@@ -2395,6 +3250,11 @@ std::uint64_t MaceNonlinearKokkosT<Precision>::prepare_factorized_graph(
         "MH-1 Execution prepared edge targets",edge_targets);
     factorized_execution_space.fence("MH-1 Execution explicit graph preparation");
     ++factorized_preparation_fences;
+    record_factorized_input_h2d(
+        prepared_node_types.size()+prepared_num_neigh.size()
+            +prepared_neigh_indices.size()+prepared_neigh_types.size()
+            +receiver_offsets.size()+edge_targets.size(),
+        sizeof(int),"prepared graph");
 
     execution_prepared_node_types_host=prepared_node_types;
     execution_prepared_num_neigh_host=prepared_num_neigh;
@@ -2409,7 +3269,163 @@ std::uint64_t MaceNonlinearKokkosT<Precision>::prepare_factorized_graph(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::prepare_factorized_geometry(
+std::pair<std::uint64_t,std::size_t>
+MaceBackboneKokkosT<Precision>::prepare_periodic_factorized_graph(
+    const std::span<const int> node_types,
+    const std::span<const double> positions,
+    const std::span<const double> cell,
+    const std::span<const double> inverse_cell,
+    const double neighbor_cutoff)
+{
+    if(!uses_prepared_execution(streamed_edges))
+        throw std::invalid_argument(
+            "Native periodic MH-1 graph construction requires "
+            "streamed_edges='direct'.");
+    if(positions.size()%3!=0||node_types.size()!=positions.size()/3
+        ||cell.size()!=9||inverse_cell.size()!=9)
+        throw std::invalid_argument(
+            "Native periodic MH-1 graph extents are inconsistent.");
+    if(node_types.size()
+        >=static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::length_error(
+            "Native periodic MH-1 graph exceeds 32-bit node indexing.");
+    const int num_nodes=static_cast<int>(node_types.size());
+    const int local_types=static_cast<int>(atomic_numbers_host.size());
+    const auto prepared_node_types=std::vector<int>(
+        node_types.begin(),node_types.end());
+    for(const int type:prepared_node_types)
+        if(type<0||type>=local_types)
+            throw std::out_of_range(
+                "Native periodic MH-1 graph node type is out of range.");
+
+    invalidate_factorized_prepared_graph();
+    auto graph=symmetrix::execution::build_periodic_neighbor_graph_kokkos(
+        positions,cell,inverse_cell,neighbor_cutoff,
+        /*retain_shifts=*/false);
+    if(graph.num_edges
+        >static_cast<std::size_t>(std::numeric_limits<int>::max()))
+        throw std::length_error(
+            "Native periodic MH-1 graph exceeds 32-bit edge indexing.");
+    const int num_edges=static_cast<int>(graph.num_edges);
+    reserve_execution_geometry_workspace(num_edges);
+
+    execution_prepared_node_types=toKokkosView(
+        "MH-1 native periodic node types",prepared_node_types);
+    execution_prepared_num_neigh=graph.num_neigh;
+    execution_prepared_neigh_indices=graph.sources;
+    execution_prepared_offsets=graph.receiver_offsets;
+    execution_prepared_neigh_types=Kokkos::View<int*>(
+        Kokkos::view_alloc(
+            "MH-1 native periodic neighbor types",Kokkos::WithoutInitializing),
+        graph.num_edges);
+    execution_prepared_targets=Kokkos::View<int*>(
+        Kokkos::view_alloc(
+            "MH-1 native periodic edge targets",Kokkos::WithoutInitializing),
+        graph.num_edges);
+    const auto prepared_offsets=execution_prepared_offsets;
+    const auto prepared_targets=execution_prepared_targets;
+    const auto prepared_sources=execution_prepared_neigh_indices;
+    const auto prepared_types=execution_prepared_neigh_types;
+    const auto prepared_nodes=execution_prepared_node_types;
+    Kokkos::parallel_for(
+        "MaceNonlinearKokkos::prepare_periodic_edge_metadata",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,0,num_nodes),
+        KOKKOS_LAMBDA(const int receiver) {
+            for(int edge=prepared_offsets(receiver);
+                edge<prepared_offsets(receiver+1);++edge) {
+                const int source=prepared_sources(edge);
+                prepared_targets(edge)=receiver;
+                prepared_types(edge)=prepared_nodes(source);
+            }
+        });
+    prepare_execution_source_schedule_device(
+        num_nodes,num_edges,execution_prepared_neigh_indices,
+        execution_prepared_targets);
+
+    const auto allocate_double=[](
+        const char* label,const std::size_t size) {
+        return Kokkos::View<double*>(
+            Kokkos::view_alloc(
+                std::string(label),Kokkos::WithoutInitializing),size);
+    };
+    execution_prepared_reference_positions=allocate_double(
+        "MH-1 native periodic reference positions",positions.size());
+    execution_prepared_reference_xyz=allocate_double(
+        "MH-1 native periodic reference xyz",3*graph.num_edges);
+    execution_prepared_cell=allocate_double(
+        "MH-1 native periodic cell",cell.size());
+    execution_prepared_inverse_cell=allocate_double(
+        "MH-1 native periodic inverse cell",inverse_cell.size());
+    execution_prepared_pbc=Kokkos::View<int*>(
+        "MH-1 native periodic pbc",3);
+    execution_prepared_positions=allocate_double(
+        "MH-1 native periodic current positions",positions.size());
+    execution_prepared_displacements=allocate_double(
+        "MH-1 native periodic atom displacements",positions.size());
+    execution_prepared_geometry_invalid=Kokkos::View<int*>(
+        "MH-1 native periodic geometry invalid",1);
+
+    const auto positions_host=Kokkos::View<
+        const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            positions.data(),positions.size());
+    const auto cell_host=Kokkos::View<
+        const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            cell.data(),cell.size());
+    const auto inverse_cell_host=Kokkos::View<
+        const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            inverse_cell.data(),inverse_cell.size());
+    Kokkos::deep_copy(
+        factorized_execution_space,execution_prepared_reference_positions,
+        positions_host);
+    Kokkos::deep_copy(
+        factorized_execution_space,execution_prepared_cell,cell_host);
+    Kokkos::deep_copy(
+        factorized_execution_space,execution_prepared_inverse_cell,
+        inverse_cell_host);
+    Kokkos::deep_copy(
+        factorized_execution_space,execution_prepared_pbc,1);
+    const auto fractional_xyz=graph.fractional_xyz;
+    const auto reference_xyz=execution_prepared_reference_xyz;
+    const auto prepared_cell=execution_prepared_cell;
+    Kokkos::parallel_for(
+        "MaceNonlinearKokkos::prepare_periodic_reference_xyz",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,std::size_t(0),graph.num_edges),
+        KOKKOS_LAMBDA(const std::size_t edge) {
+            for(int component=0;component<3;++component) {
+                double value=0.0;
+                for(int lattice=0;lattice<3;++lattice)
+                    value+=fractional_xyz(edge,lattice)
+                        *prepared_cell(3*lattice+component);
+                reference_xyz(3*edge+component)=value;
+            }
+        });
+    factorized_execution_space.fence(
+        "Native periodic MH-1 graph preparation");
+    ++factorized_preparation_fences;
+
+    execution_prepared_node_types_host=prepared_node_types;
+    std::vector<int>().swap(execution_prepared_num_neigh_host);
+    std::vector<int>().swap(execution_prepared_neigh_indices_host);
+    std::vector<int>().swap(execution_prepared_neigh_types_host);
+    execution_prepared_cell_host.assign(cell.begin(),cell.end());
+    execution_prepared_pbc_host={1,1,1};
+    execution_prepared_positions_host.clear();
+    execution_prepared_positions_graph_generation=0;
+    factorized_completed_evaluation_graph_generation=0;
+    ++factorized_graph_generation_counter;
+    if(factorized_graph_generation_counter==0)
+        ++factorized_graph_generation_counter;
+    factorized_prepared_graph_generation=factorized_graph_generation_counter;
+    factorized_prepared_geometry_graph_generation=
+        factorized_prepared_graph_generation;
+    ++factorized_prepared_graphs;
+    return {factorized_prepared_graph_generation,graph.num_edges};
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::prepare_factorized_geometry(
     const std::uint64_t graph_generation,
     const std::span<const double> reference_positions,
     const std::span<const double> reference_xyz,
@@ -2437,56 +3453,329 @@ void MaceNonlinearKokkosT<Precision>::prepare_factorized_geometry(
         throw std::invalid_argument(
             "MH-1 Execution prepared geometry contains a non-finite value.");
 
-    const auto copy_double=[&](
-        const char* label,const std::span<const double> source,
-        Kokkos::View<double*>& destination) {
-        const auto host=Kokkos::View<
-            const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
-                source.data(),source.size());
-        destination=Kokkos::View<double*>(
+    std::vector<double> staged_cell_host(cell.begin(),cell.end());
+    std::vector<int> staged_pbc_host(pbc.begin(),pbc.end());
+    const auto allocate_double=[](
+        const char* label,const std::size_t size) {
+        return Kokkos::View<double*>(
             Kokkos::view_alloc(
-                std::string(label),Kokkos::WithoutInitializing),source.size());
-        Kokkos::deep_copy(factorized_execution_space,destination,host);
+                std::string(label),Kokkos::WithoutInitializing),size);
     };
-    copy_double("MH-1 Execution reference positions",reference_positions,
-        execution_prepared_reference_positions);
-    copy_double("MH-1 Execution reference xyz",reference_xyz,
-        execution_prepared_reference_xyz);
-    copy_double("MH-1 Execution cell",cell,execution_prepared_cell);
-    copy_double("MH-1 Execution inverse cell",inverse_cell,
-        execution_prepared_inverse_cell);
+    auto staged_reference_positions=allocate_double(
+        "MH-1 Execution reference positions",reference_positions.size());
+    auto staged_reference_xyz=allocate_double(
+        "MH-1 Execution reference xyz",reference_xyz.size());
+    auto staged_cell=allocate_double("MH-1 Execution cell",cell.size());
+    auto staged_inverse_cell=allocate_double(
+        "MH-1 Execution inverse cell",inverse_cell.size());
     const auto pbc_host=Kokkos::View<
         const int*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
             pbc.data(),pbc.size());
-    execution_prepared_pbc=Kokkos::View<int*>(
+    Kokkos::View<int*> staged_pbc(
         Kokkos::view_alloc("MH-1 Execution pbc",Kokkos::WithoutInitializing),
         pbc.size());
-    Kokkos::deep_copy(
-        factorized_execution_space,execution_prepared_pbc,pbc_host);
-    execution_prepared_positions=Kokkos::View<double*>(
+    Kokkos::View<double*> staged_positions(
         Kokkos::view_alloc(
             "MH-1 Execution current positions",Kokkos::WithoutInitializing),
         3*num_nodes);
-    execution_prepared_displacements=Kokkos::View<double*>(
+    Kokkos::View<double*> staged_displacements(
         Kokkos::view_alloc(
             "MH-1 Execution atom displacements",Kokkos::WithoutInitializing),
         3*num_nodes);
-    execution_prepared_geometry_invalid=Kokkos::View<int*>(
+    Kokkos::View<int*> staged_geometry_invalid(
         "MH-1 Execution geometry invalid",1);
-    factorized_execution_space.fence(
-        "MH-1 Execution prepared geometry initialization");
+    const auto copy_double=[&](
+        Kokkos::View<double*> destination,
+        const std::span<const double> source) {
+        const auto host=Kokkos::View<
+            const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+                source.data(),source.size());
+        Kokkos::deep_copy(factorized_execution_space,destination,host);
+    };
+    try {
+        copy_double(staged_reference_positions,reference_positions);
+        copy_double(staged_reference_xyz,reference_xyz);
+        copy_double(staged_cell,cell);
+        copy_double(staged_inverse_cell,inverse_cell);
+        Kokkos::deep_copy(factorized_execution_space,staged_pbc,pbc_host);
+        factorized_execution_space.fence(
+            "MH-1 Execution prepared geometry initialization");
+        record_factorized_input_h2d(
+            reference_positions.size()+reference_xyz.size()+cell.size()
+                +inverse_cell.size(),
+            sizeof(double),"prepared geometry");
+        record_factorized_input_h2d(
+            pbc.size(),sizeof(int),"prepared PBC");
+    }
+    catch(...) {
+        factorized_execution_space.fence(
+            "MH-1 Execution failed prepared geometry cleanup");
+        throw;
+    }
+    if(factorized_geometry_prepare_failure_armed_) {
+        factorized_geometry_prepare_failure_armed_=false;
+        throw std::runtime_error(
+            "injected prepared-geometry failure before state publication");
+    }
+
+    execution_prepared_reference_positions=staged_reference_positions;
+    execution_prepared_reference_xyz=staged_reference_xyz;
+    execution_prepared_cell=staged_cell;
+    execution_prepared_inverse_cell=staged_inverse_cell;
+    execution_prepared_pbc=staged_pbc;
+    execution_prepared_positions=staged_positions;
+    execution_prepared_displacements=staged_displacements;
+    execution_prepared_geometry_invalid=staged_geometry_invalid;
+    execution_prepared_cell_host=std::move(staged_cell_host);
+    execution_prepared_pbc_host=std::move(staged_pbc_host);
+    execution_prepared_positions_host.clear();
+    execution_prepared_positions_graph_generation=0;
+    factorized_completed_evaluation_graph_generation=0;
     factorized_prepared_geometry_graph_generation=graph_generation;
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::compute_prepared_factorized(
+std::uint64_t MaceBackboneKokkosT<Precision>::replace_factorized_graph_geometry(
+    const int num_nodes,const std::span<const int> node_types,
+    const std::span<const int> num_neigh,
+    const std::span<const int> neigh_indices,
+    const std::span<const int> neigh_types,
+    const std::span<const double> reference_positions,
+    const std::span<const double> reference_xyz,
+    const std::span<const double> cell,
+    const std::span<const double> inverse_cell,
+    const std::span<const int> pbc)
+{
+    // Move host owners and retain device-view handles instead of copying or
+    // downloading the predecessor.  Clearing the live handles forces the
+    // existing preparation routines to allocate a disjoint candidate.
+#define SYMMETRIX_RETAIN_VIEW(name) auto old_##name=std::move(name);name={}
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_node_types);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_num_neigh);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_neigh_indices);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_neigh_types);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_offsets);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_targets);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_reference_positions);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_reference_xyz);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_cell);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_inverse_cell);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_pbc);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_positions);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_displacements);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_geometry_invalid);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_xyz);
+    SYMMETRIX_RETAIN_VIEW(execution_prepared_distances);
+    SYMMETRIX_RETAIN_VIEW(execution_block_source_segments);
+    SYMMETRIX_RETAIN_VIEW(execution_source_edge_offsets);
+    SYMMETRIX_RETAIN_VIEW(execution_source_edges);
+    SYMMETRIX_RETAIN_VIEW(execution_block_receivers);
+    SYMMETRIX_RETAIN_VIEW(execution_graph_source_edge_offsets);
+    SYMMETRIX_RETAIN_VIEW(execution_graph_source_edges);
+    SYMMETRIX_RETAIN_VIEW(execution_graph_receivers);
+    SYMMETRIX_RETAIN_VIEW(execution_block_source_segments_storage);
+    SYMMETRIX_RETAIN_VIEW(execution_source_edge_offsets_storage);
+    SYMMETRIX_RETAIN_VIEW(execution_source_edges_storage);
+    SYMMETRIX_RETAIN_VIEW(execution_block_receivers_storage);
+    SYMMETRIX_RETAIN_VIEW(execution_graph_source_edge_offsets_storage);
+    SYMMETRIX_RETAIN_VIEW(execution_graph_source_edges_storage);
+    SYMMETRIX_RETAIN_VIEW(execution_graph_receivers_storage);
+    SYMMETRIX_RETAIN_VIEW(xyz_shuffled);
+    SYMMETRIX_RETAIN_VIEW(Y);
+    SYMMETRIX_RETAIN_VIEW(Y_grad);
+    SYMMETRIX_RETAIN_VIEW(Y_grad_shuffled);
+    SYMMETRIX_RETAIN_VIEW(xyz_shuffled_storage);
+    SYMMETRIX_RETAIN_VIEW(Y_storage);
+    SYMMETRIX_RETAIN_VIEW(Y_grad_storage);
+    SYMMETRIX_RETAIN_VIEW(Y_grad_shuffled_storage);
+#undef SYMMETRIX_RETAIN_VIEW
+
+#define SYMMETRIX_RETAIN_HOST(name) auto old_##name=std::move(name);name={}
+    SYMMETRIX_RETAIN_HOST(execution_block_source_segments_host);
+    SYMMETRIX_RETAIN_HOST(execution_block_receiver_counts_host);
+    SYMMETRIX_RETAIN_HOST(execution_schedule_sources_host);
+    SYMMETRIX_RETAIN_HOST(execution_schedule_targets_host);
+    SYMMETRIX_RETAIN_HOST(execution_prepared_node_types_host);
+    SYMMETRIX_RETAIN_HOST(execution_prepared_num_neigh_host);
+    SYMMETRIX_RETAIN_HOST(execution_prepared_neigh_indices_host);
+    SYMMETRIX_RETAIN_HOST(execution_prepared_neigh_types_host);
+    SYMMETRIX_RETAIN_HOST(execution_prepared_cell_host);
+    SYMMETRIX_RETAIN_HOST(execution_prepared_pbc_host);
+    SYMMETRIX_RETAIN_HOST(execution_prepared_positions_host);
+    SYMMETRIX_RETAIN_HOST(execution_prepared_batch_edge_offsets_host);
+#undef SYMMETRIX_RETAIN_HOST
+
+    const auto old_graph_generation_counter=factorized_graph_generation_counter;
+    const auto old_graph_generation=factorized_prepared_graph_generation;
+    const auto old_geometry_generation=
+        factorized_prepared_geometry_graph_generation;
+    const auto old_batch_generation=factorized_prepared_batch_graph_generation;
+    const auto old_completed_generation=
+        factorized_completed_evaluation_graph_generation;
+    const auto old_positions_generation=
+        execution_prepared_positions_graph_generation;
+    const auto old_prepared_graphs=factorized_prepared_graphs;
+    const auto old_geometry_capacity=execution_geometry_edge_capacity;
+    const auto old_geometry_growth_reason=execution_geometry_growth_reason_;
+    const auto old_schedule_num_nodes=execution_schedule_num_nodes;
+    const auto old_graph_source_owner_count=execution_graph_source_owner_count;
+    const auto old_graph_receiver_count=execution_graph_receiver_count;
+    const auto old_schedule_dirty=execution_source_schedule_dirty;
+
+    factorized_prepared_graph_generation=0;
+    factorized_prepared_geometry_graph_generation=0;
+    factorized_prepared_batch_graph_generation=0;
+    factorized_completed_evaluation_graph_generation=0;
+    execution_prepared_positions_graph_generation=0;
+    execution_geometry_edge_capacity=0;
+    execution_schedule_num_nodes=0;
+    execution_graph_source_owner_count=0;
+    execution_graph_receiver_count=0;
+    execution_source_schedule_dirty=true;
+
+    const auto restore_predecessor=[&] {
+        factorized_execution_space.fence(
+            "Restore predecessor after failed MH-1 graph replacement");
+#define SYMMETRIX_RESTORE_VIEW(name) name=std::move(old_##name)
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_node_types);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_num_neigh);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_neigh_indices);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_neigh_types);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_offsets);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_targets);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_reference_positions);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_reference_xyz);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_cell);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_inverse_cell);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_pbc);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_positions);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_displacements);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_geometry_invalid);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_xyz);
+        SYMMETRIX_RESTORE_VIEW(execution_prepared_distances);
+        SYMMETRIX_RESTORE_VIEW(execution_block_source_segments);
+        SYMMETRIX_RESTORE_VIEW(execution_source_edge_offsets);
+        SYMMETRIX_RESTORE_VIEW(execution_source_edges);
+        SYMMETRIX_RESTORE_VIEW(execution_block_receivers);
+        SYMMETRIX_RESTORE_VIEW(execution_graph_source_edge_offsets);
+        SYMMETRIX_RESTORE_VIEW(execution_graph_source_edges);
+        SYMMETRIX_RESTORE_VIEW(execution_graph_receivers);
+        SYMMETRIX_RESTORE_VIEW(execution_block_source_segments_storage);
+        SYMMETRIX_RESTORE_VIEW(execution_source_edge_offsets_storage);
+        SYMMETRIX_RESTORE_VIEW(execution_source_edges_storage);
+        SYMMETRIX_RESTORE_VIEW(execution_block_receivers_storage);
+        SYMMETRIX_RESTORE_VIEW(execution_graph_source_edge_offsets_storage);
+        SYMMETRIX_RESTORE_VIEW(execution_graph_source_edges_storage);
+        SYMMETRIX_RESTORE_VIEW(execution_graph_receivers_storage);
+        SYMMETRIX_RESTORE_VIEW(xyz_shuffled);
+        SYMMETRIX_RESTORE_VIEW(Y);
+        SYMMETRIX_RESTORE_VIEW(Y_grad);
+        SYMMETRIX_RESTORE_VIEW(Y_grad_shuffled);
+        SYMMETRIX_RESTORE_VIEW(xyz_shuffled_storage);
+        SYMMETRIX_RESTORE_VIEW(Y_storage);
+        SYMMETRIX_RESTORE_VIEW(Y_grad_storage);
+        SYMMETRIX_RESTORE_VIEW(Y_grad_shuffled_storage);
+#undef SYMMETRIX_RESTORE_VIEW
+#define SYMMETRIX_RESTORE_HOST(name) name=std::move(old_##name)
+        SYMMETRIX_RESTORE_HOST(execution_block_source_segments_host);
+        SYMMETRIX_RESTORE_HOST(execution_block_receiver_counts_host);
+        SYMMETRIX_RESTORE_HOST(execution_schedule_sources_host);
+        SYMMETRIX_RESTORE_HOST(execution_schedule_targets_host);
+        SYMMETRIX_RESTORE_HOST(execution_prepared_node_types_host);
+        SYMMETRIX_RESTORE_HOST(execution_prepared_num_neigh_host);
+        SYMMETRIX_RESTORE_HOST(execution_prepared_neigh_indices_host);
+        SYMMETRIX_RESTORE_HOST(execution_prepared_neigh_types_host);
+        SYMMETRIX_RESTORE_HOST(execution_prepared_cell_host);
+        SYMMETRIX_RESTORE_HOST(execution_prepared_pbc_host);
+        SYMMETRIX_RESTORE_HOST(execution_prepared_positions_host);
+        SYMMETRIX_RESTORE_HOST(execution_prepared_batch_edge_offsets_host);
+#undef SYMMETRIX_RESTORE_HOST
+        factorized_graph_generation_counter=old_graph_generation_counter;
+        factorized_prepared_graph_generation=old_graph_generation;
+        factorized_prepared_geometry_graph_generation=old_geometry_generation;
+        factorized_prepared_batch_graph_generation=old_batch_generation;
+        factorized_completed_evaluation_graph_generation=old_completed_generation;
+        execution_prepared_positions_graph_generation=old_positions_generation;
+        factorized_prepared_graphs=old_prepared_graphs;
+        execution_geometry_edge_capacity=old_geometry_capacity;
+        execution_geometry_growth_reason_=old_geometry_growth_reason;
+        execution_schedule_num_nodes=old_schedule_num_nodes;
+        execution_graph_source_owner_count=old_graph_source_owner_count;
+        execution_graph_receiver_count=old_graph_receiver_count;
+        execution_source_schedule_dirty=old_schedule_dirty;
+    };
+
+    try {
+        const auto generation=prepare_factorized_graph(
+            num_nodes,node_types,num_neigh,neigh_indices,neigh_types);
+        prepare_factorized_geometry(
+            generation,reference_positions,reference_xyz,cell,inverse_cell,pbc);
+        return generation;
+    } catch(...) {
+        restore_predecessor();
+        throw;
+    }
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::validate_factorized_prepared_system(
+    const std::uint64_t graph_generation,
+    const std::span<const int> node_types,
+    const std::span<const double> cell,
+    const std::span<const int> pbc) const
+{
+    if(graph_generation==0
+        ||graph_generation!=factorized_prepared_graph_generation
+        ||graph_generation!=factorized_prepared_geometry_graph_generation)
+        throw std::invalid_argument(
+            "Prepared MH-1 system validation requires the current prepared "
+            "graph and geometry token.");
+    if(node_types.size()!=execution_prepared_node_types_host.size()
+        ||!std::equal(node_types.begin(),node_types.end(),
+            execution_prepared_node_types_host.begin()))
+        throw std::invalid_argument(
+            "Prepared MH-1 system node types do not match the prepared graph.");
+    if(cell.size()!=execution_prepared_cell_host.size()
+        ||!std::equal(cell.begin(),cell.end(),
+            execution_prepared_cell_host.begin()))
+        throw std::invalid_argument(
+            "Prepared MH-1 system cell does not match the prepared geometry.");
+    if(pbc.size()!=execution_prepared_pbc_host.size()
+        ||!std::equal(pbc.begin(),pbc.end(),execution_prepared_pbc_host.begin()))
+        throw std::invalid_argument(
+            "Prepared MH-1 system PBC does not match the prepared geometry.");
+}
+
+template<typename Precision>
+double MaceBackboneKokkosT<Precision>::factorized_prepared_cell_volume(
+    const std::uint64_t graph_generation) const
+{
+    if(graph_generation==0
+        ||graph_generation!=factorized_prepared_geometry_graph_generation
+        ||execution_prepared_cell_host.size()!=9)
+        throw std::invalid_argument(
+            "Prepared MH-1 cell volume requires the current prepared "
+            "geometry token.");
+    const auto& c=execution_prepared_cell_host;
+    const double determinant=
+        c[0]*(c[4]*c[8]-c[5]*c[7])
+        -c[1]*(c[3]*c[8]-c[5]*c[6])
+        +c[2]*(c[3]*c[7]-c[4]*c[6]);
+    const double volume=std::abs(determinant);
+    if(!std::isfinite(volume)||!(volume>0.0))
+        throw std::invalid_argument(
+            "Prepared periodic MH-1 cell must have a finite positive volume.");
+    return volume;
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::compute_prepared_factorized(
     const std::uint64_t graph_generation,const std::span<const double> xyz,
     const std::span<const double> distances)
 {
-    if(!mace_uses_prepared_execution(streamed_edges))
+    if(!uses_prepared_execution(streamed_edges))
         throw std::invalid_argument(
-            "An execution graph token requires streamed_edges='direct' or "
-            "'receiver_factorized'.");
+            "An execution graph token requires streamed_edges='direct'.");
     if(graph_generation==0
         ||graph_generation!=factorized_prepared_graph_generation
         ||execution_source_schedule_dirty)
@@ -2513,6 +3802,9 @@ void MaceNonlinearKokkosT<Precision>::compute_prepared_factorized(
         Kokkos::deep_copy(factorized_execution_space,xyz_device,xyz_host);
         Kokkos::deep_copy(
             factorized_execution_space,distances_device,distances_host);
+        record_factorized_input_h2d(
+            xyz.size()+distances.size(),sizeof(double),
+            "prepared edge geometry");
         execution_geometry_copies+=2;
         compute_node_energies_forces(
             static_cast<int>(execution_prepared_node_types.extent(0)),
@@ -2529,11 +3821,11 @@ void MaceNonlinearKokkosT<Precision>::compute_prepared_factorized(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::compute_prepared_factorized_positions(
+void MaceBackboneKokkosT<Precision>::compute_prepared_factorized_positions(
     const std::uint64_t graph_generation,
     const std::span<const double> positions)
 {
-    if(!mace_uses_prepared_execution(streamed_edges))
+    if(!uses_prepared_execution(streamed_edges))
         throw std::invalid_argument(
             "Prepared MH-1 Execution positions require streamed_edges='factorized'.");
     if(graph_generation==0
@@ -2552,11 +3844,28 @@ void MaceNonlinearKokkosT<Precision>::compute_prepared_factorized_positions(
         throw std::invalid_argument(
             "MH-1 Execution prepared positions contain a non-finite value.");
 
+    auto xyz=Kokkos::subview(execution_prepared_xyz,
+        std::make_pair(std::size_t(0),3*static_cast<std::size_t>(num_edges)));
+    auto distances=Kokkos::subview(execution_prepared_distances,
+        std::make_pair(std::size_t(0),static_cast<std::size_t>(num_edges)));
+    if(execution_prepared_positions_graph_generation==graph_generation
+        &&execution_prepared_positions_host.size()==positions.size()
+        &&std::equal(execution_prepared_positions_host.begin(),
+            execution_prepared_positions_host.end(),positions.begin())) {
+        compute_node_energies_forces(
+            num_nodes,Kokkos::View<const int*>(),Kokkos::View<const int*>(),
+            Kokkos::View<const int*>(),Kokkos::View<const int*>(),
+            xyz,distances,graph_generation);
+        return;
+    }
+
     const auto positions_host=Kokkos::View<
         const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
             positions.data(),positions.size());
     Kokkos::deep_copy(
         factorized_execution_space,execution_prepared_positions,positions_host);
+    record_factorized_input_h2d(
+        positions.size(),sizeof(double),"prepared positions");
     ++execution_geometry_copies;
     Kokkos::deep_copy(
         factorized_execution_space,execution_prepared_geometry_invalid,0);
@@ -2570,10 +3879,6 @@ void MaceNonlinearKokkosT<Precision>::compute_prepared_factorized_positions(
     const auto edge_receivers=execution_prepared_targets;
     const auto edge_sources=execution_prepared_neigh_indices;
     auto displacements=execution_prepared_displacements;
-    auto xyz=Kokkos::subview(execution_prepared_xyz,
-        std::make_pair(std::size_t(0),3*static_cast<std::size_t>(num_edges)));
-    auto distances=Kokkos::subview(execution_prepared_distances,
-        std::make_pair(std::size_t(0),static_cast<std::size_t>(num_edges)));
     auto invalid=execution_prepared_geometry_invalid;
     const double cutoff=r_cut;
 
@@ -2650,17 +3955,298 @@ void MaceNonlinearKokkosT<Precision>::compute_prepared_factorized_positions(
         throw std::invalid_argument(
             "MH-1 Execution prepared positions produced invalid edge geometry.");
     }
+    execution_prepared_positions_host.assign(positions.begin(),positions.end());
+    execution_prepared_positions_graph_generation=graph_generation;
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::streams_layer(int) const
+typename MaceBackboneKokkosT<Precision>::LayerRetainedFeatureLayout
+MaceBackboneKokkosT<Precision>::make_layer_retained_feature_layout(
+    const std::size_t layer) const
 {
-    return streamed_edges==MACEStreamedEdgesMode::generic
-        ||mace_uses_prepared_execution(streamed_edges);
+    if(layer>=mh1_family.layer_count()||layer>=products.size())
+        throw std::out_of_range(
+            "MH-1 retained-feature layer index is out of range.");
+    const auto& descriptor=mh1_family.layer(layer);
+    LayerRetainedFeatureLayout layout;
+    layout.channels=mh1_family.node_channels;
+    int offset=0;
+    for(const auto& block:descriptor.product_output_blocks) {
+        if(block.multiplicity!=layout.channels)
+            throw std::runtime_error(
+                "MH-1 retained-feature blocks must use the family node "
+                "channel count.");
+        if(block.l==0&&layout.scalar_offset<0) {
+            layout.scalar_offset=offset;
+            layout.scalar_multiplicity=block.multiplicity;
+        } else if(block.l==1&&layout.vector_offset<0) {
+            layout.vector_offset=offset;
+            layout.vector_multiplicity=block.multiplicity;
+            layout.vector_components=3;
+            layout.retained_from_native_components={1,2,0};
+            layout.retained_from_native_signs={-1,-1,-1};
+        } else
+            throw std::runtime_error(
+                "MH-1 retained features support one scalar and one optional "
+                "vector block in canonical order.");
+        offset+=block.multiplicity*(2*block.l+1);
+    }
+    layout.width=offset;
+    if(layout.scalar_offset<0
+        ||layout.width!=products.at(layer).output_dimension())
+        throw std::runtime_error(
+            "MH-1 retained-feature layout does not match the product output.");
+
+    std::vector<int> portable_indices(layout.width,-1);
+    std::vector<int> generated_indices(layout.width,-1);
+    std::vector<Precision> signs(layout.width,Precision(1));
+    for(int channel=0;channel<layout.scalar_multiplicity;++channel) {
+        const int index=layout.scalar_offset+channel;
+        portable_indices[index]=index;
+        generated_indices[index]=index;
+    }
+    if(layout.vector_offset>=0)
+        for(int channel=0;channel<layout.vector_multiplicity;++channel)
+            for(int retained_component=0;
+                retained_component<layout.vector_components;
+                ++retained_component) {
+                const int retained=layout.vector_offset
+                    +channel*layout.vector_components+retained_component;
+                const int source_component=
+                    layout.retained_from_native_components[retained_component];
+                portable_indices[retained]=layout.vector_offset
+                    +channel*layout.vector_components+source_component;
+                generated_indices[retained]=layout.vector_offset
+                    +source_component*layout.vector_multiplicity+channel;
+                signs[retained]=Precision(
+                    layout.retained_from_native_signs[retained_component]);
+            }
+    if(std::any_of(portable_indices.begin(),portable_indices.end(),
+            [](const int index) { return index<0; })
+        ||std::any_of(generated_indices.begin(),generated_indices.end(),
+            [](const int index) { return index<0; }))
+        throw std::runtime_error(
+            "MH-1 retained-feature layout leaves an output component unmapped.");
+    const auto suffix=std::to_string(layer);
+    const auto portable_label="mh1 retained portable source indices "+suffix;
+    const auto generated_label="mh1 retained generated source indices "+suffix;
+    const auto signs_label="mh1 retained feature signs "+suffix;
+    layout.portable_source_indices=toKokkosView(
+        portable_label.c_str(),portable_indices);
+    layout.generated_source_indices=toKokkosView(
+        generated_label.c_str(),generated_indices);
+    layout.retained_signs=toKokkosView(
+        signs_label.c_str(),signs);
+    return layout;
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::prepare_execution_source_schedule(
+const typename MaceBackboneKokkosT<Precision>::LayerRetainedFeatureLayout&
+MaceBackboneKokkosT<Precision>::mh1_layer_retained_feature_layout(
+    const std::size_t layer) const
+{
+    if(layer>=layer_retained_feature_layouts.size())
+        throw std::out_of_range(
+            "MH-1 retained-feature layer index is out of range.");
+    return layer_retained_feature_layouts[layer];
+}
+
+template<typename Precision>
+int MaceBackboneKokkosT<Precision>::layer_feature_components(
+    const int width) const
+{
+    const auto found=std::find_if(
+        layer_retained_feature_layouts.begin(),
+        layer_retained_feature_layouts.end(),
+        [&](const auto& layout) { return layout.width==width; });
+    if(found==layer_retained_feature_layouts.end())
+        throw std::runtime_error(
+            "MH-1 layer node features do not match a retained layout.");
+    return (found->scalar_multiplicity>0?1:0)+found->vector_components;
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::retain_layer_output(
+    const int layer, const int num_nodes,
+    const Kokkos::View<const Precision**,Kokkos::LayoutRight>& output,
+    const bool generated_layout)
+{
+    if(!retain_layer_features)
+        return;
+    if(layer<0||layer>=static_cast<int>(interactions.size()))
+        return;
+    const int layers=static_cast<int>(interactions.size());
+    if(static_cast<int>(retained_layer_features.size())!=layers)
+        retained_layer_features.assign(static_cast<std::size_t>(layers),{});
+    const auto& layout=mh1_layer_retained_feature_layout(
+        static_cast<std::size_t>(layer));
+    const int width=layout.width;
+    if(output.extent(1)!=static_cast<std::size_t>(width))
+        throw std::invalid_argument(
+            "MH-1 retained-feature width does not match its layer layout.");
+    auto& storage=retained_layer_features[static_cast<std::size_t>(layer)];
+    if(storage.extent(0)!=static_cast<std::size_t>(num_nodes)
+        ||storage.extent(1)!=static_cast<std::size_t>(width))
+        storage=Kokkos::View<Precision**,Kokkos::LayoutRight>(
+            "mh1 retained layer features",num_nodes,width);
+    auto destination=storage;
+    auto source=output;
+    const auto source_indices=generated_layout
+        ?layout.generated_source_indices:layout.portable_source_indices;
+    const auto signs=layout.retained_signs;
+    Kokkos::parallel_for("mh1 retain layer features",
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+            {0,0},{num_nodes,width}),
+        KOKKOS_LAMBDA(const int node,const int retained) {
+            destination(node,retained)=signs(retained)
+                *source(node,source_indices(retained));
+        });
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::set_layer_product_seed(
+    const std::vector<Kokkos::View<const Precision**,Kokkos::LayoutRight>>&
+        seeds)
+{
+    if(seeds.empty()) {
+        clear_layer_product_seed();
+        return;
+    }
+    if(static_cast<int>(seeds.size())!=static_cast<int>(interactions.size()))
+        throw std::invalid_argument(
+            "MH-1 layer-product seeds must carry one entry per interaction "
+            "layer.");
+    if(layer_product_seed_storage.size()!=seeds.size())
+        layer_product_seed_storage.resize(seeds.size());
+    layer_product_seeds.clear();
+    layer_product_seeds.reserve(seeds.size());
+    for(std::size_t layer=0;layer<seeds.size();++layer) {
+        const auto& seed=seeds[layer];
+        const auto& layout=mh1_layer_retained_feature_layout(layer);
+        if(seed.extent(1)!=static_cast<std::size_t>(layout.width))
+            throw std::invalid_argument(
+                "MH-1 layer-product seed width does not match its retained "
+                "layout.");
+        auto& storage=layer_product_seed_storage[layer];
+        if(storage.extent(0)!=seed.extent(0)
+            ||storage.extent(1)!=seed.extent(1)) {
+            storage=Kokkos::View<Precision**,Kokkos::LayoutRight>(
+                "mh1 layer product seed",seed.extent(0),seed.extent(1));
+            ++layer_product_seed_workspace_replacements;
+        }
+        Kokkos::deep_copy(storage,seed);
+        layer_product_seeds.push_back(storage);
+    }
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::set_layer_product_seed_flat(
+    const Kokkos::View<const Precision**,Kokkos::LayoutRight>& seeds)
+{
+    if(seeds.extent(0)==0||seeds.extent(1)==0) {
+        clear_layer_product_seed();
+        return;
+    }
+    const std::size_t layers=interactions.size();
+    if(layer_retained_feature_layouts.size()!=layers)
+        throw std::invalid_argument(
+            "MH-1 flat layer-product seed requires every retained layout.");
+    std::size_t total_width=0;
+    for(const auto& layout:layer_retained_feature_layouts)
+        total_width+=static_cast<std::size_t>(layout.width);
+    if(seeds.extent(1)!=total_width)
+        throw std::invalid_argument(
+            "MH-1 flat layer-product seed width does not match the retained "
+            "layer layouts.");
+
+    if(layer_product_seed_storage.size()!=layers)
+        layer_product_seed_storage.resize(layers);
+    layer_product_seeds.clear();
+    layer_product_seeds.reserve(layers);
+    std::size_t offset=0;
+    for(std::size_t layer=0;layer<layers;++layer) {
+        const int width=layer_retained_feature_layouts[layer].width;
+        auto& storage=layer_product_seed_storage[layer];
+        if(storage.extent(0)!=seeds.extent(0)
+            ||storage.extent(1)!=static_cast<std::size_t>(width)) {
+            storage=Kokkos::View<Precision**,Kokkos::LayoutRight>(
+                "mh1 native layer product seed",seeds.extent(0),width);
+            ++layer_product_seed_workspace_replacements;
+        }
+        auto destination=storage;
+        auto source=seeds;
+        const std::size_t source_offset=offset;
+        Kokkos::parallel_for("mh1 adopt flat layer product seed",
+            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                {0,0},{static_cast<int>(seeds.extent(0)),width}),
+            KOKKOS_LAMBDA(const int node,const int column) {
+                destination(node,column)=source(
+                    node,source_offset+static_cast<std::size_t>(column));
+            });
+        layer_product_seeds.push_back(storage);
+        offset+=static_cast<std::size_t>(width);
+    }
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::clear_layer_product_seed()
+{
+    layer_product_seeds.clear();
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::add_layer_product_seed(
+    const int layer, const int num_nodes,
+    const Kokkos::View<Precision**,Kokkos::LayoutRight>& adjoint,
+    const bool generated_layout) const
+{
+    if(layer<0||layer>=static_cast<int>(layer_product_seeds.size()))
+        throw std::invalid_argument(
+            "MH-1 layer-product seed index is outside the adopted seeds.");
+    const auto& seed=layer_product_seeds[static_cast<std::size_t>(layer)];
+    if(seed.extent(1)!=adjoint.extent(1))
+        throw std::invalid_argument(
+            "MH-1 layer-product seed width does not match its product "
+            "output.");
+    if(seed.extent(0)!=adjoint.extent(0))
+        throw std::invalid_argument(
+            "MH-1 layer-product seed node count does not match its product "
+            "output.");
+    const auto& layout=mh1_layer_retained_feature_layout(
+        static_cast<std::size_t>(layer));
+    auto local_seed=seed;
+    auto local_adjoint=adjoint;
+    const auto source_indices=generated_layout
+        ?layout.generated_source_indices:layout.portable_source_indices;
+    const auto signs=layout.retained_signs;
+    const int width=layout.width;
+    Kokkos::parallel_for("mh1 add layer product seed",
+        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+            {0,0},{num_nodes,width}),
+        KOKKOS_LAMBDA(const int node,const int retained) {
+            local_adjoint(node,source_indices(retained))+=signs(retained)
+                *local_seed(node,retained);
+        });
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::set_retain_layer_features(
+    const bool retain)
+{
+    retain_layer_features=retain;
+    if(!retain)
+        retained_layer_features.clear();
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::streams_layer(int) const
+{
+    return streamed_edges==ExecutionMode::generic
+        ||uses_prepared_execution(streamed_edges);
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::prepare_execution_source_schedule(
     int num_nodes,int samples,Kokkos::View<const int*> source_indices,
     Kokkos::View<const int*> target_indices)
 {
@@ -2673,6 +4259,13 @@ void MaceNonlinearKokkosT<Precision>::prepare_execution_source_schedule(
         ||target_indices.extent(0)<static_cast<std::size_t>(samples))
         throw std::invalid_argument(
             "MH-1 Execution source schedule dimensions are inconsistent.");
+    const std::size_t copied_elements=2*static_cast<std::size_t>(samples);
+    if(copied_elements
+        >std::numeric_limits<std::size_t>::max()
+            -factorized_schedule_topology_d2h_elements_)
+        throw std::overflow_error(
+            "MH-1 Execution topology transfer counter overflowed.");
+    factorized_schedule_topology_d2h_elements_+=copied_elements;
     const auto host_sources=Kokkos::create_mirror_view_and_copy(
         Kokkos::HostSpace(),source_indices);
     const auto host_targets=Kokkos::create_mirror_view_and_copy(
@@ -2684,7 +4277,241 @@ void MaceNonlinearKokkosT<Precision>::prepare_execution_source_schedule(
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::prepare_execution_source_schedule_host(
+void MaceBackboneKokkosT<Precision>::prepare_execution_source_schedule_device(
+    const int num_nodes,const int samples,
+    Kokkos::View<const int*> source_indices,
+    Kokkos::View<const int*> target_indices)
+{
+    if(num_nodes<0||samples<0
+        ||source_indices.extent(0)<static_cast<std::size_t>(samples)
+        ||target_indices.extent(0)<static_cast<std::size_t>(samples))
+        throw std::invalid_argument(
+            "MH-1 device source schedule dimensions are inconsistent.");
+    if(factorized_prepared_graph_generation!=0)
+        invalidate_factorized_prepared_graph();
+
+    const std::int64_t block_count_64=(static_cast<std::int64_t>(samples)
+        +streamed_edge_block_size-1)/streamed_edge_block_size;
+    if(block_count_64>std::numeric_limits<int>::max())
+        throw std::overflow_error(
+            "MH-1 device source schedule is too large.");
+    const int block_count=static_cast<int>(block_count_64);
+    const int block_size=streamed_edge_block_size;
+
+    ensure_view(execution_block_source_segments,
+        execution_block_source_segments_storage,
+        static_cast<std::size_t>(block_count)+1);
+    ensure_view(execution_source_edges,execution_source_edges_storage,samples);
+    ensure_view(execution_block_receivers,
+        execution_block_receivers_storage,samples);
+
+    if(samples==0) {
+        ensure_view(execution_source_edge_offsets,
+            execution_source_edge_offsets_storage,1);
+        ensure_view(execution_graph_source_edge_offsets,
+            execution_graph_source_edge_offsets_storage,1);
+        ensure_view(execution_graph_source_edges,
+            execution_graph_source_edges_storage,0);
+        ensure_view(execution_graph_receivers,
+            execution_graph_receivers_storage,0);
+        Kokkos::deep_copy(
+            factorized_execution_space,execution_block_source_segments,0);
+        Kokkos::deep_copy(
+            factorized_execution_space,execution_source_edge_offsets,0);
+        Kokkos::deep_copy(
+            factorized_execution_space,execution_graph_source_edge_offsets,0);
+        execution_graph_source_owner_count=0;
+        execution_graph_receiver_count=0;
+        execution_block_source_segments_host={0};
+        execution_block_receiver_counts_host.clear();
+        std::vector<int>().swap(execution_schedule_sources_host);
+        std::vector<int>().swap(execution_schedule_targets_host);
+        execution_schedule_num_nodes=num_nodes;
+        execution_source_schedule_dirty=false;
+        ++factorized_schedule_builds;
+        ++factorized_device_schedule_builds;
+        return;
+    }
+
+    auto entries=Kokkos::View<MH1ExecutionSourceScheduleEntry*>(
+        Kokkos::view_alloc(
+            "MH-1 device source schedule sort entries",
+            Kokkos::WithoutInitializing),
+        static_cast<std::size_t>(samples));
+    const auto sources=source_indices;
+    const auto targets=target_indices;
+    Kokkos::parallel_for(
+        "MH-1 device block source schedule entries",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,0,samples),
+        KOKKOS_LAMBDA(const int edge) {
+            entries(edge)={edge/block_size,sources(edge),edge};
+        });
+    int invalid_nodes=0;
+    Kokkos::parallel_reduce(
+        "MH-1 device source schedule validation",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,0,samples),
+        KOKKOS_LAMBDA(const int edge,int& invalid) {
+            invalid+=sources(edge)<0||sources(edge)>=num_nodes
+                ||targets(edge)<0||targets(edge)>=num_nodes;
+        },invalid_nodes);
+    if(invalid_nodes!=0)
+        throw std::invalid_argument(
+            "MH-1 device source schedule contains an invalid node.");
+
+    Kokkos::sort(
+        factorized_execution_space,entries,
+        MH1ExecutionSourceScheduleEntryLess{});
+    int source_segments=0;
+    Kokkos::parallel_reduce(
+        "MH-1 device block source segment count",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,0,samples),
+        KOKKOS_LAMBDA(const int ordered_edge,int& count) {
+            count+=ordered_edge==0
+                ||entries(ordered_edge).block!=entries(ordered_edge-1).block
+                ||entries(ordered_edge).source!=entries(ordered_edge-1).source;
+        },source_segments);
+    ensure_view(execution_source_edge_offsets,
+        execution_source_edge_offsets_storage,
+        static_cast<std::size_t>(source_segments)+1);
+    const auto block_segments=execution_block_source_segments;
+    const auto source_offsets=execution_source_edge_offsets;
+    const auto source_edges=execution_source_edges;
+    Kokkos::parallel_scan(
+        "MH-1 device block source schedule",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,0,samples),
+        KOKKOS_LAMBDA(
+            const int ordered_edge,int& update,const bool final) {
+            const bool new_block=ordered_edge==0
+                ||entries(ordered_edge).block!=entries(ordered_edge-1).block;
+            const bool new_source=new_block
+                ||entries(ordered_edge).source!=entries(ordered_edge-1).source;
+            if(final) {
+                source_edges(ordered_edge)=entries(ordered_edge).edge;
+                if(new_source)source_offsets(update)=ordered_edge;
+                if(new_block)block_segments(entries(ordered_edge).block)=update;
+            }
+            if(new_source)++update;
+            if(final&&ordered_edge==samples-1) {
+                source_offsets(update)=samples;
+                block_segments(block_count)=update;
+            }
+        });
+
+    auto block_receiver_counts=Kokkos::View<int*>(
+        Kokkos::view_alloc(
+            "MH-1 device block receiver counts",Kokkos::WithoutInitializing),
+        block_count);
+    const auto block_receivers=execution_block_receivers;
+    Kokkos::parallel_for(
+        "MH-1 device block receiver schedule",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,0,block_count),
+        KOKKOS_LAMBDA(const int block) {
+            const int begin=block*block_size;
+            const int remaining=samples-begin;
+            const int end=begin+(block_size<remaining?block_size:remaining);
+            int count=0;
+            for(int edge=begin;edge<end;++edge)
+                if(edge==begin||targets(edge)!=targets(edge-1))
+                    block_receivers(begin+count++)=targets(edge);
+            block_receiver_counts(block)=count;
+        });
+
+    Kokkos::parallel_for(
+        "MH-1 device graph source schedule entries",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,0,samples),
+        KOKKOS_LAMBDA(const int edge) {
+            entries(edge)={0,sources(edge),edge};
+        });
+    Kokkos::sort(
+        factorized_execution_space,entries,
+        MH1ExecutionSourceScheduleEntryLess{});
+    int graph_source_segments=0;
+    Kokkos::parallel_reduce(
+        "MH-1 device graph source segment count",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,0,samples),
+        KOKKOS_LAMBDA(const int ordered_edge,int& count) {
+            count+=ordered_edge==0
+                ||entries(ordered_edge).source!=entries(ordered_edge-1).source;
+        },graph_source_segments);
+    int graph_receiver_count=0;
+    Kokkos::parallel_reduce(
+        "MH-1 device graph receiver count",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,0,samples),
+        KOKKOS_LAMBDA(const int edge,int& count) {
+            count+=edge==0||targets(edge)!=targets(edge-1);
+        },graph_receiver_count);
+    ensure_view(execution_graph_source_edge_offsets,
+        execution_graph_source_edge_offsets_storage,
+        static_cast<std::size_t>(graph_source_segments)+1);
+    ensure_view(execution_graph_source_edges,
+        execution_graph_source_edges_storage,samples);
+    ensure_view(execution_graph_receivers,
+        execution_graph_receivers_storage,graph_receiver_count);
+    const auto graph_source_offsets=execution_graph_source_edge_offsets;
+    const auto graph_source_edges=execution_graph_source_edges;
+    Kokkos::parallel_scan(
+        "MH-1 device graph source schedule",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,0,samples),
+        KOKKOS_LAMBDA(
+            const int ordered_edge,int& update,const bool final) {
+            const bool new_source=ordered_edge==0
+                ||entries(ordered_edge).source!=entries(ordered_edge-1).source;
+            if(final) {
+                graph_source_edges(ordered_edge)=entries(ordered_edge).edge;
+                if(new_source)graph_source_offsets(update)=ordered_edge;
+            }
+            if(new_source)++update;
+            if(final&&ordered_edge==samples-1)
+                graph_source_offsets(update)=samples;
+        });
+    const auto graph_receivers=execution_graph_receivers;
+    Kokkos::parallel_scan(
+        "MH-1 device graph receiver schedule",
+        Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+            factorized_execution_space,0,samples),
+        KOKKOS_LAMBDA(const int edge,int& update,const bool final) {
+            const bool new_receiver=edge==0||targets(edge)!=targets(edge-1);
+            if(final&&new_receiver)graph_receivers(update)=targets(edge);
+            if(new_receiver)++update;
+        });
+
+    // The host launches one kernel per fixed-size edge block, so it retains
+    // only two compact integers per block.  Edge topology and both O(E)
+    // schedules remain in Kokkos memory.
+    const auto host_block_segments=Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(),execution_block_source_segments);
+    const auto host_block_receiver_counts=Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(),block_receiver_counts);
+    execution_block_source_segments_host.resize(
+        static_cast<std::size_t>(block_count)+1);
+    for(int block=0;block<=block_count;++block)
+        execution_block_source_segments_host[static_cast<std::size_t>(block)]=
+            host_block_segments(block);
+    execution_block_receiver_counts_host.resize(block_count);
+    for(int block=0;block<block_count;++block)
+        execution_block_receiver_counts_host[static_cast<std::size_t>(block)]=
+            host_block_receiver_counts(block);
+    std::vector<int>().swap(execution_schedule_sources_host);
+    std::vector<int>().swap(execution_schedule_targets_host);
+    execution_graph_source_owner_count=graph_source_segments;
+    execution_graph_receiver_count=graph_receiver_count;
+    execution_schedule_num_nodes=num_nodes;
+    execution_source_schedule_dirty=false;
+    ++factorized_schedule_builds;
+    ++factorized_device_schedule_builds;
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::prepare_execution_source_schedule_host(
     const int num_nodes,const std::span<const int> source_indices,
     const std::span<const int> target_indices)
 {
@@ -2816,6 +4643,12 @@ bool MaceNonlinearKokkosT<Precision>::prepare_execution_source_schedule_host(
     copy_to_device(execution_graph_source_edge_offsets,graph_source_edge_offsets);
     copy_to_device(execution_graph_source_edges,graph_source_edges);
     copy_to_device(execution_graph_receivers,graph_receivers);
+    record_factorized_input_h2d(
+        block_source_segments.size()+source_edge_offsets.size()
+            +source_edges.size()+block_receivers.size()
+            +graph_source_edge_offsets.size()+graph_source_edges.size()
+            +graph_receivers.size(),
+        sizeof(int),"prepared source schedule");
     execution_graph_source_owner_count=
         static_cast<int>(graph_source_edge_offsets.size())-1;
     execution_graph_receiver_count=static_cast<int>(graph_receivers.size());
@@ -2830,7 +4663,7 @@ bool MaceNonlinearKokkosT<Precision>::prepare_execution_source_schedule_host(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::release_layer_edge_workspace(int layer)
+void MaceBackboneKokkosT<Precision>::release_layer_edge_workspace(int layer)
 {
     if(layer<0||layer>=static_cast<int>(states.size()))return;
     auto& state=states[layer];
@@ -2870,7 +4703,7 @@ void MaceNonlinearKokkosT<Precision>::release_layer_edge_workspace(int layer)
 }
 
 template<typename Precision>
-int MaceNonlinearKokkosT<Precision>::edge_workspace_rows() const
+int MaceBackboneKokkosT<Precision>::edge_workspace_rows() const
 {
     int rows=0;
     for(int layer=0;layer<static_cast<int>(states.size());++layer) {
@@ -2923,7 +4756,7 @@ int MaceNonlinearKokkosT<Precision>::edge_workspace_rows() const
 }
 
 template<typename Precision>
-std::size_t MaceNonlinearKokkosT<Precision>::edge_workspace_bytes() const
+std::size_t MaceBackboneKokkosT<Precision>::edge_workspace_bytes() const
 {
     std::size_t bytes=0;
     for(int layer=0;layer<static_cast<int>(states.size());++layer) {
@@ -2983,13 +4816,13 @@ std::size_t MaceNonlinearKokkosT<Precision>::edge_workspace_bytes() const
 }
 
 template<typename Precision>
-std::size_t MaceNonlinearKokkosT<Precision>::conditioned_mlp_workspace_bytes() const
+std::size_t MaceBackboneKokkosT<Precision>::conditioned_mlp_workspace_bytes() const
 {
     return conditioned_mlp_workspace?conditioned_mlp_workspace->bytes():0;
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::set_e3_linear_backend(
+void MaceBackboneKokkosT<Precision>::set_e3_linear_backend(
     const std::string& backend)
 {
     std::string selected=backend;
@@ -3004,20 +4837,20 @@ void MaceNonlinearKokkosT<Precision>::set_e3_linear_backend(
 }
 
 template<typename Precision>
-std::string MaceNonlinearKokkosT<Precision>::e3_linear_backend() const
+std::string MaceBackboneKokkosT<Precision>::e3_linear_backend() const
 {
     return node_embedding.backend();
 }
 
 template<typename Precision>
-std::string MaceNonlinearKokkosT<Precision>::selected_e3_linear_backend(
+std::string MaceBackboneKokkosT<Precision>::selected_e3_linear_backend(
     std::size_t samples) const
 {
     return node_embedding.selected_backend(samples);
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::set_execution_mh1_host_node_backend(
+void MaceBackboneKokkosT<Precision>::set_execution_mh1_host_node_backend(
     const std::string& backend)
 {
     if(backend!="auto"&&backend!="generated"&&backend!="kokkos")
@@ -3033,7 +4866,7 @@ void MaceNonlinearKokkosT<Precision>::set_execution_mh1_host_node_backend(
 }
 
 template<typename Precision>
-std::string MaceNonlinearKokkosT<Precision>::
+std::string MaceBackboneKokkosT<Precision>::
 selected_execution_mh1_host_node_backend() const
 {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
@@ -3042,23 +4875,23 @@ selected_execution_mh1_host_node_backend() const
 #endif
     if(execution_mh1_host_node_backend_request=="kokkos") return "kokkos";
     if(execution_mh1_host_node_backend_request=="generated")
-        return jit_mh1_host_plugin_v4_ready()?"generated":"unavailable";
-    return jit_mh1_host_plugin_v4_ready()?"generated":"kokkos";
+        return jit_mh1_host_plugin_v7_ready()?"generated":"unavailable";
+    return jit_mh1_host_plugin_v7_ready()?"generated":"kokkos";
 }
 
 template<typename Precision>
-std::string MaceNonlinearKokkosT<Precision>::tensor_product_backend() const
+std::string MaceBackboneKokkosT<Precision>::tensor_product_backend() const
 {
     return std::all_of(interactions.begin(),interactions.end(),[](const auto& interaction) {
-        return interaction.convolution.uses_mh1_fast_path();
+        return interaction.convolution.uses_direct_execution_plan();
     }) ? "official_kokkos" : "generic_kokkos";
 }
 
 template<typename Precision>
-std::string MaceNonlinearKokkosT<Precision>::tensor_product_execution_backend() const
+std::string MaceBackboneKokkosT<Precision>::tensor_product_execution_backend() const
 {
     if(interactions.empty()) return "none";
-    if(mace_uses_prepared_execution(streamed_edges)) return "mixed";
+    if(uses_prepared_execution(streamed_edges)) return "mixed";
     const auto selected=interactions.front().convolution.execution_backend();
     return std::all_of(
         interactions.begin(),interactions.end(),[&selected](const auto& interaction) {
@@ -3067,10 +4900,10 @@ std::string MaceNonlinearKokkosT<Precision>::tensor_product_execution_backend() 
 }
 
 template<typename Precision>
-int MaceNonlinearKokkosT<Precision>::tensor_product_channel_team_size() const
+int MaceBackboneKokkosT<Precision>::tensor_product_channel_team_size() const
 {
     if(interactions.empty()) return 0;
-    if(mace_uses_prepared_execution(streamed_edges)) return -1;
+    if(uses_prepared_execution(streamed_edges)) return -1;
     const int selected=interactions.front().convolution.channel_team_size();
     return std::all_of(
         interactions.begin(),interactions.end(),[selected](const auto& interaction) {
@@ -3079,10 +4912,10 @@ int MaceNonlinearKokkosT<Precision>::tensor_product_channel_team_size() const
 }
 
 template<typename Precision>
-int MaceNonlinearKokkosT<Precision>::tensor_product_harmonic_team_size() const
+int MaceBackboneKokkosT<Precision>::tensor_product_harmonic_team_size() const
 {
     if(interactions.empty()) return 0;
-    if(mace_uses_prepared_execution(streamed_edges)) return -1;
+    if(uses_prepared_execution(streamed_edges)) return -1;
     const int selected=interactions.front().convolution.harmonic_team_size();
     return std::all_of(
         interactions.begin(),interactions.end(),[selected](const auto& interaction) {
@@ -3091,7 +4924,7 @@ int MaceNonlinearKokkosT<Precision>::tensor_product_harmonic_team_size() const
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::fused_gate_normalization_reverse_available() const
+bool MaceBackboneKokkosT<Precision>::fused_gate_normalization_reverse_available() const
 {
     if constexpr(std::is_same_v<Precision,float>)
         return mh1_fast_path&&std::all_of(
@@ -3109,7 +4942,7 @@ bool MaceNonlinearKokkosT<Precision>::fused_gate_normalization_reverse_available
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::uses_packed_node_linears() const
+bool MaceBackboneKokkosT<Precision>::uses_packed_node_linears() const
 {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>)
@@ -3119,14 +4952,14 @@ bool MaceNonlinearKokkosT<Precision>::uses_packed_node_linears() const
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::uses_fused_gate_normalization_reverse() const
+bool MaceBackboneKokkosT<Precision>::uses_fused_gate_normalization_reverse() const
 {
     return fused_gate_normalization_reverse_enabled
         &&fused_gate_normalization_reverse_available();
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::set_fused_gate_normalization_reverse(bool enabled)
+void MaceBackboneKokkosT<Precision>::set_fused_gate_normalization_reverse(bool enabled)
 {
     if(enabled&&!fused_gate_normalization_reverse_available())
         throw std::invalid_argument(
@@ -3136,7 +4969,7 @@ void MaceNonlinearKokkosT<Precision>::set_fused_gate_normalization_reverse(bool 
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::direct_node_tensor_reverse_available() const
+bool MaceBackboneKokkosT<Precision>::direct_node_tensor_reverse_available() const
 {
 #ifdef KOKKOS_ENABLE_CUDA
     if constexpr(std::is_same_v<Precision,float>
@@ -3150,21 +4983,21 @@ bool MaceNonlinearKokkosT<Precision>::direct_node_tensor_reverse_available() con
 }
 
 template<typename Precision>
-bool MaceNonlinearKokkosT<Precision>::uses_direct_node_tensor_reverse() const
+bool MaceBackboneKokkosT<Precision>::uses_direct_node_tensor_reverse() const
 {
     return direct_node_tensor_reverse_enabled
-        &&streamed_edges==MACEStreamedEdgesMode::generic
+        &&streamed_edges==ExecutionMode::generic
         &&direct_node_tensor_reverse_available();
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::set_direct_node_tensor_reverse(bool enabled)
+void MaceBackboneKokkosT<Precision>::set_direct_node_tensor_reverse(bool enabled)
 {
     if(enabled&&!direct_node_tensor_reverse_available())
         throw std::invalid_argument(
             "Direct-node tensor reverse requires a compatible Float32 CUDA MACE-MH-1 evaluator.");
     if(enabled&&!direct_node_tensor_reverse_enabled
-        &&streamed_edges==MACEStreamedEdgesMode::generic) {
+        &&streamed_edges==ExecutionMode::generic) {
         Kokkos::fence("MACE_Nonlinear direct-node reverse transition");
         for(auto& state:states) {
             state.edge_up_adj={};
@@ -3175,13 +5008,13 @@ void MaceNonlinearKokkosT<Precision>::set_direct_node_tensor_reverse(bool enable
 }
 
 template<typename Precision>
-std::size_t MaceNonlinearKokkosT<Precision>::linear_workspace_bytes() const
+std::size_t MaceBackboneKokkosT<Precision>::linear_workspace_bytes() const
 {
     return e3_linear_workspace ? e3_linear_workspace->bytes() : 0;
 }
 
 template<typename Precision>
-std::size_t MaceNonlinearKokkosT<Precision>::tensor_workspace_bytes() const
+std::size_t MaceBackboneKokkosT<Precision>::tensor_workspace_bytes() const
 {
     std::size_t bytes=0;
     for(const auto& interaction:interactions)
@@ -3190,7 +5023,7 @@ std::size_t MaceNonlinearKokkosT<Precision>::tensor_workspace_bytes() const
 }
 
 template<typename Precision>
-std::size_t MaceNonlinearKokkosT<Precision>::product_workspace_bytes() const
+std::size_t MaceBackboneKokkosT<Precision>::product_workspace_bytes() const
 {
     std::size_t bytes=0;
     for(const auto& product:products)
@@ -3199,7 +5032,7 @@ std::size_t MaceNonlinearKokkosT<Precision>::product_workspace_bytes() const
 }
 
 template<typename Precision>
-std::size_t MaceNonlinearKokkosT<Precision>::node_workspace_bytes() const
+std::size_t MaceBackboneKokkosT<Precision>::node_workspace_bytes() const
 {
     std::size_t bytes=sizeof(Precision)*(
         attrs_storage.size()+features_storage.size()
@@ -3249,17 +5082,19 @@ std::size_t MaceNonlinearKokkosT<Precision>::node_workspace_bytes() const
 }
 
 template<typename Precision>
-std::size_t MaceNonlinearKokkosT<Precision>::precision_workspace_bytes() const
+std::size_t MaceBackboneKokkosT<Precision>::precision_workspace_bytes() const
 {
     return edge_workspace_bytes()+linear_workspace_bytes()
         +tensor_workspace_bytes()+product_workspace_bytes();
 }
 
 template<typename Precision>
-MaceNonlinearKokkosT<Precision>::MaceNonlinearKokkosT(const nlohmann::json& data)
+MaceBackboneKokkosT<Precision>::MaceBackboneKokkosT(
+    const nlohmann::json& data, const MaceBackboneSchema schema,
+    const bool require_fast_float_path)
     :node_embedding(data.at("node_embedding"))
 {
-    validate_mace_nonlinear_schema(data);
+    validate_mace_backbone_schema(data,schema);
     mh1_pair_spline_nodes_=data.at("radial_embedding").value(
         "num_spline_points",256);
     selected_head=data.value("selected_head",std::string());available_heads=data.value("available_heads",std::vector<std::string>());
@@ -3318,7 +5153,18 @@ MaceNonlinearKokkosT<Precision>::MaceNonlinearKokkosT(const nlohmann::json& data
         readout.set_e3_linear_workspace(e3_linear_workspace);
     if(interactions.size()!=products.size()||interactions.size()!=readouts.size())
         throw std::invalid_argument("MACE_Nonlinear Kokkos layer counts are inconsistent.");
-    mh1_family=analyze_mh1_family_architecture(data);
+    // The stage description is the validated model's topology as data: its
+    // layer count names every profiling region the orchestration below enters,
+    // so the evaluator carries no compiled-in two-layer table.
+    stage_description=symmetrix::mace_nonlinear::StageDescription::canonical(
+        interactions.size());
+    mh1_family=analyze_mh1_family_architecture(data,schema);
+    if(mh1_family.compatible) {
+        layer_retained_feature_layouts.reserve(mh1_family.layer_count());
+        for(std::size_t layer=0;layer<mh1_family.layer_count();++layer)
+            layer_retained_feature_layouts.push_back(
+                make_layer_retained_feature_layout(layer));
+    }
     // The Python routing layer validates the contract against the complete
     // model before setting this identity. Do not trust embedded hashes here:
     // same-sized tensor-product programs can have different semantics.
@@ -3328,7 +5174,7 @@ MaceNonlinearKokkosT<Precision>::MaceNonlinearKokkosT(const nlohmann::json& data
         });
     mh1_external_uvu_tensors=std::all_of(
         interactions.begin(),interactions.end(),[](const auto& interaction) {
-            return interaction.convolution.uses_mh1_fast_path();
+            return interaction.convolution.uses_direct_execution_plan();
         });
     const bool primitive_candidate=mh1_family.compatible
         &&mh1_compiled_products&&mh1_external_uvu_tensors;
@@ -3350,9 +5196,27 @@ MaceNonlinearKokkosT<Precision>::MaceNonlinearKokkosT(const nlohmann::json& data
             mh1_fast_path_rejection="Conditioned edge MLP plan is unavailable.";
     }
     if constexpr(std::is_same_v<Precision,float>)
-        if(!mh1_fast_path)
+        if(!mh1_fast_path&&require_fast_float_path)
             throw std::invalid_argument(
                 "Float32 MACE_Nonlinear requires a compatible MACE-MH-1 family fast path.");
+    if(mh1_fast_path&&!mh1_family.layers.empty()
+        &&mh1_family.layers.back().final_output_policy
+            ==MaceMH1FinalOutputPolicy::keep_last
+        &&mh1_family.layers.back().product_output_blocks.size()==2
+        &&mh1_family.layers.back().product_output_blocks[0].multiplicity
+            ==mh1_family.node_channels
+        &&mh1_family.layers.back().product_output_blocks[0].l==0
+        &&mh1_family.layers.back().product_output_blocks[0].parity==1
+        &&mh1_family.layers.back().product_output_blocks[1].multiplicity
+            ==mh1_family.node_channels
+        &&mh1_family.layers.back().product_output_blocks[1].l==1
+        &&mh1_family.layers.back().product_output_blocks[1].parity==-1
+        &&products.back().uses_compiled_plan()
+        &&readouts.back().supports_portable_scalar_schedule()) {
+        mh1_portable_final_layer_ready_=true;
+        mh1_portable_final_layer_enabled_=true;
+        mh1_portable_final_layer_kind_="block_scalar_vector_readout_v1";
+    }
     mh1_pair_spline_lazy_=mh1_fast_path;
     mh1_pair_spline_ready_=mh1_fast_path;
     if(mh1_pair_spline_lazy_) {
@@ -3365,25 +5229,27 @@ MaceNonlinearKokkosT<Precision>::MaceNonlinearKokkosT(const nlohmann::json& data
         mh1_edge_executor_="pair_spline_v1";
     set_e3_linear_backend("auto");
     states.resize(interactions.size());has_zbl=data.at("has_zbl").get<bool>();if(has_zbl){const auto& value=data.at("zbl");zbl=ZBLKokkos(value.at("a_exp").get<double>(),value.at("a_prefactor").get<double>(),tensor_values<double>(value.at("c")),tensor_values<double>(value.at("covalent_radii")),static_cast<int>(tensor_values<double>(value.at("p")).at(0)));}
-    if(supports_streamed_edges())streamed_edges=MACEStreamedEdgesMode::direct;
+    if(supports_streamed_edges())streamed_edges=ExecutionMode::direct;
     spherical_harmonics_state=std::make_unique<SphericalHarmonicsState>(l_max);
     execution_sphericart_initializations=1;
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::prepare_execution_mh1_node_runtime_parameters()
+void MaceBackboneKokkosT<Precision>::prepare_execution_mh1_node_runtime_parameters()
 {
     if(!execution_mh1_node_runtime.empty()) return;
-    if(interactions.size()!=2||products.size()!=2||readouts.size()!=2)
+    if(interactions.empty()||interactions.size()!=products.size()
+        ||interactions.size()!=readouts.size())
         throw std::logic_error(
-            "Execution MH-1 node runtime requires exactly two interactions.");
-    execution_mh1_node_runtime.resize(2);
+            "Execution MH-1 node runtime requires one product and one readout "
+            "per interaction.");
+    execution_mh1_node_runtime.resize(interactions.size());
     auto append_linear=[](std::vector<Precision>& destination,
                           const E3LinearKokkosT<Precision>& linear) {
         auto values=linear.runtime_parameters_ir_mul();
         destination.insert(destination.end(),values.begin(),values.end());
     };
-    for(int layer=0;layer<2;++layer) {
+    for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
         const auto& interaction=interactions.at(layer);
         const auto& product=products.at(layer);
         const auto& readout=readouts.at(layer);
@@ -3404,7 +5270,15 @@ void MaceNonlinearKokkosT<Precision>::prepare_execution_mh1_node_runtime_paramet
             coefficients.data(),coefficients.data()+coefficients.size());
 
         std::vector<Precision> readout_parameters;
-        if(readout.nonlinear) {
+        if(readout.bias) {
+            // The bias variant's stack is linear_1, the square middle linear,
+            // and linear_2, in the order the node contract's readout pack
+            // declares; the generated node program reads them at those
+            // offsets.
+            append_linear(readout_parameters,readout.linear_1);
+            append_linear(readout_parameters,readout.linear_mid);
+            append_linear(readout_parameters,readout.linear_2);
+        } else if(readout.nonlinear) {
             append_linear(readout_parameters,readout.linear_1);
             append_linear(readout_parameters,readout.linear_2);
         } else append_linear(readout_parameters,readout.linear);
@@ -3426,7 +5300,7 @@ void MaceNonlinearKokkosT<Precision>::prepare_execution_mh1_node_runtime_paramet
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::reserve_execution_mh1_node_arena(int num_nodes)
+void MaceBackboneKokkosT<Precision>::reserve_execution_mh1_node_arena(int num_nodes)
 {
     if(num_nodes<0)
         throw std::invalid_argument("Execution MH-1 node count must not be negative.");
@@ -3441,32 +5315,504 @@ void MaceNonlinearKokkosT<Precision>::reserve_execution_mh1_node_arena(int num_n
         const int residual=interaction.linear_res.output_dimension();
         const int gated=interaction.gate.output_size;
         const int interaction_output=interaction.linear_2.output_dimension();
+        const int contraction_output=
+            products.at(layer).output_linear().input_dimension();
         auto reserve=[&](auto& view,const int columns) {
             if(view.extent(0)<static_cast<std::size_t>(rows)
                 ||view.extent(1)!=static_cast<std::size_t>(columns))
                 Kokkos::realloc(Kokkos::WithoutInitializing,view,rows,columns);
         };
         reserve(runtime.arena,runtime.arena_dimension);
-#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
-        if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>)
-            continue;
-#endif
         reserve(runtime.residual,residual);
         reserve(runtime.linear_1_output,residual);
         reserve(runtime.pre_gate,residual);
         reserve(runtime.gated,gated);
         reserve(runtime.interaction_output,interaction_output);
         reserve(runtime.interaction_adjoint,interaction_output);
+        reserve(runtime.contraction_output,contraction_output);
+        reserve(runtime.contraction_adjoint,contraction_output);
         reserve(runtime.gated_adjoint,gated);
         reserve(runtime.pre_gate_adjoint,residual);
         reserve(runtime.linear_1_adjoint,residual);
     }
 }
 
+// --- Family adapter interface ----------------------------------------------
+// Each member delegates to the MH-1 entry point that already owns the
+// behaviour, so the neutral lifecycle adds no second execution path.  The
+// program is compiled from the model state this evaluator has already parsed
+// and every registry predicate reads this evaluator's own readiness flags, so
+// a binding report states what this instance can actually run.
+
+template<typename Precision>
+std::uint64_t MaceBackboneKokkosT<Precision>::prepare_graph(
+    const int num_nodes,const std::span<const int> node_types,
+    const std::span<const int> num_neigh,
+    const std::span<const int> neigh_indices,
+    const std::span<const int> neigh_types)
+{
+    return prepare_factorized_graph(
+        num_nodes,node_types,num_neigh,neigh_indices,neigh_types);
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::prepare_geometry(
+    const std::uint64_t graph_generation,
+    const std::span<const double> reference_positions,
+    const std::span<const double> reference_xyz,
+    const std::span<const double> cell,
+    const std::span<const double> inverse_cell,const std::span<const int> pbc)
+{
+    prepare_factorized_geometry(graph_generation,reference_positions,
+        reference_xyz,cell,inverse_cell,pbc);
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::compute_prepared(
+    const std::uint64_t graph_generation,const std::span<const double> xyz,
+    const std::span<const double> distances)
+{
+    compute_prepared_factorized(graph_generation,xyz,distances);
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::reduce_forces(
+    const std::uint64_t graph_generation)
+{
+    reduce_prepared_node_forces(graph_generation);
+}
+
+template<typename Precision>
+void MaceBackboneKokkosT<Precision>::reduce_stress(
+    const double volume,const std::uint64_t graph_generation)
+{
+    reduce_prepared_stress(volume,graph_generation);
+}
+
+template<typename Precision>
+std::uint64_t MaceBackboneKokkosT<Precision>::graph_generation() const
+{
+    return factorized_prepared_graph_generation;
+}
+
+template<typename Precision>
+std::uint64_t MaceBackboneKokkosT<Precision>::geometry_generation() const
+{
+    return factorized_prepared_geometry_graph_generation;
+}
+
+template<typename Precision>
+symmetrix::execution::FamilyCapabilities
+MaceBackboneKokkosT<Precision>::family_capabilities() const
+{
+    using symmetrix::execution::FamilyCapabilities;
+    const bool host_build=
+        symmetrix::execution::host_execution_space<Kokkos::DefaultExecutionSpace>;
+    FamilyCapabilities capabilities;
+    capabilities.target=host_build
+        ?"host"
+        :std::string(
+            DeviceBackendTraits<Kokkos::DefaultExecutionSpace>::backend_name);
+    capabilities.precision=
+        std::is_same_v<Precision,float> ? "float32" : "float64";
+    // The reference routing is single-thread execution of the generic
+    // implementation on the default host execution space, so it exists exactly
+    // on a host build.  The portable tier is the generic Kokkos prepared path,
+    // which the MH-1 pair-spline contract admits without a generated artifact;
+    // the generated tier is the JIT/RTC artifact of one of the MH-1 ABIs.
+    capabilities.reference_ready=host_build&&supports_factorized();
+    capabilities.portable_ready=
+        supports_factorized()||mh1_pair_spline_ready();
+    capabilities.generated_ready=jit_mh1_host_plugin_v7_ready()
+        ||jit_mh1_cuda_plugin_v5_ready();
+    // The prepared path owns a real stress reduction, and the field coupling
+    // is a model property rather than a backend one.
+    capabilities.stress=true;
+    capabilities.field=has_field_coupling;
+    capabilities.parameter_gradients=false;
+    // A host artifact is always loadable; a device artifact needs a device
+    // execution space the loader can target.
+    capabilities.loads_host_artifact=true;
+    capabilities.loads_device_artifact=device_cuda_available();
+    return capabilities;
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::mh1_layer_tensor_product_ready(
+    const std::size_t index) const
+{
+    mh1_family.layer(index);
+    return interactions.at(index).convolution.uses_direct_execution_plan();
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::mh1_layer_compiled_product_ready(
+    const std::size_t index) const
+{
+    mh1_family.layer(index);
+    return products.at(index).uses_compiled_plan();
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::mh1_layer_pair_conditioning_ready(
+    const std::size_t index) const
+{
+    mh1_family.layer(index);
+    const auto& interaction=interactions.at(index);
+    return interaction.convolution_source_contributions.extent(0)>0
+        &&interaction.convolution_target_contributions.extent(0)>0
+        &&interaction.density_source_contributions.extent(0)>0
+        &&interaction.density_target_contributions.extent(0)>0;
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::mh1_layer_portable_ready(
+    const std::size_t index) const
+{
+    mh1_family.layer(index);
+    return mh1_family.compatible&&mh1_layer_tensor_product_ready(index)
+        &&mh1_layer_compiled_product_ready(index)
+        &&mh1_layer_pair_conditioning_ready(index);
+}
+
+template<typename Precision>
+std::string MaceBackboneKokkosT<Precision>::mh1_layer_capability_reason(
+    const std::size_t index) const
+{
+    const auto& layer=mh1_family.layer(index);
+    if(!mh1_family.compatible) {
+        const std::string prefix=
+            "MH-1 layer "+std::to_string(layer.interaction_index)+" ";
+        if(mh1_family.rejection_reason.starts_with(prefix))
+            return mh1_family.rejection_reason;
+        return "MH-1 architecture is not admitted: "+mh1_family.rejection_reason;
+    }
+    if(!mh1_layer_tensor_product_ready(index))
+        return "External weighted uvu tensor plan is unavailable.";
+    if(!mh1_layer_compiled_product_ready(index))
+        return "Compiled correlation-three product plan is unavailable.";
+    if(!mh1_layer_pair_conditioning_ready(index))
+        return "Conditioned edge MLP plan is unavailable.";
+    return "portable MH-1 layer admitted";
+}
+
+template<typename Precision>
+symmetrix::execution::Program
+MaceBackboneKokkosT<Precision>::compile_program() const
+{
+    using symmetrix::execution::BufferContract;
+    using symmetrix::execution::LayoutContract;
+    using symmetrix::execution::OperatorKind;
+    using symmetrix::execution::OperatorNode;
+    using symmetrix::execution::Program;
+    const int l_max=mh1_l_max();
+    const int node_channels=mh1_node_channels();
+    // The one irreps string this family declares: one copy of every l up to the
+    // model maximum, in the parity spelling the shared tensor kernels address.
+    std::string harmonics_irreps;
+    for(int l=0;l<=l_max;++l) {
+        if(!harmonics_irreps.empty())
+            harmonics_irreps+="+";
+        harmonics_irreps+="1x"+std::to_string(l)+(l%2==0?"e":"o");
+    }
+    const std::size_t harmonics_width=
+        static_cast<std::size_t>((l_max+1)*(l_max+1));
+    Program program;
+    program.family="mace-nonlinear";
+    program.precision=
+        std::is_same_v<Precision,float> ? "float32" : "float64";
+    program.version=1;
+    // Every buffer below has a runtime row count, so the leading extent stays
+    // the interface's "no static extent" zero and the column carries the
+    // static contract width where this family has one.
+    const auto declare=[&program](const OperatorKind kind,const std::string& id,
+        const std::string& capability_key) {
+        OperatorNode node;
+        node.kind=kind;
+        node.id=id;
+        node.capability_key=capability_key;
+        program.operators.push_back(std::move(node));
+        return &program.operators.back();
+    };
+    {
+        OperatorNode node;
+        node.kind=OperatorKind::geometry;
+        node.id="mh1.geometry";
+        node.capability_key="geometry";
+        BufferContract edge_geometry;
+        edge_geometry.name="edge_geometry";
+        edge_geometry.dtype="float64";
+        edge_geometry.shape={0};
+        edge_geometry.layout=LayoutContract{"edge_major","",1};
+        node.outputs.push_back(std::move(edge_geometry));
+        node.parameters.emplace_back("r_cut",r_cut);
+        program.operators.push_back(std::move(node));
+    }
+    for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
+        const auto& layer_descriptor=
+            mh1_layer_descriptor(static_cast<std::size_t>(layer));
+        const int edge_channels=layer_descriptor.uvu_channels;
+        const std::string prefix="mh1.interaction"+std::to_string(layer);
+        auto* radial=declare(OperatorKind::radial,prefix+".r0","r0");
+        radial->parameters.emplace_back("layer",layer);
+        radial->parameters.emplace_back("radial_size",mh1_radial_size());
+        auto* harmonics=declare(OperatorKind::spherical_harmonic,
+            prefix+".harmonics","harmonics");
+        BufferContract edge_harmonics;
+        edge_harmonics.name="edge_harmonics";
+        edge_harmonics.dtype="float64";
+        edge_harmonics.shape={0,harmonics_width};
+        edge_harmonics.layout=
+            LayoutContract{"edge_major",harmonics_irreps,1};
+        harmonics->outputs.push_back(std::move(edge_harmonics));
+        harmonics->parameters.emplace_back("l_max",l_max);
+        auto* product=
+            declare(OperatorKind::tensor_product,prefix+".m0","m0");
+        product->parameters.emplace_back("layer",layer);
+        product->parameters.emplace_back("node_channels",node_channels);
+        product->parameters.emplace_back("edge_channels",edge_channels);
+        const auto& layer_interaction=
+            interactions.at(static_cast<std::size_t>(layer));
+        const auto& convolution=layer_interaction.convolution;
+        product->parameters.emplace_back(
+            "input_1_dimension",convolution.input_1_dimension());
+        product->parameters.emplace_back(
+            "input_2_dimension",convolution.input_2_dimension());
+        product->parameters.emplace_back(
+            "output_dimension",convolution.output_dimension());
+        product->parameters.emplace_back("weight_size",convolution.weight_size());
+        product->parameters.emplace_back(
+            "edge_block_count",layer_descriptor.edge_blocks.size());
+        for(std::size_t block=0;block<layer_descriptor.edge_blocks.size();++block) {
+            const auto& value=layer_descriptor.edge_blocks[block];
+            const std::string block_prefix=
+                "edge_block_"+std::to_string(block)+"_";
+            product->parameters.emplace_back(
+                block_prefix+"multiplicity",value.multiplicity);
+            product->parameters.emplace_back(block_prefix+"l",value.l);
+            product->parameters.emplace_back(block_prefix+"parity",value.parity);
+        }
+        auto* node_program=declare(OperatorKind::node_program,
+            prefix+".node_program","node_program");
+        node_program->parameters.emplace_back("node_channels",node_channels);
+        node_program->parameters.emplace_back("edge_channels",edge_channels);
+        // The per-layer node-program dimensions are the model's own declared
+        // extents.  They are read from the parsed interaction, product, and
+        // readout tables rather than from the contract-derived node runtime
+        // layout, so a program compiles before the execution contract is bound
+        // and its identity does not move when the contract is.
+        const auto& layer_product=products.at(static_cast<std::size_t>(layer));
+        node_program->parameters.emplace_back(
+            "product_output_block_count",
+            layer_descriptor.product_output_blocks.size());
+        for(std::size_t block=0;
+            block<layer_descriptor.product_output_blocks.size();++block) {
+            const auto& value=layer_descriptor.product_output_blocks[block];
+            const std::string block_prefix=
+                "product_output_block_"+std::to_string(block)+"_";
+            node_program->parameters.emplace_back(
+                block_prefix+"multiplicity",value.multiplicity);
+            node_program->parameters.emplace_back(block_prefix+"l",value.l);
+            node_program->parameters.emplace_back(
+                block_prefix+"parity",value.parity);
+        }
+        node_program->parameters.emplace_back(
+            "element_count",node_embedding.input_dimension());
+        node_program->parameters.emplace_back(
+            "input_dimension",layer_interaction.linear_up.input_dimension());
+        node_program->parameters.emplace_back(
+            "up_dimension",layer_interaction.linear_up.output_dimension());
+        node_program->parameters.emplace_back(
+            "residual_dimension",layer_interaction.linear_res.output_dimension());
+        node_program->parameters.emplace_back(
+            "skip_dimension",layer_interaction.skip.output_dimension());
+        node_program->parameters.emplace_back(
+            "message_dimension",layer_interaction.linear_1.input_dimension());
+        node_program->parameters.emplace_back("interaction_output_dimension",
+            layer_interaction.linear_2.output_dimension());
+        node_program->parameters.emplace_back(
+            "output_dimension",layer_product.output_dimension());
+        node_program->parameters.emplace_back(
+            "product_term_count",layer_product.compiled_term_count());
+    }
+    {
+        OperatorNode node;
+        node.kind=OperatorKind::readout;
+        node.id="mh1.readout";
+        node.capability_key="readout";
+        program.operators.push_back(std::move(node));
+    }
+    {
+        // The pair term is admitted unconditionally: the MH-1 contract always
+        // carries it, so it is part of every compiled program.
+        OperatorNode node;
+        node.kind=OperatorKind::pair_energy;
+        node.id="mh1.pair_energy";
+        node.capability_key="pair_energy";
+        node.parameters.emplace_back("r_cut",r_cut);
+        program.operators.push_back(std::move(node));
+    }
+    program.fingerprint=symmetrix::execution::program_fingerprint(program);
+    return program;
+}
+
+template<typename Precision>
+symmetrix::execution::ImplementationRegistry
+MaceBackboneKokkosT<Precision>::family_implementation_registry() const
+{
+    using symmetrix::execution::ImplementationDescriptor;
+    using symmetrix::execution::ImplementationRegistry;
+    using symmetrix::execution::ImplementationTier;
+    using symmetrix::execution::LayoutCompatibility;
+    using symmetrix::execution::OperatorKind;
+    using symmetrix::execution::PrecisionPolicy;
+    // The portable tier is the generic Kokkos implementation the prepared path
+    // runs without an artifact and the generated tier is the JIT/RTC artifact
+    // one of the MH-1 ABIs compiles.  Every predicate reads this evaluator's
+    // own readiness flags, so the report states what this instance can run.
+    const std::string target=family_capabilities().target;
+    const std::string precision_name=
+        std::is_same_v<Precision,float> ? "float32" : "float64";
+    const PrecisionPolicy policy{precision_name,"float64"};
+    const bool portable_ready=
+        supports_factorized()||mh1_pair_spline_ready();
+    const bool generated_ready=family_artifact_ready();
+    ImplementationRegistry registry;
+    const auto declare=[this,&registry,target,policy](const std::string& id,
+        const OperatorKind kind,const std::string& capability_key,
+        const ImplementationTier tier,std::function<bool()> qualified) {
+        ImplementationDescriptor descriptor;
+        descriptor.id=id;
+        descriptor.kind=kind;
+        descriptor.capability_key=capability_key;
+        descriptor.tier=tier;
+        descriptor.target=target;
+        descriptor.precision=policy;
+        descriptor.layout=LayoutCompatibility{"node_major","node_major"};
+        descriptor.capabilities.target=target;
+        descriptor.capabilities.precision=policy.compute;
+        descriptor.identity_fingerprint=execution_mh1_generation_fingerprint();
+        descriptor.qualified=
+            [available=std::move(qualified)](const auto&) {return available();};
+        registry.declare(std::move(descriptor));
+    };
+    declare("generic_kokkos_geometry",OperatorKind::geometry,"geometry",
+        ImplementationTier::portable,[] {return true;});
+    declare("generic_kokkos_r0",OperatorKind::radial,"r0",
+        ImplementationTier::portable,
+        [portable_ready] {return portable_ready;});
+    declare("generated_r0",OperatorKind::radial,"r0",
+        ImplementationTier::generated,
+        [generated_ready] {return generated_ready;});
+    declare("generic_kokkos_harmonics",OperatorKind::spherical_harmonic,
+        "harmonics",ImplementationTier::portable,[] {return true;});
+    declare("generic_kokkos_m0",OperatorKind::tensor_product,"m0",
+        ImplementationTier::portable,
+        [portable_ready] {return portable_ready;});
+    declare("generated_m0",OperatorKind::tensor_product,"m0",
+        ImplementationTier::generated,
+        [generated_ready] {return generated_ready;});
+    declare("generic_kokkos_node_program",OperatorKind::node_program,"node_program",
+        ImplementationTier::portable,[this] {return supports_factorized();});
+    declare("generated_node_program",OperatorKind::node_program,"node_program",
+        ImplementationTier::generated,
+        [generated_ready] {return generated_ready;});
+    declare("generic_kokkos_readout",OperatorKind::readout,"readout",
+        ImplementationTier::portable,[] {return true;});
+    declare("generic_kokkos_pair_energy",OperatorKind::pair_energy,
+        "pair_energy",ImplementationTier::portable,[] {return true;});
+    return registry;
+}
+
+template<typename Precision>
+bool MaceBackboneKokkosT<Precision>::family_artifact_ready() const
+{
+    return jit_mh1_host_plugin_v7_ready()||jit_mh1_cuda_plugin_v5_ready();
+}
+
+template<typename Precision>
+symmetrix::execution::ArtifactReadiness
+MaceBackboneKokkosT<Precision>::family_artifact_readiness() const
+{
+    using symmetrix::execution::ArtifactReadiness;
+    const bool host_ready=jit_mh1_host_plugin_v7_ready();
+    const bool device_ready=jit_mh1_cuda_plugin_v5_ready();
+    ArtifactReadiness readiness;
+    readiness.ready=host_ready||device_ready;
+    readiness.target=family_capabilities().target;
+    readiness.artifact_id=host_ready
+        ?jit_mh1_host_plugin_artifact_id()
+        :jit_mh1_cuda_plugin_artifact_id();
+    readiness.generation_fingerprint=execution_mh1_generation_fingerprint();
+    readiness.semantic_fingerprint=execution_mh1_semantic_fingerprint();
+    readiness.structure_fingerprint=execution_mh1_structure_fingerprint();
+    readiness.reason=readiness.ready
+        ?"generated MH-1 artifact admitted"
+        :"no generated MH-1 artifact is admitted";
+    return readiness;
+}
+
+template<typename Precision>
+symmetrix::execution::ArtifactReadiness
+MaceBackboneKokkosT<Precision>::load_family_artifact(
+    const symmetrix::execution::ArtifactRequest& request)
+{
+    // An empty path is the interface's readiness query and must not reach a
+    // loader: no MH-1 loader admits an empty manifest path.
+    const std::string target=request.target.empty()
+        ?family_capabilities().target:request.target;
+    if(target=="host") {
+        if(!request.path.empty())
+            load_jit_mh1_host_plugin_v7(request.path);
+    } else if(!request.path.empty()) {
+        throw std::invalid_argument(
+            "Generation-19 device family artifacts require an explicit "
+            "launch plan and must use the v5 module loader.");
+    }
+    auto readiness=family_artifact_readiness();
+    readiness.target=target;
+    if(target!="host") {
+        // A device target reports the device artifact rather than a host one
+        // that happens to be ready alongside it.
+        readiness.ready=
+            jit_mh1_cuda_plugin_v5_ready();
+        readiness.artifact_id=readiness.ready
+            ?jit_mh1_cuda_plugin_artifact_id():std::string();
+        readiness.reason=readiness.ready
+            ?"generated MH-1 device artifact admitted"
+            :"no generated MH-1 device artifact is admitted";
+    }
+    return readiness;
+}
+
+template<typename Precision>
+symmetrix::execution::FamilyDiagnostics
+MaceBackboneKokkosT<Precision>::family_diagnostics() const
+{
+    using symmetrix::execution::FamilyDiagnostics;
+    FamilyDiagnostics diagnostics;
+    // The prepared path counts the evaluations it could not route through a
+    // generated artifact; the backend name is the human-readable state.
+    diagnostics.fallback_count=factorized_fallback_evaluation_count();
+    diagnostics.diagnostic=execution_mh1_execution_backend();
+    return diagnostics;
+}
+
+template<typename Precision>
+symmetrix::execution::ImplementationBindingReport
+MaceBackboneKokkosT<Precision>::family_binding_report() const
+{
+    const auto capabilities=family_capabilities();
+    return symmetrix::execution::plan_program(compile_program(),
+        family_implementation_registry(),capabilities.target,
+        capabilities.precision,family_artifact_ready(),
+        family_artifact_readiness().artifact_id);
+}
+
 #elif SYMMETRIX_MACE_NONLINEAR_KOKKOS_PART == 3
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::compute_Y(
+void MaceBackboneKokkosT<Precision>::compute_Y(
     Kokkos::View<const double*> xyz,const bool evaluator_stream)
 {
     if(xyz.extent(0)%3!=0)
@@ -3611,21 +5957,20 @@ void MaceNonlinearKokkosT<Precision>::compute_Y(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes,Kokkos::View<const int*> node_types,Kokkos::View<const int*> num_neigh,Kokkos::View<const int*> neigh_indices,Kokkos::View<const int*> neigh_types,Kokkos::View<const double*> xyz,Kokkos::View<const double*> distances,const std::uint64_t execution_graph_generation)
+void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,Kokkos::View<const int*> node_types,Kokkos::View<const int*> num_neigh,Kokkos::View<const int*> neigh_indices,Kokkos::View<const int*> neigh_types,Kokkos::View<const double*> xyz,Kokkos::View<const double*> distances,const std::uint64_t execution_graph_generation)
 {
     const bool use_pair_spline=mh1_edge_executor_=="pair_spline_v1";
-    if(!use_pair_spline&&mace_uses_direct_execution(streamed_edges)
-        &&!jit_mh1_host_plugin_ready()&&!jit_mh1_host_plugin_v4_ready()
-        &&!jit_mh1_cuda_plugin_ready()&&!jit_mh1_cuda_plugin_v4_ready())
+    if(!use_pair_spline&&uses_direct_execution(streamed_edges)
+        &&!jit_mh1_host_plugin_v7_ready()
+        &&!jit_mh1_cuda_plugin_v5_ready())
         throw std::runtime_error(
             "streamed_edges='direct' requires a loaded MH-1 RTC artifact; "
             "direct execution does not fall back to another algorithm.");
     if(execution_graph_generation!=0) {
         factorized_completed_evaluation_graph_generation=0;
-        if(!mace_uses_prepared_execution(streamed_edges))
+        if(!uses_prepared_execution(streamed_edges))
             throw std::invalid_argument(
-                "An execution graph token requires streamed_edges='direct' or "
-                "'receiver_factorized'.");
+                "An execution graph token requires streamed_edges='direct'.");
         if(execution_graph_generation!=factorized_prepared_graph_generation
             ||execution_source_schedule_dirty)
             throw std::invalid_argument(
@@ -3641,7 +5986,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         neigh_types=execution_prepared_neigh_types;
         ++factorized_prepared_evaluations;
         ++factorized_topology_validation_skips;
-    } else if(mace_uses_prepared_execution(streamed_edges)) {
+    } else if(num_nodes>0&&uses_prepared_execution(streamed_edges)) {
         ++factorized_fallback_evaluations;
         ++factorized_topology_validations;
     }
@@ -3668,14 +6013,15 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
     Kokkos::View<const int*> spline_neigh_types=neigh_types;
     int spline_type_count=static_cast<int>(atomic_numbers_host.size());
     if(use_pair_spline) {
-        prepare_mh1_pair_spline_for_graph(node_types,neigh_types);
+        prepare_mh1_pair_spline_for_graph(
+            node_types,neigh_types,execution_graph_generation);
         if(mh1_pair_spline_lazy_) {
             spline_node_types=mh1_spline_node_types_;
             spline_neigh_types=mh1_spline_neigh_types_;
             spline_type_count=mh1_spline_type_count_;
         }
     }
-    compute_Y(xyz,mace_uses_prepared_execution(streamed_edges));
+    compute_Y(xyz,uses_prepared_execution(streamed_edges));
 
     if(execution_graph_generation!=0) {
         offsets=execution_prepared_offsets;
@@ -3702,7 +6048,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                     edge<local_offsets_for_build(node+1);++edge)
                     local_targets_for_build(edge)=node;
             });
-        if(mace_uses_prepared_execution(streamed_edges))
+        if(uses_prepared_execution(streamed_edges))
             prepare_execution_source_schedule(
                 num_nodes,edges,neigh_indices,local_targets_for_build);
     }
@@ -3715,8 +6061,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>) {
             generated_node_program=
-                mace_uses_direct_execution(streamed_edges)
-                &&jit_mh1_cuda_plugin_v4_ready();
+                uses_direct_execution(streamed_edges)
+                &&jit_mh1_cuda_plugin_v5_ready();
             generated_device_spline_r_program=
                 generated_node_program&&use_pair_spline
                 &&jit_mh1_cuda_plugin_v4->has_spline_r_program();
@@ -3725,14 +6071,44 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 &&!generated_device_spline_r_program;
     } else
 #endif
-    if constexpr(std::is_same_v<Precision,float>)
+    if constexpr(symmetrix::execution::host_execution_space<
+            Kokkos::DefaultExecutionSpace>)
         generated_node_program=
-            !use_pair_spline&&mace_uses_direct_execution(streamed_edges)
-            &&jit_mh1_host_plugin_v4_ready()
+            (!use_pair_spline||jit_mh1_host_plugin_v7_ready())
+            &&uses_direct_execution(streamed_edges)
+            &&jit_mh1_host_plugin_v7_ready()
             &&execution_mh1_host_node_backend_request!="kokkos";
+    const bool shared_host_product_program=
+        jit_mh1_host_plugin_v7_ready();
+    const bool shared_device_product_program=
+        jit_mh1_cuda_plugin_v5_ready()
+        &&jit_mh1_cuda_plugin_v4->split_phase_ready();
+    const bool shared_product_program=
+        shared_host_product_program||shared_device_product_program;
+    if(shared_product_program&&!execution_mh1_product_modules_ready())
+        throw std::runtime_error(
+            "Execution MH-1 shared product composition is incomplete; fallback is forbidden.");
+    if(shared_device_product_program
+        &&std::any_of(execution_mh1_product_artifacts.begin(),
+            execution_mh1_product_artifacts.end(),[](const auto& artifact) {
+                return artifact.device_module==nullptr;
+            }))
+        throw std::runtime_error(
+            "Execution MH-1 shared device product composition is incompatible; fallback is forbidden.");
+    if(shared_product_program&&!generated_node_program)
+        throw std::runtime_error(
+            "Execution MH-1 shared product composition cannot execute on the "
+            "selected route; fallback is forbidden.");
     Kokkos::View<int*> execution_mh1_spline_intervals;
     Kokkos::View<Precision*> execution_mh1_spline_coordinates;
-    if(generated_device_spline_node_adapter) {
+    bool needs_device_spline_points=generated_device_spline_node_adapter;
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+    if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>)
+        needs_device_spline_points=needs_device_spline_points
+            ||(use_pair_spline&&uses_direct_execution(streamed_edges)
+                &&edges>0&&!generated_device_spline_r_program);
+#endif
+    if(needs_device_spline_points) {
         if(execution_mh1_spline_intervals_storage.extent(0)
             <static_cast<std::size_t>(edges))
             Kokkos::realloc(Kokkos::WithoutInitializing,
@@ -3778,26 +6154,19 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
         if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>) {
             generated_graphwide_program=
-                !use_pair_spline&&mace_uses_direct_execution(streamed_edges)&&edges>0
-                &&(jit_mh1_cuda_plugin_ready()
-                    ||jit_mh1_cuda_plugin_v4_ready());
+                !use_pair_spline&&uses_direct_execution(streamed_edges)&&edges>0
+                &&jit_mh1_cuda_plugin_v5_ready();
         } else
 #endif
         {
             generated_graphwide_program=
-                !use_pair_spline&&mace_uses_direct_execution(streamed_edges)
-                &&edges>0&&(jit_mh1_host_plugin_ready()
-                    ||jit_mh1_host_plugin_v4_ready());
+                !use_pair_spline&&uses_direct_execution(streamed_edges)
+                &&edges>0&&jit_mh1_host_plugin_v7_ready();
         }
     }
-    generated_spline_r_program=
-        use_pair_spline&&mace_uses_direct_execution(streamed_edges)
-        &&edges>0&&uses_packed_node_linears()&&jit_mh1_host_plugin_v5_ready()
-        &&std::all_of(
-            interactions.begin(),interactions.end(),
-            [](const auto& interaction) {
-                return interaction.convolution.execution_output_mask_is_identity();
-            });
+    const bool shared_host_pair_spline_node_adapter=
+        shared_host_product_program&&use_pair_spline
+        &&!generated_spline_r_program;
     execution_mh1_retain_graph_embedding.assign(interactions.size(),0);
     execution_mh1_graph_embedding_scratch_slot.assign(interactions.size(),-1);
     execution_mh1_scratch_minimum=0;
@@ -3993,7 +6362,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 execution_mh1_device_ordinal(execution_space));
             const int persistent_blocks=execution_mh1_persistent_blocks();
             check_execution_mh1_cuda_status(
-                jit_mh1_cuda_plugin_v4_ready()
+                jit_mh1_cuda_plugin_v5_ready()
                     ?jit_mh1_cuda_plugin_v4->launch_conditioning_forward(
                         &args,execution_mh1_device_stream(execution_space),
                         persistent_blocks)
@@ -4026,9 +6395,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 density_target.data(),convolution_parameters.data(),
                 density_parameters.data(),state.execution_graph_embedding.data(),
                 state.densities.data()};
-            const auto owner=jit_mh1_host_plugin_v4_ready()
-                ?jit_mh1_host_plugin_v4->descriptor()
-                    .conditioning[layer].forward_owner
+            const auto owner=mh1_host_view.conditioning!=nullptr
+                ?mh1_host_view.conditioning[layer].forward_owner
                 :jit_mh1_host_plugin->descriptor()
                     .conditioning[layer].forward_owner;
             Kokkos::parallel_for(
@@ -4081,7 +6449,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
     for(int layer=0;layer<static_cast<int>(interactions.size());++layer) {
         auto& interaction=interactions[layer];
         auto& state=states[layer];
-        const auto stage=symmetrix::mh1::layer_from_index(layer);
+        const auto stage=stage_description.layer_index(
+            static_cast<std::size_t>(layer));
         state.input=features;
         const int input_width=interaction.linear_up.input_dimension();
         const int up_width=interaction.linear_up.output_dimension();
@@ -4093,12 +6462,13 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         const bool spline_layer=use_pair_spline&&interaction.pair_spline_ready;
         bool packed_spline_messages=false;
         {
-        ScopedKokkosProfileRegion profile(symmetrix::mh1::region_name(
-            symmetrix::mh1::r_forward_regions,stage));
+        ScopedKokkosProfileRegion profile(
+            stage_description.r_forward(stage).data());
         if(generated_node_program) {
             ensure_view(state.execution_input_ir_mul,
                 state.execution_input_ir_mul_storage,num_nodes,up_width);
-            if(generated_device_spline_node_adapter)
+            if(generated_device_spline_node_adapter
+                ||shared_host_pair_spline_node_adapter)
                 ensure_view(state.up,state.up_storage,num_nodes,up_width);
             else state.up=state.execution_input_ir_mul;
             const auto& runtime=execution_mh1_node_runtime.at(layer);
@@ -4114,10 +6484,11 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 layer==0?nullptr:reinterpret_cast<const float*>(features.data()),
                 nullptr,nullptr,
                 reinterpret_cast<float*>(
-                    generated_device_spline_node_adapter
+                    (generated_device_spline_node_adapter
+                        ||shared_host_pair_spline_node_adapter)
                         ?state.execution_input_ir_mul.data():state.up.data()),
                 nullptr,nullptr,
-                reinterpret_cast<float*>(runtime.arena.data())};
+                reinterpret_cast<float*>(runtime.arena.data()),nullptr};
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
             if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>) {
                 Kokkos::DefaultExecutionSpace execution_space;
@@ -4138,24 +6509,48 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             } else
 #endif
             {
-                const auto owner=jit_mh1_host_plugin_v4->descriptor()
-                    .node_programs[layer].forward_phases[0].owner;
+                const auto split=shared_host_product_program
+                    ?&jit_mh1_host_plugin_v7->descriptor().node_programs[layer]
+                    :nullptr;
+                const auto owner=split==nullptr
+                    ?mh1_host_view.node_programs[layer].forward_phases[0].owner
+                    :nullptr;
                 for(int first=0;first<num_nodes;first+=runtime.tile_rows) {
                     const int rows=std::min(runtime.tile_rows,num_nodes-first);
                     const auto input_pointer=layer==0?nullptr:
                         reinterpret_cast<const float*>(features.data())
                         +static_cast<std::size_t>(first)*features.extent(1);
-                    auto tile_args=host_args;
-                    tile_args.num_nodes=rows;
-                    tile_args.element_indices+=first;
-                    tile_args.layer_input=input_pointer;
-                    tile_args.up_output+=static_cast<std::size_t>(first)*up_width;
-                    Kokkos::parallel_for(
-                        "ExecutionMH1HostPluginV4::node_pre_forward",rows,
-                        [=](int node) { owner(&tile_args,node); });
+                    if(split!=nullptr) {
+                        const SymmetrixJitMH1HostNodeForwardArgsV7 tile_args{
+                            sizeof(SymmetrixJitMH1HostNodeForwardArgsV7),
+                            static_cast<std::uint32_t>(layer),0u,0u,rows,
+                            reinterpret_cast<const std::int32_t*>(
+                                product_elements.data()+first),
+                            nullptr,runtime.linear_parameters.data(),nullptr,
+                            input_pointer,nullptr,nullptr,nullptr,
+                            host_args.up_output
+                                +static_cast<std::size_t>(first)*up_width,
+                            nullptr,nullptr,
+                            runtime.arena.data()};
+                        const auto initial_owner=split->initial_forward_owner;
+                        Kokkos::parallel_for(
+                            "ExecutionMH1HostPluginV7::node_initial_forward",rows,
+                            [=](int node) { initial_owner(&tile_args,node); });
+                    } else {
+                        auto tile_args=host_args;
+                        tile_args.num_nodes=rows;
+                        tile_args.element_indices+=first;
+                        tile_args.layer_input=input_pointer;
+                        tile_args.up_output+=
+                            static_cast<std::size_t>(first)*up_width;
+                        Kokkos::parallel_for(
+                            "ExecutionMH1HostPluginV4::node_pre_forward",rows,
+                            [=](int node) { owner(&tile_args,node); });
+                    }
                 }
             }
-            if(generated_device_spline_node_adapter) {
+            if(generated_device_spline_node_adapter
+                ||shared_host_pair_spline_node_adapter) {
                 const auto input_mul_to_ir=
                     interaction.convolution.execution_input_1_mul_to_ir();
                 auto input_ir_mul=state.execution_input_ir_mul;
@@ -4177,7 +6572,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         if(generated_node_program) {
             ensure_view(state.execution_output_ir_mul,
                 state.execution_output_ir_mul_storage,num_nodes,message_width);
-            if(generated_device_spline_node_adapter)
+            if(generated_device_spline_node_adapter
+                ||shared_host_pair_spline_node_adapter)
                 ensure_view(
                     state.messages,state.messages_storage,num_nodes,message_width);
             else {
@@ -4204,9 +6600,9 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             auto density_target=interaction.density_target_contributions;
             auto up=state.up;
             const bool execution_layer=
-                mace_uses_prepared_execution(streamed_edges);
+                uses_prepared_execution(streamed_edges);
             const bool generated_execution_layer=
-                mace_uses_direct_execution(streamed_edges);
+                uses_direct_execution(streamed_edges);
             bool generated_spline_forward=false;
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
             if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>)
@@ -4217,26 +6613,32 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 &&edges>0&&generated_spline_r_program;
             const bool generated_device_spline_forward=
                 spline_layer&&edges>0&&generated_device_spline_r_program;
+            // The Kokkos direct spline UVU forward belongs to the staged
+            // device node program: it consumes the ir-mul node buffers that
+            // program permutes and fills, and writes its messages into the
+            // buffer that program reads afterwards.  Without a loaded artifact
+            // no such program exists, so the compiler-free chunked Kokkos path
+            // serves the executor instead of this branch.
             bool direct_device_spline_forward=false;
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
             if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>)
                 direct_device_spline_forward=spline_layer
                     &&generated_execution_layer&&edges>0
-                    &&!generated_device_spline_r_program;
+                    &&generated_device_spline_node_adapter;
 #endif
             bool generated_graphwide=false;
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
             if constexpr(std::is_same_v<Precision,float>
                 &&device_execution_space<Kokkos::DefaultExecutionSpace>)
                 generated_graphwide=
-                    !spline_layer&&generated_execution_layer&&edges>0&&(jit_mh1_cuda_plugin_ready()
-                        ||jit_mh1_cuda_plugin_v4_ready());
+                    !spline_layer&&generated_execution_layer&&edges>0
+                    &&jit_mh1_cuda_plugin_v5_ready();
             else
 #endif
             if constexpr(std::is_same_v<Precision,float>)
                 generated_graphwide=
-                    !spline_layer&&generated_execution_layer&&edges>0&&(jit_mh1_host_plugin_ready()
-                        ||jit_mh1_host_plugin_v4_ready());
+                    !spline_layer&&generated_execution_layer&&edges>0
+                    &&jit_mh1_host_plugin_v7_ready();
             const int embedding_width=execution_layer
                 ?interaction.convolution_weights.prefix_output_size(num_bessel):0;
             const bool identity_prefix=execution_layer
@@ -4296,8 +6698,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 {
                     ensure_view(state.execution_input_ir_mul,
                         state.execution_input_ir_mul_storage,num_nodes,up_width);
-                    const auto& spline_program=jit_mh1_host_plugin_v5
-                        ->descriptor().spline_r_programs[layer];
+                    const auto& spline_program=
+                        mh1_host_view.spline_r_programs[layer];
                     packed_spline_messages=(spline_program.flags
                         &SYMMETRIX_JIT_MH1_HOST_SPLINE_R_PACKED_FORWARD_MESSAGES_V5)
                         !=0;
@@ -4305,17 +6707,19 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         ensure_view(state.execution_output_ir_mul,
                             state.execution_output_ir_mul_storage,
                             num_nodes,message_width);
-                    const auto input_mul_to_ir=
-                        interaction.convolution.execution_input_1_mul_to_ir();
-                    auto input_ir_mul=state.execution_input_ir_mul;
-                    Kokkos::parallel_for(
-                        "Execution MH-1 spline input mul-ir to ir-mul",
-                        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-                            {0,0},{num_nodes,up_width}),
-                        KOKKOS_LAMBDA(int node,int mul_ir) {
-                            input_ir_mul(node,input_mul_to_ir(mul_ir))=
-                                up(node,mul_ir);
-                        });
+                    if(!generated_node_program) {
+                        const auto input_mul_to_ir=interaction.convolution
+                            .execution_input_1_mul_to_ir();
+                        auto input_ir_mul=state.execution_input_ir_mul;
+                        Kokkos::parallel_for(
+                            "Execution MH-1 spline input mul-ir to ir-mul",
+                            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                                {0,0},{num_nodes,up_width}),
+                            KOKKOS_LAMBDA(int node,int mul_ir) {
+                                input_ir_mul(node,input_mul_to_ir(mul_ir))=
+                                    up(node,mul_ir);
+                            });
+                    }
                     if(!packed_spline_messages)
                         ordered_kokkos_deep_copy(
                             state.execution_output_ir_mul,Precision(0));
@@ -4352,7 +6756,12 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         [=](int owner_index) {
                             owner(&args,graph_receivers(owner_index));
                         });
-                    if(!packed_spline_messages) {
+                    if(generated_node_program) {
+                        // A packed spline program already emits the ir-mul
+                        // layout consumed by generated node owners.
+                        state.messages=packed_spline_messages
+                            ?messages:state.execution_output_ir_mul;
+                    } else if(!packed_spline_messages) {
                         const auto output_mul_to_ir=
                             interaction.convolution.execution_output_mul_to_ir();
                         auto output_ir_mul=state.execution_output_ir_mul;
@@ -4413,6 +6822,24 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
 #endif
             }
             if(direct_device_spline_forward) {
+                ensure_view(state.execution_input_ir_mul,
+                    state.execution_input_ir_mul_storage,num_nodes,up_width);
+                ensure_view(state.execution_output_ir_mul,
+                    state.execution_output_ir_mul_storage,
+                    num_nodes,message_width);
+                if(!generated_node_program) {
+                    const auto input_mul_to_ir=
+                        interaction.convolution.execution_input_1_mul_to_ir();
+                    auto input_ir_mul=state.execution_input_ir_mul;
+                    Kokkos::parallel_for(
+                        "portable MH-1 spline input mul-ir to ir-mul",
+                        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                            {0,0},{num_nodes,up_width}),
+                        KOKKOS_LAMBDA(int node,int mul_ir) {
+                            input_ir_mul(node,input_mul_to_ir(mul_ir))=
+                                up(node,mul_ir);
+                        });
+                }
                 if(layer==0)
                     interaction.pair_spline.prepare_evaluation_points(
                         distances,execution_mh1_spline_intervals,
@@ -4432,6 +6859,17 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 if(!dispatched)
                     throw std::logic_error(
                         "Qualified MH-1 direct spline UVU forward did not dispatch.");
+                const auto output_mul_to_ir=
+                    interaction.convolution.execution_output_mul_to_ir();
+                auto output_ir_mul=state.execution_output_ir_mul;
+                Kokkos::parallel_for(
+                    "portable MH-1 spline output ir-mul to mul-ir",
+                    Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                        {0,0},{num_nodes,message_width}),
+                    KOKKOS_LAMBDA(int node,int mul_ir) {
+                        messages(node,mul_ir)=output_ir_mul(
+                            node,output_mul_to_ir(mul_ir));
+                    });
             }
             if(!generated_conditioning&&!generated_spline_forward
                 &&!generated_device_spline_forward
@@ -4835,7 +7273,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         execution_mh1_device_ordinal(execution_space));
                     const int persistent_blocks=execution_mh1_persistent_blocks();
                     check_execution_mh1_cuda_status(
-                        jit_mh1_cuda_plugin_v4_ready()
+                        jit_mh1_cuda_plugin_v5_ready()
                             ?jit_mh1_cuda_plugin_v4->launch_forward(
                                 &args,execution_mh1_device_stream(
                                     execution_space),
@@ -4861,7 +7299,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                     if(graph_fixed_contribution.size()!=0)
                         flags|=
                             SYMMETRIX_JIT_MH1_HOST_HAS_FIXED_CONTRIBUTION_V3;
-                    const auto linear_weight=jit_mh1_host_plugin_v4_ready()
+                    const auto linear_weight=jit_mh1_host_plugin_v7_ready()
                         ?interaction.convolution_weights
                             .final_linear_weight_phi_major(num_bessel)
                         :interaction.convolution_weights
@@ -4883,8 +7321,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         edge_harmonics.data(),cutoffs.data(),output_mask.data(),
                         state.execution_input_ir_mul.data(),
                         state.execution_output_ir_mul.data()};
-                    const auto owner=jit_mh1_host_plugin_v4_ready()
-                        ?jit_mh1_host_plugin_v4->descriptor().forward_owner
+                    const auto owner=mh1_host_view.node_programs_ready()
+                        ?mh1_host_view.forward_owner
                         :jit_mh1_host_plugin->descriptor().forward_owner;
                     auto graph_receivers=execution_graph_receivers;
                     Kokkos::parallel_for(
@@ -4911,7 +7349,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         });
                 }
             }
-            if(mace_uses_prepared_execution(streamed_edges))
+            if(uses_prepared_execution(streamed_edges))
                 ++factorized_forward_evaluations;
         } else {
         if(mh1_fast_path) {
@@ -5026,7 +7464,23 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         }
         }
 
-        if(generated_device_spline_node_adapter&&!use_pair_spline) {
+        if(shared_host_pair_spline_node_adapter) {
+            ensure_view(state.execution_output_ir_mul,
+                state.execution_output_ir_mul_storage,num_nodes,message_width);
+            const auto output_mul_to_ir=
+                interaction.convolution.execution_output_mul_to_ir();
+            auto output_mul_ir=state.messages;
+            auto output_ir_mul=state.execution_output_ir_mul;
+            Kokkos::parallel_for(
+                "Execution MH-1 pair spline output mul-ir to shared ir-mul",
+                Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                    {0,0},{num_nodes,message_width}),
+                KOKKOS_LAMBDA(int node,int mul_ir) {
+                    output_ir_mul(node,output_mul_to_ir(mul_ir))=
+                        output_mul_ir(node,mul_ir);
+                });
+            state.messages=state.execution_output_ir_mul;
+        } else if(generated_device_spline_node_adapter&&!use_pair_spline) {
             const auto output_mul_to_ir=
                 interaction.convolution.execution_output_mul_to_ir();
             auto output_mul_ir=state.messages;
@@ -5040,8 +7494,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         output_mul_ir(node,mul_ir);
                 });
         }
-        ScopedKokkosProfileRegion profile(symmetrix::mh1::region_name(
-            symmetrix::mh1::m_forward_regions,stage));
+        ScopedKokkosProfileRegion profile(
+            stage_description.m_forward(stage).data());
         auto densities=state.densities;
         if(!generated_node_program) {
             ensure_view(state.residual,state.residual_storage,num_nodes,res_width);
@@ -5060,15 +7514,48 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 ensure_view(state.pre_gate,state.pre_gate_storage,num_nodes,
                     runtime.retained_pre_gate_dimension);
             else state.pre_gate={};
-            if(runtime.retained_interaction_output_dimension>0)
+            if(shared_product_program
+                &&runtime.retained_interaction_output_dimension>0)
+                ensure_view(state.interaction_output,
+                    state.interaction_output_storage,num_nodes,output_width);
+            else if(runtime.retained_interaction_output_dimension>0)
                 ensure_view(state.interaction_output,
                     state.interaction_output_storage,num_nodes,
                     runtime.retained_interaction_output_dimension);
             else state.interaction_output={};
-            const auto node_up=generated_device_spline_node_adapter
+            if(shared_product_program) {
+                state.contraction_output={};
+                state.contraction_output_storage={};
+                state.contraction_output_adjoint={};
+                state.contraction_output_adjoint_storage={};
+                state.interaction_output_adj={};
+                state.interaction_output_adj_storage={};
+                ensure_view(state.agnostic_elements,
+                    state.agnostic_elements_storage,num_nodes);
+                ordered_kokkos_deep_copy(state.agnostic_elements,0);
+            }
+            const auto node_up=(generated_device_spline_node_adapter
+                    ||shared_host_pair_spline_node_adapter)
                 ?state.execution_input_ir_mul:state.up;
-            const auto node_messages=generated_device_spline_node_adapter
+            const auto node_messages=(generated_device_spline_node_adapter
+                    ||shared_host_pair_spline_node_adapter)
                 ?state.execution_output_ir_mul:state.messages;
+            Precision* retained_output=nullptr;
+            if(retain_layer_features) {
+                const int layers=static_cast<int>(interactions.size());
+                if(static_cast<int>(retained_layer_features.size())!=layers)
+                    retained_layer_features.assign(
+                        static_cast<std::size_t>(layers),{});
+                auto& retained=retained_layer_features.at(
+                    static_cast<std::size_t>(layer));
+                if(retained.extent(0)!=static_cast<std::size_t>(num_nodes)
+                    ||retained.extent(1)!=
+                        static_cast<std::size_t>(layer_output_width))
+                    retained=Kokkos::View<Precision**,Kokkos::LayoutRight>(
+                        "mh1 retained layer features",num_nodes,
+                        layer_output_width);
+                retained_output=retained.data();
+            }
             const SymmetrixJitMH1HostNodeForwardArgsV4 host_args{
                 sizeof(SymmetrixJitMH1HostNodeForwardArgsV4),
                 static_cast<std::uint32_t>(layer),
@@ -5083,7 +7570,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 reinterpret_cast<const float*>(node_messages.data()),nullptr,
                 reinterpret_cast<float*>(state.output.data()),
                 reinterpret_cast<float*>(readout_contribution.data()),
-                reinterpret_cast<float*>(runtime.arena.data())};
+                reinterpret_cast<float*>(runtime.arena.data()),
+                reinterpret_cast<float*>(retained_output)};
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
             if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>) {
                 Kokkos::DefaultExecutionSpace execution_space;
@@ -5094,6 +7582,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                     runtime.retained_interaction_output_dimension>0
                         ?reinterpret_cast<float*>(
                             state.interaction_output.data()):nullptr;
+                void* stream=execution_mh1_device_stream(execution_space);
                 for(int first=0;first<num_nodes;first+=runtime.tile_rows) {
                     const int rows=std::min(
                         runtime.tile_rows,num_nodes-first);
@@ -5103,6 +7592,65 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         runtime.retained_interaction_output_dimension,
                         retained_pre_gate,retained_interaction_output,
                         sizeof(Precision));
+                    if(shared_device_product_program) {
+                        auto& product_artifact=
+                            execution_mh1_product_artifacts.at(layer);
+                        const auto weights=
+                            products[layer].runtime_compiled_coefficients();
+                        const int product_channels=weights.extent_int(2);
+                        const auto contracted_offset=output_width
+                            +(layer==0?input_width:0)+layer_output_width;
+                        auto external_args=args;
+                        external_args.contraction_output=
+                            reinterpret_cast<const float*>(
+                                reinterpret_cast<Precision*>(args.node_arena)
+                                    +contracted_offset);
+                        external_args.phase=0u;
+                        check_execution_mh1_cuda_status(
+                            jit_mh1_cuda_plugin_v4
+                                ->launch_split_forward(
+                                    &external_args,stream,persistent_blocks),
+                            "Launching Execution MH-1 device product pre-forward");
+                        SymmetrixJitM0ArgsV2 product_args{{
+                            sizeof(SymmetrixJitM0ArgsV1),0u,rows,
+                            product_channels,0,state.agnostic_elements.data()+first,
+                            args.node_arena,weights.data(),nullptr,
+                            reinterpret_cast<Precision*>(args.node_arena)
+                                +contracted_offset,nullptr,nullptr},
+                            runtime.arena_dimension,runtime.arena_dimension,
+                            runtime.arena_dimension,runtime.arena_dimension};
+                        const auto ceil_div=[](const std::int64_t value,
+                                               const std::int64_t divisor) {
+                            return (value+divisor-1)/divisor;
+                        };
+                        product_artifact.forward_logical_tiles=
+                            ceil_div(product_channels,product_artifact.channel_tile)
+                            *ceil_div(rows,product_artifact.forward_node_tile)
+                            *ceil_div(product_artifact.output_components,
+                                product_artifact.forward_component_tile);
+                        product_artifact.forward_required_blocks=ceil_div(
+                            product_artifact.forward_logical_tiles,
+                            product_artifact.logical_tiles_per_block);
+                        product_artifact.forward_realized_blocks=std::min(
+                            product_artifact.forward_required_blocks,
+                            static_cast<std::int64_t>(
+                                product_artifact.persistent_blocks));
+                        if(product_artifact.kind=="M0")
+                            product_artifact.device_module->launch_m0_forward_strided(
+                                product_args,stream,
+                                product_artifact.persistent_blocks);
+                        else product_artifact.device_module->launch_m1_forward_strided(
+                            product_args,stream,
+                            product_artifact.persistent_blocks);
+                        ++product_artifact.forward_launch_count;
+                        external_args.phase=1u;
+                        check_execution_mh1_cuda_status(
+                            jit_mh1_cuda_plugin_v4
+                                ->launch_split_forward(
+                                    &external_args,stream,persistent_blocks),
+                            "Launching Execution MH-1 device product post-forward");
+                        continue;
+                    }
                     check_execution_mh1_cuda_status(
                         jit_mh1_cuda_plugin_v4->launch_node_forward(
                             &args,execution_mh1_device_stream(execution_space),
@@ -5112,26 +7660,89 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             } else
 #endif
             {
-                const auto owner=jit_mh1_host_plugin_v4->descriptor()
-                    .node_programs[layer].forward_phases[1].owner;
+                if(shared_host_product_program) {
+                const auto& split=jit_mh1_host_plugin_v7->descriptor()
+                    .node_programs[layer];
+                auto& product_artifact=execution_mh1_product_artifacts.at(layer);
+                const auto& product_descriptor=product_artifact.host_plugin->descriptor();
+                const int channel_tile=(product_descriptor.capabilities
+                        &SYMMETRIX_JIT_M0_HOST_CHANNEL_TILED_OWNER_V1)
+                    ?static_cast<int>(product_descriptor.owner_channel_tile):1;
+                const std::int64_t channel_tiles=
+                    (product_descriptor.channels+channel_tile-1)/channel_tile;
+                const auto weights=products[layer].runtime_compiled_coefficients();
                 for(int first=0;first<num_nodes;first+=runtime.tile_rows) {
                     const int rows=std::min(runtime.tile_rows,num_nodes-first);
-                    auto tile_args=host_args;
-                    tile_args.num_nodes=rows;
-                    tile_args.element_indices+=first;
-                    tile_args.node_density+=first;
-                    if(tile_args.layer_input!=nullptr)
-                        tile_args.layer_input+=static_cast<std::size_t>(first)
-                            *input_width;
-                    tile_args.up+=static_cast<std::size_t>(first)*up_width;
-                    tile_args.messages+=static_cast<std::size_t>(first)
-                        *message_width;
-                    tile_args.layer_output+=static_cast<std::size_t>(first)
-                        *layer_output_width;
-                    tile_args.readout_contribution+=first;
+                    auto* interaction_output=
+                        runtime.retained_interaction_output_dimension>0
+                        ?state.interaction_output.data()
+                            +static_cast<std::size_t>(first)
+                                *split.contraction_input_dimension
+                        :runtime.interaction_output.data();
+                    const SymmetrixJitMH1HostNodeForwardArgsV7 tile_args{
+                        sizeof(SymmetrixJitMH1HostNodeForwardArgsV7),
+                        static_cast<std::uint32_t>(layer),0u,0u,rows,
+                        reinterpret_cast<const std::int32_t*>(
+                            product_elements.data()+first),
+                        state.densities.data()+first,runtime.linear_parameters.data(),
+                        runtime.readout_parameters.data(),
+                        layer==0?nullptr:features.data()
+                            +static_cast<std::size_t>(first)*input_width,
+                        node_up.data()+static_cast<std::size_t>(first)*up_width,
+                        node_messages.data()+static_cast<std::size_t>(first)
+                            *message_width,
+                        runtime.contraction_output.data(),interaction_output,
+                        state.output.data()+static_cast<std::size_t>(first)
+                            *layer_output_width,
+                        readout_contribution.data()+first,
+                        runtime.arena.data()};
                     Kokkos::parallel_for(
-                        "ExecutionMH1HostPluginV4::node_post_forward",rows,
-                        [=](int node) { owner(&tile_args,node); });
+                        "ExecutionMH1HostPluginV7::node_pre_product_forward",rows,
+                        [=](int node) { split.pre_forward_owner(&tile_args,node); });
+                    const SymmetrixJitM0HostArgsV1 product_args{
+                        sizeof(SymmetrixJitM0HostArgsV1),0u,rows,
+                        product_descriptor.channels,0,
+                        state.agnostic_elements.data()+first,
+                        interaction_output,
+                        weights.data(),nullptr,
+                        runtime.contraction_output.data(),
+                        nullptr,nullptr};
+                    const auto product_owner=product_descriptor.forward_owner;
+                    Kokkos::parallel_for(
+                        "ExecutionMH1SharedProduct::host_forward",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                            Kokkos::IndexType<std::int64_t>>(
+                            0,static_cast<std::int64_t>(rows)*channel_tiles),
+                        [=](std::int64_t owner) {
+                            product_owner(&product_args,owner);
+                        });
+                    ++product_artifact.forward_launch_count;
+                    Kokkos::parallel_for(
+                        "ExecutionMH1HostPluginV7::node_post_product_forward",rows,
+                        [=](int node) { split.post_forward_owner(&tile_args,node); });
+                }
+                } else {
+                    const auto owner=mh1_host_view
+                        .node_programs[layer].forward_phases[1].owner;
+                    for(int first=0;first<num_nodes;first+=runtime.tile_rows) {
+                        const int rows=std::min(runtime.tile_rows,num_nodes-first);
+                        auto tile_args=host_args;
+                        tile_args.num_nodes=rows;
+                        tile_args.element_indices+=first;
+                        tile_args.node_density+=first;
+                        if(tile_args.layer_input!=nullptr)
+                            tile_args.layer_input+=static_cast<std::size_t>(first)
+                                *input_width;
+                        tile_args.up+=static_cast<std::size_t>(first)*up_width;
+                        tile_args.messages+=static_cast<std::size_t>(first)
+                            *message_width;
+                        tile_args.layer_output+=static_cast<std::size_t>(first)
+                            *layer_output_width;
+                        tile_args.readout_contribution+=first;
+                        Kokkos::parallel_for(
+                            "ExecutionMH1HostPluginV4::node_post_forward",rows,
+                            [=](int node) { owner(&tile_args,node); });
+                    }
                 }
             }
             auto energies=node_energies;
@@ -5139,8 +7750,9 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             Kokkos::parallel_for(
                 "sum generated readout",num_nodes,KOKKOS_LAMBDA(int node) {
                     energies(node)+=contribution(node);
-                });
+            });
             features=state.output;
+            retain_layer_output(layer,num_nodes,state.output,true);
             continue;
         }
 
@@ -5220,12 +7832,25 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 :E3ProductBasisKokkosT<Precision>::InputLayout::native,
             interaction.skip.active_output_prefix_dimension());
         features=state.output;
+        const bool generated_wide_final=generated_node_program
+            &&mh1_portable_final_layer_ready_
+            &&mh1_family.node_channels==512
+            &&layer+1==static_cast<int>(interactions.size());
+        if(!generated_wide_final)
+            retain_layer_output(
+                layer,num_nodes,state.output,generated_node_program);
     }
 
     for(int layer=0;!generated_node_program
         &&layer<static_cast<int>(readouts.size());++layer) {
         auto& state=states[layer];
-        readouts[layer].evaluate(state.output,readout_contribution);
+        const bool portable_final=mh1_portable_final_layer_enabled_
+            &&layer+1==static_cast<int>(readouts.size());
+        if(portable_final) {
+            readouts[layer].evaluate_portable_scalar(
+                state.output,readout_contribution);
+            ++mh1_portable_final_layer_evaluations_;
+        } else readouts[layer].evaluate(state.output,readout_contribution);
         auto energies=node_energies;
         auto contribution=readout_contribution;
         Kokkos::parallel_for("sum readout",num_nodes,KOKKOS_LAMBDA(int node) {
@@ -5233,7 +7858,10 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         });
         ensure_view(state.layer_adjoint,state.layer_adjoint_storage,num_nodes,
             products[layer].output_dimension());
-        readouts[layer].reverse(state.output,scale,state.layer_adjoint);
+        if(portable_final)
+            readouts[layer].reverse_portable_scalar(
+                state.output,scale,state.layer_adjoint);
+        else readouts[layer].reverse(state.output,scale,state.layer_adjoint);
     }
     if(generated_node_program)
         for(int layer=0;layer<static_cast<int>(states.size());++layer) {
@@ -5242,6 +7870,21 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 num_nodes,products[layer].output_dimension());
             ordered_kokkos_deep_copy(state.layer_adjoint,Precision(0));
         }
+    if(has_layer_product_seed()) {
+        // Validate every adopted input before launching reverse work. The
+        // actual merge is layer-local below: a successor's generated reverse
+        // may initialize its predecessor's adjoint, so preloading every layer
+        // here would let that propagation overwrite an external contribution.
+        for(int layer=0;layer<static_cast<int>(states.size());++layer) {
+            const auto& seed=layer_product_seeds.at(layer);
+            if(seed.extent(0)!=static_cast<std::size_t>(num_nodes)
+                ||seed.extent(1)!=static_cast<std::size_t>(
+                    products[layer].output_dimension()))
+                throw std::invalid_argument(
+                    "MH-1 layer-product seed dimensions do not match the "
+                    "current graph and product output.");
+        }
+    }
     auto energies=node_energies;
     auto e0=atomic_energies;
     const Precision energy_scale=scale,energy_shift=shift;
@@ -5318,7 +7961,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         state.execution_input_adjoint_ir_mul_storage={};
     }
     if(generated_graphwide_program||generated_spline_r_program
-        ||generated_device_spline_node_adapter) {
+        ||generated_device_spline_node_adapter
+        ||shared_host_pair_spline_node_adapter) {
         reserve(execution_mh1_input_adjoint_scratch_storage,
             static_cast<std::size_t>(num_nodes)*maximum_up_width);
     } else execution_mh1_input_adjoint_scratch_storage={};
@@ -5326,7 +7970,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
     for(int layer=static_cast<int>(interactions.size())-1;layer>=0;--layer) {
         auto& interaction=interactions[layer];
         auto& state=states[layer];
-        const auto stage=symmetrix::mh1::layer_from_index(layer);
+        const auto stage=stage_description.layer_index(
+            static_cast<std::size_t>(layer));
         const int input_width=interaction.linear_up.input_dimension();
         const int up_width=interaction.linear_up.output_dimension();
         const int message_width=interaction.convolution.output_dimension();
@@ -5334,16 +7979,19 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         const int layer_output_width=products[layer].output_dimension();
         const int pre_gate_width=state.pre_gate.extent(1);
         const int skip_width=interaction.skip.output_dimension();
+        if(has_layer_product_seed())
+            add_layer_product_seed(
+                layer,num_nodes,state.layer_adjoint,generated_node_program);
         const bool spline_layer=use_pair_spline&&interaction.pair_spline_ready;
         bool packed_spline_messages=false;
         if(generated_spline_r_program&&spline_layer)
-            packed_spline_messages=(jit_mh1_host_plugin_v5->descriptor()
+            packed_spline_messages=(mh1_host_view
                     .spline_r_programs[layer].flags
                 &SYMMETRIX_JIT_MH1_HOST_SPLINE_R_PACKED_FORWARD_MESSAGES_V5)!=0;
 
         {
-        ScopedKokkosProfileRegion profile(symmetrix::mh1::region_name(
-            symmetrix::mh1::m_reverse_regions,stage));
+        ScopedKokkosProfileRegion profile(
+            stage_description.m_reverse(stage).data());
         if(generated_node_program) {
             // The ABI requires a packed row stride, so wrap each flat shared
             // owner with the current layer's exact width.
@@ -5365,6 +8013,20 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         execution_mh1_input_adjoint_scratch_storage.data(),
                         num_nodes,up_width);
                 node_up_adj=state.execution_input_adjoint_ir_mul;
+            } else if(shared_host_pair_spline_node_adapter) {
+                ++execution_mh1_up_adjoint_scratch_reuses;
+                state.message_adj=node_message_adj;
+                state.up_adj=decltype(state.up_adj)(
+                    execution_mh1_up_adjoint_scratch_storage.data(),
+                    num_nodes,up_width);
+                ordered_kokkos_deep_copy(state.up_adj,Precision(0));
+                state.execution_input_adjoint_ir_mul=
+                    decltype(state.execution_input_adjoint_ir_mul)(
+                        execution_mh1_input_adjoint_scratch_storage.data(),
+                        num_nodes,up_width);
+                ordered_kokkos_deep_copy(
+                    state.execution_input_adjoint_ir_mul,Precision(0));
+                node_up_adj=state.execution_input_adjoint_ir_mul;
             } else {
                 state.message_adj=node_message_adj;
                 state.up_adj=decltype(state.up_adj)(
@@ -5377,10 +8039,16 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             auto previous_adjoint=layer==0
                 ?Kokkos::View<Precision**,Kokkos::LayoutRight>()
                 :states[layer-1].layer_adjoint;
-            const auto node_up=generated_device_spline_node_adapter
+            const auto node_up=(generated_device_spline_node_adapter
+                    ||shared_host_pair_spline_node_adapter)
                 ?state.execution_input_ir_mul:state.up;
-            const auto node_messages=generated_device_spline_node_adapter
+            const auto node_messages=(generated_device_spline_node_adapter
+                    ||shared_host_pair_spline_node_adapter)
                 ?state.execution_output_ir_mul:state.messages;
+            // Product seeds are accumulated above in the owning Kokkos view.
+            // Keep the generated-kernel ABI field null so a wide final layer
+            // cannot merge the same contribution a second time.
+            const Precision* external_product_seed=nullptr;
             const SymmetrixJitMH1HostNodeReverseArgsV4 host_args{
                 sizeof(SymmetrixJitMH1HostNodeReverseArgsV4),
                 static_cast<std::uint32_t>(layer),
@@ -5400,7 +8068,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 reinterpret_cast<float*>(node_message_adj.data()),
                 reinterpret_cast<float*>(node_up_adj.data()),
                 layer==0?nullptr:reinterpret_cast<float*>(previous_adjoint.data()),
-                reinterpret_cast<float*>(state.density_adj.data())};
+                reinterpret_cast<float*>(state.density_adj.data()),
+                reinterpret_cast<const float*>(external_product_seed)};
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
             if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>) {
                 Kokkos::DefaultExecutionSpace execution_space;
@@ -5413,6 +8082,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                     runtime.retained_interaction_output_dimension>0
                         ?reinterpret_cast<const float*>(
                             state.interaction_output.data()):nullptr;
+                void* stream=execution_mh1_device_stream(execution_space);
                 for(int first=0;first<num_nodes;first+=runtime.tile_rows) {
                     const int rows=std::min(
                         runtime.tile_rows,num_nodes-first);
@@ -5423,6 +8093,72 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         runtime.retained_interaction_output_dimension,
                         retained_pre_gate,retained_interaction_output,
                         sizeof(Precision));
+                    if(shared_device_product_program) {
+                        auto& product_artifact=
+                            execution_mh1_product_artifacts.at(layer);
+                        const auto weights=
+                            products[layer].runtime_compiled_coefficients();
+                        const int product_channels=weights.extent_int(2);
+                        const auto* interaction_output=
+                            runtime.retained_interaction_output_dimension>0
+                            ?args.retained_interaction_output:args.node_arena;
+                        const auto interaction_stride=
+                            runtime.retained_interaction_output_dimension>0
+                            ?interaction_width:runtime.arena_dimension;
+                        auto external_args=args;
+                        external_args.contraction_output=interaction_output;
+                        external_args.contraction_output_adjoint=
+                            reinterpret_cast<float*>(
+                                reinterpret_cast<Precision*>(args.node_arena)
+                                    +interaction_width);
+                        external_args.phase=2u;
+                        check_execution_mh1_cuda_status(
+                            jit_mh1_cuda_plugin_v4
+                                ->launch_split_reverse(
+                                    &external_args,stream,persistent_blocks),
+                            "Launching Execution MH-1 device product post-reverse");
+                        SymmetrixJitM0ArgsV2 product_reverse_args{{
+                            sizeof(SymmetrixJitM0ArgsV1),0u,rows,
+                            product_channels,0,state.agnostic_elements.data()+first,
+                            interaction_output,weights.data(),
+                            reinterpret_cast<Precision*>(args.node_arena)+interaction_width,
+                            nullptr,
+                            reinterpret_cast<Precision*>(args.node_arena)
+                                +interaction_width+layer_output_width,nullptr},
+                            interaction_stride,runtime.arena_dimension,
+                            runtime.arena_dimension,runtime.arena_dimension};
+                        const auto ceil_div=[](const std::int64_t value,
+                                               const std::int64_t divisor) {
+                            return (value+divisor-1)/divisor;
+                        };
+                        product_artifact.reverse_logical_tiles=
+                            ceil_div(product_channels,product_artifact.channel_tile)
+                            *ceil_div(rows,product_artifact.reverse_node_tile)
+                            *ceil_div(product_artifact.input_components,
+                                product_artifact.reverse_component_tile);
+                        product_artifact.reverse_required_blocks=ceil_div(
+                            product_artifact.reverse_logical_tiles,
+                            product_artifact.logical_tiles_per_block);
+                        product_artifact.reverse_realized_blocks=std::min(
+                            product_artifact.reverse_required_blocks,
+                            static_cast<std::int64_t>(
+                                product_artifact.persistent_blocks));
+                        if(product_artifact.kind=="M0")
+                            product_artifact.device_module->launch_m0_reverse_strided(
+                                product_reverse_args,stream,
+                                product_artifact.persistent_blocks);
+                        else product_artifact.device_module->launch_m1_reverse_strided(
+                            product_reverse_args,stream,
+                            product_artifact.persistent_blocks);
+                        ++product_artifact.reverse_launch_count;
+                        external_args.phase=3u;
+                        check_execution_mh1_cuda_status(
+                            jit_mh1_cuda_plugin_v4
+                                ->launch_split_reverse(
+                                    &external_args,stream,persistent_blocks),
+                            "Launching Execution MH-1 device product pre-reverse");
+                        continue;
+                    }
                     check_execution_mh1_cuda_status(
                         jit_mh1_cuda_plugin_v4->launch_node_reverse(
                             &args,execution_mh1_device_stream(execution_space),
@@ -5432,35 +8168,151 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             } else
 #endif
             {
-                const auto owner=jit_mh1_host_plugin_v4->descriptor()
-                    .node_programs[layer].reverse_phases[0].owner;
+                if(shared_host_product_program) {
+                const auto& split=jit_mh1_host_plugin_v7->descriptor()
+                    .node_programs[layer];
+                auto& product_artifact=execution_mh1_product_artifacts.at(layer);
+                const auto& product_descriptor=product_artifact.host_plugin->descriptor();
+                const int channel_tile=(product_descriptor.capabilities
+                        &SYMMETRIX_JIT_M0_HOST_CHANNEL_TILED_OWNER_V1)
+                    ?static_cast<int>(product_descriptor.owner_channel_tile):1;
+                const std::int64_t channel_tiles=
+                    (product_descriptor.channels+channel_tile-1)/channel_tile;
+                const auto weights=products[layer].runtime_compiled_coefficients();
                 for(int first=0;first<num_nodes;first+=runtime.tile_rows) {
                     const int rows=std::min(runtime.tile_rows,num_nodes-first);
-                    auto tile_args=host_args;
-                    tile_args.num_nodes=rows;
-                    tile_args.element_indices+=first;
-                    tile_args.node_density+=first;
-                    if(tile_args.layer_input!=nullptr)
-                        tile_args.layer_input+=static_cast<std::size_t>(first)
-                            *input_width;
-                    tile_args.up+=static_cast<std::size_t>(first)*up_width;
-                    tile_args.messages+=static_cast<std::size_t>(first)
-                        *message_width;
-                    tile_args.layer_output+=static_cast<std::size_t>(first)
-                        *layer_output_width;
-                    tile_args.layer_output_adjoint+=
-                        static_cast<std::size_t>(first)*layer_output_width;
-                    tile_args.message_adjoint+=static_cast<std::size_t>(first)
-                        *message_width;
-                    tile_args.up_adjoint+=static_cast<std::size_t>(first)
-                        *up_width;
-                    if(tile_args.layer_input_adjoint!=nullptr)
-                        tile_args.layer_input_adjoint+=
-                            static_cast<std::size_t>(first)*input_width;
-                    tile_args.node_density_adjoint+=first;
+                    auto* interaction_output=
+                        runtime.retained_interaction_output_dimension>0
+                        ?state.interaction_output.data()
+                            +static_cast<std::size_t>(first)
+                                *split.contraction_input_dimension
+                        :runtime.interaction_output.data();
+                    if(runtime.retained_interaction_output_dimension==0) {
+                        const SymmetrixJitMH1HostNodeForwardArgsV7 recompute_args{
+                            sizeof(SymmetrixJitMH1HostNodeForwardArgsV7),
+                            static_cast<std::uint32_t>(layer),0u,0u,rows,
+                            reinterpret_cast<const std::int32_t*>(
+                                product_elements.data()+first),
+                            state.densities.data()+first,
+                            runtime.linear_parameters.data(),
+                            runtime.readout_parameters.data(),
+                            layer==0?nullptr:state.input.data()
+                                +static_cast<std::size_t>(first)*input_width,
+                            node_up.data()+static_cast<std::size_t>(first)*up_width,
+                            node_messages.data()+static_cast<std::size_t>(first)
+                                *message_width,nullptr,interaction_output,
+                            nullptr,nullptr,runtime.arena.data()};
+                        Kokkos::parallel_for(
+                            "ExecutionMH1HostPluginV7::recompute_product_input",rows,
+                            [=](int node) {
+                                split.pre_forward_owner(&recompute_args,node);
+                            });
+                    }
+                    const SymmetrixJitM0HostArgsV1 recompute_product_args{
+                        sizeof(SymmetrixJitM0HostArgsV1),0u,rows,
+                        product_descriptor.channels,0,
+                        state.agnostic_elements.data()+first,interaction_output,
+                        weights.data(),nullptr,runtime.contraction_output.data(),
+                        nullptr,nullptr};
+                    const auto product_forward_owner=
+                        product_descriptor.forward_owner;
                     Kokkos::parallel_for(
-                        "ExecutionMH1HostPluginV4::node_post_reverse",rows,
-                        [=](int node) { owner(&tile_args,node); });
+                        "ExecutionMH1SharedProduct::host_reverse_recompute",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                            Kokkos::IndexType<std::int64_t>>(
+                            0,static_cast<std::int64_t>(rows)*channel_tiles),
+                        [=](std::int64_t owner) {
+                            product_forward_owner(&recompute_product_args,owner);
+                        });
+                    ++product_artifact.forward_launch_count;
+                    const SymmetrixJitMH1HostNodeReverseArgsV7 tile_args{
+                        sizeof(SymmetrixJitMH1HostNodeReverseArgsV7),
+                        static_cast<std::uint32_t>(layer),0u,0u,
+                        static_cast<double>(scale),rows,
+                        reinterpret_cast<const std::int32_t*>(
+                            product_elements.data()+first),
+                        state.densities.data()+first,runtime.linear_parameters.data(),
+                        runtime.readout_parameters.data(),
+                        layer==0?nullptr:state.input.data()
+                            +static_cast<std::size_t>(first)*input_width,
+                        node_up.data()+static_cast<std::size_t>(first)*up_width,
+                        node_messages.data()+static_cast<std::size_t>(first)
+                            *message_width,
+                        runtime.contraction_output.data(),
+                        state.output.data()+static_cast<std::size_t>(first)
+                            *layer_output_width,
+                        runtime.arena.data(),
+                        state.layer_adjoint.data()+static_cast<std::size_t>(first)
+                            *layer_output_width,
+                        runtime.contraction_adjoint.data(),
+                        node_message_adj.data()+static_cast<std::size_t>(first)
+                            *message_width,
+                        node_up_adj.data()+static_cast<std::size_t>(first)*up_width,
+                        layer==0?nullptr:previous_adjoint.data()
+                            +static_cast<std::size_t>(first)*input_width,
+                        state.density_adj.data()+first};
+                    Kokkos::parallel_for(
+                        "ExecutionMH1HostPluginV7::node_post_product_reverse",rows,
+                        [=](int node) { split.post_reverse_owner(&tile_args,node); });
+                    const SymmetrixJitM0HostArgsV1 product_args{
+                        sizeof(SymmetrixJitM0HostArgsV1),0u,rows,
+                        product_descriptor.channels,0,
+                        state.agnostic_elements.data()+first,
+                        interaction_output,weights.data(),
+                        runtime.contraction_adjoint.data(),nullptr,
+                        runtime.interaction_adjoint.data(),
+                        nullptr};
+                    const auto product_owner=product_descriptor.reverse_owner;
+                    Kokkos::parallel_for(
+                        "ExecutionMH1SharedProduct::host_reverse",
+                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                            Kokkos::IndexType<std::int64_t>>(
+                            0,static_cast<std::int64_t>(rows)*channel_tiles),
+                        [=](std::int64_t owner) {
+                            product_owner(&product_args,owner);
+                        });
+                    ++product_artifact.reverse_launch_count;
+                    auto pre_args=tile_args;
+                    pre_args.contraction_output_adjoint=
+                        runtime.interaction_adjoint.data();
+                    Kokkos::parallel_for(
+                        "ExecutionMH1HostPluginV7::node_pre_product_reverse",rows,
+                        [=](int node) { split.pre_reverse_owner(&pre_args,node); });
+                }
+                // The composed product changes only node-local contraction;
+                // the retained graph reverse remains source-owned.
+                factorized_source_owned_reverse_used=true;
+                } else {
+                    const auto owner=mh1_host_view
+                        .node_programs[layer].reverse_phases[0].owner;
+                    for(int first=0;first<num_nodes;first+=runtime.tile_rows) {
+                        const int rows=std::min(runtime.tile_rows,num_nodes-first);
+                        auto tile_args=host_args;
+                        tile_args.num_nodes=rows;
+                        tile_args.element_indices+=first;
+                        tile_args.node_density+=first;
+                        if(tile_args.layer_input!=nullptr)
+                            tile_args.layer_input+=static_cast<std::size_t>(first)
+                                *input_width;
+                        tile_args.up+=static_cast<std::size_t>(first)*up_width;
+                        tile_args.messages+=static_cast<std::size_t>(first)
+                            *message_width;
+                        tile_args.layer_output+=static_cast<std::size_t>(first)
+                            *layer_output_width;
+                        tile_args.layer_output_adjoint+=
+                            static_cast<std::size_t>(first)*layer_output_width;
+                        tile_args.message_adjoint+=static_cast<std::size_t>(first)
+                            *message_width;
+                        tile_args.up_adjoint+=static_cast<std::size_t>(first)
+                            *up_width;
+                        if(tile_args.layer_input_adjoint!=nullptr)
+                            tile_args.layer_input_adjoint+=
+                                static_cast<std::size_t>(first)*input_width;
+                        tile_args.node_density_adjoint+=first;
+                        Kokkos::parallel_for(
+                            "ExecutionMH1HostPluginV4::node_post_reverse",rows,
+                            [=](int node) { owner(&tile_args,node); });
+                    }
                 }
             }
             if(generated_device_spline_node_adapter) {
@@ -5486,6 +8338,24 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                                 output_ir_mul_adjoint(
                                     node,output_mul_to_ir(column));
                     });
+            } else if(shared_host_pair_spline_node_adapter) {
+                const auto output_mul_to_ir=
+                    interaction.convolution.execution_output_mul_to_ir();
+                auto output_ir_mul_adjoint=state.message_adj;
+                // The permutation is generally non-identity.  Reuse the
+                // forward ir-mul buffer as a distinct destination now that
+                // node reverse has consumed its forward messages.
+                auto output_mul_ir_adjoint=state.execution_output_ir_mul;
+                Kokkos::parallel_for(
+                    "Execution MH-1 shared adjoint ir-mul to pair spline mul-ir",
+                    Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                        {0,0},{num_nodes,message_width}),
+                    KOKKOS_LAMBDA(int node,int mul_ir) {
+                        output_mul_ir_adjoint(node,mul_ir)=
+                            output_ir_mul_adjoint(
+                                node,output_mul_to_ir(mul_ir));
+                    });
+                state.message_adj=state.execution_output_ir_mul;
             }
         } else {
             ensure_view(state.interaction_output_adj,
@@ -5619,8 +8489,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         }
         auto density_adj=state.density_adj;
 
-        ScopedKokkosProfileRegion profile(symmetrix::mh1::region_name(
-            symmetrix::mh1::r_reverse_regions,stage));
+        ScopedKokkosProfileRegion profile(
+            stage_description.r_reverse(stage).data());
         const bool stream_layer=streams_layer(layer);
         if(stream_layer) {
             const int convolution_width=
@@ -5635,22 +8505,22 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             auto local_up_adj=state.up_adj;
             auto up=state.up;
             const bool execution_layer=
-                mace_uses_prepared_execution(streamed_edges);
+                uses_prepared_execution(streamed_edges);
             const bool generated_execution_layer=
-                mace_uses_direct_execution(streamed_edges);
+                uses_direct_execution(streamed_edges);
             bool generated_graphwide=false;
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
             if constexpr(std::is_same_v<Precision,float>
                 &&device_execution_space<Kokkos::DefaultExecutionSpace>)
                 generated_graphwide=
-                    !spline_layer&&generated_execution_layer&&edges>0&&(jit_mh1_cuda_plugin_ready()
-                        ||jit_mh1_cuda_plugin_v4_ready());
+                    !spline_layer&&generated_execution_layer&&edges>0
+                    &&jit_mh1_cuda_plugin_v5_ready();
             else
 #endif
             if constexpr(std::is_same_v<Precision,float>)
                 generated_graphwide=
-                    !spline_layer&&generated_execution_layer&&edges>0&&(jit_mh1_host_plugin_ready()
-                        ||jit_mh1_host_plugin_v4_ready());
+                    !spline_layer&&generated_execution_layer&&edges>0
+                    &&jit_mh1_host_plugin_v7_ready();
             const int embedding_width=execution_layer
                 ?interaction.convolution_weights.prefix_output_size(num_bessel):0;
             const bool identity_prefix=execution_layer
@@ -5761,7 +8631,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         execution_mh1_device_ordinal(execution_space));
                     const int persistent_blocks=execution_mh1_persistent_blocks();
                     check_execution_mh1_cuda_status(
-                        jit_mh1_cuda_plugin_v4_ready()
+                        jit_mh1_cuda_plugin_v5_ready()
                             ?jit_mh1_cuda_plugin_v4->launch_reverse(
                                 &args,execution_mh1_device_stream(
                                     execution_space),
@@ -5774,10 +8644,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         "Launching graph-wide Execution MH-1 CUDA reverse plugin");
                     ++execution_mh1_generated_source_reverse_launches;
                     execution_mh1_generated_edge_reverse_launches+=
-                        jit_mh1_cuda_plugin_v4_ready()
-                            ?jit_mh1_cuda_plugin_v4->descriptor()
-                                .interactions[layer]
-                                .edge_reverse_physical_launch_count
+                        jit_mh1_cuda_plugin_v5_ready()
+                            ?jit_mh1_cuda_plugin_v4->edge_launch_count(layer)
                             :jit_mh1_cuda_plugin->descriptor()
                                 .interactions[layer]
                                 .edge_reverse_physical_launch_count;
@@ -5820,14 +8688,12 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         state.execution_graph_embedding_adj.data(),
                         state.execution_graph_harmonic_adj.data(),
                         state.execution_graph_cutoff_adj.data()};
-                    const auto source_owner=jit_mh1_host_plugin_v4_ready()
-                        ?jit_mh1_host_plugin_v4->descriptor()
-                            .source_reverse_owner
+                    const auto source_owner=mh1_host_view.node_programs_ready()
+                        ?mh1_host_view.source_reverse_owner
                         :jit_mh1_host_plugin->descriptor()
                             .source_reverse_owner;
-                    const auto edge_owner=jit_mh1_host_plugin_v4_ready()
-                        ?jit_mh1_host_plugin_v4->descriptor()
-                            .edge_reverse_owner
+                    const auto edge_owner=mh1_host_view.node_programs_ready()
+                        ?mh1_host_view.edge_reverse_owner
                         :jit_mh1_host_plugin->descriptor()
                             .edge_reverse_owner;
                     Kokkos::parallel_for(
@@ -5835,8 +8701,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         execution_graph_source_owner_count,
                         [=](int owner) { source_owner(&args,owner); });
                     const bool source_owns_edge_reverse=
-                        jit_mh1_host_plugin_v4_ready()
-                        &&(jit_mh1_host_plugin_v4->descriptor().capabilities
+                        mh1_host_view.node_programs_ready()
+                        &&(mh1_host_view.capabilities
                             &SYMMETRIX_JIT_MH1_HOST_SOURCE_OWNS_EDGE_REVERSE_V4)
                             !=0u;
                     if(!source_owns_edge_reverse) Kokkos::parallel_for(
@@ -5844,6 +8710,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         [=](int edge) { edge_owner(&args,edge); });
                     ++execution_mh1_generated_source_reverse_launches;
                     ++execution_mh1_generated_edge_reverse_launches;
+                    if(source_owns_edge_reverse)
+                        factorized_source_owned_reverse_used=true;
                 }
                 auto input_adjoint_ir_mul=state.execution_input_adjoint_ir_mul;
                 if(generated_node_program)
@@ -5904,7 +8772,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         execution_mh1_device_ordinal(execution_space));
                     const int persistent_blocks=execution_mh1_persistent_blocks();
                     check_execution_mh1_cuda_status(
-                        jit_mh1_cuda_plugin_v4_ready()
+                        jit_mh1_cuda_plugin_v5_ready()
                             ?jit_mh1_cuda_plugin_v4->launch_conditioning_reverse(
                                 &args,execution_mh1_device_stream(
                                     execution_space),
@@ -5942,9 +8810,8 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         state.execution_graph_embedding_adj.data(),density_adj.data(),
                         radial_adjoint_values.data(),
                         state.execution_graph_cutoff_adj.data()};
-                    const auto owner=jit_mh1_host_plugin_v4_ready()
-                        ?jit_mh1_host_plugin_v4->descriptor()
-                            .conditioning[layer].reverse_owner
+                    const auto owner=mh1_host_view.conditioning!=nullptr
+                        ?mh1_host_view.conditioning[layer].reverse_owner
                         :jit_mh1_host_plugin->descriptor()
                             .conditioning[layer].reverse_owner;
                     Kokkos::parallel_for(
@@ -5972,12 +8839,15 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 generated_spline_r_program&&spline_layer;
             const bool generated_device_spline_reverse=
                 generated_device_spline_r_program&&spline_layer&&edges>0;
+            // Same staged-program contract as the forward branch: the Kokkos
+            // direct spline UVU reverse consumes the evaluation points and the
+            // ir-mul node buffers that the staged device node program owns.
             bool direct_device_spline_reverse=false;
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
             if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>)
                 direct_device_spline_reverse=spline_layer
-                    &&mace_uses_direct_execution(streamed_edges)&&edges>0
-                    &&!generated_device_spline_r_program;
+                    &&uses_direct_execution(streamed_edges)&&edges>0
+                    &&generated_device_spline_node_adapter;
 #endif
             if(generated_spline_reverse) {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
@@ -5987,7 +8857,9 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 } else
 #endif
                 {
-                    if(!packed_spline_messages) {
+                    if(generated_node_program) {
+                        state.execution_output_ir_mul=local_message_adj;
+                    } else if(!packed_spline_messages) {
                         ensure_view(state.execution_output_ir_mul,
                             state.execution_output_ir_mul_storage,
                             num_nodes,message_width);
@@ -6037,24 +8909,35 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         state.execution_input_adjoint_ir_mul.data(),
                         harmonic_adjoint_values.data(),
                         pair_spline_distance_adjoints.data()};
-                    const auto owner=jit_mh1_host_plugin_v5->descriptor()
+                    const auto owner=mh1_host_view
                         .spline_r_programs[layer].source_reverse_owner;
                     Kokkos::parallel_for(
                         "ExecutionMH1HostPluginV5::spline_r_source_reverse",
                         execution_graph_source_owner_count,
                         [=](int source_owner) { owner(&args,source_owner); });
-                    const auto input_mul_to_ir=
-                        interaction.convolution.execution_input_1_mul_to_ir();
                     auto input_adjoint_ir_mul=
                         state.execution_input_adjoint_ir_mul;
-                    Kokkos::parallel_for(
-                        "Execution MH-1 spline input adjoint ir-mul to mul-ir",
-                        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
-                            {0,0},{num_nodes,up_width}),
-                        KOKKOS_LAMBDA(int node,int mul_ir) {
-                            local_up_adj(node,mul_ir)+=input_adjoint_ir_mul(
-                                node,input_mul_to_ir(mul_ir));
-                        });
+                    if(generated_node_program) {
+                        Kokkos::parallel_for(
+                            "Execution MH-1 spline generated input adjoint",
+                            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                                {0,0},{num_nodes,up_width}),
+                            KOKKOS_LAMBDA(int node,int column) {
+                                local_up_adj(node,column)+=
+                                    input_adjoint_ir_mul(node,column);
+                            });
+                    } else {
+                        const auto input_mul_to_ir=interaction.convolution
+                            .execution_input_1_mul_to_ir();
+                        Kokkos::parallel_for(
+                            "Execution MH-1 spline input adjoint ir-mul to mul-ir",
+                            Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                                {0,0},{num_nodes,up_width}),
+                            KOKKOS_LAMBDA(int node,int mul_ir) {
+                                local_up_adj(node,mul_ir)+=input_adjoint_ir_mul(
+                                    node,input_mul_to_ir(mul_ir));
+                            });
+                    }
                     ++execution_mh1_generated_source_reverse_launches;
                     ++execution_mh1_generated_edge_reverse_launches;
                     factorized_source_owned_reverse_used=true;
@@ -6630,7 +9513,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                         });
                 }
             }
-            if(mace_uses_prepared_execution(streamed_edges))
+            if(uses_prepared_execution(streamed_edges))
                 ++factorized_reverse_evaluations;
         } else {
         ensure_view(state.edge_message_adj,state.edge_message_adj_storage,edges,
@@ -6737,10 +9620,27 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                                 node,input_mul_to_ir(mul_ir))=
                                 input_mul_ir_adjoint(node,mul_ir);
                         });
+                } else if(shared_host_pair_spline_node_adapter) {
+                    const auto input_mul_to_ir=
+                        interaction.convolution.execution_input_1_mul_to_ir();
+                    auto input_mul_ir_adjoint=state.up_adj;
+                    auto input_ir_mul_adjoint=
+                        state.execution_input_adjoint_ir_mul;
+                    Kokkos::parallel_for(
+                        "Execution MH-1 shared input adjoint mul-ir to ir-mul",
+                        Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
+                            {0,0},{num_nodes,up_width}),
+                        KOKKOS_LAMBDA(int node,int mul_ir) {
+                            input_ir_mul_adjoint(
+                                node,input_mul_to_ir(mul_ir))+=
+                                input_mul_ir_adjoint(node,mul_ir);
+                        });
                 }
-                const auto node_up=generated_device_spline_node_adapter
+                const auto node_up=(generated_device_spline_node_adapter
+                        ||shared_host_pair_spline_node_adapter)
                     ?state.execution_input_ir_mul:state.up;
-                const auto node_up_adjoint=generated_device_spline_node_adapter
+                const auto node_up_adjoint=(generated_device_spline_node_adapter
+                        ||shared_host_pair_spline_node_adapter)
                     ?state.execution_input_adjoint_ir_mul:state.up_adj;
                 const SymmetrixJitMH1HostNodeReverseArgsV4 host_args{
                     sizeof(SymmetrixJitMH1HostNodeReverseArgsV4),
@@ -6759,7 +9659,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                     reinterpret_cast<const float*>(node_up.data()),nullptr,nullptr,
                     reinterpret_cast<float*>(runtime.arena.data()),nullptr,nullptr,
                     reinterpret_cast<float*>(node_up_adjoint.data()),
-                    reinterpret_cast<float*>(previous.data()),nullptr};
+                    reinterpret_cast<float*>(previous.data()),nullptr,nullptr};
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
                 if constexpr(device_execution_space<
                     Kokkos::DefaultExecutionSpace>) {
@@ -6782,24 +9682,50 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
                 } else
 #endif
                 {
-                    const auto owner=jit_mh1_host_plugin_v4->descriptor()
-                        .node_programs[layer].reverse_phases[1].owner;
+                    const auto split=shared_host_product_program
+                        ?&jit_mh1_host_plugin_v7->descriptor().node_programs[layer]
+                        :nullptr;
+                    const auto owner=split==nullptr
+                        ?mh1_host_view.node_programs[layer].reverse_phases[1].owner
+                        :nullptr;
                     for(int first=0;first<num_nodes;first+=runtime.tile_rows) {
                         const int rows=std::min(
                             runtime.tile_rows,num_nodes-first);
-                        auto tile_args=host_args;
-                        tile_args.num_nodes=rows;
-                        tile_args.element_indices+=first;
-                        tile_args.layer_input+=static_cast<std::size_t>(first)
-                            *input_width;
-                        tile_args.up+=static_cast<std::size_t>(first)*up_width;
-                        tile_args.up_adjoint+=static_cast<std::size_t>(first)
-                            *up_width;
-                        tile_args.layer_input_adjoint+=
-                            static_cast<std::size_t>(first)*input_width;
-                        Kokkos::parallel_for(
-                            "ExecutionMH1HostPluginV4::node_pre_reverse",rows,
-                            [=](int node) { owner(&tile_args,node); });
+                        if(split!=nullptr) {
+                            const SymmetrixJitMH1HostNodeReverseArgsV7 tile_args{
+                                sizeof(SymmetrixJitMH1HostNodeReverseArgsV7),
+                                static_cast<std::uint32_t>(layer),0u,0u,
+                                static_cast<double>(scale),rows,
+                                reinterpret_cast<const std::int32_t*>(
+                                    product_elements.data()+first),
+                                nullptr,runtime.linear_parameters.data(),nullptr,
+                                nullptr,nullptr,nullptr,nullptr,nullptr,
+                                runtime.arena.data(),
+                                nullptr,nullptr,nullptr,
+                                node_up_adjoint.data()
+                                    +static_cast<std::size_t>(first)*up_width,
+                                layer==0?nullptr:previous.data()
+                                    +static_cast<std::size_t>(first)*input_width,
+                                nullptr};
+                            const auto final_owner=split->final_reverse_owner;
+                            Kokkos::parallel_for(
+                                "ExecutionMH1HostPluginV7::node_final_reverse",rows,
+                                [=](int node) { final_owner(&tile_args,node); });
+                        } else {
+                            auto tile_args=host_args;
+                            tile_args.num_nodes=rows;
+                            tile_args.element_indices+=first;
+                            tile_args.layer_input+=static_cast<std::size_t>(first)
+                                *input_width;
+                            tile_args.up+=static_cast<std::size_t>(first)*up_width;
+                            tile_args.up_adjoint+=static_cast<std::size_t>(first)
+                                *up_width;
+                            tile_args.layer_input_adjoint+=
+                                static_cast<std::size_t>(first)*input_width;
+                            Kokkos::parallel_for(
+                                "ExecutionMH1HostPluginV4::node_pre_reverse",rows,
+                                [=](int node) { owner(&tile_args,node); });
+                        }
                     }
                 }
             }
@@ -6873,7 +9799,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
         ensure_view(zbl_forces,zbl_forces_storage,xyz.size());
         ordered_kokkos_deep_copy(zbl_energies,Precision(0));
         ordered_kokkos_deep_copy(zbl_forces,Precision(0));
-        if(mace_uses_prepared_execution(streamed_edges)) {
+        if(uses_prepared_execution(streamed_edges)) {
             ++factorized_zbl_evaluator_stream_launches;
             zbl.compute_ZBL(
                 factorized_execution_space,num_nodes,node_types,num_neigh,
@@ -6892,7 +9818,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
             forces(index)+=energy_scale*zbl_f(index);
         });
     }
-    if(mace_uses_prepared_execution(streamed_edges)) {
+    if(uses_prepared_execution(streamed_edges)) {
         factorized_execution_space.fence(
             "MH-1 Execution energy and force evaluation");
         ++factorized_evaluation_fences;
@@ -6902,7 +9828,7 @@ void MaceNonlinearKokkosT<Precision>::compute_node_energies_forces(int num_nodes
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::reduce_node_forces(
+void MaceBackboneKokkosT<Precision>::reduce_node_forces(
     const int num_nodes,Kokkos::View<const int*> edge_receivers,
     Kokkos::View<const int*> edge_sources)
 {
@@ -6937,7 +9863,7 @@ void MaceNonlinearKokkosT<Precision>::reduce_node_forces(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::reduce_prepared_node_forces(
+void MaceBackboneKokkosT<Precision>::reduce_prepared_node_forces(
     const std::uint64_t graph_generation)
 {
     if(graph_generation==0
@@ -6951,7 +9877,7 @@ void MaceNonlinearKokkosT<Precision>::reduce_prepared_node_forces(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::reduce_stress(
+void MaceBackboneKokkosT<Precision>::reduce_stress(
     const double volume,Kokkos::View<const double*> xyz)
 {
     if(!std::isfinite(volume)||!(volume>0.0)||xyz.extent(0)%3!=0)
@@ -6982,7 +9908,7 @@ void MaceNonlinearKokkosT<Precision>::reduce_stress(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::reduce_prepared_stress(
+void MaceBackboneKokkosT<Precision>::reduce_prepared_stress(
     const double volume,const std::uint64_t graph_generation)
 {
     if(graph_generation==0
@@ -6997,7 +9923,7 @@ void MaceNonlinearKokkosT<Precision>::reduce_prepared_stress(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::prepare_factorized_batch(
+void MaceBackboneKokkosT<Precision>::prepare_factorized_batch(
     const std::uint64_t graph_generation,
     const std::span<const std::int64_t> edge_offsets)
 {
@@ -7035,7 +9961,7 @@ void MaceNonlinearKokkosT<Precision>::prepare_factorized_batch(
 }
 
 template<typename Precision>
-void MaceNonlinearKokkosT<Precision>::reduce_prepared_batched_stress(
+void MaceBackboneKokkosT<Precision>::reduce_prepared_batched_stress(
     const std::span<const double> volumes,
     const std::uint64_t graph_generation)
 {
@@ -7101,5 +10027,5 @@ void MaceNonlinearKokkosT<Precision>::reduce_prepared_batched_stress(
 #error "SYMMETRIX_MACE_NONLINEAR_KOKKOS_PART must select one implementation partition"
 #endif
 
-template class MaceNonlinearKokkosT<float>;
-template class MaceNonlinearKokkosT<double>;
+template class MaceBackboneKokkosT<float>;
+template class MaceBackboneKokkosT<double>;

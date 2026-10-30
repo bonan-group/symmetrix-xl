@@ -85,6 +85,7 @@ void MACEKokkos<Precision>::reduce_node_forces(
                         }
                     }
                 });
+            compose_model_forces(num_nodes);
             return;
         }
     }
@@ -104,6 +105,21 @@ void MACEKokkos<Precision>::reduce_node_forces(
                     &reduced_forces(3*receiver+component), -force);
             }
         });
+    compose_model_forces(num_nodes);
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::reduce_forces(
+    const std::uint64_t graph_generation)
+{
+    reduce_prepared_node_forces(graph_generation);
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::reduce_stress(
+    const double volume, const std::uint64_t graph_generation)
+{
+    reduce_prepared_stress(volume, graph_generation);
 }
 
 template <typename Precision>
@@ -119,6 +135,8 @@ void MACEKokkos<Precision>::reduce_prepared_node_forces(
         if (!single_layer_tiled_outputs_ready)
             throw std::logic_error(
                 "Single-layer tiled atom forces are not ready.");
+        compose_model_forces(
+            static_cast<int>(execution_prepared_node_types.extent(0)));
         return;
     }
     reduce_node_forces(
@@ -131,7 +149,7 @@ template <typename Precision>
 void MACEKokkos<Precision>::reduce_prepared_all_interactions_node_forces(
     const std::uint64_t graph_generation)
 {
-    if (streamed_edges != MACEStreamedEdgesMode::generic
+    if (streamed_edges != ExecutionMode::generic
         || graph_generation == 0
         || graph_generation != all_interactions_prepared_graph_generation
         || graph_generation != all_interactions_completed_graph_generation)
@@ -183,6 +201,7 @@ void MACEKokkos<Precision>::reduce_stress(
             },
             Kokkos::subview(reduced_stress, component));
     }
+    compose_model_stress(volume);
 }
 
 template <typename Precision>
@@ -217,6 +236,7 @@ void MACEKokkos<Precision>::reduce_prepared_stress(
             KOKKOS_LAMBDA (const int component) {
                 stress(component) = virial(component)/volume;
             });
+        compose_model_stress(volume);
         return;
     }
     const std::size_t num_edges = execution_prepared_neigh_indices.extent(0);
@@ -261,6 +281,7 @@ void MACEKokkos<Precision>::reduce_prepared_stress(
                         for (int component=0; component<9; ++component)
                             reduced_stress(component) = value[component];
                     });
+                compose_model_stress(volume);
                 return;
             }
         }
@@ -281,6 +302,7 @@ void MACEKokkos<Precision>::reduce_prepared_stress(
                 },
                 Kokkos::subview(reduced_stress, component));
         }
+        compose_model_stress(volume);
         return;
     }
     reduce_stress(
@@ -295,7 +317,7 @@ void MACEKokkos<Precision>::reduce_prepared_all_interactions_stress(
     const double volume,
     const std::uint64_t graph_generation)
 {
-    if (streamed_edges != MACEStreamedEdgesMode::generic
+    if (streamed_edges != ExecutionMode::generic
         || graph_generation == 0
         || graph_generation != all_interactions_prepared_graph_generation
         || graph_generation != all_interactions_completed_graph_generation)
@@ -323,8 +345,13 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
     const bool streamed_schedule_prepared)
 {
     const auto evaluation_start = std::chrono::steady_clock::now();
+    model_evaluation_graph_generation = execution_graph_generation;
+    begin_model_evaluation(num_nodes);
+    if (alchemical_weights_active() && execution_graph_generation == 0)
+        throw std::invalid_argument(
+            "Alchemical evaluation requires the current prepared direct graph token.");
     if (execution_graph_generation != 0) {
-        if (!mace_uses_prepared_execution(streamed_edges))
+        if (!uses_prepared_execution(streamed_edges))
             throw std::invalid_argument(
                 "An execution graph token requires streamed_edges='direct'.");
         if (execution_graph_generation != factorized_prepared_graph_generation
@@ -353,7 +380,7 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
         neigh_types = execution_prepared_neigh_types;
         factorized_prepared_evaluation_count += 1;
         factorized_topology_validation_skip_count += 1;
-    } else if (mace_uses_prepared_execution(streamed_edges)) {
+    } else if (uses_prepared_execution(streamed_edges)) {
         factorized_fallback_evaluation_count += 1;
     }
 
@@ -369,7 +396,7 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
     single_layer_tiled_outputs_ready = false;
     const std::size_t directed_force_extent = 3*r.extent(0);
     if (execution_graph_generation != 0
-        && mace_uses_prepared_execution(streamed_edges)) {
+        && uses_prepared_execution(streamed_edges)) {
         ensure_execution_result_capacity(
             num_nodes, execution_prepared_num_feature_nodes,
             static_cast<int>(r.extent(0)));
@@ -387,7 +414,7 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
         if (node_forces.size() != directed_force_extent)
             Kokkos::realloc(node_forces, directed_force_extent);
     }
-    if (mace_uses_prepared_execution(streamed_edges)) {
+    if (uses_prepared_execution(streamed_edges)) {
         Kokkos::deep_copy(factorized_execution_space, node_energies, 0.0);
         Kokkos::deep_copy(factorized_execution_space, node_forces, 0.0);
         if (single_layer_tiled_plan_active || dual_layer_tiled_plan_active) {
@@ -405,12 +432,12 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
     }
     begin_execution_parameter_gradients();
 
-    if (streamed_edges != MACEStreamedEdgesMode::materialized
-        && !mace_uses_prepared_execution(streamed_edges)
+    if (streamed_edges != ExecutionMode::materialized
+        && !uses_prepared_execution(streamed_edges)
         && !streamed_schedule_prepared)
         prepare_streamed_edge_schedule(
             num_nodes, static_cast<int>(neigh_indices.extent(0)), num_neigh);
-    if (mace_uses_prepared_execution(streamed_edges)
+    if (uses_prepared_execution(streamed_edges)
         && execution_graph_generation == 0)
         prepare_factorized_schedule(
             num_nodes, static_cast<int>(neigh_indices.extent(0)),
@@ -422,26 +449,28 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
                 factorized_execution_space,
                 num_nodes, node_types, num_neigh, neigh_types,
                 atomic_numbers, streamed_first_neigh, r,
-                execution_prepared_unit_direction, node_energies, node_forces);
+                execution_prepared_unit_direction, node_energies, node_forces,
+                0, alchemical_node_weights, alchemical_edge_weights);
         else if (use_factorized_async_inference())
             zbl.compute_ZBL(
                 factorized_execution_space,
                 num_nodes, node_types, num_neigh, neigh_types,
                 atomic_numbers, streamed_first_neigh, r, xyz,
-                node_energies, node_forces);
+                node_energies, node_forces,
+                0, alchemical_node_weights, alchemical_edge_weights);
         else
             zbl.compute_ZBL(
                 num_nodes, node_types, num_neigh, neigh_types,
                 atomic_numbers, r, xyz, node_energies, node_forces);
     }
-    if (mace_uses_prepared_execution(streamed_edges))
+    if (uses_prepared_execution(streamed_edges))
         begin_factorized_observation(
             num_nodes, static_cast<int>(neigh_indices.extent(0)));
-    if (streamed_edges != MACEStreamedEdgesMode::generic
-        && !mace_uses_prepared_execution(streamed_edges))
+    if (streamed_edges != ExecutionMode::generic
+        && !uses_prepared_execution(streamed_edges))
         compute_R0(num_nodes, node_types, num_neigh, neigh_types, r);
     if (!single_layer_readout
-        && streamed_edges == MACEStreamedEdgesMode::materialized)
+        && streamed_edges == ExecutionMode::materialized)
         compute_R1(num_nodes, node_types, num_neigh, neigh_types, r);
     if (!single_layer_tiled_plan_active && !dual_layer_tiled_plan_active)
         compute_Y(xyz, r, use_factorized_async_inference());
@@ -472,12 +501,12 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
         return;
     }
 
-    if (streamed_edges == MACEStreamedEdgesMode::generic
-        || mace_uses_prepared_execution(streamed_edges))
+    if (streamed_edges == ExecutionMode::generic
+        || uses_prepared_execution(streamed_edges))
         compute_A0_streamed(num_nodes, node_types, num_neigh, neigh_types, r);
     else
         compute_A0(num_nodes, node_types, num_neigh, neigh_types);
-    if (mace_uses_prepared_execution(streamed_edges))
+    if (uses_prepared_execution(streamed_edges))
         capture_standard_r0_output(num_nodes);
     compute_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
     if (use_m0_module())
@@ -490,33 +519,32 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
     if (single_layer_readout) {
         compute_M1(num_nodes, node_types);
         compute_H2(num_nodes, node_types);
+        prepare_model_readouts(num_nodes);
         compute_readouts(num_nodes, node_types, false, false);
+        evaluate_model_after_readouts(num_nodes);
         reverse_H2(num_nodes, node_types, false);
         reverse_M1(num_nodes, node_types);
     } else {
         const bool execution_direct_r1 =
-            mace_uses_prepared_execution(streamed_edges)
+            uses_prepared_execution(streamed_edges)
             && use_factorized_direct_inference();
         if (execution_direct_r1)
             release_factorized_stateful_workspace();
-        if (streamed_edges == MACEStreamedEdgesMode::materialized)
+        if (streamed_edges == ExecutionMode::materialized)
             compute_Phi1(num_nodes, num_neigh, neigh_indices);
-        else if (!mace_uses_prepared_execution(streamed_edges)
-                 || execution_direct_r1) {
-            if (execution_direct_r1 && use_factorized_direct_jit_forward())
-                compute_Phi1_streamed_jit(
-                    num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
-            else
-                compute_Phi1_streamed(
-                    num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
-        }
-        if (mace_uses_prepared_execution(streamed_edges)
+        else if (execution_direct_r1)
+            compute_Phi1_streamed_jit(
+                num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
+        else if (!uses_prepared_execution(streamed_edges))
+            compute_Phi1_streamed(
+                num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
+        if (uses_prepared_execution(streamed_edges)
             && !execution_direct_r1) {
             compute_factorized(
                 num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
         }
-        else if ((!mace_uses_prepared_execution(streamed_edges)
-                 || execution_direct_r1)
+        else if ((!uses_prepared_execution(streamed_edges)
+                  || execution_direct_r1)
                  && !use_receiver_local_phi1()
                  && !use_channel_tiled_phi1()) {
             prepare_A1_scale_factors(
@@ -527,12 +555,14 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
         compute_M1(num_nodes, node_types);
         compute_H2(num_nodes, node_types);
 
+        prepare_model_readouts(num_nodes);
         compute_readouts(num_nodes, node_types, false, false);
+        evaluate_model_after_readouts(num_nodes);
 
         reverse_H2(num_nodes, node_types, false);
         reverse_M1(num_nodes, node_types);
         reverse_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
-        if (mace_uses_prepared_execution(streamed_edges)) {
+        if (uses_prepared_execution(streamed_edges)) {
             if (execution_direct_r1) {
                 if (!use_receiver_local_phi1() && !use_channel_tiled_phi1())
                     reverse_A1(
@@ -555,9 +585,9 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
                 std::chrono::duration<double,std::milli>(
                     std::chrono::steady_clock::now()-parameter_start).count();
         }
-        if (streamed_edges == MACEStreamedEdgesMode::materialized)
+        if (streamed_edges == ExecutionMode::materialized)
             reverse_Phi1(num_nodes, num_neigh, neigh_indices, xyz, r, false, false);
-        else if (!mace_uses_prepared_execution(streamed_edges))
+        else if (!uses_prepared_execution(streamed_edges))
             reverse_Phi1_streamed(
                 num_nodes, node_types, num_neigh, neigh_indices, neigh_types,
                 xyz, r, false, false);
@@ -569,16 +599,16 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
     else
         reverse_M0(num_nodes, node_types);
     reverse_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
-    if (mace_uses_prepared_execution(streamed_edges))
+    if (uses_prepared_execution(streamed_edges))
         begin_standard_r0_reverse_observation(
             num_nodes, static_cast<int>(neigh_indices.extent(0)));
-    if (streamed_edges == MACEStreamedEdgesMode::generic
-        || mace_uses_prepared_execution(streamed_edges))
+    if (streamed_edges == ExecutionMode::generic
+        || uses_prepared_execution(streamed_edges))
         reverse_A0_streamed(
             num_nodes, node_types, num_neigh, neigh_types, xyz, r);
     else
         reverse_A0(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
-    if (mace_uses_prepared_execution(streamed_edges)) {
+    if (uses_prepared_execution(streamed_edges)) {
         finish_standard_r0_reverse_observation();
         if (execution_parameter_gradients_enabled) {
             const auto parameter_start = std::chrono::steady_clock::now();
@@ -601,11 +631,14 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
                     std::chrono::steady_clock::now()-density_start).count();
             execution_parameter_gradients_ready = true;
         }
+        before_model_evaluation_fence();
         factorized_execution_space.fence("Execution R1 energy and force evaluation");
         factorized_evaluation_fence_count += 1;
+        after_model_evaluation_fence();
         factorized_last_evaluation_ms = std::chrono::duration<double,std::milli>(
             std::chrono::steady_clock::now()-evaluation_start).count();
     }
+    finish_model_evaluation(num_nodes);
     if (execution_graph_generation != 0)
         complete_factorized_prepared_evaluation(execution_graph_generation);
 }
@@ -1174,7 +1207,7 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
     if (!has_field_coupling)
         throw std::invalid_argument("MACEKokkos::compute_node_energies_forces_field requires field coupling.");
     if (execution_graph_generation != 0) {
-        if (!mace_uses_prepared_execution(streamed_edges))
+        if (!uses_prepared_execution(streamed_edges))
             throw std::invalid_argument(
                 "An execution graph token requires streamed_edges='direct'.");
         if (execution_graph_generation != factorized_prepared_graph_generation
@@ -1199,7 +1232,7 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
         neigh_types = execution_prepared_neigh_types;
         factorized_prepared_evaluation_count += 1;
         factorized_topology_validation_skip_count += 1;
-    } else if (mace_uses_prepared_execution(streamed_edges)) {
+    } else if (uses_prepared_execution(streamed_edges)) {
         factorized_fallback_evaluation_count += 1;
     }
 
@@ -1214,7 +1247,7 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
     begin_factorized_production_evaluation();
     const std::size_t directed_force_extent = 3*r.extent(0);
     if (execution_graph_generation != 0
-        && mace_uses_prepared_execution(streamed_edges)) {
+        && uses_prepared_execution(streamed_edges)) {
         ensure_execution_result_capacity(
             num_nodes, execution_prepared_num_feature_nodes,
             static_cast<int>(r.extent(0)));
@@ -1232,7 +1265,7 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
         if (node_forces.size() != directed_force_extent)
             Kokkos::realloc(node_forces, directed_force_extent);
     }
-    if (mace_uses_prepared_execution(streamed_edges)) {
+    if (uses_prepared_execution(streamed_edges)) {
         Kokkos::deep_copy(factorized_execution_space, node_energies, 0.0);
         Kokkos::deep_copy(factorized_execution_space, node_forces, 0.0);
     } else {
@@ -1241,11 +1274,11 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
     }
     begin_execution_parameter_gradients();
 
-    if (streamed_edges != MACEStreamedEdgesMode::materialized
-        && !mace_uses_prepared_execution(streamed_edges))
+    if (streamed_edges != ExecutionMode::materialized
+        && !uses_prepared_execution(streamed_edges))
         prepare_streamed_edge_schedule(
             num_nodes, static_cast<int>(neigh_indices.extent(0)), num_neigh);
-    if (mace_uses_prepared_execution(streamed_edges)
+    if (uses_prepared_execution(streamed_edges)
         && execution_graph_generation == 0) {
         prepare_factorized_schedule(
             num_nodes, static_cast<int>(neigh_indices.extent(0)),
@@ -1269,22 +1302,22 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
                 num_nodes, node_types, num_neigh, neigh_types,
                 atomic_numbers, r, xyz, node_energies, node_forces);
     }
-    if (mace_uses_prepared_execution(streamed_edges))
+    if (uses_prepared_execution(streamed_edges))
         begin_factorized_observation(
             num_nodes, static_cast<int>(neigh_indices.extent(0)));
-    if (streamed_edges != MACEStreamedEdgesMode::generic
-        && !mace_uses_prepared_execution(streamed_edges))
+    if (streamed_edges != ExecutionMode::generic
+        && !uses_prepared_execution(streamed_edges))
         compute_R0(num_nodes, node_types, num_neigh, neigh_types, r);
-    if (streamed_edges == MACEStreamedEdgesMode::materialized)
+    if (streamed_edges == ExecutionMode::materialized)
         compute_R1(num_nodes, node_types, num_neigh, neigh_types, r);
     compute_Y(xyz, r, use_factorized_async_inference());
 
-    if (streamed_edges == MACEStreamedEdgesMode::generic
-        || mace_uses_prepared_execution(streamed_edges))
+    if (streamed_edges == ExecutionMode::generic
+        || uses_prepared_execution(streamed_edges))
         compute_A0_streamed(num_nodes, node_types, num_neigh, neigh_types, r);
     else
         compute_A0(num_nodes, node_types, num_neigh, neigh_types);
-    if (mace_uses_prepared_execution(streamed_edges))
+    if (uses_prepared_execution(streamed_edges))
         capture_standard_r0_output(num_nodes);
     compute_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, r);
     if (use_m0_module())
@@ -1297,28 +1330,25 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
     compute_H1_linear_up(num_nodes);
 
     const bool execution_direct_r1 =
-        mace_uses_prepared_execution(streamed_edges)
+        uses_prepared_execution(streamed_edges)
         && use_factorized_direct_inference();
     if (execution_direct_r1)
         release_factorized_stateful_workspace();
-    if (streamed_edges == MACEStreamedEdgesMode::materialized)
+    if (streamed_edges == ExecutionMode::materialized)
         compute_Phi1(num_nodes, num_neigh, neigh_indices);
-    else if (!mace_uses_prepared_execution(streamed_edges)
-             || execution_direct_r1) {
-        if (execution_direct_r1 && use_factorized_direct_jit_forward())
-            compute_Phi1_streamed_jit(
-                num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
-        else
-            compute_Phi1_streamed(
-                num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
-    }
-    if (mace_uses_prepared_execution(streamed_edges)
+    else if (execution_direct_r1)
+        compute_Phi1_streamed_jit(
+            num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
+    else if (!uses_prepared_execution(streamed_edges))
+        compute_Phi1_streamed(
+            num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
+    if (uses_prepared_execution(streamed_edges)
         && !execution_direct_r1) {
         compute_factorized(
             num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
     }
-    else if ((!mace_uses_prepared_execution(streamed_edges)
-             || execution_direct_r1)
+    else if ((!uses_prepared_execution(streamed_edges)
+              || execution_direct_r1)
              && !use_receiver_local_phi1()
              && !use_channel_tiled_phi1()) {
         prepare_A1_scale_factors(
@@ -1334,11 +1364,10 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
     reverse_H2(num_nodes, node_types, false);
     reverse_M1(num_nodes, node_types);
     reverse_A1_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
-    if (mace_uses_prepared_execution(streamed_edges)) {
+    if (uses_prepared_execution(streamed_edges)) {
         if (execution_direct_r1) {
             if (!use_receiver_local_phi1() && !use_channel_tiled_phi1())
-                reverse_A1(
-                    num_nodes, !use_factorized_direct_jit_reverse());
+                reverse_A1(num_nodes, false);
             reverse_factorized_direct(
                 num_nodes, node_types, neigh_indices, neigh_types, xyz, r);
         } else {
@@ -1357,9 +1386,9 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
             std::chrono::duration<double,std::milli>(
                 std::chrono::steady_clock::now()-parameter_start).count();
     }
-    if (streamed_edges == MACEStreamedEdgesMode::materialized)
+    if (streamed_edges == ExecutionMode::materialized)
         reverse_Phi1(num_nodes, num_neigh, neigh_indices, xyz, r, false, false);
-    else if (!mace_uses_prepared_execution(streamed_edges))
+    else if (!uses_prepared_execution(streamed_edges))
         reverse_Phi1_streamed(
             num_nodes, node_types, num_neigh, neigh_indices, neigh_types,
             xyz, r, false, false);
@@ -1372,16 +1401,16 @@ void MACEKokkos<Precision>::compute_node_energies_forces_field(
     else
         reverse_M0(num_nodes, node_types);
     reverse_A0_scaled(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
-    if (mace_uses_prepared_execution(streamed_edges))
+    if (uses_prepared_execution(streamed_edges))
         begin_standard_r0_reverse_observation(
             num_nodes, static_cast<int>(neigh_indices.extent(0)));
-    if (streamed_edges == MACEStreamedEdgesMode::generic
-        || mace_uses_prepared_execution(streamed_edges))
+    if (streamed_edges == ExecutionMode::generic
+        || uses_prepared_execution(streamed_edges))
         reverse_A0_streamed(
             num_nodes, node_types, num_neigh, neigh_types, xyz, r);
     else
         reverse_A0(num_nodes, node_types, num_neigh, neigh_types, xyz, r);
-    if (mace_uses_prepared_execution(streamed_edges)) {
+    if (uses_prepared_execution(streamed_edges)) {
         finish_standard_r0_reverse_observation();
         if (execution_parameter_gradients_enabled) {
             const auto parameter_start = std::chrono::steady_clock::now();
@@ -1584,10 +1613,14 @@ void MACEKokkos<Precision>::begin_factorized_distributed_evaluation(
     Kokkos::View<const double*> r,
     const std::uint64_t execution_graph_generation)
 {
+    validate_model_capability(MACEModelCapability::distributed_prepared);
+    if (alchemical_weights_active())
+        throw std::invalid_argument(
+            "Alchemical coefficients do not support distributed evaluation.");
     if (factorized_distributed_phase != FactorizedDistributedPhase::idle)
         throw std::logic_error(
             "A factorized distributed evaluation is already active.");
-    if (!mace_uses_prepared_execution(streamed_edges))
+    if (!uses_prepared_execution(streamed_edges))
         throw std::invalid_argument(
             "Distributed prepared evaluation requires streamed_edges='direct'.");
     if (execution_graph_generation == 0
@@ -1844,14 +1877,9 @@ void MACEKokkos<Precision>::continue_factorized_distributed_evaluation(
     if (execution_direct_r1)
         release_factorized_stateful_workspace();
     if (execution_direct_r1) {
-        if (use_factorized_direct_jit_forward())
-            compute_Phi1_streamed_jit(
-                num_receivers, node_types, num_neigh,
-                neigh_indices, neigh_types, r);
-        else
-            compute_Phi1_streamed(
-                num_receivers, node_types, num_neigh,
-                neigh_indices, neigh_types, r);
+        compute_Phi1_streamed_jit(
+            num_receivers, node_types, num_neigh,
+            neigh_indices, neigh_types, r);
         if (!use_receiver_local_phi1() && !use_channel_tiled_phi1()) {
             prepare_A1_scale_factors(
                 num_receivers, node_types, num_neigh, neigh_types, r);
@@ -1874,8 +1902,7 @@ void MACEKokkos<Precision>::continue_factorized_distributed_evaluation(
         num_receivers, node_types, num_neigh, neigh_types, xyz, r);
     if (execution_direct_r1) {
         if (!use_receiver_local_phi1() && !use_channel_tiled_phi1())
-            reverse_A1(
-                num_receivers, !use_factorized_direct_jit_reverse());
+            reverse_A1(num_receivers, false);
         reverse_factorized_direct(
             num_receivers, node_types, neigh_indices, neigh_types, xyz, r);
     } else {

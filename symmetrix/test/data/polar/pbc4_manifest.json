@@ -1,0 +1,517 @@
+{
+  "arrays": {
+    "batch": {
+      "dtype": "int64",
+      "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+      "shape": [
+        4
+      ]
+    },
+    "cell": {
+      "dtype": "float64",
+      "sha256": "91df25b559a2dda63679c86d74d4f0b1cc12308f0d243c4748de828c1a2d16cd",
+      "shape": [
+        1,
+        3,
+        3
+      ]
+    },
+    "correction_mask_is_molecule_node": {
+      "dtype": "bool",
+      "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+      "shape": [
+        4
+      ]
+    },
+    "correction_mask_is_slab_node": {
+      "dtype": "bool",
+      "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+      "shape": [
+        4
+      ]
+    },
+    "cosines": {
+      "dtype": "float64",
+      "sha256": "30c3559136141cff2ed0bea7b97550b960fa779afce694acc3c64426d245c64d",
+      "shape": [
+        55,
+        4
+      ]
+    },
+    "density_basis_fs": {
+      "dtype": "float64",
+      "sha256": "4675f81d88c67992d13fd40461bac5e43bbafd59a8c770fa981b5348b743f8bf",
+      "shape": [
+        55,
+        1,
+        4,
+        2
+      ]
+    },
+    "energy_final_alpha": {
+      "dtype": "float64",
+      "sha256": "233da654fad61200b78b03ba43c3abf25f6f6245f454a26e94fa78d554ae6159",
+      "shape": [
+        1
+      ]
+    },
+    "energy_final_beta": {
+      "dtype": "float64",
+      "sha256": "a11c6cd4aa00fe9a5faf57a84fe729189089160334fa7269755524b0bd9349cc",
+      "shape": [
+        1
+      ]
+    },
+    "energy_final_total": {
+      "dtype": "float64",
+      "sha256": "b0f5e1317d9d6e3f1fa0873bc51ac191bda8664f57d9ec9bfb08a0ddbc784ad6",
+      "shape": [
+        1
+      ]
+    },
+    "energy_kspace_alpha": {
+      "dtype": "float64",
+      "sha256": "2f396566e2a3a406525b956ea693e10fa6ad7c018d257e0a6a050fa38e11617d",
+      "shape": [
+        1
+      ]
+    },
+    "energy_kspace_beta": {
+      "dtype": "float64",
+      "sha256": "a8efc2858a92632f339d0d969cc1e91839b2f2cfca2ea3cd3261f1c48bee5415",
+      "shape": [
+        1
+      ]
+    },
+    "energy_kspace_total": {
+      "dtype": "float64",
+      "sha256": "2cab3d2b195a9bf92b89ad96bd87927f1698b51edb968ef354a7bd6d959927bd",
+      "shape": [
+        1
+      ]
+    },
+    "energy_molecule_correction_alpha": {
+      "dtype": "float64",
+      "sha256": "e9e2dd6c8e3e92a8314b3670cf84c2f7d5c57c751fd334b5006d2b15b4a66ece",
+      "shape": [
+        1
+      ]
+    },
+    "energy_molecule_correction_beta": {
+      "dtype": "float64",
+      "sha256": "724caabc325cefb4f4639b20a02c8720e55258ece76aee1e387070be3ab261da",
+      "shape": [
+        1
+      ]
+    },
+    "energy_molecule_correction_total": {
+      "dtype": "float64",
+      "sha256": "20f42e2e82a65bf659dd0b677e541ef6b11ac412bc8b6b3e0dead56655fc1c55",
+      "shape": [
+        1
+      ]
+    },
+    "energy_self_fields_alpha": {
+      "dtype": "float64",
+      "sha256": "b2862ec766068e3d180f30314957f2db3453d4dbafd33a09e3dc325147a019b0",
+      "shape": [
+        4,
+        4
+      ]
+    },
+    "energy_self_fields_beta": {
+      "dtype": "float64",
+      "sha256": "e1c053a13988acf5c9d2620d0df285fcb7c73101a4470e03035c928cc4a5371e",
+      "shape": [
+        4,
+        4
+      ]
+    },
+    "energy_self_fields_total": {
+      "dtype": "float64",
+      "sha256": "8e3ad0fdb179efd49ed0c2d14e0364e47de9359d58fd82bed392c899deac3245",
+      "shape": [
+        4,
+        4
+      ]
+    },
+    "energy_slab_correction_alpha": {
+      "dtype": "float64",
+      "sha256": "9bfcfd26f6a4e6ce7933e21db9542f5896f02806478257002cfb9f7e75cdae16",
+      "shape": [
+        1
+      ]
+    },
+    "energy_slab_correction_beta": {
+      "dtype": "float64",
+      "sha256": "4ad54a6c821c7cc307de9be981e645a97e74c4aa885f9750f407334b569ed9cd",
+      "shape": [
+        1
+      ]
+    },
+    "energy_slab_correction_total": {
+      "dtype": "float64",
+      "sha256": "9d06a3742da364df5a5bf054da94cad6ba5d31c2c93d2650240c877b71ebbef3",
+      "shape": [
+        1
+      ]
+    },
+    "esps_alpha": {
+      "dtype": "float64",
+      "sha256": "b2908eb004a102c9a1175e5edbea17febd6bf58bfd782503defca0353c3cb3cd",
+      "shape": [
+        4
+      ]
+    },
+    "esps_beta": {
+      "dtype": "float64",
+      "sha256": "9410dd3c48466a247d558baddb6a35799737ef34379c60380c83d1fe79232f6c",
+      "shape": [
+        4
+      ]
+    },
+    "external_field_matrix": {
+      "dtype": "float64",
+      "sha256": "f842f86e57dea1ce776961685286f0a21e9cfa18e82e07e36e00181a0eefc61b",
+      "shape": [
+        8,
+        4
+      ]
+    },
+    "feature_basis_fs": {
+      "dtype": "float64",
+      "sha256": "46a567d584c1e2fe8eccaa8e22f774528232c1249db214b0294084c1c1d2a201",
+      "shape": [
+        55,
+        2,
+        4,
+        2
+      ]
+    },
+    "features_correction_alpha": {
+      "dtype": "float64",
+      "sha256": "5341e6b2646979a70e57653007a1f310169421ec9bdd9f1a5648f75ade005af1",
+      "shape": [
+        4,
+        8
+      ]
+    },
+    "features_correction_beta": {
+      "dtype": "float64",
+      "sha256": "5341e6b2646979a70e57653007a1f310169421ec9bdd9f1a5648f75ade005af1",
+      "shape": [
+        4,
+        8
+      ]
+    },
+    "features_final_alpha": {
+      "dtype": "float64",
+      "sha256": "a9905fd4f766472065e28952166ca000bd7e296beec2bfeea5c2da88e4d2970c",
+      "shape": [
+        4,
+        8
+      ]
+    },
+    "features_final_beta": {
+      "dtype": "float64",
+      "sha256": "e38be9bd66ff70b14de64622dc617ead057c4839a86972eae1905e8e8d54b103",
+      "shape": [
+        4,
+        8
+      ]
+    },
+    "features_pbc_alpha": {
+      "dtype": "float64",
+      "sha256": "67d2006abda76a036cea2084efd9b7e03fef272d39d85fe4a5a51e7b79d11d63",
+      "shape": [
+        4,
+        8
+      ]
+    },
+    "features_pbc_beta": {
+      "dtype": "float64",
+      "sha256": "aa570fc909ce64053c233733281f3153d4592bd6b75740ccce4354799a22e769",
+      "shape": [
+        4,
+        8
+      ]
+    },
+    "features_self_interaction_alpha": {
+      "dtype": "float64",
+      "sha256": "653fd1af45e36244ae12ec32e0323696f174a466fa1ba233b193882c4e3fdace",
+      "shape": [
+        4,
+        8
+      ]
+    },
+    "features_self_interaction_beta": {
+      "dtype": "float64",
+      "sha256": "f33ea4fa628dd3d60cb12ae09f5c9098fd729e620f3625e0c33828b959910114",
+      "shape": [
+        4,
+        8
+      ]
+    },
+    "field_constant": {
+      "dtype": "float64",
+      "sha256": "716b3b6c4b62310339d06b1baba880d9797ed6e0113f58e1838eada032c050ee",
+      "shape": [
+        1
+      ]
+    },
+    "half_sphere_weight": {
+      "dtype": "float64",
+      "sha256": "3f710ac088db33363087de2b9a657541fe5447821debaa9fe5cbd538eb1a5f29",
+      "shape": [
+        1
+      ]
+    },
+    "internal_field_matrix": {
+      "dtype": "float64",
+      "sha256": "f842f86e57dea1ce776961685286f0a21e9cfa18e82e07e36e00181a0eefc61b",
+      "shape": [
+        8,
+        4
+      ]
+    },
+    "k0_mask": {
+      "dtype": "float64",
+      "sha256": "7d98d35b0f4f23e0485a72202a95e02858b4a92df17b27e865663e6698011278",
+      "shape": [
+        55
+      ]
+    },
+    "k_batch": {
+      "dtype": "int64",
+      "sha256": "360d579dbd14759b41afdf7fb5e80c0101e15150ae401d59f92a1e32d129f7cb",
+      "shape": [
+        55
+      ]
+    },
+    "k_dot_r": {
+      "dtype": "float64",
+      "sha256": "25f138914587772be1f2ea6cadbf4a3135a60a91975cd98ec6735992ffda6727",
+      "shape": [
+        55,
+        4
+      ]
+    },
+    "k_factor_coulomb": {
+      "dtype": "float64",
+      "sha256": "f3526777b1270f438cabe6291f4d1aadba6e750e28ec7362014c7252c1044c00",
+      "shape": [
+        55
+      ]
+    },
+    "k_factor_proj": {
+      "dtype": "float64",
+      "sha256": "dc3f71da48db5d079f227564f5de9b7ce9db93594b533418ad319bac460c39a3",
+      "shape": [
+        55
+      ]
+    },
+    "k_norm2": {
+      "dtype": "float64",
+      "sha256": "0c8c84c5a91c235f1576eef64c2c8f7a3a646be9dc22ad9a8d4f1878e2ddbfaf",
+      "shape": [
+        55
+      ]
+    },
+    "k_vectors": {
+      "dtype": "float64",
+      "sha256": "f25e2273a7db51342dce7c88dcb06ee00e7ddcf15021ddc490795c5e42966152",
+      "shape": [
+        55,
+        3
+      ]
+    },
+    "kspace_cutoff": {
+      "dtype": "float64",
+      "sha256": "1443dd5a4b6d601fc4c305bf4bfb157326271f2817015e009407e87e9ac886fa",
+      "shape": [
+        1
+      ]
+    },
+    "node_positions": {
+      "dtype": "float64",
+      "sha256": "2ec5ce309edab347eda0828a64ee2cad76a63a1958bac453d3cdd17f9e4d5b77",
+      "shape": [
+        4,
+        3
+      ]
+    },
+    "output_permutation": {
+      "dtype": "int64",
+      "sha256": "b4fde523ffbd8c7f31d11ae062f0cad42a14c1b9ec6000a5404ed381bbe53450",
+      "shape": [
+        8
+      ]
+    },
+    "pbc": {
+      "dtype": "bool",
+      "sha256": "75c8fd04ad916aec3e3d5cb76a452b116b3d4d0912a0a485e9fb8e3d240e210c",
+      "shape": [
+        1,
+        3
+      ]
+    },
+    "potential_alpha": {
+      "dtype": "float64",
+      "sha256": "e6d8aa1f8c13c2105b90f73b866ca76d7df54e5260ced7dfc23ed74182fb777f",
+      "shape": [
+        55,
+        2
+      ]
+    },
+    "potential_beta": {
+      "dtype": "float64",
+      "sha256": "6abe56237d43a171d6ab1cd87bb6f18b1020b171d21419815731860c9f9873d3",
+      "shape": [
+        55,
+        2
+      ]
+    },
+    "rcell": {
+      "dtype": "float64",
+      "sha256": "4807fda13a0fb3b8ea6d9ae9c484710c291d0a0fcabd469dc3ac4978bae6f470",
+      "shape": [
+        1,
+        3,
+        3
+      ]
+    },
+    "rho_alpha": {
+      "dtype": "float64",
+      "sha256": "ffbb1487031fdee84c16c934003d732c73bad59feed471e0a6fc1166b34be664",
+      "shape": [
+        55,
+        2
+      ]
+    },
+    "rho_beta": {
+      "dtype": "float64",
+      "sha256": "1bbf65a54206c272bc92e5798de538f511ffdb8f2ad2780d209f086162dc1001",
+      "shape": [
+        55,
+        2
+      ]
+    },
+    "si_overlap_constants_energy": {
+      "dtype": "float64",
+      "sha256": "bd8976d1bbf2554b98cdd63a7b35901a48d48b2cbf9b0f1b6bdae86c25ef99b4",
+      "shape": [
+        4
+      ]
+    },
+    "si_overlap_constants_features": {
+      "dtype": "float64",
+      "sha256": "28466b1ade9bede77841119902b6636309eb6c2cc58258f0b4fcc9327d35380b",
+      "shape": [
+        8
+      ]
+    },
+    "sines": {
+      "dtype": "float64",
+      "sha256": "8dae499aee191298e56dacedf9d82bd846c2fd4747a352c25569f1d028f47c1f",
+      "shape": [
+        55,
+        4
+      ]
+    },
+    "source_feats_alpha": {
+      "dtype": "float64",
+      "sha256": "55501d29a9c145367ffe10aa6c0f723152228d89de04fef60d0e849dd70c1bc6",
+      "shape": [
+        4,
+        4
+      ]
+    },
+    "source_feats_beta": {
+      "dtype": "float64",
+      "sha256": "2ef6c6aed79ed742c6e2790b512aa86d57ef2dec64d79064beb89d89f194df42",
+      "shape": [
+        4,
+        4
+      ]
+    },
+    "source_feats_total": {
+      "dtype": "float64",
+      "sha256": "ff3fd8a3ac83ac15ff51e9b8e99f453868a6ca521728b19a4256863a34114e73",
+      "shape": [
+        4,
+        4
+      ]
+    },
+    "volume": {
+      "dtype": "float64",
+      "sha256": "cd59e610abb6f2975448eb49735cea3b63c04e9d0771e77d4917924b6951fc47",
+      "shape": [
+        1
+      ]
+    },
+    "volume_per_k": {
+      "dtype": "float64",
+      "sha256": "70a362e82d903458465575effb67babe6f0f39ce42cf3f79f2e038e5e06a474c",
+      "shape": [
+        55
+      ]
+    }
+  },
+  "description": "MACE-POLAR-1 long-range op-level golden fixture captured from the frozen graph_electrostatics/mace oracle stack (docs/user/models.md#mace-polar-1).",
+  "environment": {
+    "e3nn": "0.6.0",
+    "numpy": "2.5.4",
+    "scipy": "1.18.1",
+    "torch": "2.14.1+cu130"
+  },
+  "geometry": {
+    "graph_class": "bulk",
+    "n_k": 55,
+    "n_nodes": 4,
+    "name": "pbc4",
+    "pbc": [
+      true,
+      true,
+      true
+    ],
+    "periodic": true,
+    "volume": 95.67999999999999
+  },
+  "oracle": {
+    "graph_electrostatics_sha": "e0eb8945c21e203656f4e0bbece5d1da488b6753",
+    "graph_longrange_version": "0.4.4",
+    "mace_ref": "v0.3.16-2-g22f08097",
+    "mace_sha": "22f0809735bd4dd1deba80cf8e16f89913a35ff4"
+  },
+  "parameters": {
+    "density_max_l": 1,
+    "density_smearing_width": 1.0,
+    "feature_max_l": 1,
+    "feature_smearing_widths": [
+      1.0,
+      1.5
+    ],
+    "include_self_interaction": false,
+    "integral_normalization": "receiver",
+    "kspace_cutoff": 4.155112395039092,
+    "kspace_cutoff_factor": 1.5,
+    "pbc_handling": "mixed_periodic",
+    "seed": 20261014
+  },
+  "payload": {
+    "bytes": 43305,
+    "format": "npz",
+    "path": "pbc4_arrays.npz",
+    "sha256": "9f1ce3238e9157103222949bcc5e473f656a2f4cd4b7179a653cf7507ff1c996"
+  },
+  "schema": "symmetrix.polar.oracle-op-fixtures",
+  "units": {
+    "charge": "e",
+    "energy": "eV",
+    "field_constant": 180.95128022746667,
+    "half_sphere_weight": 2.0,
+    "length": "Angstrom",
+    "potential": "V"
+  },
+  "version": 1
+}

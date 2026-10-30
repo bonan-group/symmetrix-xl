@@ -7,6 +7,16 @@ loading a native extension, so it can identify a stale virtual environment even
 when the backend cannot initialize on the current host.
 An `unknown` identity means that artifact was built without the provenance
 metadata; it is not evidence that the artifact matches the current worktree.
+`source_dirty` includes both superproject changes and recursive submodule state;
+the packaged descriptor and `_backend_build_info()` must agree or probing fails.
+The native build report also includes `prebuilt_operator_artifacts`: its
+`off`/`r0`/`full` MACE mode, exact backend target, catalog path and SHA-256,
+artifact count, installed bytes, compiler identity, source hashes, and measured
+artifact build duration. The catalog may also contain the independently
+selected known-OAM bundle; official CPU and CUDA wheels contain eight OAM
+entries alongside the six `r0` entries. Probe and doctor validation report catalog tampering, unsafe
+symlinks, missing or extra files, and provenance mismatches instead of treating
+package data as a JIT cache hit.
 The command probes the selected native backend by default, including its
 compiled code identity, extension path, linked runtime/BLAS libraries, and
 Kokkos/device runtime details. If probing fails, it reports the error and falls

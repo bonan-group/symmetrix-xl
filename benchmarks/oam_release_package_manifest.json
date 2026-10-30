@@ -1,0 +1,61 @@
+{
+  "schema": "symmetrix.oam-release-package/2",
+  "qualification": {
+    "status": "pending",
+    "artifact_abi_versions": {"host": 7, "cuda": 3},
+    "execution_variants": ["full-message"]
+  },
+  "catalog": {
+    "oam_artifact_count": 8,
+    "architectures": ["S", "M", "L", "XL"],
+    "architecture_fingerprints": {
+      "S": "sha256:676b385abb23c436411e3d9cb6032a7030b7141d4dd42db5b2e2f7104d93a307",
+      "M": "sha256:d8b773a86ebec83d1ea4dcbc3babe72242aebac3c88df245d6afbfc8352ced79",
+      "L": "sha256:8e8b6c963d1be1449a43b0c02c6b80bdbd1b83070fb7abff5f6c806a0efa670f",
+      "XL": "sha256:4ad5f8500b618300493547dca76321e8d9c870988239228e071d91bd9cc40c12"
+    },
+    "precisions": ["float32", "float64"],
+    "variants_per_artifact": ["full-message"],
+    "incidental_tuning_variants": "excluded",
+    "budgets": {
+      "installed_bytes_max": 128000000,
+      "build_duration_seconds_max": 1800.0,
+      "repaired_wheel_bytes_max": 256000000
+    }
+  },
+  "host": {
+    "target": "x86-64-v3",
+    "runtime_qualified": [],
+    "available_not_runtime_qualified": [
+      "S/float32",
+      "S/float64",
+      "M/float32",
+      "M/float64",
+      "L/float32",
+      "L/float64",
+      "XL/float32",
+      "XL/float64"
+    ]
+  },
+  "cuda": {
+    "runtime_qualified_targets": [],
+    "runtime_qualified": [],
+    "capacity_qualified": [],
+    "available_not_runtime_qualified_targets": [
+      "sm70",
+      "sm80",
+      "sm86",
+      "sm89",
+      "sm90",
+      "sm100",
+      "sm120"
+    ]
+  },
+  "unsupported": [
+    "HIP",
+    "parameter gradients",
+    "LAMMPS/MPI",
+    "multi-GPU",
+    "oam-fixed-workspace-v1"
+  ]
+}

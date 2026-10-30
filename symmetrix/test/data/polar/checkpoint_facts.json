@@ -1,0 +1,480 @@
+{
+  "schema": "symmetrix.polar.checkpoint-facts",
+  "version": 1,
+  "source": {
+    "release_tag": "mace_polar_1",
+    "repository": "ACEsuit/mace-foundations",
+    "url_template": "https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-{size}.model"
+  },
+  "extraction": {
+    "extractor": "symmetrix.extract_mace_polar.extract_mace_polar_data",
+    "oracle_mace_sha": "22f0809735bd4dd1deba80cf8e16f89913a35ff4",
+    "oracle_mace_ref": "v0.3.16-2-g22f08097",
+    "oracle_graph_electrostatics_sha": "e0eb8945c21e203656f4e0bbece5d1da488b6753",
+    "oracle_graph_longrange_version": "0.4.4"
+  },
+  "models": {
+    "S": {
+      "status": "available",
+      "file": {
+        "name": "MACE-POLAR-1-S.model",
+        "bytes": 33375439,
+        "sha256": "e4495612037b3b3312633182882a38a694ecac9ea0be2b9889ac0b2a84a99510",
+        "source_url": "https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-S.model",
+        "release_asset_bytes": 33375439
+      },
+      "model_class": "PolarMACE",
+      "interaction_count": 1,
+      "readout_classes": [
+        "LinearReadoutBlock"
+      ],
+      "sigma_set": [
+        1.5,
+        3.0
+      ],
+      "atomic_multipoles_max_l": 1,
+      "atomic_multipoles_smearing_width": 1.5,
+      "field_feature_max_l": 1,
+      "field_feature_widths": [
+        1.5,
+        3.0
+      ],
+      "field_feature_norms": [
+        20.0,
+        20.0,
+        0.5,
+        0.5,
+        0.5,
+        0.5,
+        0.5,
+        0.5
+      ],
+      "kspace_cutoff": 1.8467166423797607,
+      "kspace_cutoff_heuristic": 1.8467166200173746,
+      "kspace_cutoff_factor_inferred": 1.0000000121092678,
+      "num_update": 2,
+      "element_coverage_count": 83,
+      "has_zbl": false,
+      "keep_last_layer_irreps": true,
+      "include_electrostatic_self_interaction": true,
+      "field_si": false,
+      "r_cut": 6.0,
+      "l_max": 3,
+      "charges_irreps": "1x0e+1x1o+1x0e+1x1o",
+      "charges_dimension": 8,
+      "field_irreps": "2x0e+2x1o",
+      "field_dimension": 8,
+      "potential_irreps": "2x0e+2x1o+2x0e+2x1o",
+      "potential_dimension": 16,
+      "node_feats_irreps": "512x0e",
+      "spin_source_heads": {
+        "count": 1,
+        "zero_charges": [
+          false
+        ],
+        "linear": [
+          {
+            "input_irreps": "512x0e",
+            "output_irreps": "1x0e+1x1o+1x0e+1x1o",
+            "input_dimension": 512,
+            "output_dimension": 8
+          }
+        ]
+      },
+      "feature_mixer": {
+        "count": 1,
+        "linear": [
+          {
+            "input_irreps": "512x0e",
+            "output_irreps": "512x0e",
+            "input_dimension": 512,
+            "output_dimension": 512
+          }
+        ]
+      },
+      "field_update_blocks": {
+        "count": 2,
+        "runtime_parameter_counts": [
+          978062,
+          978062
+        ]
+      },
+      "constant_matrices": {
+        "external_field_projection": {
+          "shape": [
+            8,
+            4
+          ],
+          "sha256_float64": "517533f48838fd290ff1a11bc409f73f16e79d75aa900814b01e6f5cd4e3af7e"
+        },
+        "feature_self_interaction_overlaps": {
+          "shape": [
+            8
+          ],
+          "sha256_float64": "5629250a7e2fac07d868169b525140c9c197ce0b2c1e2b7123494b8621114f08"
+        },
+        "energy_self_interaction_overlaps": {
+          "shape": [
+            4
+          ],
+          "sha256_float64": "4fbb54a8195e48e08c76690dd9dfff5385b17d901c75705a88e30159e541f5b3"
+        }
+      },
+      "execution_contracts": {
+        "embedded": [
+          "MH1_UVU",
+          "POLAR_BACKBONE"
+        ],
+        "polar_backbone": {
+          "status": "validated",
+          "tag": "symmetrix.execution.polar_backbone/2",
+          "schema": "symmetrix.execution.polar_backbone",
+          "version": 2,
+          "interaction_count": 1,
+          "recursion_step_count": 2,
+          "structure_fingerprint": "sha256:2da94de6be439cefd494bd7775ed9e83dc914c46f37b045b75296028b07321df",
+          "semantic_fingerprint": "sha256:3085d0e56f9c3df3da750bc0a0379a800dd443d20b828a44821f72dbf6418cd4",
+          "generation_fingerprint": "sha256:6016529895b1abbacf51bfbcc493dc66d1b082637ff599a241dd130404b8e652"
+        },
+        "mh1_uvu": {
+          "status": "embedded",
+          "validated": true,
+          "tag": "symmetrix.execution.mh1_uvu/3",
+          "version": 3,
+          "interaction_count": 1,
+          "structure_fingerprint": "sha256:fee8a5b422a21e905cb9ef348c33f090228d02a2b26c13300baf901235f2836d",
+          "semantic_fingerprint": "sha256:ad918fb4e17ac7406c5af4760b5fa6bbf7c7d67060ad14fab007960d529053d0",
+          "generation_fingerprint": "sha256:4da60eaaa6300ec25483a56533be909c388417c02b1bab94be256644f32fbf18"
+        },
+        "mh1_uvu_v4": {
+          "status": "rejected",
+          "reason": "MH-1 node generation requires a linear readout for every layer but the last, and a nonlinear or bias readout for the last"
+        }
+      }
+    },
+    "M": {
+      "status": "available",
+      "file": {
+        "name": "MACE-POLAR-1-M.model",
+        "bytes": 68133235,
+        "sha256": "fab8b8713c832f31a2a853aaa22fd638be8a369cbf5095e6b3e982a18d10e93a",
+        "source_url": "https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-M.model",
+        "release_asset_bytes": 68133235
+      },
+      "model_class": "PolarMACE",
+      "interaction_count": 2,
+      "readout_classes": [
+        "LinearReadoutBlock",
+        "NonLinearBiasReadoutBlock"
+      ],
+      "sigma_set": [
+        1.5,
+        3.0
+      ],
+      "atomic_multipoles_max_l": 1,
+      "atomic_multipoles_smearing_width": 1.5,
+      "field_feature_max_l": 1,
+      "field_feature_widths": [
+        1.5,
+        3.0
+      ],
+      "field_feature_norms": [
+        20.0,
+        20.0,
+        0.5,
+        0.5,
+        0.5,
+        0.5,
+        0.5,
+        0.5
+      ],
+      "kspace_cutoff": 1.8467166423797607,
+      "kspace_cutoff_heuristic": 1.8467166200173746,
+      "kspace_cutoff_factor_inferred": 1.0000000121092678,
+      "num_update": 2,
+      "element_coverage_count": 83,
+      "has_zbl": false,
+      "keep_last_layer_irreps": true,
+      "include_electrostatic_self_interaction": true,
+      "field_si": false,
+      "r_cut": 6.0,
+      "l_max": 3,
+      "charges_irreps": "1x0e+1x1o+1x0e+1x1o",
+      "charges_dimension": 8,
+      "field_irreps": "2x0e+2x1o",
+      "field_dimension": 8,
+      "potential_irreps": "2x0e+2x1o+2x0e+2x1o",
+      "potential_dimension": 16,
+      "node_feats_irreps": "512x0e+512x1o",
+      "spin_source_heads": {
+        "count": 2,
+        "zero_charges": [
+          false,
+          false
+        ],
+        "linear": [
+          {
+            "input_irreps": "512x0e+512x1o",
+            "output_irreps": "1x0e+1x1o+1x0e+1x1o",
+            "input_dimension": 2048,
+            "output_dimension": 8
+          },
+          {
+            "input_irreps": "512x0e+512x1o",
+            "output_irreps": "1x0e+1x1o+1x0e+1x1o",
+            "input_dimension": 2048,
+            "output_dimension": 8
+          }
+        ]
+      },
+      "feature_mixer": {
+        "count": 2,
+        "linear": [
+          {
+            "input_irreps": "512x0e+512x1o",
+            "output_irreps": "512x0e+512x1o",
+            "input_dimension": 2048,
+            "output_dimension": 2048
+          },
+          {
+            "input_irreps": "512x0e+512x1o",
+            "output_irreps": "512x0e+512x1o",
+            "input_dimension": 2048,
+            "output_dimension": 2048
+          }
+        ]
+      },
+      "field_update_blocks": {
+        "count": 2,
+        "runtime_parameter_counts": [
+          1788558,
+          1788558
+        ]
+      },
+      "constant_matrices": {
+        "external_field_projection": {
+          "shape": [
+            8,
+            4
+          ],
+          "sha256_float64": "517533f48838fd290ff1a11bc409f73f16e79d75aa900814b01e6f5cd4e3af7e"
+        },
+        "feature_self_interaction_overlaps": {
+          "shape": [
+            8
+          ],
+          "sha256_float64": "5629250a7e2fac07d868169b525140c9c197ce0b2c1e2b7123494b8621114f08"
+        },
+        "energy_self_interaction_overlaps": {
+          "shape": [
+            4
+          ],
+          "sha256_float64": "4fbb54a8195e48e08c76690dd9dfff5385b17d901c75705a88e30159e541f5b3"
+        }
+      },
+      "execution_contracts": {
+        "embedded": [
+          "MH1_UVU",
+          "POLAR_BACKBONE"
+        ],
+        "polar_backbone": {
+          "status": "validated",
+          "tag": "symmetrix.execution.polar_backbone/2",
+          "schema": "symmetrix.execution.polar_backbone",
+          "version": 2,
+          "interaction_count": 2,
+          "recursion_step_count": 2,
+          "structure_fingerprint": "sha256:3d702edc5be9b0c37c1b5b7dc04d2c822a1138bc14fad990d0ec70c742968c48",
+          "semantic_fingerprint": "sha256:da0dc9ef90129f5cea32ad5d26fc6e2d8376cc768a840d97b152e27090a3315e",
+          "generation_fingerprint": "sha256:33ba71ea360316d03d107ce3d0c6dfa95977c62f40fd6a56521b8528e3038176"
+        },
+        "mh1_uvu": {
+          "status": "embedded",
+          "validated": true,
+          "tag": "symmetrix.execution.mh1_uvu/3",
+          "version": 3,
+          "interaction_count": 2,
+          "structure_fingerprint": "sha256:fba25789a95c702e3aa97b2512b34455bc39c05d80c8ff3b3d78332d9f42abc0",
+          "semantic_fingerprint": "sha256:5f0b547aceebd2cc0888ce4022638bd43ef6071647e9e350cdab791b5de372b7",
+          "generation_fingerprint": "sha256:a93bbb27f9c406582918bae92b56f37f71ec3971cd1c11aac9f445270373f2d3"
+        },
+        "mh1_uvu_v4": {
+          "status": "built",
+          "tag": "symmetrix.execution.mh1_uvu/4",
+          "version": 4,
+          "interaction_count": 2,
+          "node_program_layer_count": 2
+        }
+      }
+    },
+    "L": {
+      "status": "available",
+      "file": {
+        "name": "MACE-POLAR-1-L.model",
+        "bytes": 129808715,
+        "sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+        "source_url": "https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-L.model",
+        "release_asset_bytes": 129808715
+      },
+      "model_class": "PolarMACE",
+      "interaction_count": 3,
+      "readout_classes": [
+        "LinearReadoutBlock",
+        "LinearReadoutBlock",
+        "NonLinearBiasReadoutBlock"
+      ],
+      "sigma_set": [
+        1.5,
+        3.0
+      ],
+      "atomic_multipoles_max_l": 1,
+      "atomic_multipoles_smearing_width": 1.5,
+      "field_feature_max_l": 1,
+      "field_feature_widths": [
+        1.5,
+        3.0
+      ],
+      "field_feature_norms": [
+        20.0,
+        20.0,
+        0.5,
+        0.5,
+        0.5,
+        0.5,
+        0.5,
+        0.5
+      ],
+      "kspace_cutoff": 1.8467166423797607,
+      "kspace_cutoff_heuristic": 1.8467166200173746,
+      "kspace_cutoff_factor_inferred": 1.0000000121092678,
+      "num_update": 2,
+      "element_coverage_count": 83,
+      "has_zbl": false,
+      "keep_last_layer_irreps": true,
+      "include_electrostatic_self_interaction": true,
+      "field_si": false,
+      "r_cut": 6.0,
+      "l_max": 3,
+      "charges_irreps": "1x0e+1x1o+1x0e+1x1o",
+      "charges_dimension": 8,
+      "field_irreps": "2x0e+2x1o",
+      "field_dimension": 8,
+      "potential_irreps": "2x0e+2x1o+2x0e+2x1o",
+      "potential_dimension": 16,
+      "node_feats_irreps": "512x0e+512x1o+512x2e",
+      "spin_source_heads": {
+        "count": 3,
+        "zero_charges": [
+          false,
+          false,
+          false
+        ],
+        "linear": [
+          {
+            "input_irreps": "512x0e+512x1o+512x2e",
+            "output_irreps": "1x0e+1x1o+1x0e+1x1o",
+            "input_dimension": 4608,
+            "output_dimension": 8
+          },
+          {
+            "input_irreps": "512x0e+512x1o+512x2e",
+            "output_irreps": "1x0e+1x1o+1x0e+1x1o",
+            "input_dimension": 4608,
+            "output_dimension": 8
+          },
+          {
+            "input_irreps": "512x0e+512x1o+512x2e",
+            "output_irreps": "1x0e+1x1o+1x0e+1x1o",
+            "input_dimension": 4608,
+            "output_dimension": 8
+          }
+        ]
+      },
+      "feature_mixer": {
+        "count": 3,
+        "linear": [
+          {
+            "input_irreps": "512x0e+512x1o+512x2e",
+            "output_irreps": "512x0e+512x1o+512x2e",
+            "input_dimension": 4608,
+            "output_dimension": 4608
+          },
+          {
+            "input_irreps": "512x0e+512x1o+512x2e",
+            "output_irreps": "512x0e+512x1o+512x2e",
+            "input_dimension": 4608,
+            "output_dimension": 4608
+          },
+          {
+            "input_irreps": "512x0e+512x1o+512x2e",
+            "output_irreps": "512x0e+512x1o+512x2e",
+            "input_dimension": 4608,
+            "output_dimension": 4608
+          }
+        ]
+      },
+      "field_update_blocks": {
+        "count": 2,
+        "runtime_parameter_counts": [
+          2582670,
+          2582670
+        ]
+      },
+      "constant_matrices": {
+        "external_field_projection": {
+          "shape": [
+            8,
+            4
+          ],
+          "sha256_float64": "517533f48838fd290ff1a11bc409f73f16e79d75aa900814b01e6f5cd4e3af7e"
+        },
+        "feature_self_interaction_overlaps": {
+          "shape": [
+            8
+          ],
+          "sha256_float64": "5629250a7e2fac07d868169b525140c9c197ce0b2c1e2b7123494b8621114f08"
+        },
+        "energy_self_interaction_overlaps": {
+          "shape": [
+            4
+          ],
+          "sha256_float64": "4fbb54a8195e48e08c76690dd9dfff5385b17d901c75705a88e30159e541f5b3"
+        }
+      },
+      "execution_contracts": {
+        "embedded": [
+          "MH1_UVU",
+          "POLAR_BACKBONE"
+        ],
+        "polar_backbone": {
+          "status": "validated",
+          "tag": "symmetrix.execution.polar_backbone/2",
+          "schema": "symmetrix.execution.polar_backbone",
+          "version": 2,
+          "interaction_count": 3,
+          "recursion_step_count": 2,
+          "structure_fingerprint": "sha256:82e935125d13eaf402366bc2d8dd2250167ffa8bfedebfaae35d3ac41f17f29a",
+          "semantic_fingerprint": "sha256:e9f2e3f748a2d88d4604fac2cba8a8af55756b37c111a8a39292c3e3b0f4d6aa",
+          "generation_fingerprint": "sha256:dc6d8d761abd4152d3de03a3fd5167110bf7752d9437024a28ce36719c1e4936"
+        },
+        "mh1_uvu": {
+          "status": "embedded",
+          "validated": true,
+          "tag": "symmetrix.execution.mh1_uvu/3",
+          "version": 3,
+          "interaction_count": 3,
+          "structure_fingerprint": "sha256:e0b670a38c4e8af4f2302ae01e11926efa5c781b73dcf2dc716f4153a1de9bb7",
+          "semantic_fingerprint": "sha256:5199a02b6808e4eba976afc33e89bdd949b4295c2505fd44555072253a8a2207",
+          "generation_fingerprint": "sha256:38ebb105e5bc3eaad2f9a199d2434d87e30d6cfbf8a48a86b27bd0973673fde0"
+        },
+        "mh1_uvu_v4": {
+          "status": "built",
+          "tag": "symmetrix.execution.mh1_uvu/4",
+          "version": 4,
+          "interaction_count": 3,
+          "node_program_layer_count": 3
+        }
+      }
+    }
+  }
+}

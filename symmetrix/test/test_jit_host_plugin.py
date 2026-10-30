@@ -36,7 +36,7 @@ def host_plugin_fixture(tmp_path_factory):
     plugin_source = directory / "fixture_plugin.cpp"
     plugin_source.write_text(
         r"""
-#include "jit_host_plugin_abi.h"
+#include "mace_jit_host_plugin_abi.h"
 
 extern "C" void fixture_forward(
     const SymmetrixJitHostR1ForwardArgsV1* args,
@@ -93,7 +93,7 @@ symmetrix_jit_host_plugin_query_v1()
     harness_source = directory / "loader_harness.cpp"
     harness_source.write_text(
         r"""
-#include "jit_host_plugin.hpp"
+#include "mace_jit_host_plugin.hpp"
 
 #include <array>
 #include <exception>
@@ -157,7 +157,7 @@ int main(int argc, char** argv)
             && message.find("null descriptor") != std::string::npos)
             return 0;
         if (mode == "missing-function"
-            && message.find("function pointer disagree") != std::string::npos)
+            && message.find("function pointers disagree") != std::string::npos)
             return 0;
         if (mode == "missing-expectation"
             && message.find("requires a contract fingerprint")
@@ -223,7 +223,7 @@ int main(int argc, char** argv)
         compiler,
         *common,
         harness_source,
-        SOURCE / "jit_host_plugin.cpp",
+        SOURCE / "mace_jit_host_plugin.cpp",
         "-ldl",
         "-o",
         harness,

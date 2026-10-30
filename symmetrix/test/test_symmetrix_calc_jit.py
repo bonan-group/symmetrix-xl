@@ -1,9 +1,13 @@
+import builtins
+import dis
 import importlib
 import importlib.util
 import json
 import shutil
 import sys
+import threading
 import types
+import warnings
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,10 +16,27 @@ import pytest
 
 _PACKAGE_NAME = "_symmetrix_calc_jit_test"
 _PACKAGE_SOURCE = Path(__file__).resolve().parents[1] / "source" / "symmetrix"
+# A well-formed stand-in for the digest the real extension reports; the harness
+# patches every artifact preparer, so the value only has to satisfy the shape
+# the JIT layer validates.
+_STUB_SOURCE_DIGEST = "0" * 64
 _PACKAGE = types.ModuleType(_PACKAGE_NAME)
 _PACKAGE.__path__ = [str(_PACKAGE_SOURCE)]
 sys.modules[_PACKAGE_NAME] = _PACKAGE
+# The sandbox stands in for the compiled extension, so the stub has to report
+# the same well-formed build identity a real build does: production JIT artifact
+# identity reads ``_backend_build_info()`` from the loaded native module. This is
+# a labelled test identity, not a real source digest.
+_NATIVE_SOURCE_CONTENT_SHA256 = "a" * 64
 _NATIVE = types.ModuleType(f"{_PACKAGE_NAME}.symmetrix")
+# The JIT path keys every prepared artifact on the native extension's own
+# source identity (``native_source_content_sha256``), so the stub that stands
+# in for the extension here reports one.  Without it the harness's JIT
+# configuration fails closed with "the native extension does not report source
+# build identity", which is what the real extension always supplies.
+_NATIVE._backend_build_info = lambda: {
+    "source_content_sha256": _NATIVE_SOURCE_CONTENT_SHA256,
+}
 sys.modules[f"{_PACKAGE_NAME}.symmetrix"] = _NATIVE
 _SPEC = importlib.util.spec_from_file_location(
     f"{_PACKAGE_NAME}.calculator", _PACKAGE_SOURCE / "calculator.py"
@@ -101,10 +122,29 @@ _MH1_V4_METADATA = {
     "layers": [],
     "node_state_policy": "full-retention-v1",
 }
-_MH1_V5_METADATA = {
+_MH1_V7_METADATA = {
     **_MH1_V4_METADATA,
-    "abi": "symmetrix.jit.mh1.host-plugin/5",
-    "abi_version": 5,
+    "abi": "symmetrix.jit.mh1.host-plugin/7",
+    "abi_version": 7,
+}
+# The fields the real v4 contract builder adds to the fixture contract.  The
+# interaction count is envelope data the builder always emits (the version-3
+# identity carries it and the version-4 identity derives from it) and the
+# loader selection reads it to follow the model's own topology, so the
+# harness's validator stand-in and every expectation of what it returned share
+# this one spelling.
+_MH1_V4_CONTRACT_ENVELOPE = {
+    "tag": "symmetrix.execution.mh1_uvu/4",
+    "generation_fingerprint": "sha256:generation-v4",
+    "semantic_fingerprint": "sha256:semantic-v4",
+    "structure_fingerprint": "sha256:structure-v4",
+    "runtime_layout_fingerprint": "sha256:runtime-v4",
+    "interaction_count": 2,
+}
+_MH1_V7_METADATA = {
+    **_MH1_V4_METADATA,
+    "abi": "symmetrix.jit.mh1.host-plugin/7",
+    "abi_version": 7,
 }
 _MH1_CUDA_METADATA = {
     **_MH1_METADATA,
@@ -147,8 +187,8 @@ _MH1_CUDA_METADATA_WITH_POLICY = {
 }
 _MH1_CUDA_V4_METADATA_WITH_POLICY = {
     **_MH1_CUDA_METADATA_WITH_POLICY,
-    "abi": "symmetrix.jit.mh1.cuda-plugin/4",
-    "abi_version": 4,
+    "abi": "symmetrix.jit.mh1.cuda-plugin/5",
+    "abi_version": 5,
     "artifact_id": "jit-mh1-v4-fixture",
     "generation_fingerprint": "sha256:generation-v4",
     "semantic_fingerprint": "sha256:semantic-v4",
@@ -156,6 +196,11 @@ _MH1_CUDA_V4_METADATA_WITH_POLICY = {
     "runtime_layout_fingerprint": "sha256:runtime-v4",
     "layers": [],
     "node_state_policy": "full-retention-v1",
+}
+_MH1_CUDA_V5_METADATA_WITH_POLICY = {
+    **_MH1_CUDA_V4_METADATA_WITH_POLICY,
+    "abi": "symmetrix.jit.mh1.cuda-plugin/5",
+    "abi_version": 5,
 }
 
 
@@ -185,14 +230,14 @@ class _DummyEvaluator:
         self.jit_hip_plugin_artifact_id = ""
         self.jit_host_plugin_ready = False
         self.jit_host_plugin_artifact_id = ""
-        self.receiver_factorized_host_plugin_ready = False
-        self.receiver_factorized_host_plugin_artifact_id = ""
         self.jit_mh1_host_plugin_ready = False
         self.jit_mh1_host_plugin_v4_ready = False
         self.jit_mh1_host_plugin_v5_ready = False
+        self.jit_mh1_host_plugin_v7_ready = False
         self.jit_mh1_host_plugin_artifact_id = ""
         self.jit_mh1_cuda_plugin_ready = False
         self.jit_mh1_cuda_plugin_v4_ready = False
+        self.jit_mh1_cuda_plugin_v5_ready = False
         self.jit_mh1_cuda_plugin_artifact_id = ""
         self.execution_mh1_scratch_budget_bytes = None
         self.execution_mh1_node_arena_policy = "throughput-v1"
@@ -258,13 +303,6 @@ class _DummyEvaluator:
         self.jit_host_plugin_ready = True
         self.jit_host_plugin_artifact_id = "jit-r1-fixture"
 
-    def _load_receiver_factorized_host_plugin(self, path):
-        self.events.append(("receiver_load", path))
-        if self.load_error is not None:
-            raise self.load_error
-        self.receiver_factorized_host_plugin_ready = True
-        self.receiver_factorized_host_plugin_artifact_id = "receiver-r1-fixture"
-
     def _load_jit_cuda_plugin(self, path, persistent_blocks):
         self.events.append(("cuda_load", path, persistent_blocks))
         if self.load_error is not None:
@@ -300,6 +338,13 @@ class _DummyEvaluator:
         self.jit_mh1_host_plugin_v5_ready = True
         self.jit_mh1_host_plugin_artifact_id = "jit-mh1-v4-fixture"
 
+    def _load_jit_mh1_host_plugin_v7(self, path):
+        self.events.append(("mh1_v7_load", path))
+        if self.load_error is not None:
+            raise self.load_error
+        self.jit_mh1_host_plugin_v7_ready = True
+        self.jit_mh1_host_plugin_artifact_id = "jit-mh1-v4-fixture"
+
     def _load_jit_mh1_cuda_plugin(self, path):
         self.events.append(("mh1_cuda_load", path))
         if self.load_error is not None:
@@ -312,6 +357,12 @@ class _DummyEvaluator:
         if self.load_error is not None:
             raise self.load_error
         self.jit_mh1_cuda_plugin_v4_ready = True
+
+    def _load_jit_mh1_cuda_plugin_v5(self, path, launch_plan_json):
+        self.events.append(("mh1_cuda_v5_load", path, launch_plan_json))
+        if self.load_error is not None:
+            raise self.load_error
+        self.jit_mh1_cuda_plugin_v5_ready = True
         self.jit_mh1_cuda_plugin_artifact_id = "jit-mh1-v4-fixture"
 
 
@@ -319,7 +370,6 @@ def test_m1_polynomial_policy_rejects_unknown_value(jit_harness):
     with pytest.raises(ValueError, match="m1_polynomial_policy must be one of"):
         Symmetrix(
             jit_harness["model_path"],
-            use_kokkos=True,
             streamed_edges="materialized",
             m1_polynomial_policy="unknown",
         )
@@ -329,7 +379,6 @@ def test_edge_geometry_policy_rejects_unknown_value(jit_harness):
     with pytest.raises(ValueError, match="edge_geometry_policy must be one of"):
         Symmetrix(
             jit_harness["model_path"],
-            use_kokkos=True,
             streamed_edges="factorized",
             edge_geometry_policy="unknown",
         )
@@ -341,7 +390,6 @@ def test_mh1_node_arena_policy_rejects_unknown_value(jit_harness):
     ):
         Symmetrix(
             jit_harness["model_path"],
-            use_kokkos=True,
             streamed_edges="materialized",
             execution_mh1_node_arena_policy="unknown",
         )
@@ -350,7 +398,6 @@ def test_mh1_node_arena_policy_rejects_unknown_value(jit_harness):
 def test_mh1_node_arena_policy_is_configured_before_jit_load(jit_harness):
     calculator = Symmetrix(
         jit_harness["model_path"],
-        use_kokkos=True,
         streamed_edges="factorized",
         execution_mh1_node_arena_policy="capacity-v1",
     )
@@ -367,7 +414,6 @@ def test_mh1_node_arena_policy_is_configured_before_jit_load(jit_harness):
 def test_compact_edge_geometry_is_configured_after_jit_load(jit_harness):
     calculator = Symmetrix(
         jit_harness["model_path"],
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
         edge_geometry_policy="unit-f32-radius-f64-v1",
@@ -390,7 +436,6 @@ def test_m1_polynomial_policy_falls_back_for_legacy_evaluator(
     monkeypatch.delattr(_DummyEvaluator, "_set_m1_polynomial_policy")
     calculator = Symmetrix(
         jit_harness["model_path"],
-        use_kokkos=True,
         streamed_edges="materialized",
         m1_polynomial_policy=policy,
     )
@@ -413,7 +458,6 @@ def test_m1_polynomial_policy_explicit_recompute_fails_without_support(
     ):
         Symmetrix(
             jit_harness["model_path"],
-            use_kokkos=True,
             streamed_edges="materialized",
             m1_polynomial_policy="recompute",
         )
@@ -438,7 +482,6 @@ def test_low_memory_bundle_is_applied_after_jit_load(
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype=dtype,
-        use_kokkos=True,
         streamed_edges="factorized",
         low_memory=True,
         m1_polynomial_policy="retained",
@@ -487,7 +530,6 @@ def test_mh0_state_policy_is_configured_after_jit_load(jit_harness):
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
         m1_polynomial_policy="recompute",
         execution_mh0_state_policy="reuse-adjoints-v1",
@@ -510,7 +552,6 @@ def test_low_memory_rejects_non_boolean_values(jit_harness, low_memory):
 @pytest.mark.parametrize(
     ("options", "message"),
     (
-        ({"dtype": "float32", "use_kokkos": False}, "requires use_kokkos=True"),
         (
             {"dtype": "float32", "streamed_edges": "all_interactions"},
             "requires streamed_edges='direct'",
@@ -539,7 +580,6 @@ def test_low_memory_requires_native_bundle_support(jit_harness, monkeypatch):
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
             low_memory=True,
         )
@@ -581,7 +621,6 @@ def test_low_memory_selects_mh1_hybrid_before_cuda_jit_configuration(
     calculator = Symmetrix(
         model_path,
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
         low_memory=True,
     )
@@ -599,16 +638,12 @@ def test_low_memory_selects_mh1_hybrid_before_cuda_jit_configuration(
 @pytest.fixture
 def jit_harness(monkeypatch, tmp_path):
     jit = importlib.import_module(f"{_PACKAGE_NAME}.jit")
-    jit_codegen = importlib.import_module(f"{_PACKAGE_NAME}.jit_codegen")
-    receiver_codegen = pytest.importorskip(
-        f"{_PACKAGE_NAME}.receiver_factorized_rtc",
-        reason=(
-            "receiver-factorized RTC execution has not been merged into this branch yet"
-        ),
+    jit_codegen = importlib.import_module(f"{_PACKAGE_NAME}.mace_jit_codegen")
+    mh1_jit_codegen = importlib.import_module(
+        f"{_PACKAGE_NAME}.mace_nonlinear_jit_codegen"
     )
-    mh1_jit_codegen = importlib.import_module(f"{_PACKAGE_NAME}.mh1_jit_codegen")
     execution_mh1_contract = importlib.import_module(
-        f"{_PACKAGE_NAME}.execution_mh1_contract"
+        f"{_PACKAGE_NAME}.mace_nonlinear_execution_contract"
     )
 
     events = []
@@ -623,6 +658,7 @@ def jit_harness(monkeypatch, tmp_path):
             status="built",
             cache_key="cache-key",
             artifact_path=artifact,
+            manifest={"key_inputs": {"fixture": "calculator"}},
             diagnostics=("compiler diagnostic",),
             reason=None,
             available=True,
@@ -669,6 +705,15 @@ def jit_harness(monkeypatch, tmp_path):
         state["events"].append(("prepare", source))
         state["prepare_calls"].append((source, kwargs))
         return state["prepare_result"]
+
+    validate_entry = jit._validated_entry
+
+    def validate_real_entries(entry, cache_key, inputs):
+        if cache_key.startswith("cache-"):
+            return None
+        return validate_entry(entry, cache_key, inputs)
+
+    monkeypatch.setattr(jit, "_validated_entry", validate_real_entries)
 
     def render_cuda(contract, compute_capability, **_kwargs):
         state["events"].append(("cuda_render", contract, compute_capability))
@@ -867,7 +912,7 @@ def jit_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(
         jit_codegen,
         "jit_r1_host_plugin_metadata",
-        lambda contract, precision="float32": {
+        lambda contract, precision="float32", **_kwargs: {
             **_METADATA,
             "precision": precision,
             "scalar_kind": 1 if precision == "float32" else 2,
@@ -875,20 +920,6 @@ def jit_harness(monkeypatch, tmp_path):
         },
     )
     monkeypatch.setattr(jit_codegen, "render_jit_r1_host_plugin", render)
-    monkeypatch.setattr(
-        receiver_codegen,
-        "receiver_factorized_host_plugin_metadata",
-        lambda contract: {
-            "abi": "symmetrix.receiver-factorized.host-plugin/1",
-            "abi_version": 1,
-            "artifact_id": "receiver-r1-fixture",
-        },
-    )
-    monkeypatch.setattr(
-        receiver_codegen,
-        "render_receiver_factorized_host_source",
-        render,
-    )
     monkeypatch.setattr(
         jit_codegen,
         "factorized_gpu_codegen_identity",
@@ -947,12 +978,12 @@ def jit_harness(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         mh1_jit_codegen,
-        "render_jit_mh1_host_plugin_v4",
+        "render_jit_mh1_host_plugin_v7",
         render_mh1,
     )
     monkeypatch.setattr(
         mh1_jit_codegen,
-        "render_jit_mh1_host_plugin_v5",
+        "render_jit_mh1_host_plugin_v7",
         render_mh1,
     )
     monkeypatch.setattr(
@@ -987,11 +1018,6 @@ def jit_harness(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         mh1_jit_codegen,
-        "render_jit_mh1_cuda_plugin_v4",
-        render_mh1_cuda,
-    )
-    monkeypatch.setattr(
-        mh1_jit_codegen,
         "render_execution_mh1_cuda_module_v4",
         render_mh1_cuda_module,
     )
@@ -1008,14 +1034,7 @@ def jit_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(
         execution_mh1_contract,
         "validate_execution_mh1_v4_contract_for_model",
-        lambda _model, contract: {
-            **contract,
-            "tag": "symmetrix.execution.mh1_uvu/4",
-            "generation_fingerprint": "sha256:generation-v4",
-            "semantic_fingerprint": "sha256:semantic-v4",
-            "structure_fingerprint": "sha256:structure-v4",
-            "runtime_layout_fingerprint": "sha256:runtime-v4",
-        },
+        lambda _model, contract: {**contract, **_MH1_V4_CONTRACT_ENVELOPE},
     )
     monkeypatch.setattr(
         execution_mh1_contract,
@@ -1048,7 +1067,6 @@ def test_jit_miss_builds_or_reuses_and_loads_plugin(jit_harness, cache_status):
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
     )
 
@@ -1056,7 +1074,16 @@ def test_jit_miss_builds_or_reuses_and_loads_plugin(jit_harness, cache_status):
     assert calculator.jit_cache_key == "cache-key"
     assert calculator.jit_artifact_path == str(jit_harness["artifact"])
     assert calculator.jit_artifact_id == "jit-r1-fixture"
-    assert calculator.jit_diagnostics == ("compiler diagnostic",)
+    expected_origin = "cache" if cache_status == "cached" else "runtime"
+    assert calculator.jit_origin == expected_origin
+    assert calculator.jit_diagnostics == (
+        "origin=prebuilt status=absent operator=R1 reason=catalog-absent",
+        "compiler diagnostic",
+        "origin="
+        + expected_origin
+        + " status="
+        + ("hit" if expected_origin == "cache" else "compiled"),
+    )
     assert calculator.jit_reason is None
     assert jit_harness["render_contracts"] == [
         jit_harness["model"]["execution_contracts"]["R1"]
@@ -1076,9 +1103,161 @@ def test_jit_miss_builds_or_reuses_and_loads_plugin(jit_harness, cache_status):
     )
     assert options["cxx_flags"] is None
     assert options["artifact_name"] == "factorized_host_plugin"
+    assert options["show_progress"] is True
     assert jit_harness["events"][-1] == (
         "load",
         str(jit_harness["artifact"]),
+    )
+
+
+def test_exact_installed_r1_precedes_cache_and_runtime(jit_harness, monkeypatch):
+    jit = importlib.import_module(f"{_PACKAGE_NAME}.jit")
+    installed = importlib.import_module(f"{_PACKAGE_NAME}.installed_operator_artifact")
+    artifact = jit_harness["model_path"].parent / "installed-r1.so"
+    artifact.write_bytes(b"installed R1")
+    requests = []
+
+    monkeypatch.setattr(
+        installed,
+        "installed_operator_build_target",
+        lambda **_arguments: "x86-64-v3",
+    )
+    monkeypatch.setattr(
+        jit,
+        "probe_compiler_identity",
+        lambda *_args, **_kwargs: pytest.fail("installed R1 probed the compiler"),
+    )
+
+    def resolve(**arguments):
+        requests.append(arguments)
+        arguments["loader"](str(artifact))
+        return SimpleNamespace(
+            status="resolved",
+            origin="prebuilt",
+            artifact_path=artifact,
+            artifact_id="jit-r1-fixture",
+            diagnostics=("origin=prebuilt status=loaded operator=R1",),
+        )
+
+    monkeypatch.setattr(installed, "resolve_installed_operator_artifact", resolve)
+
+    calculator = Symmetrix(
+        jit_harness["model_path"],
+        dtype="float32",
+        streamed_edges="factorized",
+    )
+
+    assert len(requests) == 1
+    assert requests[0]["operator"] == "R1"
+    assert requests[0]["identity"] == {"artifact_id": "jit-r1-fixture"}
+    assert jit_harness["prepare_calls"] == []
+    assert calculator.jit_origin == "prebuilt"
+    assert calculator.jit_status == "loaded"
+    assert calculator.jit_artifact_path == str(artifact)
+    assert calculator.jit_cache_key is None
+
+
+def test_host_r1_fallback_uses_one_native_policy_for_identity_and_manifest(
+    jit_harness, monkeypatch, tmp_path
+):
+    jit = importlib.import_module(f"{_PACKAGE_NAME}.jit")
+    jit_codegen = importlib.import_module(f"{_PACKAGE_NAME}.mace_jit_codegen")
+    installed = importlib.import_module(f"{_PACKAGE_NAME}.installed_operator_artifact")
+    real_jit = _load_unpatched_jit()
+    installed_target = "x86-64-v3"
+    runtime_target = "host-sha256-" + "8" * 64
+    metadata_targets = []
+    render_targets = []
+    installed_identities = []
+    prepare_calls = []
+
+    monkeypatch.delenv("SYMMETRIX_JIT_HOST_TARGET", raising=False)
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "r1-cache"))
+    monkeypatch.setattr(
+        installed,
+        "installed_operator_build_target",
+        lambda **_arguments: installed_target,
+    )
+
+    def metadata(contract, *, precision, target, **_arguments):
+        assert contract == jit_harness["model"]["execution_contracts"]["R1"]
+        metadata_targets.append(target)
+        return {
+            **_METADATA,
+            "precision": precision,
+            "generated_identity": {
+                "artifact_id": "jit-r1-fixture",
+                "target": target,
+            },
+        }
+
+    def render(contract, *, target, **_arguments):
+        assert contract == jit_harness["model"]["execution_contracts"]["R1"]
+        render_targets.append(target)
+        return f'extern "C" int symmetrix_test_r1_{len(render_targets)} = 1;\n'
+
+    def absent(**arguments):
+        installed_identities.append(arguments["identity"])
+        return SimpleNamespace(
+            status="absent",
+            diagnostics=(
+                "origin=prebuilt status=absent operator=R1 reason=catalog-absent",
+            ),
+        )
+
+    policy = real_jit.HostJitPolicy(
+        requested="automatic",
+        selected="native",
+        effective_target=runtime_target,
+        flags=("-ffast-math", "-march=native"),
+        diagnostics=("host JIT policy: native",),
+    )
+
+    def prepare(source, **arguments):
+        prepare_calls.append((source, arguments))
+        return real_jit.prepare_jit_artifact(source, **arguments)
+
+    monkeypatch.setattr(jit_codegen, "jit_r1_host_plugin_metadata", metadata)
+    monkeypatch.setattr(jit_codegen, "render_jit_r1_host_plugin", render)
+    monkeypatch.setattr(installed, "resolve_installed_operator_artifact", absent)
+    monkeypatch.setattr(
+        jit,
+        "probe_compiler_identity",
+        lambda *_arguments, **_keywords: (("c++",), {"kind": "cxx"}),
+    )
+    monkeypatch.setattr(
+        jit, "resolve_host_jit_policy", lambda *_args, **_kwargs: policy
+    )
+    monkeypatch.setattr(jit, "prepare_jit_artifact", prepare)
+
+    calculator = Symmetrix(
+        jit_harness["model_path"],
+        dtype="float32",
+        streamed_edges="factorized",
+    )
+
+    assert metadata_targets == [installed_target, runtime_target]
+    assert render_targets == [installed_target, runtime_target]
+    assert installed_identities == [
+        {"artifact_id": "jit-r1-fixture", "target": installed_target}
+    ]
+    source, arguments = prepare_calls[0]
+    assert (
+        runtime_target in arguments["build"]["contract"]["generated_identity"].values()
+    )
+    assert source.endswith("symmetrix_test_r1_2 = 1;\n")
+    assert arguments["cxx"] == ("c++",)
+    assert arguments["cxx_flags"] is None
+    assert arguments["host_policy"] is policy
+    manifest = json.loads(
+        (Path(calculator.jit_artifact_path).parent / "manifest.json").read_text()
+    )
+    key_inputs = manifest["key_inputs"]
+    assert key_inputs["cxx_flags"] == list(policy.flags)
+    assert key_inputs["build"]["host_jit_policy"] == policy.identity
+    assert (
+        key_inputs["build"]["contract"]["generated_identity"]["target"]
+        == runtime_target
     )
 
 
@@ -1086,7 +1265,6 @@ def test_jit_float64_build_identity_and_loader(jit_harness):
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float64",
-        use_kokkos=True,
         streamed_edges="factorized",
     )
 
@@ -1114,7 +1292,6 @@ def test_low_memory_r1_host_jit_prefers_generated_m0_plugin(jit_harness, monkeyp
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
         low_memory=True,
     )
@@ -1134,6 +1311,114 @@ def test_low_memory_r1_host_jit_prefers_generated_m0_plugin(jit_harness, monkeyp
         symmetrix_calc._require_matching_jit_generation_version()
     )
     assert calls[0]["prefer_host_m0_plugin"] is True
+
+
+def test_low_memory_host_keeps_builtin_m0_and_compiles_r1_r0_with_two_workers(
+    jit_harness, monkeypatch, tmp_path
+):
+    jit = importlib.import_module(f"{_PACKAGE_NAME}.jit")
+    operator_codegen = importlib.import_module(
+        f"{_PACKAGE_NAME}.mace_jit_operator_codegen"
+    )
+    evaluator = jit_harness["evaluator"]
+    evaluator.m0_implementation = "builtin"
+    evaluator.r0_implementation = "generic"
+    evaluator.m0_host_plugin_ready = False
+    evaluator.m0_host_plugin_artifact_id = ""
+    evaluator.m0_module_id = "builtin-m0"
+    evaluator.r0_host_plugin_ready = False
+    evaluator.r0_host_plugin_artifact_id = ""
+
+    def load_m0(path):
+        evaluator.events.append(("m0_load", path))
+        evaluator.m0_host_plugin_ready = True
+        evaluator.m0_host_plugin_artifact_id = "m0-artifact"
+
+    evaluator._load_m0_host_plugin = load_m0
+
+    def load_r0(path, apply_edge_weights=False, target="host"):
+        evaluator.events.append(("r0_load", path, apply_edge_weights, target))
+        evaluator.r0_host_plugin_ready = True
+        evaluator.r0_host_plugin_artifact_id = "r0-artifact"
+
+    evaluator._load_r0_host_plugin = load_r0
+    jit_harness["model"]["execution_contracts"]["M0"] = {"fixture": "m0"}
+    jit_harness["model"]["execution_contracts"]["R0"] = {"fixture": "r0"}
+    jit_harness["model_path"].write_text(
+        json.dumps(jit_harness["model"]), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        operator_codegen,
+        "render_jit_m0_host_plugin",
+        lambda contract, **arguments: (
+            "generated M0 source",
+            {
+                "schema": "symmetrix.jit.m0-host-plugin/1",
+                "abi_version": 1,
+                "artifact_id": "m0-generated",
+                "structure_fingerprint": "sha256:" + "d" * 64,
+                "capabilities": 0x1F,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        operator_codegen,
+        "render_jit_r0_host_plugin",
+        lambda contract, **arguments: (
+            "generated R0 source",
+            {
+                "schema": "symmetrix.jit.r0-host-plugin/2",
+                "abi_version": 2,
+                "compatibility_version": 2,
+                "artifact_id": "r0-generated",
+                "structure_fingerprint": "sha256:" + "e" * 64,
+                "capabilities": 0xF,
+            },
+        ),
+    )
+
+    compile_barrier = threading.Barrier(2)
+    compile_threads = set()
+    prepared_sources = []
+
+    def prepare(source, **arguments):
+        prepared_sources.append(source)
+        compile_threads.add(threading.get_ident())
+        if len(prepared_sources) <= 2:
+            compile_barrier.wait(timeout=2)
+        name = "m0" if "M0" in source else "r0" if "R0" in source else "r1"
+        artifact = tmp_path / f"{name}.so"
+        artifact.write_bytes(name.encode())
+        return SimpleNamespace(
+            status="built",
+            cache_key=f"cache-{name}",
+            artifact_path=artifact,
+            manifest={"key_inputs": {"fixture": name}},
+            diagnostics=(f"compiled-{name}",),
+            reason=None,
+            available=True,
+        )
+
+    monkeypatch.setattr(jit, "prepare_jit_artifact", prepare)
+
+    calculator = Symmetrix(
+        jit_harness["model_path"],
+        dtype="float32",
+        streamed_edges="factorized",
+        low_memory=True,
+    )
+
+    assert len(compile_threads) == 2
+    assert set(prepared_sources) == {"generated source", "generated R0 source"}
+    load_events = [event[0] for event in evaluator.events if "load" in event[0]]
+    assert load_events == ["load", "r0_load"]
+    assert calculator.jit_operator_modules["M0"] == {
+        "status": "builtin",
+        "implementation": "builtin",
+        "compiler": None,
+        "artifact_id": "builtin-m0",
+    }
+    assert calculator.jit_operator_modules["R0"]["artifact_id"] == "r0-artifact"
 
 
 def test_macefield_uses_prepared_execution_graph_and_field_entry_point():
@@ -1189,6 +1474,87 @@ def test_macefield_uses_prepared_execution_graph_and_field_entry_point():
         calculator._compute_macefield(None, np.array([np.nan, 0.0, 0.0]), mace_inputs)
 
 
+@pytest.mark.parametrize(
+    ("signals", "code"),
+    (
+        (
+            {
+                "artifact_rejected": True,
+                "cache_entry_present": True,
+                "artifact_present": True,
+                "compiler_available": True,
+            },
+            "rejected-stale-artifact",
+        ),
+        (
+            {
+                "artifact_rejected": False,
+                "cache_entry_present": True,
+                "artifact_present": False,
+                "compiler_available": True,
+            },
+            "missing-artifact",
+        ),
+        (
+            {
+                "artifact_rejected": False,
+                "cache_entry_present": False,
+                "artifact_present": False,
+                "compiler_available": False,
+            },
+            "compilation-unavailable",
+        ),
+        (
+            {
+                "artifact_rejected": False,
+                "cache_entry_present": False,
+                "artifact_present": False,
+                "compiler_available": True,
+            },
+            "empty-cache",
+        ),
+    ),
+)
+def test_direct_artifact_failure_cause_is_four_way(signals, code):
+    resolved_code, description = Symmetrix._direct_artifact_failure_cause(
+        backend="host", **signals
+    )
+
+    assert resolved_code == code
+    assert description
+
+
+def test_direct_artifact_failure_reports_four_way_diagnostic(jit_harness, monkeypatch):
+    monkeypatch.setattr(
+        symmetrix_calc.Symmetrix,
+        "_direct_artifact_compiler_available",
+        staticmethod(lambda backend: False),
+    )
+    jit_harness["prepare_result"] = SimpleNamespace(
+        status="fallback",
+        cache_key=None,
+        artifact_path=None,
+        diagnostics=("compiler missing",),
+        reason="CXX compiler executable was not found",
+        available=False,
+    )
+
+    with pytest.raises(
+        symmetrix_calc._JitRequiredError,
+        match=(
+            "(?s)compiler missing.*does not fall back.*"
+            r"Direct R1 artifact diagnostic \(compilation-unavailable\): "
+            "no working host compiler is available.*"
+            r"\(a\) .*\(b\) .*\(c\) .*\(d\) "
+        ),
+    ):
+        Symmetrix(
+            jit_harness["model_path"],
+            dtype="float32",
+            streamed_edges="direct",
+        )
+
+
 def test_jit_default_failure_raises(jit_harness):
     jit_harness["prepare_result"] = SimpleNamespace(
         status="fallback",
@@ -1206,7 +1572,6 @@ def test_jit_default_failure_raises(jit_harness):
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -1228,7 +1593,6 @@ def test_literal_direct_failure_never_switches_to_generic(jit_harness):
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="direct",
         )
 
@@ -1252,7 +1616,6 @@ def test_deprecated_jit_fallback_is_ignored(jit_harness):
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
             jit="fallback",
         )
@@ -1274,7 +1637,6 @@ def test_jit_required_failure_raises(jit_harness):
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -1289,7 +1651,6 @@ def test_jit_loader_failure_is_always_fatal(jit_harness):
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
             jit="fallback",
         )
@@ -1316,7 +1677,6 @@ def test_jit_successful_retry_removes_load_quarantine(jit_harness, monkeypatch):
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
     )
 
@@ -1354,7 +1714,6 @@ def test_jit_required_reports_real_compiler_failure(jit_harness, tmp_path):
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -1368,7 +1727,6 @@ def test_jit_required_reports_real_compiler_failure(jit_harness, tmp_path):
 def test_jit_is_not_applicable_to_non_factorized_modes(jit_harness, kwargs, reason):
     options = {
         "dtype": "float32",
-        "use_kokkos": True,
         "streamed_edges": "factorized",
     }
     options.update(kwargs)
@@ -1380,6 +1738,125 @@ def test_jit_is_not_applicable_to_non_factorized_modes(jit_harness, kwargs, reas
     assert jit_harness["prepare_calls"] == []
 
 
+def _unbound_global_loads(code, namespace):
+    """Return every global name ``code`` loads that does not resolve."""
+
+    unbound = set()
+    for instruction in dis.get_instructions(code):
+        if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}:
+            name = instruction.argval
+            if name not in namespace and name not in dir(builtins):
+                unbound.add(name)
+    for constant in code.co_consts:
+        if isinstance(constant, types.CodeType):
+            unbound |= _unbound_global_loads(constant, namespace)
+    return unbound
+
+
+def test_jit_configuration_binds_the_model_type_it_reports():
+    """The CUDA ABI diagnostic interpolates the model type, so it is a local.
+
+    The registry refactor moved the family lookup into a call and dropped the
+    method's ``model_type`` binding, which would have turned that diagnostic
+    into a NameError on an accelerator build; no host test executes the branch,
+    but the bytecode shows the load, so this pins the binding and every other
+    global the configuration step reads.
+    """
+
+    code = Symmetrix._configure_jit.__code__
+
+    assert "model_type" in code.co_varnames
+    assert "model_type" not in code.co_names
+    assert _unbound_global_loads(code, vars(symmetrix_calc)) == set()
+
+
+def test_jit_cuda_abi_diagnostic_names_the_model_type(jit_harness, monkeypatch):
+    """An evaluator without the generated CUDA ABI is reported by model type.
+
+    The message interpolates the model type the configuration step read from the
+    model. The branch is selected from the reported execution space, so it runs
+    on a host-only build.
+    """
+
+    monkeypatch.setattr(
+        symmetrix_calc.symmetrix,
+        "_kokkos_default_execution_space",
+        lambda: "Cuda",
+    )
+
+    class CudaEvaluatorWithoutGeneratedAbi:
+        """A CUDA evaluator that offers the mode handshake but no plugin loader."""
+
+        streamed_edges_mode = "direct"
+
+        def set_streamed_edges(self, mode):
+            self.streamed_edges_mode = mode
+
+    monkeypatch.setattr(
+        symmetrix_calc.symmetrix,
+        "MACEKokkosFloat",
+        lambda path, head="": CudaEvaluatorWithoutGeneratedAbi(),
+        raising=False,
+    )
+
+    with pytest.raises(
+        symmetrix_calc._JitRequiredError,
+        match="the native evaluator does not provide the generated MACE CUDA-plugin ABI",
+    ):
+        Symmetrix(
+            jit_harness["model_path"],
+            dtype="float32",
+            streamed_edges="factorized",
+        )
+
+
+def test_jit_routes_the_single_layer_variant_declared_by_its_family(
+    jit_harness, tmp_path
+):
+    """The family declaration, not a model-type comparison, routes this variant."""
+
+    model_path = tmp_path / "single-layer.json"
+    model_path.write_text(
+        json.dumps({**jit_harness["model"], "single_layer_readout": True}),
+        encoding="utf-8",
+    )
+
+    calculator = Symmetrix(
+        model_path,
+        dtype="float32",
+        streamed_edges="factorized",
+    )
+
+    assert calculator.jit_status == "not_applicable"
+    assert "single-layer invariant readout" in calculator.jit_reason
+    assert jit_harness["prepare_calls"] == []
+
+
+def test_jit_rejects_a_model_type_no_family_declares(jit_harness, tmp_path):
+    """An undeclared model type keeps the frontend's own rejection."""
+
+    model_path = tmp_path / "undeclared.json"
+    model_path.write_text(
+        json.dumps({**jit_harness["model"], "model_type": "NequIP"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        symmetrix_calc._JitRequiredError,
+        match=(
+            "Execution JIT currently supports ordinary MACE, MACEField, and "
+            "compatible MACE-MH-1-family models"
+        ),
+    ):
+        Symmetrix(
+            model_path,
+            dtype="float32",
+            streamed_edges="factorized",
+        )
+
+    assert jit_harness["prepare_calls"] == []
+
+
 @pytest.mark.parametrize(
     ("dtype", "evaluator_name"),
     (("float32", "MACENonlinearKokkosFloat"), ("float64", "MACENonlinearKokkos")),
@@ -1387,7 +1864,8 @@ def test_jit_is_not_applicable_to_non_factorized_modes(jit_harness, kwargs, reas
 def test_mh1_host_jit_builds_and_loads_generated_plugin(
     jit_harness, monkeypatch, tmp_path, dtype, evaluator_name
 ):
-    contract = {"fixture": "mh1-contract"}
+    # Host MH-1 execution requires the split-product ABI-v7 generation.
+    contract = {"fixture": "mh1-contract", "interaction_count": 2}
     model_path = tmp_path / "mh1.json"
     model_path.write_text(
         json.dumps(
@@ -1413,7 +1891,6 @@ def test_mh1_host_jit_builds_and_loads_generated_plugin(
     calculator = Symmetrix(
         model_path,
         dtype=dtype,
-        use_kokkos=True,
         streamed_edges="factorized",
     )
     assert calculator.streamed_edges == "direct"
@@ -1427,18 +1904,18 @@ def test_mh1_host_jit_builds_and_loads_generated_plugin(
     source, options = jit_harness["prepare_calls"][0]
     assert source == f"generated MH1 {dtype} source"
     assert options["abi"] == {
-        "tag": _MH1_V5_METADATA["abi"],
-        "version": _MH1_V5_METADATA["abi_version"],
+        "tag": _MH1_V7_METADATA["abi"],
+        "version": _MH1_V7_METADATA["abi_version"],
     }
     assert options["build"] == {
-        "generator": "symmetrix.jit.mh1-host-v5",
+        "generator": "symmetrix.jit.mh1-host-v7-composed",
         "precision": dtype,
-        "contract": _MH1_V5_METADATA,
+        "contract": _MH1_V7_METADATA,
         "jit_generation_version": jit_harness["jit_generation_version"],
     }
     assert options["artifact_name"] == "jit_mh1_host_plugin"
     assert jit_harness["events"][-1] == (
-        "mh1_v5_load",
+        "mh1_v7_load",
         str(jit_harness["artifact"]),
     )
 
@@ -1447,7 +1924,9 @@ def test_mh1_cuda_jit_uses_subgroup_generator_provenance(
     jit_harness, monkeypatch, tmp_path
 ):
     jit = importlib.import_module(f"{_PACKAGE_NAME}.jit")
-    mh1_jit_codegen = importlib.import_module(f"{_PACKAGE_NAME}.mh1_jit_codegen")
+    mh1_jit_codegen = importlib.import_module(
+        f"{_PACKAGE_NAME}.mace_nonlinear_jit_codegen"
+    )
     contract = {"fixture": "mh1-cuda-contract"}
     model_path = tmp_path / "mh1-cuda.json"
     model_path.write_text(
@@ -1484,7 +1963,6 @@ def test_mh1_cuda_jit_uses_subgroup_generator_provenance(
     calculator = Symmetrix(
         model_path,
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
     )
 
@@ -1503,36 +1981,27 @@ def test_mh1_cuda_jit_uses_subgroup_generator_provenance(
     assert jit_harness["mh1_cuda_edge_policy_requests"] == [(contract, 120, "auto")]
     assert jit_harness["mh1_cuda_metadata_policies"] == [
         (
-            {
-                **contract,
-                "tag": "symmetrix.execution.mh1_uvu/4",
-                "generation_fingerprint": "sha256:generation-v4",
-                "semantic_fingerprint": "sha256:semantic-v4",
-                "structure_fingerprint": "sha256:structure-v4",
-                "runtime_layout_fingerprint": "sha256:runtime-v4",
-            },
+            {**contract, **_MH1_V4_CONTRACT_ENVELOPE},
             120,
             _MH1_CUDA_FORWARD_POLICY,
             _MH1_CUDA_SOURCE_POLICY,
             _MH1_CUDA_EDGE_POLICY,
         )
     ]
-    assert jit_harness["mh1_cuda_render_contracts"] == [
-        (
-            {
-                **contract,
-                "tag": "symmetrix.execution.mh1_uvu/4",
-                "generation_fingerprint": "sha256:generation-v4",
-                "semantic_fingerprint": "sha256:semantic-v4",
-                "structure_fingerprint": "sha256:structure-v4",
-                "runtime_layout_fingerprint": "sha256:runtime-v4",
-            },
-            120,
-            _MH1_CUDA_FORWARD_POLICY,
-            _MH1_CUDA_SOURCE_POLICY,
-            _MH1_CUDA_EDGE_POLICY,
-        )
-    ]
+    assert jit_harness["mh1_cuda_render_contracts"] == []
+    rendered_contract, rendered_capability, rendered_policies = jit_harness[
+        "mh1_cuda_module_render_contracts"
+    ][0]
+    assert rendered_contract["fixture"] == contract["fixture"]
+    assert rendered_contract["tag"] == "symmetrix.execution.mh1_uvu/4"
+    assert rendered_capability == 120
+    assert rendered_policies == {
+        "forward_policy": _MH1_CUDA_FORWARD_POLICY,
+        "source_policy": _MH1_CUDA_SOURCE_POLICY,
+        "edge_policy": _MH1_CUDA_EDGE_POLICY,
+        "node_state_policy": "full-retention-v1",
+        "precision": "float32",
+    }
     source, options = jit_harness["nvrtc_prepare_calls"][0]
     assert source == "generated MH1 CUDA module source"
     assert options["abi"] == {
@@ -1540,14 +2009,14 @@ def test_mh1_cuda_jit_uses_subgroup_generator_provenance(
         "version": mh1_jit_codegen.MH1_CUDA_MODULE_ABI_VERSION,
     }
     assert options["build"]["generator"] == "symmetrix.jit.mh1-cuda-module-v1"
-    assert options["build"]["contract"] == _MH1_CUDA_V4_METADATA_WITH_POLICY
+    assert options["build"]["contract"] == _MH1_CUDA_V5_METADATA_WITH_POLICY
     assert options["build"]["launch_plan"]["tag"] == (
         "symmetrix.jit.mh1.cuda-module-launch-plan/1"
     )
     assert options["artifact_name"] == "execution_mh1_cuda_module"
     assert jit_harness["cuda_prepare_calls"] == []
     event = jit_harness["events"][-1]
-    assert event[:2] == ("mh1_cuda_v4_load", str(jit_harness["artifact"]))
+    assert event[:2] == ("mh1_cuda_v5_load", str(jit_harness["artifact"]))
     assert json.loads(event[2]) == options["build"]["launch_plan"]
 
 
@@ -1555,7 +2024,9 @@ def test_mh1_cuda_explicit_nvrtc_uses_module_and_launch_plan(
     jit_harness, monkeypatch, tmp_path
 ):
     jit = importlib.import_module(f"{_PACKAGE_NAME}.jit")
-    mh1_jit_codegen = importlib.import_module(f"{_PACKAGE_NAME}.mh1_jit_codegen")
+    mh1_jit_codegen = importlib.import_module(
+        f"{_PACKAGE_NAME}.mace_nonlinear_jit_codegen"
+    )
     contract = {"fixture": "mh1-cuda-nvrtc-contract"}
     model_path = tmp_path / "mh1-cuda-nvrtc.json"
     model_path.write_text(
@@ -1593,7 +2064,6 @@ def test_mh1_cuda_explicit_nvrtc_uses_module_and_launch_plan(
     calculator = Symmetrix(
         model_path,
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
     )
 
@@ -1611,7 +2081,7 @@ def test_mh1_cuda_explicit_nvrtc_uses_module_and_launch_plan(
     )
     assert options["artifact_name"] == "execution_mh1_cuda_module"
     event = jit_harness["events"][-1]
-    assert event[:2] == ("mh1_cuda_v4_load", str(jit_harness["artifact"]))
+    assert event[:2] == ("mh1_cuda_v5_load", str(jit_harness["artifact"]))
     assert json.loads(event[2]) == options["build"]["launch_plan"]
 
 
@@ -1654,7 +2124,6 @@ def test_mh1_cuda_automatic_uses_nvrtc_module_and_launch_plan(
     calculator = Symmetrix(
         model_path,
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
     )
 
@@ -1711,7 +2180,6 @@ def test_mh1_cuda_compilation_failure_is_fatal(jit_harness, monkeypatch, tmp_pat
         Symmetrix(
             model_path,
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -1739,7 +2207,6 @@ def test_mh1_required_rejects_model_without_generation_contract(
         Symmetrix(
             model_path,
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -1770,7 +2237,7 @@ def test_mh1_required_rejects_contract_not_bound_to_model(
         raising=False,
     )
     execution_mh1_contract = importlib.import_module(
-        f"{_PACKAGE_NAME}.execution_mh1_contract"
+        f"{_PACKAGE_NAME}.mace_nonlinear_execution_contract"
     )
 
     def reject_stale_contract(_model, _contract):
@@ -1787,7 +2254,6 @@ def test_mh1_required_rejects_contract_not_bound_to_model(
         Symmetrix(
             model_path,
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
     assert jit_harness["prepare_calls"] == []
@@ -1802,7 +2268,6 @@ def test_jit_parameter_is_deprecated_and_ignored(jit_harness, legacy_value):
         calculator = Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
             jit=legacy_value,
         )
@@ -1826,7 +2291,6 @@ def test_jit_none_policy_rejects_rtc_modes_without_fallback(jit_harness, monkeyp
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
     assert jit_harness["prepare_calls"] == []
@@ -1839,7 +2303,6 @@ def test_jit_environment_policy_rejects_unknown_value(jit_harness, monkeypatch):
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -1848,7 +2311,6 @@ def test_execution_mh1_scratch_budget_validation_and_routing(jit_harness):
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
         execution_mh1_scratch_budget_bytes=12345,
     )
@@ -1874,7 +2336,6 @@ def test_non_factorized_modes_do_not_dispatch_jit(jit_harness, monkeypatch, mode
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float32",
-        use_kokkos=True,
         streamed_edges=mode,
     )
     assert calculator.jit_status == "not_applicable"
@@ -1883,34 +2344,85 @@ def test_non_factorized_modes_do_not_dispatch_jit(jit_harness, monkeypatch, mode
 
 
 @pytest.mark.parametrize(
-    ("requested", "canonical", "alias", "uses_jit"),
+    ("requested", "routing", "native", "alias", "uses_jit"),
     (
-        ("materialized", "materialized", None, False),
-        ("generic", "generic", "generic", False),
-        ("all_interactions", "generic", "all_interactions", False),
-        ("direct", "direct", None, True),
-        ("factorized", "direct", "factorized", True),
-        ("direct_streamed", "direct", "direct_streamed", True),
+        ("materialized", "reference", "generic", "materialized", False),
+        ("generic", "reference", "generic", "generic", False),
+        ("non-compiled", "reference", "generic", "non-compiled", False),
+        ("all_interactions", "reference", "generic", "all_interactions", False),
+        ("direct", "direct", "direct", None, True),
+        ("factorized", "direct", "direct", "factorized", True),
+        ("direct_streamed", "direct", "direct", "direct_streamed", True),
+        ("auto", "reference", "generic", None, False),
     ),
 )
 def test_execution_mode_aliases_canonicalize_before_native_dispatch(
-    jit_harness, requested, canonical, alias, uses_jit
+    jit_harness, requested, routing, native, alias, uses_jit
 ):
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float32",
-        use_kokkos=True,
         streamed_edges=requested,
         execution_profile="speed",
     )
 
     assert calculator.streamed_edges_requested == requested
-    assert calculator.streamed_edges == canonical
-    assert calculator.execution_algorithm == canonical
+    assert calculator.streamed_edges == routing
+    assert calculator.execution_algorithm == routing
     assert calculator.streamed_edges_alias == alias
-    assert ("mode", canonical) in jit_harness["events"]
+    # The evaluator is handed the family's native spelling for the routing.
+    assert jit_harness["evaluator"].streamed_edges_mode == native
+    assert ("mode", native) in jit_harness["events"]
     assert bool(jit_harness["prepare_calls"]) is uses_jit
     assert calculator.jit_status == ("built" if uses_jit else "not_applicable")
+
+
+@pytest.mark.parametrize(
+    ("requested", "deprecated"),
+    (
+        ("materialized", False),
+        ("direct", False),
+        ("non-compiled", False),
+        ("factorized", False),
+        ("direct_streamed", False),
+        ("auto", False),
+        ("generic", True),
+        ("all_interactions", True),
+    ),
+)
+def test_every_documented_mode_spelling_keeps_its_warning_behavior(
+    jit_harness, requested, deprecated
+):
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        calculator = Symmetrix(
+            jit_harness["model_path"],
+            dtype="float32",
+            streamed_edges=requested,
+            execution_profile="speed",
+        )
+
+    deprecations = [
+        warning
+        for warning in recorded
+        if issubclass(warning.category, DeprecationWarning)
+        and "streamed_edges" in str(warning.message)
+    ]
+    assert bool(deprecations) is deprecated
+    assert calculator.streamed_edges in ("direct", "reference")
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ("debug_v1", "mlp_reference", "Direct", "DIRECT", ""),
+)
+def test_family_foreign_and_unknown_mode_spellings_are_rejected(jit_harness, mode):
+    with pytest.raises(ValueError, match="streamed_edges must be one of"):
+        Symmetrix(
+            jit_harness["model_path"],
+            dtype="float32",
+            streamed_edges=mode,
+        )
 
 
 @pytest.mark.parametrize("mode", ("factorized", "direct_streamed"))
@@ -1918,7 +2430,6 @@ def test_direct_compatibility_aliases_preserve_speed_profile(jit_harness, mode):
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float32",
-        use_kokkos=True,
         streamed_edges=mode,
     )
 
@@ -1931,7 +2442,6 @@ def test_removed_receiver_factorized_selector_is_rejected(jit_harness):
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="receiver_factorized",
         )
 
@@ -1949,7 +2459,6 @@ def test_jit_generation_version_mismatch_fails_before_generation(
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -1967,7 +2476,6 @@ def test_legacy_native_extension_fails_before_jit_generation(jit_harness, monkey
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -1995,7 +2503,6 @@ def test_jit_cuda_miss_builds_and_loads_on_exact_target(
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
     )
 
@@ -2056,7 +2563,6 @@ def test_jit_cuda_serial_override_preserves_rollback(jit_harness, monkeypatch):
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
     )
 
@@ -2097,7 +2603,6 @@ def test_jit_cuda_compiler_failure_obeys_policy(jit_harness, monkeypatch, policy
     )
     options = {
         "dtype": "float32",
-        "use_kokkos": True,
         "streamed_edges": "factorized",
         "jit": policy,
     }
@@ -2145,7 +2650,6 @@ def test_jit_cuda_automatic_compile_failure_never_invokes_nvcc(
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -2177,7 +2681,6 @@ def test_jit_cuda_automatic_load_failure_never_invokes_nvcc(jit_harness, monkeyp
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -2217,7 +2720,9 @@ def test_mh1_hip_explicit_hiprtc_uses_shared_v4_handle(
     jit_harness, monkeypatch, tmp_path
 ):
     _configure_hip_fixture(jit_harness, monkeypatch)
-    mh1_jit_codegen = importlib.import_module(f"{_PACKAGE_NAME}.mh1_jit_codegen")
+    mh1_jit_codegen = importlib.import_module(
+        f"{_PACKAGE_NAME}.mace_nonlinear_jit_codegen"
+    )
     contract = {"fixture": "mh1-hiprtc-contract"}
     model_path = tmp_path / "mh1-hiprtc.json"
     model_path.write_text(
@@ -2267,19 +2772,18 @@ def test_mh1_hip_explicit_hiprtc_uses_shared_v4_handle(
     calculator = Symmetrix(
         model_path,
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
     )
 
     assert calculator.jit_compiler_backend == "hiprtc"
-    assert calculator.evaluator.jit_mh1_cuda_plugin_v4_ready
+    assert calculator.evaluator.jit_mh1_cuda_plugin_v5_ready
     assert calculator.jit_artifact_id == "jit-mh1-v4-fixture"
     source, options = jit_harness["hiprtc_prepare_calls"][0]
     assert source == "generated MH1 HIP module source"
     assert options["build"]["generator"] == "symmetrix.jit.mh1-hip-module-v1"
     assert options["build"]["launch_plan"] == launch_plan
     event = jit_harness["events"][-1]
-    assert event[:2] == ("mh1_cuda_v4_load", str(jit_harness["artifact"]))
+    assert event[:2] == ("mh1_cuda_v5_load", str(jit_harness["artifact"]))
 
 
 def test_jit_hip_explicit_hiprtc_uses_device_module(jit_harness, monkeypatch):
@@ -2289,7 +2793,6 @@ def test_jit_hip_explicit_hiprtc_uses_device_module(jit_harness, monkeypatch):
     calculator = Symmetrix(
         jit_harness["model_path"],
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
     )
 
@@ -2326,7 +2829,6 @@ def test_jit_hip_automatic_compile_failure_never_invokes_hipcc(
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -2346,7 +2848,6 @@ def test_jit_hip_automatic_load_failure_never_invokes_hipcc(jit_harness, monkeyp
         Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -2378,7 +2879,6 @@ def test_jit_explicit_nvcc_quarantines_broken_artifact(jit_harness, monkeypatch)
         calculator = Symmetrix(
             jit_harness["model_path"],
             dtype="float32",
-            use_kokkos=True,
             streamed_edges="factorized",
         )
 
@@ -2418,7 +2918,6 @@ def test_jit_uses_extracted_checkpoint_data_after_temporary_json_closes(
     calculator = Symmetrix(
         checkpoint,
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="factorized",
     )
 

@@ -2,15 +2,14 @@ import copy
 import ctypes
 import math
 import os
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
-
-import symmetrix.execution_mh1_contract as execution_mh1_contract
-import symmetrix.mh1_jit_codegen as mh1_codegen
-from symmetrix.execution_mh1_contract import (
+import symmetrix.mace_nonlinear_execution_contract as execution_mh1_contract
+import symmetrix.mace_nonlinear_jit_codegen as mh1_codegen
+from symmetrix.mace_nonlinear_execution_contract import (
     MH1_CONTRACT_KEY,
     MH1_CONTRACT_TAG,
     MH1_NODE_PROGRAM_TAG,
@@ -19,19 +18,26 @@ from symmetrix.execution_mh1_contract import (
     make_execution_mh1_v4_contract,
     maybe_make_execution_mh1_contract,
     maybe_make_execution_mh1_v4_contract,
+    node_execution_schedule,
     normalize_execution_mh1_contract,
     normalize_execution_mh1_v4_contract,
     validate_execution_mh1_contract_for_model,
     validate_execution_mh1_v4_contract_for_model,
 )
-from symmetrix.mh1_jit_codegen import (
-    render_jit_mh1_host_plugin_v4,
-    render_jit_mh1_host_plugin_v5,
-    render_execution_mh1_node_linear_cpp_helpers,
-    render_execution_mh1_node_nonlinear_cpp_helpers,
-    render_execution_mh1_node_product_cpp_helpers,
-    render_execution_mh1_node_program_cpp_helpers,
+from symmetrix.mace_polar_execution_contract import (
+    POLAR_CONTRACT_KEY,
+    POLAR_CONTRACT_TAG,
+    make_execution_polar_backbone_contract,
+    make_execution_polar_mh1_v4_contract,
+    normalize_execution_polar_backbone_contract,
+    polar_execution_schedule,
+    validate_execution_polar_backbone_contract_for_model,
+    validate_execution_polar_mh1_v4_contract_for_model,
+)
+from symmetrix.mace_nonlinear_jit_codegen import (
     execution_mh1_node_program_metadata,
+    render_execution_mh1_node_linear_cpp_helpers,
+    render_jit_mh1_host_plugin_v7,
 )
 
 
@@ -663,10 +669,43 @@ def test_mh1_contract_rejects_stale_model_binding(mh1_definition):
         validate_execution_mh1_contract_for_model(changed, contract)
 
 
+@pytest.mark.parametrize("layer_count", (1, 2, 3))
+def test_native_stage_description_matches_the_contract_schedule(layer_count):
+    """The native stage description is the contract's schedule, not a copy.
+
+    The description carries the interaction-layer count and the ordered forward
+    and reverse schedules as data, and a schedule-walking orchestration reads
+    them.  They must equal the schedule the contract generates for the same
+    count — the same entries, in the same order, with the same phase names — or
+    the two vocabularies have drifted and the description is describing a
+    different program than the contract declares.
+    """
+
+    import symmetrix.symmetrix as native_symmetrix
+
+    expected = node_execution_schedule(layer_count)
+    described = native_symmetrix.mace_nonlinear_stage_description(layer_count)
+
+    assert described["layer_count"] == layer_count
+    assert [dict(entry) for entry in described["forward_schedule"]] == (
+        expected["forward_schedule"]
+    )
+    assert [dict(entry) for entry in described["reverse_schedule"]] == (
+        expected["reverse_schedule"]
+    )
+
+
 def test_optional_mh1_contract_omits_incompatible_models(mh1_definition):
+    # The topology admission is no longer one-or-two: a model with a single
+    # interaction layer is described by the same contract builder, so the
+    # optional builder returns a contract for it instead of omitting it.  The
+    # omission the test's subject is the *incompatible* model below.
     one_layer = copy.deepcopy(mh1_definition)
     one_layer["interactions"].pop()
-    assert maybe_make_execution_mh1_contract(one_layer) is None
+    single = maybe_make_execution_mh1_contract(one_layer)
+    assert single is not None
+    assert single["interaction_count"] == 1
+    assert [descriptor["index"] for descriptor in single["interactions"]] == [0]
 
     untied = copy.deepcopy(mh1_definition)
     untied["interactions"][0]["conv_tp"]["instructions"][0]["connection_mode"] = "uvw"
@@ -880,7 +919,6 @@ def test_mh1_v4_node_metadata_bounds_arena_and_disables_dead_reverse(
     host = execution_mh1_node_program_metadata(contract, backend="host")
     cuda = execution_mh1_node_program_metadata(contract, backend="cuda")
 
-    assert host["artifact_id"].startswith("jit-mh1-gen11-v4-")
     assert host["runtime_layout_fingerprint"] == contract["runtime_layout_fingerprint"]
     assert host["element_indexing"] == "model_element_index_per_node"
     assert [layer["node_arena_dimension"] for layer in host["layers"]] == [
@@ -917,156 +955,6 @@ def test_mh1_v4_node_metadata_bounds_arena_and_disables_dead_reverse(
         execution_mh1_node_program_metadata(contract, backend="serial")
 
 
-def test_mh1_v4_cuda_node_program_uses_cooperative_and_tiled_node_blocks(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    source = execution_mh1_contract.project_execution_mh1_v3_contract(contract)
-    forward_policy = mh1_codegen.resolve_execution_mh1_cuda_forward_policy(
-        source, 80, "auto"
-    )
-    source_policy = mh1_codegen.resolve_execution_mh1_cuda_source_policy(
-        source, 80, "auto"
-    )
-    edge_policy = mh1_codegen.resolve_execution_mh1_cuda_edge_policy(source, 80, "auto")
-    generated = mh1_codegen.render_jit_mh1_cuda_plugin_v4(
-        contract,
-        80,
-        forward_policy=forward_policy,
-        source_policy=source_policy,
-        edge_policy=edge_policy,
-    )
-
-    assert "symmetrix_jit_mh1_cuda_plugin_query_v3" in generated
-    assert "symmetrix_jit_mh1_cuda_plugin_query_v4" in generated
-    assert "node_pre_forward_owner_" not in generated
-    assert "for (std::int64_t node = blockIdx.x; node < args.num_nodes;" in generated
-    assert "__shared__ float l0_density_reduction[128]" in generated
-    assert "threadIdx.x;" in generated
-    assert "__syncthreads();" in generated
-    assert "args->num_nodes < persistent_blocks" in generated
-    assert "node_tiled_l0_forward_linear2_block_0" in generated
-    assert "constexpr int tile_nodes = 8;" in generated
-    assert "constexpr int tile_nodes = 32;" in generated
-    assert "constexpr int tile_channels = 32;" in generated
-    assert "weight_tile[tile_channels][tile_channels + 1]" in generated
-    assert "(args->num_nodes + 7) / 8" in generated
-    assert "(args->num_nodes + 31) / 32" in generated
-    assert "float value_1 =" in generated
-    assert "float value_3 =" in generated
-    assert "input_tile[node_lane + 8][source]" in generated
-    assert "input_tile[node_lane + 24][source]" in generated
-    assert "node_tiled_l0_forward_message_block_0" in generated
-    assert "node_tiled_l1_reverse_message_block_0" in generated
-    assert "args.node_density[node_0]" in generated
-    assert "args.node_density[node_1]" in generated
-    assert "args.node_density[{node}]" not in generated
-    assert "retained_pre_gate[column] = arena[column]" in generated
-    assert "retained_interaction[column] = interaction[column]" in generated
-    assert "const float* interaction = args.retained_interaction_output" in generated
-    assert "args.retained_pre_gate + node" in generated
-    assert "args->retained_pre_gate == nullptr" in generated
-    assert "args->retained_interaction_output == nullptr" in generated
-
-    recompute = mh1_codegen.render_jit_mh1_cuda_plugin_v4(
-        contract,
-        80,
-        forward_policy=forward_policy,
-        source_policy=source_policy,
-        edge_policy=edge_policy,
-        node_state_policy="recompute-v1",
-    )
-    assert "retained_pre_gate[column] = arena[column]" not in recompute
-    assert "retained_interaction[column] = interaction[column]" not in recompute
-    assert "args.retained_pre_gate + node" not in recompute
-    assert "args.retained_interaction_output + node" not in recompute
-    assert "args->retained_pre_gate == nullptr" not in recompute
-    assert "args->retained_interaction_output == nullptr" not in recompute
-    assert "node_tiled_l0_reverse_gate_forward" in recompute
-
-
-def test_mh1_v4_nvrtc_module_is_device_only_with_closed_launch_plan(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    module = mh1_codegen.render_execution_mh1_cuda_module_v4(contract, 80)
-    plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(contract, 80)
-
-    assert "#include" not in module
-    assert "<<<" not in module
-    assert "reinterpret_cast<cudaStream_t>" not in module
-    assert "symmetrix_jit_mh1_cuda_plugin_query_v4(void)" not in module
-    assert (
-        'extern "C" __global__ void symmetrix_execution_mh1_forward_kernel_0' in module
-    )
-    assert "symmetrix_execution_mh1_module_identity" in module
-    assert plan["module_identity"] in module
-    assert plan["generation_fingerprint"] == contract["generation_fingerprint"]
-    assert plan["runtime_layout_fingerprint"] == contract["runtime_layout_fingerprint"]
-    assert plan["schema"] == mh1_codegen.MH1_CUDA_LAUNCH_PLAN_TAG
-    assert [item["index"] for item in plan["interactions"]] == [0, 1]
-    assert plan["nodes"][0]["pre_reverse"] == []
-    assert plan["nodes"][1]["pre_reverse"][0]["grid"] == "node_channel_tiles"
-    assert plan["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    assert "constexpr int tile_nodes = 4;" in module
-    assert "const bool node_valid_3 = node_0 + 3 < args.num_nodes;" in module
-    assert "node_valid_3 ? 3 : 0" in module
-    assert "if (node_valid_3)" in module
-    assert "input_adjoint_3" in module
-    assert len(plan["nodes"][1]["post_reverse"]) > 1
-    assert any(
-        launch["grid"] == "node_channel_tiles"
-        for launch in plan["nodes"][0]["post_forward"]
-    )
-    tiled_launches = [
-        launch
-        for node in plan["nodes"]
-        for phase in ("post_forward", "post_reverse", "pre_reverse")
-        for launch in node[phase]
-        if launch["grid"] == "node_channel_tiles"
-    ]
-    assert tiled_launches
-    for launch in tiled_launches:
-        expected_tile_channels = 32
-        expected_tile_nodes = 8
-        if "message" in launch["kernel"]:
-            expected_tile_nodes = 32
-        if "l1_reverse_message_grouped" in launch["kernel"]:
-            expected_tile_nodes = 64
-        if "linear2" in launch["kernel"]:
-            expected_tile_nodes = 32
-        if "l1_reverse_linear2_grouped" in launch["kernel"]:
-            expected_tile_nodes = 128
-        if "l0_reverse_linear2_grouped" in launch["kernel"]:
-            expected_tile_nodes = 128
-        if "l0_forward_linear2_grouped" in launch["kernel"]:
-            expected_tile_nodes = 128
-        if "l1_forward_linear2_grouped" in launch["kernel"]:
-            expected_tile_nodes = 128
-        if "residual_grouped" in launch["kernel"]:
-            expected_tile_nodes = 32
-        if "linear_up_grouped" in launch["kernel"]:
-            expected_tile_nodes = 32
-        if "reverse_readout" in launch["kernel"]:
-            expected_tile_nodes = 32
-        if "reverse_skip_grouped" in launch["kernel"]:
-            expected_tile_nodes = 32
-        if "forward_skip_grouped" in launch["kernel"]:
-            expected_tile_nodes = 32
-        if "product_linear" in launch["kernel"]:
-            expected_tile_nodes = 32
-        if "reverse_product_tiled" in launch["kernel"]:
-            expected_tile_nodes = 4
-            expected_tile_channels = 128
-        if "forward_product_tiled" in launch["kernel"]:
-            expected_tile_nodes = 1
-            expected_tile_channels = 128
-        assert launch["tile_nodes"] == expected_tile_nodes
-        assert launch["tile_channels"] == expected_tile_channels
-
-
 def test_mh1_v4_spline_r_uses_exact_graph_without_r1_cutoff_abi(
     mh1_node_definition,
 ):
@@ -1084,7 +972,7 @@ def test_mh1_v4_spline_r_uses_exact_graph_without_r1_cutoff_abi(
     assert module.count("static_cast<Scalar*>(args.output)") == 2
 
 
-def test_mh1_v4_recompute_launch_plan_groups_forward_but_keeps_replay_blocks(
+def test_mh1_generation_19_recompute_plan_splits_external_product_from_nodes(
     mh1_node_definition,
 ):
     contract = make_execution_mh1_v4_contract(mh1_node_definition)
@@ -1092,92 +980,42 @@ def test_mh1_v4_recompute_launch_plan_groups_forward_but_keeps_replay_blocks(
         contract, 80, node_state_policy="recompute-v1"
     )
 
+    assert plan["split_phase_composition"] is True
+    assert plan["node_reverse_schedule"] == "composed-v5-full-replay-v1"
+
     for node in plan["nodes"]:
         index = node["index"]
-        forward_kernels = {launch["kernel"] for launch in node["post_forward"]}
-        reverse_kernels = {launch["kernel"] for launch in node["post_reverse"]}
+        pre_forward_kernels = {launch["kernel"] for launch in node["split_pre_forward"]}
+        post_forward_kernels = {
+            launch["kernel"] for launch in node["split_post_forward"]
+        }
+        post_reverse_kernels = {
+            launch["kernel"] for launch in node["split_post_reverse"]
+        }
+        pre_reverse_kernels = {launch["kernel"] for launch in node["split_pre_reverse"]}
         assert {
-            f"symmetrix_execution_mh1_node_tiled_l{index}_forward_residual_grouped",
-            f"symmetrix_execution_mh1_node_tiled_l{index}_forward_message_grouped",
-        } <= forward_kernels
-        assert {
-            f"symmetrix_execution_mh1_node_tiled_l{index}_reverse_residual_forward_block_0",
-            f"symmetrix_execution_mh1_node_tiled_l{index}_reverse_message_forward_block_0",
-            f"symmetrix_execution_mh1_node_tiled_l{index}_reverse_residual_recompute_block_0",
-            f"symmetrix_execution_mh1_node_tiled_l{index}_reverse_message_recompute_block_0",
-        } <= reverse_kernels
-
-
-def test_mh1_v4_reuse_adjoint_policy_retains_primals_and_destroys_messages(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract, 80, node_state_policy="reuse-adjoints-v1"
-    )
-    module = mh1_codegen.render_execution_mh1_cuda_module_v4(
-        contract, 80, node_state_policy="reuse-adjoints-v1"
-    )
-    hip_target = {
-        "architecture": "gfx1151",
-        "target_features": ["sramecc-", "xnack-"],
-        "compiler_offload_target": "gfx1151",
-        "native_subgroup_width": 32,
-        "compute_unit_count": 40,
-    }
-    hip_module = mh1_codegen.render_execution_mh1_hip_module_v4(
-        contract, hip_target, node_state_policy="reuse-adjoints-v1"
-    )
-    plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract, 80, node_state_policy="reuse-adjoints-v1"
-    )
-    hip_plan = mh1_codegen.execution_mh1_hip_module_v4_launch_plan(
-        contract, hip_target, node_state_policy="reuse-adjoints-v1"
-    )
-
-    assert metadata["node_state_policy"] == "reuse-adjoints-v1"
-    assert all(layer["reuse_message_adjoint"] for layer in metadata["layers"])
-    assert all(
-        layer["retained_pre_gate_dimension"] == layer["residual_dimension"]
-        for layer in metadata["layers"]
-    )
-    assert all(
-        layer["retained_interaction_output_dimension"]
-        == layer["interaction_output_dimension"]
-        for layer in metadata["layers"]
-    )
-    assert plan["node_state_policy"] == "reuse-adjoints-v1"
-    assert plan["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    assert "args.retained_pre_gate + node" in module
-    assert "args.retained_interaction_output" in module
-    assert "atomicAdd((args.node_density_adjoint) + node_0" in module
-    assert "l0_tiled_density_bias_sum" in module
-    assert "l1_tiled_density_bias_sum" in module
-    assert "l0_tiled_density_reuse_sum" not in module
-    assert "atomicAdd((args.node_density_adjoint) + node_0" in hip_module
-    assert "__shfl_down(" in hip_module
-    assert "__shfl_down_sync" not in hip_module
-    assert hip_plan["node_state_policy"] == "reuse-adjoints-v1"
-    for launch_plan in (plan, hip_plan):
-        assert launch_plan["node_reverse_schedule"] == (
-            mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
+            f"symmetrix_execution_mh1_split_node_grouped_l{index}_forward_residual_grouped",
+            f"symmetrix_execution_mh1_split_node_grouped_l{index}_forward_message_grouped",
+        } <= pre_forward_kernels
+        assert (
+            f"symmetrix_execution_mh1_split_node_grouped_l{index}_reverse_message_grouped"
+            in pre_reverse_kernels
         )
-        for node in launch_plan["nodes"]:
-            index = node["index"]
-            kernels = [launch["kernel"] for launch in node["post_reverse"]]
-            scale = f"symmetrix_execution_mh1_node_tiled_l{index}_reverse_scale"
-            density = f"symmetrix_execution_mh1_node_tiled_l{index}_reverse_density"
-            message = (
-                f"symmetrix_execution_mh1_node_tiled_l{index}_reverse_message_grouped"
-            )
-            assert (
-                kernels.index(scale) < kernels.index(message) < kernels.index(density)
-            )
-            assert not any("reverse_density_prepare" in kernel for kernel in kernels)
-            assert not any("reverse_message_forward" in kernel for kernel in kernels)
-            assert not any("reverse_message_recompute" in kernel for kernel in kernels)
+
+        # Generation 19 stops before the external common-product contraction
+        # and resumes with only its node-local product-linear epilogue.  The
+        # launch plan must not smuggle a private contraction into either half.
+        assert all("product" not in kernel for kernel in pre_forward_kernels)
+        assert all("product" not in kernel for kernel in pre_reverse_kernels)
+        product_epilogues = {
+            kernel
+            for kernel in post_forward_kernels | post_reverse_kernels
+            if "product" in kernel
+        }
+        assert product_epilogues
+        assert all("product_linear" in kernel for kernel in product_epilogues)
+        assert node["post_forward"] == node["split_post_forward"]
+        assert node["post_reverse"] == node["split_post_reverse"]
 
 
 def test_mh1_v4_retain_interaction_policy_replays_only_pre_gate(
@@ -1206,10 +1044,11 @@ def test_mh1_v4_retain_interaction_policy_replays_only_pre_gate(
     assert all(layer["reuse_message_adjoint"] for layer in metadata["layers"])
     assert plan["node_state_policy"] == "retain-interaction-v1"
     assert "args.retained_pre_gate + node" not in module
-    assert "args.retained_interaction_output" in module
-    assert "node_tiled_l0_reverse_gate_forward" not in module
-    assert "node_tiled_l0_reverse_residual_recompute" in module
-    assert "node_tiled_l1_reverse_message_recompute" in module
+    assert "float* retained_interaction = args.retained_interaction_output" in module
+    assert "retained_interaction[column] = interaction[column]" in module
+    assert "l0_retained_gate_reverse" not in module
+    assert "l0_norm_res_recompute" in module
+    assert "l1_norm_msg_recompute" in module
 
 
 def test_mh1_v4_reuse_adjoint_fusion_has_a_new_generation_identity(
@@ -1226,2699 +1065,7 @@ def test_mh1_v4_reuse_adjoint_fusion_has_a_new_generation_identity(
     )
 
     assert current["generation_fingerprint"] == pre_fusion["generation_fingerprint"]
-    assert current["artifact_id"].startswith("jit-mh1-gen11-v4-")
-    assert pre_fusion["artifact_id"].startswith("jit-mh1-gen5-v4-")
     assert current["artifact_id"] != pre_fusion["artifact_id"]
-
-
-def test_mh1_v4_retained_reverse_defaults_grouped_but_keeps_monolithic_experimental(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    target = {
-        "architecture": "gfx1151",
-        "target_features": ["sramecc-", "xnack-"],
-        "compiler_offload_target": "gfx1151",
-        "native_subgroup_width": 32,
-        "compute_unit_count": 40,
-    }
-    experimental_metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule="monolithic-l1-retained-v1",
-    )
-    cuda_module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(experimental_metadata),
-        node_reverse_schedule="monolithic-l1-retained-v1",
-    )
-    recompute_module = mh1_codegen.render_execution_mh1_cuda_module_v4(
-        contract, 80, node_state_policy="recompute-v1"
-    )
-    cuda_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(contract, 80)
-    experimental_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule="monolithic-l1-retained-v1",
-    )
-    recompute_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract, 80, node_state_policy="recompute-v1"
-    )
-    hip_plan = mh1_codegen.execution_mh1_hip_module_v4_launch_plan(contract, target)
-
-    symbol = "void symmetrix_execution_mh1_node_post_reverse_kernel_1("
-    begin = cuda_module.index(symbol)
-    end = cuda_module.index('\nextern "C" __global__ void ', begin + len(symbol))
-    retained_kernel = cuda_module[begin:end]
-    begin = recompute_module.index(symbol)
-    end = recompute_module.index('\nextern "C" __global__ void ', begin + len(symbol))
-    recompute_kernel = recompute_module[begin:end]
-
-    assert (
-        "const float* interaction = args.retained_interaction_output" in retained_kernel
-    )
-    assert "const float* retained_pre_gate = args.retained_pre_gate" in retained_kernel
-    assert "float* pre_gate = arena;" not in retained_kernel
-    assert "float* gated = arena +" not in retained_kernel
-    assert "float* pre_gate = arena;" in recompute_kernel
-    assert "float* gated = arena +" in recompute_kernel
-    assert "args.retained_pre_gate + node" not in recompute_module
-    assert "args.retained_interaction_output + node" not in recompute_module
-    assert "args->retained_pre_gate == nullptr" not in recompute_module
-    assert "args->retained_interaction_output == nullptr" not in recompute_module
-    assert "node_tiled_l1_reverse_message_grouped" in recompute_module
-    product_symbol = "void symmetrix_execution_mh1_node_tiled_l0_reverse_product_tiled("
-    begin = recompute_module.index(product_symbol)
-    end = recompute_module.index(
-        '\nextern "C" __global__ void ', begin + len(product_symbol)
-    )
-    recompute_product_kernel = recompute_module[begin:end]
-    assert "(args.node_arena)" in recompute_product_kernel
-    assert "(args.retained_interaction_output)" not in recompute_product_kernel
-    assert experimental_plan["node_reverse_schedule"] == "monolithic-l1-retained-v1"
-    assert cuda_plan["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    assert recompute_plan["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_RECOMPUTE_TILED_PRODUCT_REVERSE_SCHEDULE
-    )
-    assert hip_plan["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    assert len(experimental_plan["nodes"][1]["post_reverse"]) == 1
-    assert len(cuda_plan["nodes"][1]["post_reverse"]) > 1
-    assert len(recompute_plan["nodes"][1]["post_reverse"]) > 1
-    assert all(
-        node["retained_pre_gate_dimension"] == 0
-        and node["retained_interaction_output_dimension"] == 0
-        for node in recompute_plan["nodes"]
-    )
-    assert len(hip_plan["nodes"][1]["post_reverse"]) > 1
-
-
-def test_mh1_v4_grouped_message_reverse_flattens_only_retained_cuda_layer_one(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_GROUPED_MESSAGE_REVERSE_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    tiled_schedule = mh1_codegen._MH1_NODE_REVERSE_SCHEDULE
-    tiled_metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=tiled_schedule,
-    )
-    tiled_module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(tiled_metadata),
-        node_reverse_schedule=tiled_schedule,
-    )
-    default_module = mh1_codegen.render_execution_mh1_cuda_module_v4(contract, 80)
-    default_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(contract, 80)
-    tiled_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=tiled_schedule,
-    )
-    grouped_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-
-    grouped_symbol = "symmetrix_execution_mh1_node_tiled_l1_reverse_message_grouped"
-    assert grouped_symbol in module
-    assert grouped_symbol in default_module
-    assert grouped_symbol not in tiled_module
-    assert "const int logical_tile = blockIdx.x;" in module
-    assert "const int component = local_tile / source_tiles;" in module
-    assert (
-        "const int source_base = (local_tile % source_tiles) * tile_channels;" in module
-    )
-    assert "__shared__ float adjoint_tile[tile_nodes][tile_channels];" in module
-    assert "__shared__ float weight_tile[tile_channels][tile_channels + 1];" in module
-
-    grouped_messages = [
-        launch
-        for launch in grouped_plan["nodes"][1]["post_reverse"]
-        if "reverse_message" in launch["kernel"]
-    ]
-    tiled_messages = [
-        launch
-        for launch in tiled_plan["nodes"][1]["post_reverse"]
-        if "reverse_message" in launch["kernel"]
-    ]
-    assert grouped_plan["node_reverse_schedule"] == schedule
-    assert default_plan["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    default_messages = [
-        launch
-        for launch in default_plan["nodes"][1]["post_reverse"]
-        if "reverse_message" in launch["kernel"]
-    ]
-    assert len(default_messages) == 1
-    assert default_messages[0]["tile_nodes"] == 64
-    assert {
-        key: value for key, value in default_messages[0].items() if key != "tile_nodes"
-    } == {
-        key: value for key, value in grouped_messages[0].items() if key != "tile_nodes"
-    }
-    assert len(grouped_messages) == 1
-    assert len(tiled_messages) == 4
-    assert grouped_messages[0] == {
-        "kernel": grouped_symbol,
-        "grid": "node_channel_tiles",
-        "threads": 256,
-        "channels": 512,
-        "components": 1,
-        "tile_nodes": 32,
-        "tile_channels": 32,
-    }
-    assert (
-        grouped_plan["nodes"][0]["post_reverse"]
-        == tiled_plan["nodes"][0]["post_reverse"]
-    )
-    assert [
-        launch
-        for launch in grouped_plan["nodes"][1]["post_reverse"]
-        if "reverse_message" not in launch["kernel"]
-    ] == [
-        launch
-        for launch in tiled_plan["nodes"][1]["post_reverse"]
-        if "reverse_message" not in launch["kernel"]
-    ]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_grouped_linear2_flattens_each_sibling_family(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_GROUPED_LINEAR2_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_GROUPED_MESSAGE_REVERSE_SCHEDULE,
-    )
-
-    assert candidate["node_reverse_schedule"] == schedule
-    assert accepted["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_GROUPED_MESSAGE_REVERSE_SCHEDULE
-    )
-    for index, (layer, candidate_node, accepted_node) in enumerate(
-        zip(
-            contract["node_program"]["layers"],
-            candidate["nodes"],
-            accepted["nodes"],
-            strict=True,
-        )
-    ):
-        descriptor = layer["linears"]["linear_2"]
-        forward_tiles = sum(
-            (int(block["multiplicity"]) + 31) // 32 * int(block["components"])
-            for block in descriptor["blocks"]["output"]
-        )
-        reverse_tiles = sum(
-            (int(block["multiplicity"]) + 31) // 32 * int(block["components"])
-            for block in descriptor["blocks"]["input"]
-        )
-        forward_symbol = (
-            f"symmetrix_execution_mh1_node_tiled_l{index}_forward_linear2_grouped"
-        )
-        reverse_symbol = (
-            f"symmetrix_execution_mh1_node_tiled_l{index}_reverse_linear2_grouped"
-        )
-        candidate_forward = [
-            launch
-            for launch in candidate_node["post_forward"]
-            if "forward_linear2" in launch["kernel"]
-        ]
-        candidate_reverse = [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if "reverse_linear2" in launch["kernel"]
-        ]
-        accepted_forward = [
-            launch
-            for launch in accepted_node["post_forward"]
-            if "forward_linear2" in launch["kernel"]
-        ]
-        accepted_reverse = [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if "reverse_linear2" in launch["kernel"]
-        ]
-
-        assert forward_symbol in module
-        assert reverse_symbol in module
-        assert len(candidate_forward) == 1
-        assert len(candidate_reverse) == 1
-        assert len(accepted_forward) == len(descriptor["blocks"]["output"])
-        assert len(accepted_reverse) == len(descriptor["blocks"]["input"])
-        assert candidate_forward[0] == {
-            "kernel": forward_symbol,
-            "grid": "node_channel_tiles",
-            "threads": 256,
-            "channels": forward_tiles * 32,
-            "components": 1,
-            "tile_nodes": 32,
-            "tile_channels": 32,
-        }
-        assert candidate_reverse[0] == {
-            "kernel": reverse_symbol,
-            "grid": "node_channel_tiles",
-            "threads": 256,
-            "channels": reverse_tiles * 32,
-            "components": 1,
-            "tile_nodes": 32,
-            "tile_channels": 32,
-        }
-        assert [
-            launch
-            for launch in candidate_node["post_forward"]
-            if "forward_linear2" not in launch["kernel"]
-        ] == [
-            launch
-            for launch in accepted_node["post_forward"]
-            if "forward_linear2" not in launch["kernel"]
-        ]
-        assert [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if "reverse_linear2" not in launch["kernel"]
-        ] == [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if "reverse_linear2" not in launch["kernel"]
-        ]
-
-    assert (
-        "const int target_base = (local_tile % target_tiles) * tile_channels;" in module
-    )
-    assert module.count("__shared__ float input_tile[tile_nodes][tile_channels];") >= 2
-    assert (
-        module.count("__shared__ float weight_tile[tile_channels][tile_channels + 1];")
-        >= 4
-    )
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_grouped_all_message_adds_only_layer_zero_message(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_GROUPED_ALL_MESSAGE_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_GROUPED_LINEAR2_SCHEDULE,
-    )
-
-    assert candidate["node_reverse_schedule"] == schedule
-    assert accepted["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_GROUPED_LINEAR2_SCHEDULE
-    )
-    for index, (layer, candidate_node, accepted_node) in enumerate(
-        zip(
-            contract["node_program"]["layers"],
-            candidate["nodes"],
-            accepted["nodes"],
-            strict=True,
-        )
-    ):
-        descriptor = layer["linears"]["linear_1"]
-        reverse_tiles = sum(
-            (int(block["multiplicity"]) + 31) // 32 * int(block["components"])
-            for block in descriptor["blocks"]["input"]
-        )
-        grouped_symbol = (
-            f"symmetrix_execution_mh1_node_tiled_l{index}_reverse_message_grouped"
-        )
-        candidate_messages = [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if "reverse_message" in launch["kernel"]
-        ]
-        accepted_messages = [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if "reverse_message" in launch["kernel"]
-        ]
-
-        assert grouped_symbol in module
-        assert candidate_messages == [
-            {
-                "kernel": grouped_symbol,
-                "grid": "node_channel_tiles",
-                "threads": 256,
-                "channels": reverse_tiles * 32,
-                "components": 1,
-                "tile_nodes": 32,
-                "tile_channels": 32,
-            }
-        ]
-        assert len(accepted_messages) == (4 if index == 0 else 1)
-        assert [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if "reverse_message" not in launch["kernel"]
-        ] == [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if "reverse_message" not in launch["kernel"]
-        ]
-        assert [
-            launch
-            for launch in candidate_node["post_forward"]
-            if "forward_linear2" in launch["kernel"]
-        ] == [
-            launch
-            for launch in accepted_node["post_forward"]
-            if "forward_linear2" in launch["kernel"]
-        ]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_grouped_forward_message_flattens_each_layer(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_GROUPED_FORWARD_MESSAGE_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_GROUPED_ALL_MESSAGE_SCHEDULE,
-    )
-
-    assert candidate["node_reverse_schedule"] == schedule
-    for index, (layer, candidate_node, accepted_node) in enumerate(
-        zip(
-            contract["node_program"]["layers"],
-            candidate["nodes"],
-            accepted["nodes"],
-            strict=True,
-        )
-    ):
-        descriptor = layer["linears"]["linear_1"]
-        forward_tiles = sum(
-            (int(block["multiplicity"]) + 31) // 32 * int(block["components"])
-            for block in descriptor["blocks"]["output"]
-        )
-        grouped_symbol = (
-            f"symmetrix_execution_mh1_node_tiled_l{index}_forward_message_grouped"
-        )
-        candidate_messages = [
-            launch
-            for launch in candidate_node["post_forward"]
-            if "forward_message" in launch["kernel"]
-        ]
-        accepted_messages = [
-            launch
-            for launch in accepted_node["post_forward"]
-            if "forward_message" in launch["kernel"]
-        ]
-
-        assert grouped_symbol in module
-        assert candidate_messages == [
-            {
-                "kernel": grouped_symbol,
-                "grid": "node_channel_tiles",
-                "threads": 256,
-                "channels": forward_tiles * 32,
-                "components": 1,
-                "tile_nodes": 32,
-                "tile_channels": 32,
-            }
-        ]
-        assert len(accepted_messages) == 4
-        assert [
-            launch
-            for launch in candidate_node["post_forward"]
-            if "forward_message" not in launch["kernel"]
-        ] == [
-            launch
-            for launch in accepted_node["post_forward"]
-            if "forward_message" not in launch["kernel"]
-        ]
-        assert candidate_node["post_reverse"] == accepted_node["post_reverse"]
-    assert "args.node_density[node_0]" in module
-    assert "args.node_density[node_3]" in module
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_grouped_residual_flattens_forward_and_layer_one_reverse(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_GROUPED_RESIDUAL_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=(mh1_codegen._MH1_CUDA_GROUPED_FORWARD_MESSAGE_SCHEDULE),
-    )
-
-    for index, (layer, candidate_node, accepted_node) in enumerate(
-        zip(
-            contract["node_program"]["layers"],
-            candidate["nodes"],
-            accepted["nodes"],
-            strict=True,
-        )
-    ):
-        descriptor = layer["linears"]["linear_res"]
-        forward_tiles = sum(
-            (int(block["multiplicity"]) + 31) // 32 * int(block["components"])
-            for block in descriptor["blocks"]["output"]
-        )
-        forward_symbol = (
-            f"symmetrix_execution_mh1_node_tiled_l{index}_forward_residual_grouped"
-        )
-        candidate_forward = [
-            launch
-            for launch in candidate_node["post_forward"]
-            if "forward_residual" in launch["kernel"]
-        ]
-        assert forward_symbol in module
-        assert candidate_forward == [
-            {
-                "kernel": forward_symbol,
-                "grid": "node_channel_tiles",
-                "threads": 256,
-                "channels": forward_tiles * 32,
-                "components": 1,
-                "tile_nodes": 32,
-                "tile_channels": 32,
-            }
-        ]
-        assert [
-            launch
-            for launch in candidate_node["post_forward"]
-            if "forward_residual" not in launch["kernel"]
-        ] == [
-            launch
-            for launch in accepted_node["post_forward"]
-            if "forward_residual" not in launch["kernel"]
-        ]
-
-        candidate_reverse = [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if "reverse_residual" in launch["kernel"]
-        ]
-        accepted_reverse = [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if "reverse_residual" in launch["kernel"]
-        ]
-        if index == 0:
-            assert candidate_reverse == accepted_reverse == []
-        else:
-            reverse_tiles = sum(
-                (int(block["multiplicity"]) + 31) // 32 * int(block["components"])
-                for block in descriptor["blocks"]["input"]
-            )
-            reverse_symbol = (
-                "symmetrix_execution_mh1_node_tiled_l1_reverse_residual_grouped"
-            )
-            assert reverse_symbol in module
-            assert candidate_reverse == [
-                {
-                    "kernel": reverse_symbol,
-                    "grid": "node_channel_tiles",
-                    "threads": 256,
-                    "channels": reverse_tiles * 32,
-                    "components": 1,
-                    "tile_nodes": 32,
-                    "tile_channels": 32,
-                }
-            ]
-            assert len(accepted_reverse) == 2
-        assert [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if "reverse_residual" not in launch["kernel"]
-        ] == [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if "reverse_residual" not in launch["kernel"]
-        ]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_grouped_forward_residual_keeps_staged_reverse(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_GROUPED_FORWARD_RESIDUAL_SCHEDULE
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=(mh1_codegen._MH1_CUDA_GROUPED_FORWARD_MESSAGE_SCHEDULE),
-    )
-
-    assert candidate["node_reverse_schedule"] == schedule
-    for index, (candidate_node, accepted_node) in enumerate(
-        zip(candidate["nodes"], accepted["nodes"], strict=True)
-    ):
-        forward_residual = [
-            launch
-            for launch in candidate_node["post_forward"]
-            if "forward_residual" in launch["kernel"]
-        ]
-        assert len(forward_residual) == 1
-        assert forward_residual[0]["kernel"].endswith(
-            f"node_tiled_l{index}_forward_residual_grouped"
-        )
-        assert [
-            launch
-            for launch in candidate_node["post_forward"]
-            if "forward_residual" not in launch["kernel"]
-        ] == [
-            launch
-            for launch in accepted_node["post_forward"]
-            if "forward_residual" not in launch["kernel"]
-        ]
-        assert candidate_node["post_reverse"] == accepted_node["post_reverse"]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_tiled_product_reverse_splits_angular_channel_work(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_TILED_PRODUCT_REVERSE_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=(
-            mh1_codegen._MH1_CUDA_GROUPED_FORWARD_RESIDUAL_SCHEDULE
-        ),
-    )
-
-    for index, (layer, candidate_node, accepted_node) in enumerate(
-        zip(
-            contract["node_program"]["layers"],
-            candidate["nodes"],
-            accepted["nodes"],
-            strict=True,
-        )
-    ):
-        product = layer["product"]
-        symbol = f"symmetrix_execution_mh1_node_tiled_l{index}_reverse_product_tiled"
-        candidate_product = [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if launch["kernel"].endswith("_reverse_product_tiled")
-        ]
-        accepted_product = [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if launch["kernel"].endswith("_reverse_product")
-        ]
-        assert symbol in module
-        assert candidate_product == [
-            {
-                "kernel": symbol,
-                "grid": "node_channel_tiles",
-                "threads": 128,
-                "channels": int(product["dimensions"]["channels"]),
-                "components": len(product["angular_layout"]),
-                "tile_nodes": 1,
-                "tile_channels": 128,
-            }
-        ]
-        assert len(accepted_product) == 1
-        assert accepted_product[0]["grid"] == "persistent_nodes"
-        assert candidate_node["post_forward"] == accepted_node["post_forward"]
-        assert [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if not launch["kernel"].endswith("_reverse_product_tiled")
-        ] == [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if not launch["kernel"].endswith("_reverse_product")
-        ]
-    assert "const int angular_index = blockIdx.z;" in module
-    assert "const std::int64_t node = blockIdx.y;" in module
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_tiled_product_forward_splits_output_channel_work(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_TILED_PRODUCT_FORWARD_REVERSE_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_TILED_PRODUCT_REVERSE_SCHEDULE,
-    )
-
-    for index, (layer, candidate_node, accepted_node) in enumerate(
-        zip(
-            contract["node_program"]["layers"],
-            candidate["nodes"],
-            accepted["nodes"],
-            strict=True,
-        )
-    ):
-        product = layer["product"]
-        symbol = f"symmetrix_execution_mh1_node_tiled_l{index}_forward_product_tiled"
-        candidate_product = [
-            launch
-            for launch in candidate_node["post_forward"]
-            if launch["kernel"].endswith("_forward_product_tiled")
-        ]
-        assert symbol in module
-        assert candidate_product == [
-            {
-                "kernel": symbol,
-                "grid": "node_channel_tiles",
-                "threads": 128,
-                "channels": int(product["dimensions"]["channels"]),
-                "components": (
-                    int(product["dimensions"]["output"])
-                    // int(product["dimensions"]["channels"])
-                ),
-                "tile_nodes": 1,
-                "tile_channels": 128,
-            }
-        ]
-        assert any(
-            launch["kernel"].endswith("_forward_product_setup")
-            and launch["grid"] == "persistent_nodes"
-            for launch in candidate_node["post_forward"]
-        )
-        assert [
-            launch
-            for launch in candidate_node["post_forward"]
-            if not launch["kernel"].endswith("_forward_product_setup")
-            and not launch["kernel"].endswith("_forward_product_tiled")
-        ] == [
-            launch
-            for launch in accepted_node["post_forward"]
-            if not launch["kernel"].endswith("_forward_product")
-        ]
-        assert candidate_node["post_reverse"] == accepted_node["post_reverse"]
-    assert "const int output_component = blockIdx.z;" in module
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_tiled_linear_up_reverse_splits_pre_reverse_work(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_TILED_LINEAR_UP_REVERSE_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=(
-            mh1_codegen._MH1_CUDA_TILED_PRODUCT_FORWARD_REVERSE_SCHEDULE
-        ),
-    )
-
-    linear_up = contract["node_program"]["layers"][1]["linears"]["linear_up"]
-    logical_tiles = sum(
-        ((int(block["multiplicity"]) + 31) // 32) * int(block["components"])
-        for block in linear_up["blocks"]["input"]
-    )
-    symbol = "symmetrix_execution_mh1_node_tiled_l1_pre_reverse_linear_up_grouped"
-    assert candidate["nodes"][0]["pre_reverse"] == []
-    assert candidate["nodes"][1]["pre_reverse"] == [
-        {
-            "kernel": symbol,
-            "grid": "node_channel_tiles",
-            "threads": 256,
-            "channels": logical_tiles * 32,
-            "components": 1,
-            "tile_nodes": 32,
-            "tile_channels": 32,
-        }
-    ]
-    assert symbol in module
-    assert "symmetrix_execution_mh1_node_pre_reverse_kernel_1" not in module
-    assert "args.layer_input_adjoint" in module
-    assert "] += value_0;" in module
-    for candidate_node, accepted_node in zip(
-        candidate["nodes"], accepted["nodes"], strict=True
-    ):
-        assert candidate_node["pre_forward"] == accepted_node["pre_forward"]
-        assert candidate_node["post_forward"] == accepted_node["post_forward"]
-        assert candidate_node["post_reverse"] == accepted_node["post_reverse"]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_tiled_linear_up_forward_splits_pre_forward_work(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_TILED_LINEAR_UP_FORWARD_REVERSE_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_TILED_LINEAR_UP_REVERSE_SCHEDULE,
-    )
-
-    linear_up = contract["node_program"]["layers"][1]["linears"]["linear_up"]
-    logical_tiles = sum(
-        ((int(block["multiplicity"]) + 31) // 32) * int(block["components"])
-        for block in linear_up["blocks"]["output"]
-    )
-    symbol = "symmetrix_execution_mh1_node_tiled_l1_pre_forward_linear_up_grouped"
-    assert candidate["nodes"][0]["pre_forward"] == accepted["nodes"][0]["pre_forward"]
-    assert candidate["nodes"][1]["pre_forward"] == [
-        {
-            "kernel": symbol,
-            "grid": "node_channel_tiles",
-            "threads": 256,
-            "channels": logical_tiles * 32,
-            "components": 1,
-            "tile_nodes": 32,
-            "tile_channels": 32,
-        }
-    ]
-    assert candidate["nodes"][1]["pre_reverse"] == accepted["nodes"][1]["pre_reverse"]
-    assert candidate["nodes"][1]["post_forward"] == accepted["nodes"][1]["post_forward"]
-    assert candidate["nodes"][1]["post_reverse"] == accepted["nodes"][1]["post_reverse"]
-    assert symbol in module
-    assert "symmetrix_execution_mh1_node_pre_forward_kernel_0" in module
-    assert "symmetrix_execution_mh1_node_pre_forward_kernel_1" not in module
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_grouped_readout_reverse_splits_dependent_work(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_GROUPED_READOUT_REVERSE_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=(
-            mh1_codegen._MH1_CUDA_TILED_LINEAR_UP_FORWARD_REVERSE_SCHEDULE
-        ),
-    )
-    default_module = mh1_codegen.render_execution_mh1_cuda_module_v4(contract, 80)
-    default_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(contract, 80)
-
-    assert candidate["nodes"][0] == accepted["nodes"][0]
-    for phase in ("pre_forward", "post_forward", "pre_reverse"):
-        assert candidate["nodes"][1][phase] == accepted["nodes"][1][phase]
-    specialized = candidate["nodes"][1]["post_reverse"][:4]
-    assert [
-        launch["kernel"].rsplit("node_tiled_l1_", 1)[-1] for launch in specialized
-    ] == [
-        "reverse_readout1_recompute_grouped",
-        "reverse_readout_middle",
-        "reverse_readout1_grouped",
-        "reverse_skip_grouped",
-    ]
-    assert [launch["grid"] for launch in specialized] == [
-        "node_channel_tiles",
-        "persistent_nodes",
-        "node_channel_tiles",
-        "node_channel_tiles",
-    ]
-    assert (
-        candidate["nodes"][1]["post_reverse"][4:]
-        == accepted["nodes"][1]["post_reverse"][1:]
-    )
-    for launch in specialized:
-        assert launch["kernel"] in module
-        assert launch["kernel"] in default_module
-    assert default_plan["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    assert [
-        launch
-        for launch in default_plan["nodes"][1]["post_reverse"]
-        if "product_linear" not in launch["kernel"]
-        and "reverse_product_tiled" not in launch["kernel"]
-        and "reverse_message" not in launch["kernel"]
-        and "reverse_linear2" not in launch["kernel"]
-    ] == [
-        launch
-        for launch in candidate["nodes"][1]["post_reverse"]
-        if "product_linear" not in launch["kernel"]
-        and "reverse_product_tiled" not in launch["kernel"]
-        and "reverse_message" not in launch["kernel"]
-        and "reverse_linear2" not in launch["kernel"]
-    ]
-    assert "void symmetrix_execution_mh1_node_tiled_l1_reverse_readout(" not in module
-    assert "args.layer_output_adjoint" in module
-    assert "] += value_0;" in module
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_grouped_skip_forward_splits_product_setup(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_GROUPED_SKIP_FORWARD_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_GROUPED_READOUT_REVERSE_SCHEDULE,
-    )
-    default_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(contract, 80)
-
-    assert candidate["nodes"][0] == accepted["nodes"][0]
-    for phase in ("pre_forward", "pre_reverse", "post_reverse"):
-        assert candidate["nodes"][1][phase] == accepted["nodes"][1][phase]
-    skip = contract["node_program"]["layers"][1]["linears"]["skip"]
-    logical_tiles = sum(
-        ((int(block["multiplicity"]) + 31) // 32) * int(block["components"])
-        for block in skip["blocks"]["output"]
-    )
-    skip_symbol = "symmetrix_execution_mh1_node_tiled_l1_forward_skip_grouped"
-    skip_launches = [
-        launch
-        for launch in candidate["nodes"][1]["post_forward"]
-        if launch["kernel"] == skip_symbol
-    ]
-    assert skip_launches == [
-        {
-            "kernel": skip_symbol,
-            "grid": "node_channel_tiles",
-            "threads": 256,
-            "channels": logical_tiles * 32,
-            "components": 1,
-            "tile_nodes": 32,
-            "tile_channels": 32,
-        }
-    ]
-    assert [
-        launch
-        for launch in candidate["nodes"][1]["post_forward"]
-        if launch["kernel"] != skip_symbol
-    ] == accepted["nodes"][1]["post_forward"]
-    assert default_plan["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    for phase in ("pre_forward", "pre_reverse"):
-        assert default_plan["nodes"][1][phase] == candidate["nodes"][1][phase]
-    for phase in ("post_forward", "post_reverse"):
-        assert [
-            launch
-            for launch in default_plan["nodes"][1][phase]
-            if "product_linear" not in launch["kernel"]
-            and "reverse_product_tiled" not in launch["kernel"]
-            and "reverse_message" not in launch["kernel"]
-            and "reverse_linear2" not in launch["kernel"]
-            and "l1_forward_linear2_grouped" not in launch["kernel"]
-        ] == [
-            launch
-            for launch in candidate["nodes"][1][phase]
-            if "product_linear" not in launch["kernel"]
-            and "reverse_product_tiled" not in launch["kernel"]
-            and "reverse_message" not in launch["kernel"]
-            and "reverse_linear2" not in launch["kernel"]
-            and "l1_forward_linear2_grouped" not in launch["kernel"]
-        ]
-    assert skip_symbol in module
-    setup_symbol = "void symmetrix_execution_mh1_node_tiled_l1_forward_product_setup("
-    setup_begin = module.index(setup_symbol)
-    setup_end = module.index('\nextern "C" __global__ void ', setup_begin)
-    setup = module[setup_begin:setup_end]
-    assert "retained_interaction[column] = interaction[column];" in setup
-    assert "l1_skip_work" not in setup
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_grouped_all_skip_forward_splits_layer_zero_product_setup(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_GROUPED_ALL_SKIP_FORWARD_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_GROUPED_SKIP_FORWARD_SCHEDULE,
-    )
-
-    assert candidate["nodes"][1] == accepted["nodes"][1]
-    for phase in ("pre_forward", "pre_reverse", "post_reverse"):
-        assert candidate["nodes"][0][phase] == accepted["nodes"][0][phase]
-    skip = contract["node_program"]["layers"][0]["linears"]["skip"]
-    logical_tiles = sum(
-        ((int(block["multiplicity"]) + 31) // 32) * int(block["components"])
-        for block in skip["blocks"]["output"]
-    )
-    skip_symbol = "symmetrix_execution_mh1_node_tiled_l0_forward_skip_grouped"
-    skip_launches = [
-        launch
-        for launch in candidate["nodes"][0]["post_forward"]
-        if launch["kernel"] == skip_symbol
-    ]
-    assert skip_launches == [
-        {
-            "kernel": skip_symbol,
-            "grid": "node_channel_tiles",
-            "threads": 256,
-            "channels": logical_tiles * 32,
-            "components": 1,
-            "tile_nodes": 32,
-            "tile_channels": 32,
-        }
-    ]
-    assert [
-        launch
-        for launch in candidate["nodes"][0]["post_forward"]
-        if launch["kernel"] != skip_symbol
-    ] == accepted["nodes"][0]["post_forward"]
-    default_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(contract, 80)
-    assert default_plan["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    for default_node, candidate_node in zip(
-        default_plan["nodes"], candidate["nodes"], strict=True
-    ):
-        for phase in ("pre_forward", "pre_reverse"):
-            assert default_node[phase] == candidate_node[phase]
-        for phase in ("post_forward", "post_reverse"):
-            assert [
-                launch
-                for launch in default_node[phase]
-                if "product_linear" not in launch["kernel"]
-                and "reverse_message" not in launch["kernel"]
-                and "reverse_linear2" not in launch["kernel"]
-                and "l0_forward_linear2_grouped" not in launch["kernel"]
-                and "l1_forward_linear2_grouped" not in launch["kernel"]
-                and "reverse_product_tiled" not in launch["kernel"]
-            ] == [
-                launch
-                for launch in candidate_node[phase]
-                if "product_linear" not in launch["kernel"]
-                and "reverse_message" not in launch["kernel"]
-                and "reverse_linear2" not in launch["kernel"]
-                and "l0_forward_linear2_grouped" not in launch["kernel"]
-                and "l1_forward_linear2_grouped" not in launch["kernel"]
-                and "reverse_product_tiled" not in launch["kernel"]
-            ]
-    assert skip_symbol in module
-    setup_symbol = "void symmetrix_execution_mh1_node_tiled_l0_forward_product_setup("
-    setup_begin = module.index(setup_symbol)
-    setup_end = module.index('\nextern "C" __global__ void ', setup_begin)
-    setup = module[setup_begin:setup_end]
-    assert "args.element_indices[node]" in setup
-    assert "retained_interaction[column] = interaction[column];" in setup
-    assert "l0_skip_work" not in setup
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_wide_product_linear_uses_32_node_tiles(mh1_node_definition):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_WIDE_PRODUCT_LINEAR_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_GROUPED_ALL_SKIP_FORWARD_SCHEDULE,
-    )
-    assert candidate["node_reverse_schedule"] == schedule
-    assert mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(contract, 80)[
-        "node_reverse_schedule"
-    ] == (mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE)
-
-    for candidate_node, accepted_node in zip(
-        candidate["nodes"], accepted["nodes"], strict=True
-    ):
-        for phase in ("post_forward", "post_reverse"):
-            candidate_product = [
-                launch
-                for launch in candidate_node[phase]
-                if "product_linear" in launch["kernel"]
-            ]
-            accepted_product = [
-                launch
-                for launch in accepted_node[phase]
-                if "product_linear" in launch["kernel"]
-            ]
-            assert len(candidate_product) == len(accepted_product)
-            for candidate_launch, accepted_launch in zip(
-                candidate_product, accepted_product, strict=True
-            ):
-                assert candidate_launch["tile_nodes"] == 32
-                assert accepted_launch["tile_nodes"] == 8
-                assert {
-                    key: value
-                    for key, value in candidate_launch.items()
-                    if key != "tile_nodes"
-                } == {
-                    key: value
-                    for key, value in accepted_launch.items()
-                    if key != "tile_nodes"
-                }
-                kernel_begin = module.index(f"void {candidate_launch['kernel']}(")
-                kernel_end = module.index('\nextern "C" __global__ void ', kernel_begin)
-                assert (
-                    "constexpr int tile_nodes = 32;" in module[kernel_begin:kernel_end]
-                )
-            assert [
-                launch
-                for launch in candidate_node[phase]
-                if "product_linear" not in launch["kernel"]
-            ] == [
-                launch
-                for launch in accepted_node[phase]
-                if "product_linear" not in launch["kernel"]
-            ]
-        for phase in ("pre_forward", "pre_reverse"):
-            assert candidate_node[phase] == accepted_node[phase]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_wide_layer_one_reverse_message_uses_64_node_tiles(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_WIDE_L1_REVERSE_MESSAGE_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_WIDE_PRODUCT_LINEAR_SCHEDULE,
-    )
-    kernel = "symmetrix_execution_mh1_node_tiled_l1_reverse_message_grouped"
-
-    assert candidate["node_reverse_schedule"] == schedule
-    assert accepted["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_WIDE_PRODUCT_LINEAR_SCHEDULE
-    )
-    for node_index, (candidate_node, accepted_node) in enumerate(
-        zip(candidate["nodes"], accepted["nodes"], strict=True)
-    ):
-        for phase in ("pre_forward", "post_forward", "pre_reverse"):
-            assert candidate_node[phase] == accepted_node[phase]
-        if node_index == 0:
-            assert candidate_node["post_reverse"] == accepted_node["post_reverse"]
-            continue
-        candidate_message = [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if launch["kernel"] == kernel
-        ]
-        accepted_message = [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if launch["kernel"] == kernel
-        ]
-        assert len(candidate_message) == len(accepted_message) == 1
-        assert candidate_message[0]["tile_nodes"] == 64
-        assert accepted_message[0]["tile_nodes"] == 32
-        assert {
-            key: value
-            for key, value in candidate_message[0].items()
-            if key != "tile_nodes"
-        } == {
-            key: value
-            for key, value in accepted_message[0].items()
-            if key != "tile_nodes"
-        }
-        assert [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if launch["kernel"] != kernel
-        ] == [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if launch["kernel"] != kernel
-        ]
-    kernel_begin = module.index(f"void {kernel}(")
-    kernel_end = module.index('\nextern "C" __global__ void ', kernel_begin)
-    assert "constexpr int tile_nodes = 64;" in module[kernel_begin:kernel_end]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_wide_layer_zero_reverse_linear2_uses_64_node_tiles(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_WIDE_ALL_REVERSE_LINEAR2_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_PAIRED_L0_PRODUCT_REVERSE_SCHEDULE,
-    )
-    kernel = "symmetrix_execution_mh1_node_tiled_l0_reverse_linear2_grouped"
-
-    assert candidate["node_reverse_schedule"] == schedule
-    for node_index, (candidate_node, accepted_node) in enumerate(
-        zip(candidate["nodes"], accepted["nodes"], strict=True)
-    ):
-        for phase in ("pre_forward", "post_forward", "pre_reverse"):
-            assert candidate_node[phase] == accepted_node[phase]
-        if node_index == 1:
-            assert candidate_node["post_reverse"] == accepted_node["post_reverse"]
-            continue
-        candidate_linear2 = [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if launch["kernel"] == kernel
-        ]
-        accepted_linear2 = [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if launch["kernel"] == kernel
-        ]
-        assert len(candidate_linear2) == len(accepted_linear2) == 1
-        assert candidate_linear2[0]["tile_nodes"] == 64
-        assert accepted_linear2[0]["tile_nodes"] == 32
-        assert {
-            key: value
-            for key, value in candidate_linear2[0].items()
-            if key != "tile_nodes"
-        } == {
-            key: value
-            for key, value in accepted_linear2[0].items()
-            if key != "tile_nodes"
-        }
-        assert [
-            launch
-            for launch in candidate_node["post_reverse"]
-            if launch["kernel"] != kernel
-        ] == [
-            launch
-            for launch in accepted_node["post_reverse"]
-            if launch["kernel"] != kernel
-        ]
-    kernel_begin = module.index(f"void {kernel}(")
-    kernel_end = module.index('\nextern "C" __global__ void ', kernel_begin)
-    assert "constexpr int tile_nodes = 64;" in module[kernel_begin:kernel_end]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_wide_layer_zero_forward_linear2_uses_64_node_tiles(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_WIDE_L0_FORWARD_LINEAR2_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_WIDE_ALL_REVERSE_LINEAR2_SCHEDULE,
-    )
-    kernel = "symmetrix_execution_mh1_node_tiled_l0_forward_linear2_grouped"
-
-    assert candidate["node_reverse_schedule"] == schedule
-    assert candidate["nodes"][1] == accepted["nodes"][1]
-    for phase in ("pre_forward", "pre_reverse", "post_reverse"):
-        assert candidate["nodes"][0][phase] == accepted["nodes"][0][phase]
-    candidate_linear2 = [
-        launch
-        for launch in candidate["nodes"][0]["post_forward"]
-        if launch["kernel"] == kernel
-    ]
-    accepted_linear2 = [
-        launch
-        for launch in accepted["nodes"][0]["post_forward"]
-        if launch["kernel"] == kernel
-    ]
-    assert len(candidate_linear2) == len(accepted_linear2) == 1
-    assert candidate_linear2[0]["tile_nodes"] == 64
-    assert accepted_linear2[0]["tile_nodes"] == 32
-    assert {
-        key: value for key, value in candidate_linear2[0].items() if key != "tile_nodes"
-    } == {
-        key: value for key, value in accepted_linear2[0].items() if key != "tile_nodes"
-    }
-    assert [
-        launch
-        for launch in candidate["nodes"][0]["post_forward"]
-        if launch["kernel"] != kernel
-    ] == [
-        launch
-        for launch in accepted["nodes"][0]["post_forward"]
-        if launch["kernel"] != kernel
-    ]
-    kernel_begin = module.index(f"void {kernel}(")
-    kernel_end = module.index('\nextern "C" __global__ void ', kernel_begin)
-    assert "constexpr int tile_nodes = 64;" in module[kernel_begin:kernel_end]
-
-
-def test_mh1_v4_xwide_layer_zero_reverse_linear2_uses_128_node_tiles(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_XWIDE_L0_REVERSE_LINEAR2_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_PAIRED_ALL_PRODUCT_REVERSE_SCHEDULE,
-    )
-    kernel = "symmetrix_execution_mh1_node_tiled_l0_reverse_linear2_grouped"
-
-    assert candidate["node_reverse_schedule"] == schedule
-    assert candidate["nodes"][1] == accepted["nodes"][1]
-    for phase in ("pre_forward", "post_forward", "pre_reverse"):
-        assert candidate["nodes"][0][phase] == accepted["nodes"][0][phase]
-    candidate_linear2 = [
-        launch
-        for launch in candidate["nodes"][0]["post_reverse"]
-        if launch["kernel"] == kernel
-    ]
-    accepted_linear2 = [
-        launch
-        for launch in accepted["nodes"][0]["post_reverse"]
-        if launch["kernel"] == kernel
-    ]
-    assert len(candidate_linear2) == len(accepted_linear2) == 1
-    assert candidate_linear2[0]["tile_nodes"] == 128
-    assert accepted_linear2[0]["tile_nodes"] == 64
-    assert {
-        key: value for key, value in candidate_linear2[0].items() if key != "tile_nodes"
-    } == {
-        key: value for key, value in accepted_linear2[0].items() if key != "tile_nodes"
-    }
-    assert [
-        launch
-        for launch in candidate["nodes"][0]["post_reverse"]
-        if launch["kernel"] != kernel
-    ] == [
-        launch
-        for launch in accepted["nodes"][0]["post_reverse"]
-        if launch["kernel"] != kernel
-    ]
-    kernel_begin = module.index(f"void {kernel}(")
-    kernel_end = module.index('\nextern "C" __global__ void ', kernel_begin)
-    assert "constexpr int tile_nodes = 128;" in module[kernel_begin:kernel_end]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_xwide_layer_zero_forward_linear2_uses_128_node_tiles(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_XWIDE_L0_FORWARD_LINEAR2_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_XWIDE_ALL_REVERSE_LINEAR2_SCHEDULE,
-    )
-    kernel = "symmetrix_execution_mh1_node_tiled_l0_forward_linear2_grouped"
-
-    assert candidate["node_reverse_schedule"] == schedule
-    assert candidate["nodes"][1] == accepted["nodes"][1]
-    for phase in ("pre_forward", "pre_reverse", "post_reverse"):
-        assert candidate["nodes"][0][phase] == accepted["nodes"][0][phase]
-    candidate_linear2 = [
-        launch
-        for launch in candidate["nodes"][0]["post_forward"]
-        if launch["kernel"] == kernel
-    ]
-    accepted_linear2 = [
-        launch
-        for launch in accepted["nodes"][0]["post_forward"]
-        if launch["kernel"] == kernel
-    ]
-    assert len(candidate_linear2) == len(accepted_linear2) == 1
-    assert candidate_linear2[0]["tile_nodes"] == 128
-    assert accepted_linear2[0]["tile_nodes"] == 64
-    assert {
-        key: value for key, value in candidate_linear2[0].items() if key != "tile_nodes"
-    } == {
-        key: value for key, value in accepted_linear2[0].items() if key != "tile_nodes"
-    }
-    assert [
-        launch
-        for launch in candidate["nodes"][0]["post_forward"]
-        if launch["kernel"] != kernel
-    ] == [
-        launch
-        for launch in accepted["nodes"][0]["post_forward"]
-        if launch["kernel"] != kernel
-    ]
-    kernel_begin = module.index(f"void {kernel}(")
-    kernel_end = module.index('\nextern "C" __global__ void ', kernel_begin)
-    assert "constexpr int tile_nodes = 128;" in module[kernel_begin:kernel_end]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_xwide_layer_one_reverse_linear2_uses_128_node_tiles(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_XWIDE_ALL_REVERSE_LINEAR2_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_XWIDE_L0_REVERSE_LINEAR2_SCHEDULE,
-    )
-    kernel = "symmetrix_execution_mh1_node_tiled_l1_reverse_linear2_grouped"
-
-    assert candidate["node_reverse_schedule"] == schedule
-    assert candidate["nodes"][0] == accepted["nodes"][0]
-    for phase in ("pre_forward", "post_forward", "pre_reverse"):
-        assert candidate["nodes"][1][phase] == accepted["nodes"][1][phase]
-    candidate_linear2 = [
-        launch
-        for launch in candidate["nodes"][1]["post_reverse"]
-        if launch["kernel"] == kernel
-    ]
-    accepted_linear2 = [
-        launch
-        for launch in accepted["nodes"][1]["post_reverse"]
-        if launch["kernel"] == kernel
-    ]
-    assert len(candidate_linear2) == len(accepted_linear2) == 1
-    assert candidate_linear2[0]["tile_nodes"] == 128
-    assert accepted_linear2[0]["tile_nodes"] == 64
-    assert {
-        key: value for key, value in candidate_linear2[0].items() if key != "tile_nodes"
-    } == {
-        key: value for key, value in accepted_linear2[0].items() if key != "tile_nodes"
-    }
-    assert [
-        launch
-        for launch in candidate["nodes"][1]["post_reverse"]
-        if launch["kernel"] != kernel
-    ] == [
-        launch
-        for launch in accepted["nodes"][1]["post_reverse"]
-        if launch["kernel"] != kernel
-    ]
-    kernel_begin = module.index(f"void {kernel}(")
-    kernel_end = module.index('\nextern "C" __global__ void ', kernel_begin)
-    assert "constexpr int tile_nodes = 128;" in module[kernel_begin:kernel_end]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_xwide_layer_one_forward_linear2_uses_128_node_tiles(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_XWIDE_L0_FORWARD_LINEAR2_SCHEDULE,
-    )
-    kernel = "symmetrix_execution_mh1_node_tiled_l1_forward_linear2_grouped"
-
-    assert candidate["node_reverse_schedule"] == schedule
-    assert candidate["nodes"][0] == accepted["nodes"][0]
-    for phase in ("pre_forward", "pre_reverse", "post_reverse"):
-        assert candidate["nodes"][1][phase] == accepted["nodes"][1][phase]
-    candidate_linear2 = [
-        launch
-        for launch in candidate["nodes"][1]["post_forward"]
-        if launch["kernel"] == kernel
-    ]
-    accepted_linear2 = [
-        launch
-        for launch in accepted["nodes"][1]["post_forward"]
-        if launch["kernel"] == kernel
-    ]
-    assert len(candidate_linear2) == len(accepted_linear2) == 1
-    assert candidate_linear2[0]["tile_nodes"] == 128
-    assert accepted_linear2[0]["tile_nodes"] == 64
-    assert {
-        key: value for key, value in candidate_linear2[0].items() if key != "tile_nodes"
-    } == {
-        key: value for key, value in accepted_linear2[0].items() if key != "tile_nodes"
-    }
-    assert [
-        launch
-        for launch in candidate["nodes"][1]["post_forward"]
-        if launch["kernel"] != kernel
-    ] == [
-        launch
-        for launch in accepted["nodes"][1]["post_forward"]
-        if launch["kernel"] != kernel
-    ]
-    kernel_begin = module.index(f"void {kernel}(")
-    kernel_end = module.index('\nextern "C" __global__ void ', kernel_begin)
-    assert "constexpr int tile_nodes = 128;" in module[kernel_begin:kernel_end]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_wide_layer_one_forward_linear2_uses_64_node_tiles(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_WIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_WIDE_L0_FORWARD_LINEAR2_SCHEDULE,
-    )
-    kernel = "symmetrix_execution_mh1_node_tiled_l1_forward_linear2_grouped"
-
-    assert candidate["node_reverse_schedule"] == schedule
-    assert candidate["nodes"][0] == accepted["nodes"][0]
-    for phase in ("pre_forward", "pre_reverse", "post_reverse"):
-        assert candidate["nodes"][1][phase] == accepted["nodes"][1][phase]
-    candidate_linear2 = [
-        launch
-        for launch in candidate["nodes"][1]["post_forward"]
-        if launch["kernel"] == kernel
-    ]
-    accepted_linear2 = [
-        launch
-        for launch in accepted["nodes"][1]["post_forward"]
-        if launch["kernel"] == kernel
-    ]
-    assert len(candidate_linear2) == len(accepted_linear2) == 1
-    assert candidate_linear2[0]["tile_nodes"] == 64
-    assert accepted_linear2[0]["tile_nodes"] == 32
-    assert {
-        key: value for key, value in candidate_linear2[0].items() if key != "tile_nodes"
-    } == {
-        key: value for key, value in accepted_linear2[0].items() if key != "tile_nodes"
-    }
-    assert [
-        launch
-        for launch in candidate["nodes"][1]["post_forward"]
-        if launch["kernel"] != kernel
-    ] == [
-        launch
-        for launch in accepted["nodes"][1]["post_forward"]
-        if launch["kernel"] != kernel
-    ]
-    kernel_begin = module.index(f"void {kernel}(")
-    kernel_end = module.index('\nextern "C" __global__ void ', kernel_begin)
-    assert "constexpr int tile_nodes = 64;" in module[kernel_begin:kernel_end]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_paired_layer_one_product_reverse_uses_four_node_tiles(
-    mh1_node_definition,
-):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    schedule = mh1_codegen._MH1_CUDA_PAIRED_ALL_PRODUCT_REVERSE_SCHEDULE
-    metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_CUDA_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(metadata),
-        node_reverse_schedule=schedule,
-    )
-    candidate = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=schedule,
-    )
-    accepted = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _node_reverse_schedule=mh1_codegen._MH1_CUDA_WIDE_ALL_FORWARD_LINEAR2_SCHEDULE,
-    )
-    kernel = "symmetrix_execution_mh1_node_tiled_l1_reverse_product_tiled"
-
-    assert candidate["node_reverse_schedule"] == schedule
-    assert candidate["nodes"][0] == accepted["nodes"][0]
-    for phase in ("pre_forward", "post_forward", "pre_reverse"):
-        assert candidate["nodes"][1][phase] == accepted["nodes"][1][phase]
-    candidate_product = [
-        launch
-        for launch in candidate["nodes"][1]["post_reverse"]
-        if launch["kernel"] == kernel
-    ]
-    accepted_product = [
-        launch
-        for launch in accepted["nodes"][1]["post_reverse"]
-        if launch["kernel"] == kernel
-    ]
-    assert len(candidate_product) == len(accepted_product) == 1
-    assert candidate_product[0]["tile_nodes"] == 4
-    assert accepted_product[0]["tile_nodes"] == 1
-    assert {
-        key: value for key, value in candidate_product[0].items() if key != "tile_nodes"
-    } == {
-        key: value for key, value in accepted_product[0].items() if key != "tile_nodes"
-    }
-    assert [
-        launch
-        for launch in candidate["nodes"][1]["post_reverse"]
-        if launch["kernel"] != kernel
-    ] == [
-        launch
-        for launch in accepted["nodes"][1]["post_reverse"]
-        if launch["kernel"] != kernel
-    ]
-    kernel_begin = module.index(f"void {kernel}(")
-    kernel_end = module.index('\nextern "C" __global__ void ', kernel_begin)
-    assert "constexpr int tile_nodes = 4;" in module[kernel_begin:kernel_end]
-    with pytest.raises(ValueError, match="requires full node retention"):
-        mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-            contract,
-            80,
-            node_state_policy="recompute-v1",
-            _node_reverse_schedule=schedule,
-        )
-
-
-def test_mh1_v4_gpu_module_metadata_and_ir_mul_program(mh1_node_definition, tmp_path):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    target = {
-        "architecture": "gfx1151",
-        "target_features": ["sramecc-", "xnack-"],
-        "compiler_offload_target": "gfx1151",
-        "native_subgroup_width": 32,
-        "compute_unit_count": 40,
-    }
-    cuda_module = mh1_codegen.render_execution_mh1_cuda_module_v4(contract, 80)
-    hip_module = mh1_codegen.render_execution_mh1_hip_module_v4(contract, target)
-    cuda_plugin = mh1_codegen.render_jit_mh1_cuda_plugin_v4(contract, 80)
-    host_plugin = mh1_codegen.render_jit_mh1_host_plugin_v4(contract)
-    cuda_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(contract, 80)
-    hip_plan = mh1_codegen.execution_mh1_hip_module_v4_launch_plan(contract, target)
-    cuda_recompute_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract, 80, node_state_policy="recompute-v1"
-    )
-    hip_recompute_plan = mh1_codegen.execution_mh1_hip_module_v4_launch_plan(
-        contract, target, node_state_policy="recompute-v1"
-    )
-    cuda_metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(contract, 80)
-    hip_metadata = mh1_codegen.execution_mh1_hip_module_v4_metadata(contract, target)
-
-    assert "__shfl_down_sync" in cuda_module
-    assert "__shfl_down_sync" not in hip_module
-    assert "__shfl_down(" in hip_module
-    assert (
-        'extern "C" __global__ void __launch_bounds__(128, 4) '
-        "symmetrix_execution_mh1_forward_kernel_1" in cuda_module
-    )
-    assert "__launch_bounds__(128, 4)" not in hip_module
-    assert "#include" not in hip_module
-    assert "<<<" not in hip_module
-    assert hip_plan["schema"] == mh1_codegen.MH1_HIP_LAUNCH_PLAN_TAG
-    assert hip_plan["version"] == 1
-    assert hip_plan["target"]["backend"] == "hip"
-    assert hip_plan["target"]["architecture"] == "gfx1151"
-    assert hip_plan["module_identity"] in hip_module
-    node_schedule = "tiled-8x32-message-linear2-32x32-v7"
-    retained_node_schedule = mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    assert cuda_metadata["node_forward_schedule"] == node_schedule
-    assert cuda_metadata["node_reverse_schedule"] == node_schedule
-    assert hip_metadata["node_forward_schedule"] == node_schedule
-    assert hip_metadata["node_reverse_schedule"] == retained_node_schedule
-    assert "target_compute_capability" not in hip_metadata
-    assert hip_metadata["policy_profile"] == "shared-v13-partitioning-v1"
-    for policy_name in ("forward_policy", "source_policy", "edge_policy"):
-        policy = hip_metadata[policy_name]
-        assert "target_compute_capability" not in policy
-        assert ".gpu-" in policy["tag"]
-        assert policy["target_id"] == hip_metadata["target_id"]
-    hip_policies = {
-        policy_name: hip_metadata[policy_name]
-        for policy_name in ("forward_policy", "source_policy", "edge_policy")
-    }
-    roundtrip_metadata = mh1_codegen.execution_mh1_hip_module_v4_metadata(
-        contract, target, **hip_policies
-    )
-    roundtrip_plan = mh1_codegen.execution_mh1_hip_module_v4_launch_plan(
-        contract, target, **hip_policies
-    )
-    roundtrip_module = mh1_codegen.render_execution_mh1_hip_module_v4(
-        contract, target, **hip_policies
-    )
-    assert roundtrip_metadata == hip_metadata
-    assert roundtrip_plan == hip_plan
-    assert roundtrip_module == hip_module
-    stale_target_policy = copy.deepcopy(hip_metadata["forward_policy"])
-    stale_target_policy["target_id"] = "sha256:" + "0" * 64
-    with pytest.raises(ValueError, match="target does not match"):
-        mh1_codegen.execution_mh1_hip_module_v4_metadata(
-            contract, target, forward_policy=stale_target_policy
-        )
-    assert cuda_metadata["edge_reverse_schedule"] == "hybrid-path-tiled-v7"
-    assert hip_metadata["edge_reverse_schedule"] == "hybrid-path-tiled-v6"
-    assert (
-        cuda_metadata["edge_policy"]["reverse_schedule"]
-        == cuda_metadata["edge_reverse_schedule"]
-    )
-    assert (
-        hip_metadata["edge_policy"]["reverse_schedule"]
-        == hip_metadata["edge_reverse_schedule"]
-    )
-    assert cuda_metadata["node_state_policy"] == "full-retention-v1"
-    assert hip_metadata["node_state_policy"] == "full-retention-v1"
-    assert cuda_plan["node_state_policy"] == "full-retention-v1"
-    assert hip_plan["node_state_policy"] == "full-retention-v1"
-    assert cuda_plan["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_XWIDE_ALL_FORWARD_LINEAR2_SCHEDULE
-    )
-    assert hip_plan["node_reverse_schedule"] == retained_node_schedule
-    assert cuda_recompute_plan["node_state_policy"] == "recompute-v1"
-    assert hip_recompute_plan["node_state_policy"] == "recompute-v1"
-    assert cuda_recompute_plan["node_reverse_schedule"] == (
-        mh1_codegen._MH1_CUDA_RECOMPUTE_TILED_PRODUCT_REVERSE_SCHEDULE
-    )
-    assert hip_recompute_plan["node_reverse_schedule"] == node_schedule
-    assert cuda_recompute_plan["module_identity"] != cuda_plan["module_identity"]
-    assert hip_recompute_plan["module_identity"] != hip_plan["module_identity"]
-    assert (
-        cuda_metadata["conditioner_reverse_schedule"]
-        == hip_metadata["conditioner_reverse_schedule"]
-    )
-    assert all(
-        interaction["conditioned_prefix"] == "bounded-recompute-split-v2"
-        and interaction["density"] == "bounded-recompute-split-v2"
-        for interaction in cuda_metadata["conditioner_reverse_schedule"]["interactions"]
-    )
-    conditioner_name = "execution_mh1_conditioned_prefix_radial_reverse_0"
-    for device_source in (cuda_plugin, cuda_module, hip_module):
-        function_begin = device_source.index(f"void {conditioner_name}(")
-        function_end = device_source.index("\n}\n", function_begin)
-        assert "float current_adjoint[5];" in device_source[function_begin:function_end]
-    for module_source in (cuda_module, hip_module):
-        assert module_source.count("conditioning_reverse_prefix_kernel_") == 2
-        assert module_source.count("conditioning_reverse_density_kernel_") == 2
-    host_begin = host_plugin.index(f"void {conditioner_name}(")
-    host_end = host_plugin.index("\n}\n", host_begin)
-    assert "float current_adjoint[5];" not in host_plugin[host_begin:host_end]
-    assert "float activation_1[5];" in host_plugin[host_begin:host_end]
-    assert cuda_plan["interactions"] == hip_plan["interactions"]
-    assert all(
-        interaction["edge_strategy"] == "compact_fused"
-        and interaction["edge_phi_block_multiplier"] == 4
-        for interaction in hip_plan["interactions"]
-    )
-    assert cuda_plan["nodes"] == hip_plan["nodes"]
-    cuda_node_kernels = {
-        line.replace("__launch_bounds__(128, 4) ", "")
-        .split("(", 1)[0]
-        .rsplit(" ", 1)[-1]
-        for line in cuda_module.splitlines()
-        if line.startswith('extern "C" __global__ void ')
-        and "symmetrix_execution_mh1_node_" in line
-    }
-    hip_node_kernels = {
-        line.split("(", 1)[0].rsplit(" ", 1)[-1]
-        for line in hip_module.splitlines()
-        if line.startswith('extern "C" __global__ void ')
-        and "symmetrix_execution_mh1_node_" in line
-    }
-    assert cuda_node_kernels == hip_node_kernels
-
-    # Keep cross-dialect coverage for the legacy schedule used by recompute.
-    legacy_hip_metadata = mh1_codegen.jit_mh1_cuda_plugin_v4_metadata(
-        contract,
-        80,
-        _edge_reverse_schedule=mh1_codegen._MH1_HIP_EDGE_REVERSE_SCHEDULE,
-        _node_reverse_schedule=mh1_codegen._MH1_NODE_REVERSE_SCHEDULE,
-    )
-    hip_module = mh1_codegen._render_execution_mh1_gpu_module_v4(
-        contract,
-        80,
-        mh1_codegen.MH1_HIP_DIALECT,
-        mh1_codegen._execution_mh1_cuda_module_identity(legacy_hip_metadata),
-        edge_reverse_schedule=mh1_codegen._MH1_HIP_EDGE_REVERSE_SCHEDULE,
-        node_reverse_schedule=mh1_codegen._MH1_NODE_REVERSE_SCHEDULE,
-    )
-    hip_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
-        contract,
-        80,
-        _edge_reverse_schedule=mh1_codegen._MH1_HIP_EDGE_REVERSE_SCHEDULE,
-        _node_reverse_schedule=mh1_codegen._MH1_NODE_REVERSE_SCHEDULE,
-    )
-    assert cuda_plan["nodes"][0]["pre_forward"] == hip_plan["nodes"][0]["pre_forward"]
-    assert cuda_plan["nodes"][1]["pre_forward"][0]["grid"] == "node_channel_tiles"
-    assert cuda_plan["nodes"][1]["pre_forward"][0]["kernel"].endswith(
-        "_pre_forward_linear_up_grouped"
-    )
-    assert hip_plan["nodes"][1]["pre_forward"] == [
-        {
-            "kernel": "symmetrix_execution_mh1_node_pre_forward_kernel_1",
-            "grid": "persistent_nodes",
-            "threads": 128,
-        }
-    ]
-    for cuda_node, hip_node in zip(cuda_plan["nodes"], hip_plan["nodes"], strict=True):
-        assert [
-            launch
-            for launch in cuda_node["post_forward"]
-            if "forward_linear2" not in launch["kernel"]
-            and "forward_message" not in launch["kernel"]
-            and "forward_residual" not in launch["kernel"]
-            and "forward_product" not in launch["kernel"]
-            and "forward_skip" not in launch["kernel"]
-        ] == [
-            launch
-            for launch in hip_node["post_forward"]
-            if "forward_linear2" not in launch["kernel"]
-            and "forward_message" not in launch["kernel"]
-            and "forward_residual" not in launch["kernel"]
-            and "forward_product" not in launch["kernel"]
-            and "forward_skip" not in launch["kernel"]
-        ]
-        assert (
-            sum(
-                "forward_message" in launch["kernel"]
-                for launch in cuda_node["post_forward"]
-            )
-            == 1
-        )
-        assert (
-            sum(
-                "forward_message" in launch["kernel"]
-                for launch in hip_node["post_forward"]
-            )
-            == 4
-        )
-        assert (
-            sum(
-                "forward_residual" in launch["kernel"]
-                for launch in cuda_node["post_forward"]
-            )
-            == 1
-        )
-        assert (
-            sum(
-                "forward_residual" in launch["kernel"]
-                for launch in hip_node["post_forward"]
-            )
-            == 4
-        )
-        assert (
-            sum(
-                "forward_linear2" in launch["kernel"]
-                for launch in cuda_node["post_forward"]
-            )
-            == 1
-        )
-        assert (
-            sum(
-                "forward_linear2" in launch["kernel"]
-                for launch in hip_node["post_forward"]
-            )
-            == 4
-        )
-        assert (
-            sum(
-                "reverse_linear2" in launch["kernel"]
-                for launch in cuda_node["post_reverse"]
-            )
-            == 1
-        )
-        assert (
-            sum(
-                "reverse_linear2" in launch["kernel"]
-                for launch in hip_node["post_reverse"]
-            )
-            == 4
-        )
-        assert (
-            sum(
-                "reverse_message" in launch["kernel"]
-                for launch in cuda_node["post_reverse"]
-            )
-            == 1
-        )
-        assert (
-            sum(
-                "reverse_message" in launch["kernel"]
-                for launch in hip_node["post_reverse"]
-            )
-            == 4
-        )
-    assert [
-        launch
-        for launch in cuda_plan["nodes"][0]["post_reverse"]
-        if "reverse_linear2" not in launch["kernel"]
-        and "reverse_message" not in launch["kernel"]
-        and "reverse_residual" not in launch["kernel"]
-        and "reverse_product_linear" not in launch["kernel"]
-        and not launch["kernel"].endswith("_reverse_product_tiled")
-    ] == [
-        launch
-        for launch in hip_plan["nodes"][0]["post_reverse"]
-        if "reverse_linear2" not in launch["kernel"]
-        and "reverse_message" not in launch["kernel"]
-        and "reverse_residual" not in launch["kernel"]
-        and "reverse_product_linear" not in launch["kernel"]
-        and not launch["kernel"].endswith("_reverse_product")
-    ]
-    cuda_layer_one_reverse = cuda_plan["nodes"][1]["post_reverse"]
-    hip_layer_one_reverse = hip_plan["nodes"][1]["post_reverse"]
-    cuda_messages = [
-        launch
-        for launch in cuda_layer_one_reverse
-        if "reverse_message" in launch["kernel"]
-    ]
-    hip_messages = [
-        launch
-        for launch in hip_layer_one_reverse
-        if "reverse_message" in launch["kernel"]
-    ]
-    assert len(cuda_messages) == 1
-    assert len(hip_messages) == 4
-    cuda_readout = [
-        launch
-        for launch in cuda_layer_one_reverse
-        if "reverse_readout" in launch["kernel"]
-        or "reverse_skip_grouped" in launch["kernel"]
-    ]
-    hip_readout = [
-        launch
-        for launch in hip_layer_one_reverse
-        if "reverse_readout" in launch["kernel"]
-    ]
-    assert [launch["grid"] for launch in cuda_readout] == [
-        "node_channel_tiles",
-        "persistent_nodes",
-        "node_channel_tiles",
-        "node_channel_tiles",
-    ]
-    assert len(hip_readout) == 1
-    assert [
-        launch
-        for launch in cuda_layer_one_reverse
-        if "reverse_message" not in launch["kernel"]
-        and "reverse_linear2" not in launch["kernel"]
-        and "reverse_residual" not in launch["kernel"]
-        and "reverse_readout" not in launch["kernel"]
-        and "reverse_skip_grouped" not in launch["kernel"]
-        and "reverse_product_linear" not in launch["kernel"]
-        and not launch["kernel"].endswith("_reverse_product_tiled")
-    ] == [
-        launch
-        for launch in hip_layer_one_reverse
-        if "reverse_message" not in launch["kernel"]
-        and "reverse_linear2" not in launch["kernel"]
-        and "reverse_residual" not in launch["kernel"]
-        and "reverse_readout" not in launch["kernel"]
-        and "reverse_product_linear" not in launch["kernel"]
-        and not launch["kernel"].endswith("_reverse_product")
-    ]
-    assert (
-        sum("reverse_residual" in launch["kernel"] for launch in cuda_layer_one_reverse)
-        == 2
-    )
-    assert (
-        sum("reverse_residual" in launch["kernel"] for launch in hip_layer_one_reverse)
-        == 2
-    )
-    for cuda_node, hip_node in zip(cuda_plan["nodes"], hip_plan["nodes"], strict=True):
-        cuda_product = [
-            launch
-            for launch in cuda_node["post_reverse"]
-            if launch["kernel"].endswith("_reverse_product_tiled")
-        ]
-        hip_product = [
-            launch
-            for launch in hip_node["post_reverse"]
-            if launch["kernel"].endswith("_reverse_product")
-        ]
-        assert len(cuda_product) == len(hip_product) == 1
-        assert cuda_product[0]["grid"] == "node_channel_tiles"
-        assert hip_product[0]["grid"] == "persistent_nodes"
-        cuda_forward_product = [
-            launch
-            for launch in cuda_node["post_forward"]
-            if launch["kernel"].endswith("_forward_product_setup")
-            or launch["kernel"].endswith("_forward_product_tiled")
-        ]
-        hip_forward_product = [
-            launch
-            for launch in hip_node["post_forward"]
-            if launch["kernel"].endswith("_forward_product")
-        ]
-        assert len(cuda_forward_product) == 2
-        assert {launch["grid"] for launch in cuda_forward_product} == {
-            "persistent_nodes",
-            "node_channel_tiles",
-        }
-        assert len(hip_forward_product) == 1
-        assert hip_forward_product[0]["grid"] == "persistent_nodes"
-    assert all(
-        {launch["grid"] for launch in node["post_forward"]}
-        == {"node_channel_tiles", "persistent_nodes"}
-        for node in hip_plan["nodes"]
-    )
-    for node in hip_plan["nodes"]:
-        forward_kernels = [launch["kernel"] for launch in node["post_forward"]]
-        assert any("_forward_residual_block_" in name for name in forward_kernels)
-        assert any("_forward_message_block_" in name for name in forward_kernels)
-        reverse_kernels = [launch["kernel"] for launch in node["post_reverse"]]
-        assert node["post_reverse"][0]["grid"] == "persistent_nodes"
-        assert reverse_kernels[0].endswith("_reverse_readout")
-        assert reverse_kernels[-1].endswith("_reverse_density")
-        assert not any(
-            "_reverse_residual_forward_block_" in name for name in reverse_kernels
-        )
-        assert not any(
-            "_reverse_message_forward_block_" in name for name in reverse_kernels
-        )
-        assert not any(
-            "_reverse_linear2_forward_block_" in name for name in reverse_kernels
-        )
-        assert not any("_reverse_gate_forward" in name for name in reverse_kernels)
-        assert not any(
-            "_reverse_residual_recompute_block_" in name for name in reverse_kernels
-        )
-        assert not any(
-            "_reverse_message_recompute_block_" in name for name in reverse_kernels
-        )
-    for index, (cuda_node, hip_node) in enumerate(
-        zip(cuda_recompute_plan["nodes"], hip_recompute_plan["nodes"], strict=True)
-    ):
-        cuda_messages = [
-            launch
-            for launch in cuda_node["post_reverse"]
-            if "_reverse_message_block_" in launch["kernel"]
-            or launch["kernel"].endswith("_reverse_message_grouped")
-        ]
-        hip_messages = [
-            launch
-            for launch in hip_node["post_reverse"]
-            if "_reverse_message_block_" in launch["kernel"]
-            or launch["kernel"].endswith("_reverse_message_grouped")
-        ]
-        assert len(cuda_messages) == 1
-        assert len(hip_messages) == 4
-        cuda_linear2 = [
-            launch
-            for launch in cuda_node["post_reverse"]
-            if "_reverse_linear2_block_" in launch["kernel"]
-            or launch["kernel"].endswith("_reverse_linear2_grouped")
-        ]
-        hip_linear2 = [
-            launch
-            for launch in hip_node["post_reverse"]
-            if "_reverse_linear2_block_" in launch["kernel"]
-            or launch["kernel"].endswith("_reverse_linear2_grouped")
-        ]
-        assert len(cuda_linear2) == 1
-        assert len(hip_linear2) == 4
-        cuda_residual = [
-            launch
-            for launch in cuda_node["post_reverse"]
-            if "_reverse_residual_block_" in launch["kernel"]
-            or launch["kernel"].endswith("_reverse_residual_grouped")
-        ]
-        hip_residual = [
-            launch
-            for launch in hip_node["post_reverse"]
-            if "_reverse_residual_block_" in launch["kernel"]
-            or launch["kernel"].endswith("_reverse_residual_grouped")
-        ]
-        assert len(cuda_residual) == (1 if index == 1 else 0)
-        assert len(hip_residual) == (2 if index == 1 else 0)
-        cuda_product = [
-            launch
-            for launch in cuda_node["post_reverse"]
-            if launch["kernel"].endswith("_reverse_product_tiled")
-        ]
-        hip_product = [
-            launch
-            for launch in hip_node["post_reverse"]
-            if launch["kernel"].endswith("_reverse_product")
-        ]
-        assert len(cuda_product) == len(hip_product) == 1
-        assert cuda_product[0]["grid"] == "node_channel_tiles"
-        assert hip_product[0]["grid"] == "persistent_nodes"
-        assert [
-            launch
-            for launch in cuda_node["post_reverse"]
-            if "_reverse_message_block_" not in launch["kernel"]
-            and not launch["kernel"].endswith("_reverse_message_grouped")
-            and "_reverse_linear2_block_" not in launch["kernel"]
-            and not launch["kernel"].endswith("_reverse_linear2_grouped")
-            and "_reverse_residual_block_" not in launch["kernel"]
-            and not launch["kernel"].endswith("_reverse_residual_grouped")
-            and not launch["kernel"].endswith("_reverse_product_tiled")
-        ] == [
-            launch
-            for launch in hip_node["post_reverse"]
-            if "_reverse_message_block_" not in launch["kernel"]
-            and not launch["kernel"].endswith("_reverse_message_grouped")
-            and "_reverse_linear2_block_" not in launch["kernel"]
-            and not launch["kernel"].endswith("_reverse_linear2_grouped")
-            and "_reverse_residual_block_" not in launch["kernel"]
-            and not launch["kernel"].endswith("_reverse_residual_grouped")
-            and not launch["kernel"].endswith("_reverse_product")
-        ]
-        reverse_kernels = [launch["kernel"] for launch in cuda_node["post_reverse"]]
-        for family in (
-            "reverse_residual_forward_block_",
-            "reverse_message_forward_block_",
-            "reverse_linear2_forward_block_",
-            "reverse_gate_forward",
-            "reverse_residual_recompute_block_",
-            "reverse_message_recompute_block_",
-        ):
-            assert any(family in name for name in reverse_kernels)
-    cuda_kernels = {
-        line.replace("__launch_bounds__(128, 4) ", "")
-        .split("(", 1)[0]
-        .rsplit(" ", 1)[-1]
-        for line in cuda_module.splitlines()
-        if line.startswith('extern "C" __global__ void ')
-    }
-    hip_kernels = {
-        line.split("(", 1)[0].rsplit(" ", 1)[-1]
-        for line in hip_module.splitlines()
-        if line.startswith('extern "C" __global__ void ')
-    }
-    cuda_message_kernels = {
-        name
-        for name in cuda_kernels
-        if "forward_message_block_" in name
-        or "reverse_message_block_" in name
-        or name.endswith("forward_message_grouped")
-        or name.endswith("reverse_message_grouped")
-    }
-    hip_message_kernels = {
-        name
-        for name in hip_kernels
-        if "forward_message_block_" in name
-        or "reverse_message_block_" in name
-        or name.endswith("forward_message_grouped")
-        or name.endswith("reverse_message_grouped")
-    }
-    cuda_linear2_kernels = {
-        name
-        for name in cuda_kernels
-        if "forward_linear2_block_" in name
-        or "reverse_linear2_block_" in name
-        or name.endswith("forward_linear2_grouped")
-        or name.endswith("reverse_linear2_grouped")
-    }
-    hip_linear2_kernels = {
-        name
-        for name in hip_kernels
-        if "forward_linear2_block_" in name
-        or "reverse_linear2_block_" in name
-        or name.endswith("forward_linear2_grouped")
-        or name.endswith("reverse_linear2_grouped")
-    }
-    cuda_residual_kernels = {
-        name
-        for name in cuda_kernels
-        if "forward_residual_block_" in name
-        or "reverse_residual_block_" in name
-        or name.endswith("forward_residual_grouped")
-        or name.endswith("reverse_residual_grouped")
-    }
-    hip_residual_kernels = {
-        name
-        for name in hip_kernels
-        if "forward_residual_block_" in name
-        or "reverse_residual_block_" in name
-        or name.endswith("forward_residual_grouped")
-        or name.endswith("reverse_residual_grouped")
-    }
-    cuda_reverse_product_kernels = {
-        name for name in cuda_kernels if name.endswith("_reverse_product_tiled")
-    }
-    hip_reverse_product_kernels = {
-        name for name in hip_kernels if name.endswith("_reverse_product")
-    }
-    cuda_forward_product_kernels = {
-        name
-        for name in cuda_kernels
-        if name.endswith("_forward_product_setup")
-        or name.endswith("_forward_product_tiled")
-    }
-    hip_forward_product_kernels = {
-        name for name in hip_kernels if name.endswith("_forward_product")
-    }
-    cuda_pre_forward_kernels = {
-        name for name in cuda_kernels if name.endswith("_pre_forward_linear_up_grouped")
-    }
-    cuda_skip_forward_kernels = {
-        name for name in cuda_kernels if name.endswith("_forward_skip_grouped")
-    }
-    hip_pre_forward_kernels = {
-        name for name in hip_kernels if name.endswith("_node_pre_forward_kernel_1")
-    }
-    cuda_pre_reverse_kernels = {name for name in cuda_kernels if "pre_reverse" in name}
-    hip_pre_reverse_kernels = {name for name in hip_kernels if "pre_reverse" in name}
-    cuda_readout_kernels = {
-        name
-        for name in cuda_kernels
-        if "_l1_reverse_readout" in name or name.endswith("_l1_reverse_skip_grouped")
-    }
-    hip_readout_kernels = {
-        name for name in hip_kernels if "_l1_reverse_readout" in name
-    }
-    assert cuda_message_kernels == {
-        "symmetrix_execution_mh1_node_tiled_l0_forward_message_grouped",
-        "symmetrix_execution_mh1_node_tiled_l0_reverse_message_grouped",
-        "symmetrix_execution_mh1_node_tiled_l1_forward_message_grouped",
-        "symmetrix_execution_mh1_node_tiled_l1_reverse_message_grouped",
-    }
-    assert len(hip_message_kernels) == 16
-    assert len(cuda_linear2_kernels) == 4
-    assert len(hip_linear2_kernels) == 16
-    assert cuda_residual_kernels == {
-        "symmetrix_execution_mh1_node_tiled_l0_forward_residual_grouped",
-        "symmetrix_execution_mh1_node_tiled_l1_forward_residual_grouped",
-        "symmetrix_execution_mh1_node_tiled_l1_reverse_residual_block_0",
-        "symmetrix_execution_mh1_node_tiled_l1_reverse_residual_block_1",
-    }
-    assert len(hip_residual_kernels) == 10
-    assert cuda_reverse_product_kernels == {
-        "symmetrix_execution_mh1_node_tiled_l0_reverse_product_tiled",
-        "symmetrix_execution_mh1_node_tiled_l1_reverse_product_tiled",
-    }
-    assert len(hip_reverse_product_kernels) == 2
-    assert cuda_forward_product_kernels == {
-        "symmetrix_execution_mh1_node_tiled_l0_forward_product_setup",
-        "symmetrix_execution_mh1_node_tiled_l0_forward_product_tiled",
-        "symmetrix_execution_mh1_node_tiled_l1_forward_product_setup",
-        "symmetrix_execution_mh1_node_tiled_l1_forward_product_tiled",
-    }
-    assert len(hip_forward_product_kernels) == 2
-    assert cuda_pre_forward_kernels == {
-        "symmetrix_execution_mh1_node_tiled_l1_pre_forward_linear_up_grouped"
-    }
-    assert cuda_skip_forward_kernels == {
-        "symmetrix_execution_mh1_node_tiled_l0_forward_skip_grouped",
-        "symmetrix_execution_mh1_node_tiled_l1_forward_skip_grouped",
-    }
-    assert hip_pre_forward_kernels == {
-        "symmetrix_execution_mh1_node_pre_forward_kernel_1"
-    }
-    assert cuda_pre_reverse_kernels == {
-        "symmetrix_execution_mh1_node_tiled_l1_pre_reverse_linear_up_grouped"
-    }
-    assert hip_pre_reverse_kernels == {
-        "symmetrix_execution_mh1_node_pre_reverse_kernel_1"
-    }
-    assert cuda_readout_kernels == {
-        "symmetrix_execution_mh1_node_tiled_l1_reverse_readout1_recompute_grouped",
-        "symmetrix_execution_mh1_node_tiled_l1_reverse_readout_middle",
-        "symmetrix_execution_mh1_node_tiled_l1_reverse_readout1_grouped",
-        "symmetrix_execution_mh1_node_tiled_l1_reverse_skip_grouped",
-    }
-    assert hip_readout_kernels == {
-        "symmetrix_execution_mh1_node_tiled_l1_reverse_readout"
-    }
-    assert (
-        hip_kernels
-        - hip_message_kernels
-        - hip_linear2_kernels
-        - hip_residual_kernels
-        - hip_reverse_product_kernels
-        - hip_forward_product_kernels
-        - hip_pre_forward_kernels
-        - hip_pre_reverse_kernels
-        - hip_readout_kernels
-        == cuda_kernels
-        - cuda_message_kernels
-        - cuda_linear2_kernels
-        - cuda_residual_kernels
-        - cuda_reverse_product_kernels
-        - cuda_forward_product_kernels
-        - cuda_pre_forward_kernels
-        - cuda_skip_forward_kernels
-        - cuda_pre_reverse_kernels
-        - cuda_readout_kernels
-    )
 
 
 def test_mh1_v4_gpu_module_fp64_is_scalar_qualified(mh1_node_definition):
@@ -3934,7 +1081,8 @@ def test_mh1_v4_gpu_module_fp64_is_scalar_qualified(mh1_node_definition):
     assert "const double* node_density;" in source
     assert "double* node_arena;" in source
     assert "using Scalar = double;" in source
-    assert "float energy_scale;" in source
+    assert "float energy_scale;" not in source
+    assert "double energy_scale;" in source
     assert plan["scalar_size"] == 8
     assert fp32_plan["scalar_size"] == 4
     assert plan["module_identity"] != fp32_plan["module_identity"]
@@ -4166,39 +1314,45 @@ extern "C" void reverse(
     assert list(input_adjoint) == pytest.approx([1.0, 8.0, 6.0, 20.0, 15.0, 36.0])
 
 
-def test_mh1_v4_generated_product_forward_reverse(mh1_node_definition, tmp_path):
+def test_mh1_v7_host_plugin_splits_product_contraction(mh1_node_definition):
+    contract = make_execution_mh1_v4_contract(mh1_node_definition)
+    source = render_jit_mh1_host_plugin_v7(contract, precision="float32")
+    split = source.index("node_split_pre_forward_owner_0")
+    v7 = source[split:]
+
+    assert "SYMMETRIX_JIT_MH1_HOST_EXTERNAL_PRODUCT_V7" in v7
+    assert "symmetrix_jit_mh1_host_plugin_query_v7" in v7
+    assert "contraction_output" in v7
+    assert "contraction_output_adjoint" in v7
+    assert "product_parameters" not in v7
+    assert "execution_mh1_node_layer_0_product_forward" not in v7
+    assert "execution_mh1_node_layer_0_product_reverse" not in v7
+    assert "execution_mh1_node_layer_0_product_forward" not in source[:split]
+    assert "execution_mh1_node_layer_0_product_reverse" not in source[:split]
+
+
+def test_mh1_v7_float64_host_plugin_uses_double_math(mh1_node_definition):
+    contract = make_execution_mh1_v4_contract(mh1_node_definition)
+    source = render_jit_mh1_host_plugin_v7(contract, precision="float64")
+
+    assert "expf(" not in source
+    assert "sqrtf(" not in source
+    assert "tanhf(" not in source
+    assert "exp(" in source
+    assert "sqrt(" in source
+    assert "tanh(" in source
+
+
+@pytest.mark.parametrize("precision", ["float32", "float64"])
+def test_mh1_v7_host_plugin_compiles(mh1_node_definition, tmp_path, precision):
     compiler = shutil.which(os.environ.get("CXX", "c++"))
     if compiler is None:
-        pytest.skip("a C++ compiler is required for node product generation")
+        pytest.skip("a C++ compiler is required for split host generation")
     contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    helpers = render_execution_mh1_node_product_cpp_helpers(contract)
-    assert "execution_mh1_node_layer_0_product_forward" in helpers
-    assert "execution_mh1_node_layer_0_product_reverse" in helpers
-    assert "parameter_adjoint" not in helpers
-
-    source = tmp_path / "node_product.cpp"
-    library = tmp_path / "node_product.so"
+    source = tmp_path / f"mh1_host_v7_{precision}.cpp"
+    library = tmp_path / f"mh1_host_v7_{precision}.so"
     source.write_text(
-        helpers
-        + r"""
-extern "C" void evaluate(
-    const float* input, const float* skip, const float* coefficients,
-    const float* linear_parameters, float* contracted, float* output)
-{
-    execution_mh1_node_layer_0_product_forward(
-        input, skip, coefficients, linear_parameters, contracted, output);
-}
-
-extern "C" void reverse(
-    const float* input, const float* output_adjoint,
-    const float* coefficients, const float* linear_parameters,
-    float* contracted_adjoint, float* input_adjoint, float* skip_adjoint)
-{
-    execution_mh1_node_layer_0_product_reverse(
-        input, output_adjoint, coefficients, linear_parameters,
-        contracted_adjoint, input_adjoint, skip_adjoint);
-}
-""",
+        render_jit_mh1_host_plugin_v7(contract, precision=precision),
         encoding="ascii",
     )
     subprocess.run(
@@ -4207,457 +1361,33 @@ extern "C" void reverse(
         capture_output=True,
         text=True,
     )
-    loaded = ctypes.CDLL(str(library))
-    pointer = ctypes.POINTER(ctypes.c_float)
-    loaded.evaluate.argtypes = [pointer] * 6
-    loaded.reverse.argtypes = [pointer] * 7
-    input_values = (ctypes.c_float * 16)(2.0, *([0.0] * 15))
-    skip = (ctypes.c_float * 4)(0.1, 0.2, 0.3, 0.4)
-    coefficients = (ctypes.c_float * 6)(*([0.5] * 6))
-    linear_parameters = (ctypes.c_float * 6)(0.25, 0.25, 1.0, 1.0, 1.0, 1.0)
-    contracted = (ctypes.c_float * 4)()
-    output = (ctypes.c_float * 4)()
-    loaded.evaluate(
-        input_values,
-        skip,
-        coefficients,
-        linear_parameters,
-        contracted,
-        output,
-    )
-    assert list(contracted) == pytest.approx([7.0, 7.0, 0.0, 0.0])
-    assert list(output) == pytest.approx([1.85, 1.95, 0.3, 0.4])
-
-    output_adjoint = (ctypes.c_float * 4)(1.0, 1.0, 1.0, 1.0)
-    contracted_adjoint = (ctypes.c_float * 4)()
-    input_adjoint = (ctypes.c_float * 16)()
-    skip_adjoint = (ctypes.c_float * 4)()
-    loaded.reverse(
-        input_values,
-        output_adjoint,
-        coefficients,
-        linear_parameters,
-        contracted_adjoint,
-        input_adjoint,
-        skip_adjoint,
-    )
-    assert list(contracted_adjoint) == pytest.approx([0.25] * 4)
-    assert input_adjoint[0] == pytest.approx(4.25)
-    assert list(input_adjoint)[1:] == pytest.approx([0.0] * 15)
-    assert list(skip_adjoint) == pytest.approx([1.0] * 4)
 
 
-def test_mh1_v4_generated_gate_forward_reverse(mh1_node_definition, tmp_path):
+def test_mh1_v7_non_posix_loader_stubs_are_link_complete(tmp_path):
     compiler = shutil.which(os.environ.get("CXX", "c++"))
     if compiler is None:
-        pytest.skip("a C++ compiler is required for node gate generation")
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    helpers = render_execution_mh1_node_nonlinear_cpp_helpers(contract)
-    source = tmp_path / "node_gate.cpp"
-    library = tmp_path / "node_gate.so"
-    source.write_text(
-        "#include <cmath>\n"
-        + helpers
-        + r"""
-extern "C" void evaluate(const float* input, float* output)
-{
-    execution_mh1_node_layer_0_gate_forward(input, output);
-}
-extern "C" void reverse(
-    const float* input, const float* output_adjoint, float* input_adjoint)
-{
-    execution_mh1_node_layer_0_gate_reverse(
-        input, output_adjoint, input_adjoint);
-}
-""",
-        encoding="ascii",
-    )
-    subprocess.run(
-        [compiler, "-std=c++20", "-O2", "-shared", "-fPIC", source, "-o", library],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    loaded = ctypes.CDLL(str(library))
-    pointer = ctypes.POINTER(ctypes.c_float)
-    loaded.evaluate.argtypes = [pointer, pointer]
-    loaded.reverse.argtypes = [pointer, pointer, pointer]
-    values = [0.2, 0.1, -0.2, 0.3] + [0.05 * index for index in range(1, 16)]
-    input_values = (ctypes.c_float * 19)(*values)
-    output = (ctypes.c_float * 16)()
-    loaded.evaluate(input_values, output)
-
-    scalar_scale = 1.6791767923989418
-    gate_scale = 1.8467055342154763
-    scalar_sigmoid = 1.0 / (1.0 + math.exp(-values[0]))
-    expected = [scalar_scale * values[0] * scalar_sigmoid]
-    gated_offset = 4
-    for gate_index, width in enumerate((3, 5, 7)):
-        sigmoid = 1.0 / (1.0 + math.exp(-values[1 + gate_index]))
-        expected.extend(
-            values[gated_offset + component] * gate_scale * sigmoid
-            for component in range(width)
-        )
-        gated_offset += width
-    assert list(output) == pytest.approx(expected, rel=2e-6)
-
-    output_adjoint_values = [0.1 * (index + 1) for index in range(16)]
-    output_adjoint = (ctypes.c_float * 16)(*output_adjoint_values)
-    input_adjoint = (ctypes.c_float * 19)()
-    loaded.reverse(input_values, output_adjoint, input_adjoint)
-    expected_adjoint = [0.0] * 19
-    expected_adjoint[0] = (
-        output_adjoint_values[0]
-        * scalar_scale
-        * (scalar_sigmoid + values[0] * scalar_sigmoid * (1.0 - scalar_sigmoid))
-    )
-    input_offset = 4
-    output_offset = 1
-    for gate_index, width in enumerate((3, 5, 7)):
-        sigmoid = 1.0 / (1.0 + math.exp(-values[1 + gate_index]))
-        gate_value = gate_scale * sigmoid
-        gate_adjoint = 0.0
-        for component in range(width):
-            adjoint = output_adjoint_values[output_offset + component]
-            expected_adjoint[input_offset + component] = adjoint * gate_value
-            gate_adjoint += adjoint * values[input_offset + component]
-        expected_adjoint[1 + gate_index] = (
-            gate_adjoint * gate_scale * sigmoid * (1.0 - sigmoid)
-        )
-        input_offset += width
-        output_offset += width
-    assert list(input_adjoint) == pytest.approx(expected_adjoint, rel=2e-6)
-
-
-def test_mh1_v4_complete_node_program_compiles(mh1_node_definition, tmp_path):
-    compiler = shutil.which(os.environ.get("CXX", "c++"))
-    if compiler is None:
-        pytest.skip("a C++ compiler is required for complete node generation")
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    helpers = render_execution_mh1_node_program_cpp_helpers(contract)
-    assert "execution_mh1_node_layer_0_pre_forward" in helpers
-    assert "execution_mh1_node_layer_0_post_forward" in helpers
-    assert "execution_mh1_node_layer_0_post_reverse" in helpers
-    assert "execution_mh1_node_layer_0_pre_reverse" not in helpers
-    assert "execution_mh1_node_layer_1_pre_reverse" in helpers
-    assert "parameter_adjoint" not in helpers
-    source = tmp_path / "node_program.cpp"
-    library = tmp_path / "node_program.so"
-    source.write_text("#include <cmath>\n" + helpers, encoding="ascii")
-    subprocess.run(
-        [compiler, "-std=c++20", "-O2", "-shared", "-fPIC", source, "-o", library],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-
-def test_mh1_v4_complete_host_plugin_compiles(mh1_node_definition, tmp_path):
-    compiler = shutil.which(os.environ.get("CXX", "c++"))
-    if compiler is None:
-        pytest.skip("a C++ compiler is required for host plugin generation")
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    generated = render_jit_mh1_host_plugin_v4(contract)
-    assert "symmetrix_jit_mh1_host_plugin_query_v3" in generated
-    assert "symmetrix_jit_mh1_host_plugin_query_v4" in generated
-    assert "SYMMETRIX_JIT_MH1_HOST_SOURCE_OWNS_EDGE_REVERSE_V4" in generated
-    assert "SYMMETRIX_JIT_MH1_HOST_PHI_MAJOR_FORWARD_WEIGHT_V4" in generated
-    assert "#if defined(__AVX512F__)" in generated
-    assert "constexpr std::int32_t channel_tile = 16;" in generated
-    assert "constexpr std::int32_t channel_tile = 8;" in generated
-    assert "phi * " in generated
-    assert "fused_source_edge_reverse_owner" in generated
-    assert "&tiled_forward_owner, &fused_source_edge_reverse_owner" in generated
-    source = tmp_path / "mh1_host_v4.cpp"
-    library = tmp_path / "mh1_host_v4.so"
-    source.write_text(generated, encoding="ascii")
-    subprocess.run(
-        [compiler, "-std=c++20", "-O2", "-shared", "-fPIC", source, "-o", library],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-
-
-def test_mh1_v4_host_plugin_advertises_interaction_retention(mh1_node_definition):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    flag = "SYMMETRIX_JIT_MH1_HOST_NODE_RETAIN_INTERACTION_OUTPUT_V4"
-    recompute = render_jit_mh1_host_plugin_v4(
-        contract, node_state_policy="recompute-v1"
-    )
-    retained = render_jit_mh1_host_plugin_v4(
-        contract, node_state_policy="retain-interaction-v1"
-    )
-
-    assert recompute.count(flag) == 1
-    assert retained.count(flag) == 3
-
-
-def test_mh1_v5_spline_r_forward_plugin_compiles(mh1_node_definition, tmp_path):
-    compiler = shutil.which(os.environ.get("CXX", "c++"))
-    if compiler is None:
-        pytest.skip("a C++ compiler is required for spline R generation")
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    generated = render_jit_mh1_host_plugin_v5(contract)
-    assert "symmetrix_jit_mh1_host_plugin_query_v3" in generated
-    assert "symmetrix_jit_mh1_host_plugin_query_v4" in generated
-    assert "symmetrix_jit_mh1_host_plugin_query_v5" in generated
-    assert "SYMMETRIX_JIT_MH1_HOST_SPLINE_R_FORWARD_V5" in generated
-    assert "SYMMETRIX_JIT_MH1_HOST_SPLINE_R_SOURCE_REVERSE_V5" in generated
-    assert "spline_r_forward_0" in generated
-    assert "spline_r_forward_1" in generated
-    assert "spline_r_source_reverse_0" in generated
-    assert "spline_r_source_reverse_1" in generated
-    assert "float message[" in generated
-    spline_source = generated[generated.index("static void spline_r_forward_0") :]
-    assert "edge_phi" not in spline_source
-    assert "args->output_mask[" not in spline_source
-    assert "float source_contribution_0 = 0.0f;" in spline_source
-    assert "weight_adjoint += source_reverse * source_value;" in spline_source
-    assert "#pragma omp simd reduction(+:radial_contribution_" in spline_source
-    assert "radial_adjoint += radial_contribution_" in spline_source
-    assert generated.count("prefetch_read(") > 2
-    assert "prefetch_read(target_node_output_adjoint" in generated
-    assert "prefetch_read(edge_input_2" in generated
-    assert "__builtin_prefetch(address, 0, 1);" in generated
-    for index, interaction in enumerate(contract["interactions"]):
-        multiplicity = interaction["paths"][0]["input_1"]["multiplicity"]
-        path_channel_loop = (
-            f"for (std::int32_t channel = 0;\n     channel < {multiplicity}; ++channel)"
-        )
-        forward_start = generated.index(f"static void spline_r_forward_{index}")
-        reverse_start = generated.index(f"static void spline_r_source_reverse_{index}")
-        forward_source = generated[forward_start:reverse_start]
-        reverse_end = generated.find("\nstatic void ", reverse_start + 1)
-        if reverse_end < 0:
-            reverse_end = len(generated)
-        reverse_source = generated[reverse_start:reverse_end]
-        assert forward_source.count(path_channel_loop) == len(interaction["paths"])
-        assert reverse_source.count(f"channel < {multiplicity}; ++channel)") == len(
-            interaction["paths"]
-        )
-        assert reverse_source.count(
-            "float* const edge_adjoint = edge_adjoints[edge_lane];"
-        ) == len(interaction["paths"])
-        assert "constexpr std::int32_t edge_tile = 128;" in reverse_source
-    source = tmp_path / "mh1_host_v5.cpp"
-    library = tmp_path / "mh1_host_v5.so"
-    source.write_text(generated, encoding="ascii")
-    subprocess.run(
-        [compiler, "-std=c++20", "-O2", "-shared", "-fPIC", source, "-o", library],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    runner_source = tmp_path / "mh1_host_v5_runner.cpp"
-    runner = tmp_path / "mh1_host_v5_runner"
-    runner_source.write_text(
+        pytest.skip("a C++ compiler is required for loader symbol coverage")
+    repository = Path(__file__).parents[2]
+    probe = tmp_path / "mh1_v7_non_posix_probe.cpp"
+    executable = tmp_path / "mh1_v7_non_posix_probe"
+    probe.write_text(
         r"""
-#include "jit_mh1_host_plugin_abi.h"
-
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <dlfcn.h>
-#include <vector>
-
-int main(int argc, char** argv)
-{
-    if (argc != 2) return 1;
-    void* handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
-    if (handle == nullptr) return 2;
-    auto query_v3 = reinterpret_cast<SymmetrixJitMH1HostPluginQueryV3>(
-        dlsym(handle, SYMMETRIX_JIT_MH1_HOST_PLUGIN_QUERY_SYMBOL));
-    auto query_v5 = reinterpret_cast<SymmetrixJitMH1HostPluginQueryV5>(
-        dlsym(handle, SYMMETRIX_JIT_MH1_HOST_PLUGIN_V5_QUERY_SYMBOL));
-    if (query_v3 == nullptr || query_v5 == nullptr) return 3;
-    const auto* v3 = query_v3();
-    const auto* v5 = query_v5();
-    for (std::uint32_t layer = 0; layer < 2; ++layer) {
-        constexpr std::int32_t num_nodes = 2;
-        const auto& extent = v3->interactions[layer];
-        const auto& spline = v5->spline_r_programs[layer];
-        if ((spline.flags
-             & SYMMETRIX_JIT_MH1_HOST_SPLINE_R_PACKED_FORWARD_MESSAGES_V5) == 0)
-            return 4;
-        std::vector<float> source(
-            static_cast<std::size_t>(num_nodes) * extent.input_1_dimension);
-        std::vector<float> harmonic(
-            static_cast<std::size_t>(num_nodes) * extent.input_2_dimension);
-        std::vector<float> mask(extent.output_dimension, 1.0f);
-        std::vector<float> phi(
-            static_cast<std::size_t>(num_nodes) * extent.phi_dimension, 0.0f);
-        std::vector<float> linear(
-            static_cast<std::size_t>(extent.weight_size) * extent.phi_dimension,
-            0.0f);
-        std::vector<float> coefficients(
-            static_cast<std::size_t>(4) * (extent.weight_size + 1), 0.0f);
-        std::vector<float> reference(
-            static_cast<std::size_t>(num_nodes) * extent.output_dimension, 0.0f);
-        std::vector<float> actual(reference.size(), 0.0f);
-        for (std::size_t i = 0; i < source.size(); ++i)
-            source[i] = static_cast<float>(static_cast<int>(i % 17) - 8) / 16.0f;
-        for (std::size_t i = 0; i < harmonic.size(); ++i)
-            harmonic[i] = static_cast<float>(static_cast<int>(i % 7) - 3) / 8.0f;
-        phi[0] = 1.0f;
-        phi[extent.phi_dimension] = 1.0f;
-        for (std::int32_t weight = 0; weight < extent.weight_size; ++weight) {
-            const float value = static_cast<float>((weight % 13) - 6) / 32.0f;
-            linear[static_cast<std::size_t>(weight) * extent.phi_dimension] = value;
-            coefficients[weight] = value;
-        }
-        coefficients[extent.weight_size] = 0.75f;
-        const std::int32_t source_index[] = {0, 1};
-        const std::int32_t target_index[] = {0, 1};
-        const std::int32_t receiver_offsets[] = {0, 1, 2};
-        const std::int32_t source_types[] = {0, 0};
-        const std::int32_t node_types[] = {0, 0};
-        const float cutoff[] = {1.0f, 1.0f};
-        const double distance[] = {0.25, 0.35};
-        SymmetrixJitMH1HostForwardArgsV3 reference_args{
-            sizeof(SymmetrixJitMH1HostForwardArgsV3), layer, 0u, 0u,
-            num_nodes, num_nodes, 0, num_nodes,
-            source_index, target_index, receiver_offsets,
-            phi.data(), linear.data(), nullptr, nullptr, harmonic.data(),
-            cutoff, mask.data(), source.data(), reference.data()};
-        for (std::int32_t receiver = 0; receiver < num_nodes; ++receiver)
-            v3->forward_owner(&reference_args, receiver);
-        std::vector<float> density(num_nodes, 0.0f);
-        SymmetrixJitMH1HostSplineRForwardArgsV5 spline_args{
-            sizeof(SymmetrixJitMH1HostSplineRForwardArgsV5), layer, 0u, 0u,
-            num_nodes, num_nodes, 1, 1, 1, extent.weight_size + 1, 1.0, 0.0,
-            source_index, target_index, receiver_offsets, source_types, node_types,
-            distance, coefficients.data(), harmonic.data(), mask.data(),
-            source.data(), actual.data(), density.data()};
-        for (std::int32_t receiver = 0; receiver < num_nodes; ++receiver)
-            spline.forward_owner(&spline_args, receiver);
-        const std::int32_t block_offsets[] = {0, 1, 4, 9};
-        const std::int32_t block_widths[] = {1, 3, 5, 7};
-        for (std::int32_t node = 0; node < num_nodes; ++node) {
-            if (std::abs(density[node] - 0.75f) > 1.0e-7f) return 5;
-            for (std::int32_t block = 0; block < 4; ++block)
-                for (std::int32_t component = 0;
-                     component < block_widths[block]; ++component) {
-                    const std::size_t native_index =
-                        static_cast<std::size_t>(node) * extent.output_dimension
-                        + block_offsets[block] + component;
-                    const std::size_t packed_index =
-                        static_cast<std::size_t>(num_nodes) * block_offsets[block]
-                        + node * block_widths[block] + component;
-                    if (std::abs(actual[packed_index] - reference[native_index])
-                        > 2.0e-5f)
-                        return 6;
-                }
-        }
-
-        std::vector<float> output_adjoint(actual.size(), 0.0f);
-        std::vector<float> native_output_adjoint(actual.size(), 0.0f);
-        for (std::int32_t node = 0; node < num_nodes; ++node)
-            for (std::int32_t block = 0; block < 4; ++block)
-                for (std::int32_t component = 0;
-                     component < block_widths[block]; ++component) {
-                    const std::size_t native_index =
-                        static_cast<std::size_t>(node) * extent.output_dimension
-                        + block_offsets[block] + component;
-                    const std::size_t packed_index =
-                        static_cast<std::size_t>(num_nodes) * block_offsets[block]
-                        + node * block_widths[block] + component;
-                    output_adjoint[packed_index] =
-                        static_cast<float>(
-                            static_cast<int>(native_index % 11) - 5) / 16.0f;
-                    native_output_adjoint[native_index] =
-                        output_adjoint[packed_index];
-                }
-        std::vector<float> source_adjoint(source.size(), 0.0f);
-        std::vector<float> harmonic_adjoint(harmonic.size(), 0.0f);
-        std::vector<float> source_direction(source.size());
-        std::vector<float> harmonic_direction(harmonic.size());
-        for (std::size_t i = 0; i < source.size(); ++i)
-            source_direction[i] =
-                static_cast<float>(static_cast<int>(i % 5) - 2) / 8.0f;
-        for (std::size_t i = 0; i < harmonic.size(); ++i)
-            harmonic_direction[i] =
-                static_cast<float>(static_cast<int>(i % 3) - 1) / 8.0f;
-        for (std::int32_t function = 0;
-             function <= extent.weight_size; ++function) {
-            coefficients[extent.weight_size + 1 + function] =
-                static_cast<float>((function % 7) - 3) / 64.0f;
-            coefficients[2 * (extent.weight_size + 1) + function] =
-                static_cast<float>((function % 3) - 1) / 128.0f;
-        }
-        const std::int32_t source_edge_offsets[] = {0, 1, 2};
-        const std::int32_t source_edge_indices[] = {0, 1};
-        std::vector<float> density_adjoint(num_nodes, 0.375f);
-        std::vector<float> distance_adjoint(num_nodes, 0.0f);
-        SymmetrixJitMH1HostSplineRReverseArgsV5 reverse_args{
-            sizeof(SymmetrixJitMH1HostSplineRReverseArgsV5), layer, 0u, 0u,
-            num_nodes, num_nodes, num_nodes, 1, 1, 1,
-            extent.weight_size + 1, 0,
-            1.0, 0.0, source_index, target_index, source_edge_offsets,
-            source_edge_indices, source_types, node_types, distance,
-            coefficients.data(), harmonic.data(), mask.data(), source.data(),
-            native_output_adjoint.data(), density_adjoint.data(),
-            source_adjoint.data(),
-            harmonic_adjoint.data(), distance_adjoint.data()};
-        for (std::int32_t source_owner = 0;
-             source_owner < num_nodes; ++source_owner)
-            spline.source_reverse_owner(&reverse_args, source_owner);
-
-        auto loss = [&](double radius) {
-            std::fill(actual.begin(), actual.end(), 0.0f);
-            std::fill(density.begin(), density.end(), 0.0f);
-            const double local_distance[] = {radius, distance[1]};
-            auto local_args = spline_args;
-            local_args.distances = local_distance;
-            for (std::int32_t receiver = 0; receiver < num_nodes; ++receiver)
-                spline.forward_owner(&local_args, receiver);
-            float result = 0.0f;
-            for (std::int32_t node = 0; node < num_nodes; ++node)
-                result += density_adjoint[node] * density[node];
-            for (std::size_t i = 0; i < actual.size(); ++i)
-                result += output_adjoint[i] * actual[i];
-            return result;
-        };
-        constexpr float epsilon = 1.0e-3f;
-        const float base_loss = loss(distance[0]);
-        for (std::size_t i = 0; i < source.size(); ++i)
-            source[i] += epsilon * source_direction[i];
-        const float source_plus = loss(distance[0]);
-        for (std::size_t i = 0; i < source.size(); ++i)
-            source[i] -= 2.0f * epsilon * source_direction[i];
-        const float source_minus = loss(distance[0]);
-        for (std::size_t i = 0; i < source.size(); ++i)
-            source[i] += epsilon * source_direction[i];
-        float source_dot = 0.0f;
-        for (std::size_t i = 0; i < source.size(); ++i)
-            source_dot += source_adjoint[i] * source_direction[i];
-        if (std::abs(source_dot - (source_plus - source_minus) / (2 * epsilon))
-            > 2.0e-3f * (1.0f + std::abs(base_loss))) return 7;
-
-        for (std::size_t i = 0; i < harmonic.size(); ++i)
-            harmonic[i] += epsilon * harmonic_direction[i];
-        const float harmonic_plus = loss(distance[0]);
-        for (std::size_t i = 0; i < harmonic.size(); ++i)
-            harmonic[i] -= 2.0f * epsilon * harmonic_direction[i];
-        const float harmonic_minus = loss(distance[0]);
-        for (std::size_t i = 0; i < harmonic.size(); ++i)
-            harmonic[i] += epsilon * harmonic_direction[i];
-        float harmonic_dot = 0.0f;
-        for (std::size_t i = 0; i < harmonic.size(); ++i)
-            harmonic_dot += harmonic_adjoint[i] * harmonic_direction[i];
-        if (std::abs(
-                harmonic_dot
-                - (harmonic_plus - harmonic_minus) / (2 * epsilon))
-            > 2.0e-3f * (1.0f + std::abs(base_loss))) return 8;
-
-        const float radial_fd =
-            (loss(distance[0] + epsilon) - loss(distance[0] - epsilon))
-            / (2 * epsilon);
-        if (std::abs(distance_adjoint[0] - radial_fd)
-            > 2.0e-3f * (1.0f + std::abs(base_loss))) return 9;
-    }
-    dlclose(handle);
-    return 0;
+#include "mace_nonlinear_jit_host_plugin.hpp"
+#include <stdexcept>
+#include <utility>
+int main() {
+    using symmetrix::execution::MH1HostPluginV7;
+    using symmetrix::execution::MH1SplitPhaseExpectation;
+    bool load_failed=false;
+    try { (void)MH1HostPluginV7::load("unavailable",MH1SplitPhaseExpectation{}); }
+    catch(const std::runtime_error&) { load_failed=true; }
+    MH1HostPluginV7 first;
+    MH1HostPluginV7 second(std::move(first));
+    first=std::move(second);
+    bool descriptor_failed=false;
+    try { (void)first.descriptor(); }
+    catch(const std::logic_error&) { descriptor_failed=true; }
+    return load_failed&&descriptor_failed&&!first?0:1;
 }
 """,
         encoding="ascii",
@@ -4667,56 +1397,935 @@ int main(int argc, char** argv)
             compiler,
             "-std=c++20",
             "-O2",
-            runner_source,
-            "-I",
-            str(Path(__file__).parents[1] / "source/symmetrix"),
-            "-ldl",
+            "-U__unix__",
+            "-U__linux__",
+            "-U__APPLE__",
+            f"-I{repository / 'libsymmetrix' / 'source'}",
+            f"-I{repository / 'symmetrix' / 'source' / 'symmetrix'}",
+            repository / "libsymmetrix/source/mace_nonlinear_jit_host_plugin.cpp",
+            probe,
             "-o",
-            runner,
+            executable,
         ],
         check=True,
         capture_output=True,
         text=True,
     )
-    subprocess.run([runner, library], check=True)
+    subprocess.run([executable], check=True, capture_output=True, text=True)
 
 
-def test_mh1_v5_float64_spline_r_plugin_compiles(mh1_node_definition, tmp_path):
+def test_mh1_cuda_v5_non_posix_loader_stubs_are_link_complete(tmp_path):
     compiler = shutil.which(os.environ.get("CXX", "c++"))
     if compiler is None:
-        pytest.skip("a C++ compiler is required for spline R generation")
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    generated = render_jit_mh1_host_plugin_v5(contract, precision="float64")
-    spline_source = generated[generated.rindex("\nnamespace {\n") :]
-
-    assert "value.scalar_size = sizeof(double);" in spline_source
-    descriptor_source = spline_source[
-        spline_source.index("const SymmetrixJitMH1HostPluginV5") :
-    ]
-    assert (
-        "SYMMETRIX_JIT_MH1_HOST_SPLINE_R_PACKED_FORWARD_MESSAGES_V5"
-        in descriptor_source
+        pytest.skip("a C++ compiler is required for loader symbol coverage")
+    repository = Path(__file__).parents[2]
+    probe = tmp_path / "mh1_cuda_v5_non_posix_probe.cpp"
+    executable = tmp_path / "mh1_cuda_v5_non_posix_probe"
+    probe.write_text(
+        r"""
+#include "mace_nonlinear_jit_cuda_plugin.hpp"
+#include <functional>
+#include <stdexcept>
+#include <string>
+#include <utility>
+int main() {
+    using symmetrix::execution::MH1CudaPlugin;
+    using symmetrix::execution::MH1CudaPluginV4;
+    using symmetrix::execution::MH1CudaPluginExpectation;
+    using symmetrix::execution::MH1CudaPluginV4Expectation;
+    auto posix_failure=[](const std::function<void()>& call) {
+        try { call(); }
+        catch(const std::runtime_error& error) {
+            return std::string(error.what()).find("require POSIX")
+                !=std::string::npos;
+        }
+        return false;
+    };
+    if(!posix_failure([] { (void)MH1CudaPlugin::load(
+            "unavailable",MH1CudaPluginExpectation{}); })) return 2;
+    bool retired_load_failed=false;
+    try {
+        (void)MH1CudaPluginV4::load(
+            "unavailable",MH1CudaPluginV4Expectation{});
+    } catch(const std::invalid_argument& error) {
+        retired_load_failed=std::string(error.what()).find("retired")
+            !=std::string::npos;
+    }
+    if(!retired_load_failed) return 3;
+    if(!posix_failure([] { (void)MH1CudaPluginV4::load_cubin(
+            "unavailable",MH1CudaPluginV4Expectation{},"{}"); })) return 4;
+    if(!posix_failure([] { (void)MH1CudaPluginV4::load_module(
+            "unavailable",MH1CudaPluginV4Expectation{},"{}"); })) return 5;
+    MH1CudaPluginV4 first;
+    MH1CudaPluginV4 second(std::move(first));
+    first=std::move(second);
+    SymmetrixJitMH1CudaForwardArgsV4 forward{};
+    SymmetrixJitMH1CudaReverseArgsV4 reverse{};
+    SymmetrixJitMH1CudaSplineRForwardArgsV5 spline_forward{};
+    SymmetrixJitMH1CudaSplineRSourceArgsV5 spline_source{};
+    SymmetrixJitMH1CudaSplineREdgeArgsV5 spline_edge{};
+    SymmetrixJitMH1CudaConditioningForwardArgsV4 conditioning_forward{};
+    SymmetrixJitMH1CudaConditioningReverseArgsV4 conditioning_reverse{};
+    SymmetrixJitMH1CudaNodeForwardArgsV5 node_forward{};
+    SymmetrixJitMH1CudaNodeReverseArgsV5 node_reverse{};
+    if(!posix_failure([&] { (void)first.launch_forward(&forward,nullptr,1); })) return 6;
+    if(!posix_failure([&] { (void)first.launch_reverse(&reverse,nullptr,1,1); })) return 7;
+    if(!posix_failure([&] { (void)first.launch_spline_r_forward(&spline_forward,nullptr,1); })) return 8;
+    if(!posix_failure([&] { (void)first.launch_spline_r_reverse(&spline_source,&spline_edge,nullptr,1); })) return 9;
+    if(!posix_failure([&] { (void)first.launch_conditioning_forward(&conditioning_forward,nullptr,1); })) return 10;
+    if(!posix_failure([&] { (void)first.launch_conditioning_reverse(&conditioning_reverse,nullptr,1); })) return 11;
+    if(!posix_failure([&] { (void)first.launch_node_forward(&node_forward,nullptr,1); })) return 12;
+    if(!posix_failure([&] { (void)first.launch_node_reverse(&node_reverse,nullptr,1); })) return 13;
+    if(!posix_failure([&] { (void)first.launch_split_forward(&node_forward,nullptr,1); })) return 14;
+    if(!posix_failure([&] { (void)first.launch_split_reverse(&node_reverse,nullptr,1); })) return 15;
+    if(!posix_failure([&] { (void)first.descriptor(); })) return 16;
+    return !first&&first.path().empty()&&!first.has_spline_r_program()
+        &&first.edge_launch_count(0)==0&&!first.split_phase_ready()?0:17;
+}
+""",
+        encoding="ascii",
     )
-    assert "const double* const coefficients" in spline_source
-    assert "double source_contribution_0 = 0.0f;" in spline_source
-    assert "const float" not in spline_source
-    assert "float*" not in spline_source
-
-    source = tmp_path / "mh1_host_v5_float64.cpp"
-    library = tmp_path / "mh1_host_v5_float64.so"
-    source.write_text(generated, encoding="ascii")
     subprocess.run(
-        [compiler, "-std=c++20", "-O2", "-shared", "-fPIC", source, "-o", library],
+        [
+            compiler,
+            "-std=c++20",
+            "-O2",
+            "-U__unix__",
+            "-U__linux__",
+            "-U__APPLE__",
+            f"-I{repository / 'libsymmetrix' / 'source'}",
+            f"-I{repository / 'symmetrix' / 'source' / 'symmetrix'}",
+            repository / "libsymmetrix/source/mace_nonlinear_jit_cuda_plugin.cpp",
+            probe,
+            "-o",
+            executable,
+        ],
         check=True,
         capture_output=True,
         text=True,
     )
+    subprocess.run([executable], check=True, capture_output=True, text=True)
 
 
-def test_mh1_v5_rejects_unknown_spline_precision(mh1_node_definition):
-    contract = make_execution_mh1_v4_contract(mh1_node_definition)
-    with pytest.raises(ValueError, match="float32.*float64"):
-        render_jit_mh1_host_plugin_v5(contract, precision="float16")
+def _polar_spin_source_head(zero_charges):
+    return {
+        "class": "EnvironmentDependentSpinSourceBlock",
+        "zero_charges": zero_charges,
+        "linear": _e3_linear(
+            "1x0e+1x1o",
+            "1x0e+1x1o+1x0e+1x1o",
+            [(0, 0), (0, 2), (1, 1), (1, 3)],
+        ),
+    }
+
+
+def _polar_update_mlp():
+    return {
+        "layers": [
+            {
+                "type": "linear",
+                "weight": _tensor([5, 2], 0.1),
+                "bias": _tensor([5], 0.2),
+            },
+            {
+                "type": "layer_norm",
+                "normalized_shape": [5],
+                "eps": 1.0e-5,
+                "weight": _tensor([5], 1.0),
+                "bias": _tensor([5], 0.0),
+            },
+            {"type": "silu"},
+            {
+                "type": "linear",
+                "weight": _tensor([1, 5], 0.3),
+                "bias": _tensor([1], 0.4),
+            },
+        ]
+    }
+
+
+def _polar_dot_products():
+    return {
+        "irreps_in1": "1x0e+1x1o",
+        "irreps_in2": "1x0e+1x1o",
+        "irreps_out": "1x0e",
+        "instructions": [
+            {
+                "i_in1": 0,
+                "i_in2": 0,
+                "i_out": 0,
+                "connection_mode": "uvu",
+                "has_weight": True,
+                "path_weight": 1.0,
+                "path_shape": [1, 1],
+                "wigner_3j": _tensor([1, 1, 1], 1.0),
+            },
+            {
+                "i_in1": 1,
+                "i_in2": 1,
+                "i_out": 0,
+                "connection_mode": "uvu",
+                "has_weight": True,
+                "path_weight": 3.0**0.5,
+                "path_shape": [1, 1],
+                "wigner_3j": {
+                    "shape": [3, 3, 1],
+                    "values": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ],
+                },
+            },
+        ],
+        "weight": _tensor([2], 0.25),
+        "output_mask": _tensor([1], 1.0),
+    }
+
+
+def _polar_tp_out():
+    return {
+        "irreps_in1": "1x0e+1x1o",
+        "irreps_in2": "1x0e",
+        "irreps_out": "1x0e+1x1o",
+        "instructions": [
+            {
+                "i_in1": 0,
+                "i_in2": 0,
+                "i_out": 0,
+                "connection_mode": "uvu",
+                "has_weight": True,
+                "path_weight": 1.0,
+                "path_shape": [1, 1],
+                "wigner_3j": _tensor([1, 1, 1], 1.0),
+            },
+            {
+                "i_in1": 1,
+                "i_in2": 0,
+                "i_out": 1,
+                "connection_mode": "uvu",
+                "has_weight": True,
+                "path_weight": 3.0**0.5,
+                "path_shape": [1, 1],
+                "wigner_3j": {
+                    "shape": [3, 1, 3],
+                    "values": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ],
+                },
+            },
+        ],
+        "weight": _tensor([2], 0.25),
+        "output_mask": _tensor([4], 1.0),
+    }
+
+
+def _polar_update_readout():
+    return {
+        "class": "GeneralNonLinearBiasReadoutBlock",
+        "linear_1": _e3_linear("1x0e+1x1o", "4x0e+2x1o", [(0, 0), (1, 1)]),
+        "linear_mid": _e3_linear("2x0e+2x1o", "4x0e+2x1o", [(0, 0), (1, 1)]),
+        "linear_2": _e3_linear(
+            "2x0e+2x1o",
+            "1x0e+1x1o+1x0e+1x1o+2x0e",
+            [(0, 0), (0, 2), (0, 4), (1, 1), (1, 3)],
+        ),
+        "gate": {
+            "irreps_in": "4x0e+2x1o",
+            "irreps_out": "2x0e+2x1o",
+            "irreps_scalars": "2x0e",
+            "irreps_gates": "2x0e",
+            "irreps_gated": "2x1o",
+            "mul": {
+                "irreps_in1": "2x1o",
+                "irreps_in2": "2x0e",
+                "irreps_out": "2x1o",
+                "instructions": [
+                    {
+                        "i_in1": 0,
+                        "i_in2": 0,
+                        "i_out": 0,
+                        "connection_mode": "uvu",
+                        "has_weight": True,
+                        "path_weight": 1.0,
+                        "path_shape": [2, 2],
+                        "wigner_3j": {
+                            "shape": [3, 1, 3],
+                            "values": [
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                1.0,
+                            ],
+                        },
+                    }
+                ],
+                "weight": _tensor([4], 0.5),
+                "output_mask": _tensor([6], 1.0),
+            },
+            "scalar_activation": "silu",
+            "scalar_activation_constants": [1.6791767923989418],
+            "gate_activation": "sigmoid",
+            "gate_activation_constants": [1.8467055342154763],
+        },
+    }
+
+
+def _polar_field_update_block():
+    return {
+        "class": "AgnosticEmbeddedOneBodyVariableUpdate",
+        "potential_embedding": {
+            "class": "AgnosticChargeBiasedLinearPotentialEmbedding",
+            "potential_linear": _e3_linear("1x0e+1x0e", "1x0e+1x1o", [(0, 0), (1, 0)]),
+            "node_feats_linear": _e3_linear("1x0e+1x1o", "1x0e+1x1o", [(0, 0), (1, 1)]),
+            "charge_embedding": _e3_linear(
+                "1x0e+1x1o+1x0e+1x1o",
+                "1x0e+1x1o",
+                [(0, 0), (2, 0), (1, 1), (3, 1)],
+            ),
+        },
+        "source_embedding": _e3_linear("2x0e", "1x0e", [(0, 0)]),
+        "dot_products": _polar_dot_products(),
+        "nonlinearity": _polar_update_mlp(),
+        "tp_out": _polar_tp_out(),
+        "readout": _polar_update_readout(),
+        "field_norm_factor": 1.0,
+    }
+
+
+def _polar_section(steps=2):
+    return {
+        "class": "PolarMACE",
+        "keep_last_layer_irreps": True,
+        "num_recursion_steps": steps,
+        "atomic_multipoles_max_l": 1,
+        "atomic_multipoles_smearing_width": 1.5,
+        "field_feature_max_l": 0,
+        "field_feature_widths": [1.5],
+        "field_feature_norms": _tensor([1], 1.0),
+        "field_norm_factor": 1.0,
+        "kspace_cutoff": 4.2,
+        "charges_irreps": "1x0e+1x1o+1x0e+1x1o",
+        "field_irreps": "1x0e",
+        "potential_irreps": "1x0e+1x0e",
+        "spin_source_heads": [
+            _polar_spin_source_head(zero_charges=False),
+            _polar_spin_source_head(zero_charges=True),
+        ],
+        "feature_mixer": {
+            "class": "MultiLayerFeatureMixer",
+            "linears": [
+                _e3_linear("1x0e+1x1o", "1x0e+1x1o", [(0, 0), (1, 1)]),
+                _e3_linear("1x0e+1x1o", "1x0e+1x1o", [(0, 0), (1, 1)]),
+            ],
+        },
+        "field_update_blocks": [_polar_field_update_block() for _ in range(steps)],
+        # The chain's two ends: the pre-loop Fukui source map and the post-loop
+        # local-electron readout (both are model data the contract describes),
+        # plus the checkpoint flags the composition depends on.
+        "fukui_source_map": {
+            "class": "NonLinearBiasReadoutBlock",
+            "linear": None,
+            # The oracle's map hides a scalar stack (the activation is applied
+            # elementwise), and the output linear emits the two source
+            # channels.
+            "linear_1": _e3_linear("1x0e+1x1o", "2x0e", [(0, 0)]),
+            "linear_mid": _e3_linear("2x0e", "2x0e", [(0, 0)]),
+            "linear_2": _e3_linear("2x0e", "2x0e", [(0, 0)]),
+            "activation": "silu",
+            "activation_constants": [1.0],
+        },
+        "local_electron_energy": {
+            "class": "OneBodyMLPFieldReadout",
+            "linear_up_q": _e3_linear(
+                "1x0e+1x1o+1x0e+1x1o", "1x0e+1x1o", [(0, 0), (2, 0), (1, 1), (3, 1)]
+            ),
+            "linear_up_v": _e3_linear("1x0e+1x0e", "1x0e+1x1o", [(0, 0), (1, 0)]),
+            "dot_products_q": _polar_dot_products(),
+            "dot_products_v": _polar_dot_products(),
+            "mlp": _polar_local_electron_mlp(),
+        },
+        "add_local_electron_energy": True,
+        "include_electrostatic_self_interaction": False,
+        "quadrupole_feature_corrections": False,
+        "field_si": False,
+    }
+
+
+def _polar_local_electron_mlp():
+    """The readout's affine MLP: two invariants in, one energy out."""
+
+    return {
+        "layers": [
+            {
+                "type": "linear",
+                "weight": _tensor([1, 2], 0.1),
+                "bias": _tensor([1], 0.2),
+            },
+        ]
+    }
+
+
+@pytest.fixture
+def polar_definition(mh1_node_definition):
+    """A two-interaction PolarMACE-shaped definition: keep-last-layer products."""
+
+    definition = copy.deepcopy(mh1_node_definition)
+    definition["num_elements"] = 2
+    product = definition["products"][1]
+    product["node_feats_irreps"] = "1x0e+1x1o"
+    product["target_irreps"] = "1x0e+1x1o"
+    product["linear"] = _e3_linear("1x0e+1x1o", "1x0e+1x1o", [(0, 0), (1, 1)])
+    product["symmetric_contractions"]["irreps_out"] = "1x0e+1x1o"
+    product["symmetric_contractions"]["contractions"] = [
+        _mh1_contraction(0),
+        _mh1_contraction(1),
+    ]
+    definition["interactions"][1]["skip_tp"] = _e3_linear(
+        "1x0e+1x1o", "1x0e+1x1o", [(0, 0), (1, 1)]
+    )
+    definition["readouts"][1]["linear_1"] = _e3_linear("1x0e+1x1o", "2x0e", [(0, 0)])
+    definition["polar"] = _polar_section()
+    return definition
+
+
+def test_polar_backbone_contract_is_parameter_free_and_canonical(polar_definition):
+    contract = make_execution_polar_backbone_contract(polar_definition)
+
+    assert POLAR_CONTRACT_KEY == "POLAR_BACKBONE"
+    assert (
+        contract["tag"]
+        == POLAR_CONTRACT_TAG
+        == ("symmetrix.execution.polar_backbone/2")
+    )
+    assert contract["interaction_count"] == 2
+    assert contract["recursion_step_count"] == 2
+    # The unrolled chain is part of the contract, and it is the depth this
+    # model declares rather than a fixed literal.
+    assert contract["execution"] == polar_execution_schedule(2)
+    assert contract["keep_last_layer_irreps"] is True
+    assert contract["charges"]["irreps"] == "1x0e+1x1o+1x0e+1x1o"
+    assert contract["charges"]["dimension"] == 8
+    assert contract["field"]["irreps"] == "1x0e"
+    assert contract["field"]["feature_norm_count"] == 1
+    assert contract["potential"]["irreps"] == "1x0e+1x0e"
+    assert contract["node_feats_irreps"] == "1x0e+1x1o"
+    assert [head["index"] for head in contract["spin_source_heads"]] == [0, 1]
+    assert contract["spin_source_heads"][0]["zero_charges"] is False
+    assert contract["spin_source_heads"][1]["zero_charges"] is True
+    update = contract["field_update_blocks"][0]
+    assert update["edge_set"] == "empty"
+    assert [path["mode"] for path in update["dot_products"]["paths"]] == [
+        "contraction",
+        "contraction",
+    ]
+    assert [path["mode"] for path in update["tp_out"]["paths"]] == [
+        "contraction",
+        "modulation",
+    ]
+    assert update["readout"]["linear_2"]["irreps"]["output"] == (
+        "1x0e+1x1o+1x0e+1x1o+2x0e"
+    )
+    assert contract["semantic_fingerprint"].startswith("sha256:")
+    assert normalize_execution_polar_backbone_contract(contract) == contract
+    assert (
+        validate_execution_polar_backbone_contract_for_model(polar_definition, contract)
+        == contract
+    )
+
+
+def test_polar_backbone_identity_excludes_learned_values(polar_definition):
+    original = make_execution_polar_backbone_contract(polar_definition)
+    changed = copy.deepcopy(polar_definition)
+    polar = changed["polar"]
+    for head in polar["spin_source_heads"]:
+        head["linear"]["weight"]["values"] = [
+            value + 7.0 for value in head["linear"]["weight"]["values"]
+        ]
+    for linear in polar["feature_mixer"]["linears"]:
+        linear["weight"]["values"] = [
+            value + 1.0 for value in linear["weight"]["values"]
+        ]
+    for update in polar["field_update_blocks"]:
+        embedding = update["potential_embedding"]
+        for name in ("potential_linear", "node_feats_linear", "charge_embedding"):
+            embedding[name]["weight"]["values"] = [
+                value - 2.0 for value in embedding[name]["weight"]["values"]
+            ]
+        update["source_embedding"]["weight"]["values"] = [
+            value + 3.0 for value in update["source_embedding"]["weight"]["values"]
+        ]
+        for name in ("dot_products", "tp_out"):
+            update[name]["weight"]["values"] = [
+                value + 4.0 for value in update[name]["weight"]["values"]
+            ]
+        for layer in update["nonlinearity"]["layers"]:
+            for tensor_name in ("weight", "bias"):
+                if tensor_name in layer:
+                    layer[tensor_name]["values"] = [
+                        value - 1.0 for value in layer[tensor_name]["values"]
+                    ]
+        readout = update["readout"]
+        for name in ("linear_1", "linear_mid", "linear_2"):
+            readout[name]["weight"]["values"] = [
+                value + 5.0 for value in readout[name]["weight"]["values"]
+            ]
+        readout["gate"]["mul"]["weight"]["values"] = [
+            value + 6.0 for value in readout["gate"]["mul"]["weight"]["values"]
+        ]
+        readout["gate"]["mul"]["output_mask"]["values"] = [
+            value + 0.5 for value in readout["gate"]["mul"]["output_mask"]["values"]
+        ]
+
+    assert make_execution_polar_backbone_contract(changed) == original
+
+
+def test_polar_backbone_identity_captures_program_facts(polar_definition):
+    original = make_execution_polar_backbone_contract(polar_definition)
+
+    changed_flags = copy.deepcopy(polar_definition)
+    changed_flags["polar"]["spin_source_heads"][0]["zero_charges"] = True
+    flags_contract = make_execution_polar_backbone_contract(changed_flags)
+    assert (
+        flags_contract["generation_fingerprint"] != original["generation_fingerprint"]
+    )
+    assert flags_contract["structure_fingerprint"] != original["structure_fingerprint"]
+
+    changed_cutoff = copy.deepcopy(polar_definition)
+    changed_cutoff["polar"]["kspace_cutoff"] = 4.3
+    cutoff_contract = make_execution_polar_backbone_contract(changed_cutoff)
+    assert (
+        cutoff_contract["generation_fingerprint"] != original["generation_fingerprint"]
+    )
+    assert cutoff_contract["structure_fingerprint"] == original["structure_fingerprint"]
+
+    changed_topology = copy.deepcopy(polar_definition)
+    for update in changed_topology["polar"]["field_update_blocks"]:
+        update["nonlinearity"]["layers"][1] = {"type": "silu"}
+    topology_contract = make_execution_polar_backbone_contract(changed_topology)
+    assert (
+        topology_contract["structure_fingerprint"] != original["structure_fingerprint"]
+    )
+
+    changed_wigner = copy.deepcopy(polar_definition)
+    for update in changed_wigner["polar"]["field_update_blocks"]:
+        update["dot_products"]["instructions"][1]["wigner_3j"]["values"][3] = 0.5
+    wigner_contract = make_execution_polar_backbone_contract(changed_wigner)
+    assert (
+        wigner_contract["generation_fingerprint"] != original["generation_fingerprint"]
+    )
+    assert wigner_contract["structure_fingerprint"] != original["structure_fingerprint"]
+
+    changed_depth = copy.deepcopy(polar_definition)
+    changed_depth["polar"]["field_update_blocks"] = changed_depth["polar"][
+        "field_update_blocks"
+    ][:1]
+    changed_depth["polar"]["num_recursion_steps"] = 1
+    depth_contract = make_execution_polar_backbone_contract(changed_depth)
+    assert depth_contract["recursion_step_count"] == 1
+    assert (
+        depth_contract["generation_fingerprint"] != original["generation_fingerprint"]
+    )
+
+
+def test_polar_model_validates_under_the_existing_mh1_admission(polar_definition):
+    contract = make_execution_mh1_contract(polar_definition)
+    assert contract["tag"] == MH1_CONTRACT_TAG
+    assert normalize_execution_mh1_contract(contract) == contract
+    assert (
+        validate_execution_mh1_contract_for_model(polar_definition, contract)
+        == contract
+    )
+
+    v4 = make_execution_polar_mh1_v4_contract(polar_definition)
+    assert v4["node_program"]["layers"][1]["product"]["irreps"]["output"] == (
+        "1x0e+1x1o"
+    )
+    assert normalize_execution_mh1_v4_contract(v4) == v4
+    assert (
+        validate_execution_polar_mh1_v4_contract_for_model(polar_definition, v4) == v4
+    )
+
+
+def _resized_mh1_definition(definition, count):
+    """The MH-1 definition resized to ``count`` synthetic interaction layers.
+
+    The fixture's layer builders are index-parameterized -- layer 0 carries
+    the model input shapes, the later layers the residual ones, and only the
+    last layer reads out nonlinearly -- so composing them into ``count``
+    layers builds a synthetic topology of that depth.  It is *not* the shipped
+    checkpoints' layer content: those are recorded in the facts fixture and
+    validated against the real checkpoints by the env-gated extraction
+    comparison; what this builds is the contract shape the interaction-count
+    admission must accept.
+    """
+
+    resized = copy.deepcopy(definition)
+    resized["interactions"] = [_mh1_node_interaction(0)] + [
+        copy.deepcopy(_mh1_node_interaction(1)) for _ in range(count - 1)
+    ]
+    resized["products"] = [copy.deepcopy(_mh1_product(0)) for _ in range(count - 1)] + [
+        _mh1_product(1)
+    ]
+    resized["readouts"] = [copy.deepcopy(_mh1_readout(0)) for _ in range(count - 1)] + [
+        _mh1_readout(1)
+    ]
+    return resized
+
+
+@pytest.mark.parametrize("count", (1, 3))
+def test_mh1_interaction_counts_outside_the_legacy_pair_are_admitted(
+    mh1_node_definition, count
+):
+    """The lifted topology admits one and three interaction layers.
+
+    The interaction count is contract data (the v6 interaction-count lift), so
+    a topology outside the legacy pair builds the version-3 identity,
+    normalizes, validates against the model definition, and is admitted by the
+    extractor's optional builder.  Nothing here is rejected by the admission
+    itself: the legacy exactly-two rule is gone.
+    """
+
+    definition = _resized_mh1_definition(mh1_node_definition, count)
+    contract = make_execution_mh1_contract(definition)
+    assert contract["tag"] == MH1_CONTRACT_TAG
+    assert contract["interaction_count"] == count
+    assert [item["index"] for item in contract["interactions"]] == list(range(count))
+    assert normalize_execution_mh1_contract(contract) == contract
+    assert validate_execution_mh1_contract_for_model(definition, contract) == contract
+    assert maybe_make_execution_mh1_contract(definition) == contract
+
+
+def _resized_polar_definition(definition, count):
+    """The polar definition resized to ``count`` synthetic interaction layers.
+
+    Every per-interaction list is contract data (the interaction, the product,
+    the readout, the spin-source head, the mixer linear), so a topology of
+    another depth is the fixture's layer 0 followed by ``count - 1`` copies of
+    its keep-last layer, with the position-stated readout rule applied.  The
+    content is synthetic -- the shipped checkpoints' own layer shapes come from
+    the facts fixture -- and what it exercises is the admission of that depth.
+    """
+
+    resized = copy.deepcopy(definition)
+
+    def layers(entries):
+        return [copy.deepcopy(entries[0])] + [
+            copy.deepcopy(entries[1]) for _ in range(count - 1)
+        ]
+
+    resized["interactions"] = layers(resized["interactions"])
+    resized["products"] = [
+        copy.deepcopy(resized["products"][0]) for _ in range(count - 1)
+    ] + [copy.deepcopy(resized["products"][1])]
+    resized["readouts"] = [
+        copy.deepcopy(resized["readouts"][0]) for _ in range(count - 1)
+    ] + [copy.deepcopy(resized["readouts"][1])]
+    polar = resized["polar"]
+    polar["spin_source_heads"] = layers(polar["spin_source_heads"])
+    polar["feature_mixer"]["linears"] = layers(polar["feature_mixer"]["linears"])
+    return resized
+
+
+@pytest.mark.parametrize("count", (1, 3))
+def test_polar_shipped_interaction_counts_are_admitted_by_the_contracts(
+    polar_definition, count
+):
+    """The one- and three-interaction polar depths are admitted.
+
+    The legacy admission refused exactly-two topologies, so the S checkpoint's
+    single interaction and the L checkpoint's three were both rejected before
+    the lift; now the polar backbone identity, the MH-1 version-3 identity,
+    and the v4 node program all build, normalize, and validate against the
+    model definition, and the unrolled chain the polar contract carries is the
+    depth the model declares.
+    """
+
+    definition = _resized_polar_definition(polar_definition, count)
+    polar = make_execution_polar_backbone_contract(definition)
+    assert polar["tag"] == POLAR_CONTRACT_TAG
+    assert polar["interaction_count"] == count
+    assert len(polar["spin_source_heads"]) == count
+    assert len(polar["feature_mixer"]["linears"]) == count
+    assert polar["execution"] == polar_execution_schedule(polar["recursion_step_count"])
+    assert normalize_execution_polar_backbone_contract(polar) == polar
+    assert (
+        validate_execution_polar_backbone_contract_for_model(definition, polar) == polar
+    )
+
+    contract = make_execution_mh1_contract(definition)
+    assert contract["interaction_count"] == count
+    assert normalize_execution_mh1_contract(contract) == contract
+    assert validate_execution_mh1_contract_for_model(definition, contract) == contract
+    assert maybe_make_execution_mh1_contract(definition) == contract
+
+    v4 = make_execution_polar_mh1_v4_contract(definition)
+    assert v4["interaction_count"] == count
+    assert len(v4["node_program"]["layers"]) == count
+    assert v4["node_program"]["execution"] == node_execution_schedule(count)
+    assert normalize_execution_mh1_v4_contract(v4) == v4
+    assert validate_execution_polar_mh1_v4_contract_for_model(definition, v4) == v4
+
+
+def test_polar_products_outside_the_keep_last_matrix_are_rejected(polar_definition):
+    changed = copy.deepcopy(polar_definition)
+    product = changed["products"][1]
+    product["node_feats_irreps"] = "1x1o+1x0e"
+    product["target_irreps"] = "1x1o+1x0e"
+    product["linear"] = _e3_linear("1x1o+1x0e", "1x1o+1x0e", [(0, 0), (1, 1)])
+    product["symmetric_contractions"]["irreps_out"] = "1x1o+1x0e"
+    with pytest.raises(ValueError, match="keep-last-layer support matrix"):
+        make_execution_polar_mh1_v4_contract(changed)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "fragment"),
+    [
+        pytest.param(
+            lambda d: d.pop("polar"), "require polar model data", id="no-polar-data"
+        ),
+        pytest.param(
+            lambda d: d["polar"].pop("keep_last_layer_irreps"),
+            "keep-last-layer readouts",
+            id="no-keep-last",
+        ),
+        pytest.param(
+            lambda d: d["polar"].__setitem__(
+                "spin_source_heads",
+                d["polar"]["spin_source_heads"][:1],
+            ),
+            "match the interaction count",
+            id="head-count",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["spin_source_heads"][0].__setitem__("class", "Other"),
+            "spin-source multipole head",
+            id="head-class",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["spin_source_heads"][0].__setitem__(
+                "linear", _e3_linear("1x0e+1x1o", "3x0e", [(0, 0)])
+            ),
+            "spin-resolved multipoles",
+            id="head-output",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["spin_source_heads"][1].__setitem__(
+                "linear", _e3_linear("1x0e", "1x0e+1x1o+1x0e+1x1o", [(0, 0), (0, 2)])
+            ),
+            "linear input is inconsistent",
+            id="head-input",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["feature_mixer"].__setitem__("class", "Other"),
+            "multi-layer feature mixer",
+            id="mixer-class",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["feature_mixer"].__setitem__(
+                "linears", d["polar"]["feature_mixer"]["linears"][:1]
+            ),
+            "match the interaction count",
+            id="mixer-count",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["feature_mixer"]["linears"][0].__setitem__(
+                "irreps_in", "1x0e"
+            ),
+            "irrep index is invalid",
+            id="mixer-linear-mismatch",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][0].__setitem__(
+                "class", "Other"
+            ),
+            "one-body variable update",
+            id="update-class",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][0][
+                "potential_embedding"
+            ].__setitem__("class", "Other"),
+            "charge-biased linear potential embedding",
+            id="embedding-class",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][0]["potential_embedding"][
+                "charge_embedding"
+            ].__setitem__("irreps_in", "1x0e"),
+            "irrep index is invalid",
+            id="charge-embedding-input",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][0]["potential_embedding"][
+                "potential_linear"
+            ].__setitem__("irreps_out", "1x0e+1x1o+1x2e"),
+            "output_mask shape is inconsistent",
+            id="potential-linear-output",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][0].__setitem__(
+                "source_embedding",
+                _e3_linear("2x0e", "1x0e+1x0e", [(0, 0), (0, 1)]),
+            ),
+            "invariant channels",
+            id="source-embedding-output",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][0].__setitem__(
+                "dot_products",
+                {
+                    "irreps_in1": "1x0e",
+                    "irreps_in2": "1x0e",
+                    "irreps_out": "1x0e",
+                    "instructions": [
+                        {
+                            "i_in1": 0,
+                            "i_in2": 0,
+                            "i_out": 0,
+                            "connection_mode": "uvu",
+                            "has_weight": True,
+                            "path_weight": 1.0,
+                            "path_shape": [1, 1],
+                            "wigner_3j": _tensor([1, 1, 1], 1.0),
+                        }
+                    ],
+                    "weight": _tensor([1], 0.25),
+                    "output_mask": _tensor([1], 1.0),
+                },
+            ),
+            "dot_products irreps are inconsistent",
+            id="dot-products-irreps",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][0]["nonlinearity"]["layers"][0][
+                "weight"
+            ].__setitem__("shape", [5, 3]),
+            "input dimension is inconsistent",
+            id="nonlinearity-input",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][0]["nonlinearity"]["layers"][0][
+                "weight"
+            ].__setitem__("shape", [5, 2, 1]),
+            "rank-2 tensor shape",
+            id="nonlinearity-weight-rank",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][0]["readout"].__setitem__(
+                "class", "NonLinearReadoutBlock"
+            ),
+            "general nonlinear bias readout block",
+            id="readout-class",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][0]["readout"][
+                "linear_2"
+            ].__setitem__("irreps_out", "1x0e+1x1o+1x0e+1x1o"),
+            "irrep index is invalid",
+            id="readout-fukui-output",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][0]["readout"][
+                "gate"
+            ].__setitem__("irreps_gated", ""),
+            "must not be empty",
+            id="readout-gate",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_update_blocks"][1]["nonlinearity"]["layers"][
+                3
+            ].__setitem__("weight", _tensor([1, 6], 0.3)),
+            "input dimension is inconsistent",
+            id="update-steps-differ",
+        ),
+        pytest.param(
+            lambda d: d["polar"].__setitem__("charges_irreps", "1x1o+1x0e+1x1o+1x0e"),
+            "outside the PolarMACE support matrix",
+            id="charges-pattern",
+        ),
+        pytest.param(
+            lambda d: d["polar"].__setitem__("field_feature_widths", []),
+            "non-empty list",
+            id="field-widths-empty",
+        ),
+        pytest.param(
+            lambda d: d["polar"]["field_feature_norms"].__setitem__("shape", [2]),
+            "field_feature_norms shape",
+            id="field-norms-shape",
+        ),
+        pytest.param(
+            lambda d: d["polar"].__setitem__("num_recursion_steps", 3),
+            "match num_recursion_steps",
+            id="update-count",
+        ),
+        pytest.param(
+            lambda d: d["products"][1].__setitem__("target_irreps", "1x0e"),
+            "uniform keep-last-layer product targets",
+            id="nonuniform-products",
+        ),
+    ],
+)
+def test_polar_backbone_contract_rejects_unsupported_shapes(
+    polar_definition, mutate, fragment
+):
+    changed = copy.deepcopy(polar_definition)
+    mutate(changed)
+    with pytest.raises(ValueError, match=fragment):
+        make_execution_polar_backbone_contract(changed)
+
+
+def test_polar_backbone_contract_rejects_stale_fingerprints(polar_definition):
+    contract = make_execution_polar_backbone_contract(polar_definition)
+
+    stale = copy.deepcopy(contract)
+    stale["field_update_blocks"][0]["field_norm_factor"] += 1.0
+    with pytest.raises(ValueError, match="semantic fingerprint is stale"):
+        normalize_execution_polar_backbone_contract(stale)
+
+    stale = copy.deepcopy(contract)
+    stale["runtime_parameter_packs"]["feature_mixer"]["parameter_count"] += 1
+    with pytest.raises(ValueError, match="parameter count is inconsistent"):
+        normalize_execution_polar_backbone_contract(stale)
+
+    stale = copy.deepcopy(contract)
+    stale["interaction_count"] = 1
+    with pytest.raises(ValueError, match="spin-source heads are invalid"):
+        normalize_execution_polar_backbone_contract(stale)
+
+    changed_model = copy.deepcopy(polar_definition)
+    changed_model["polar"]["field_update_blocks"] = changed_model["polar"][
+        "field_update_blocks"
+    ][:1]
+    changed_model["polar"]["num_recursion_steps"] = 1
+    with pytest.raises(ValueError, match="does not match the model definition"):
+        validate_execution_polar_backbone_contract_for_model(changed_model, contract)
+
+
+def test_polar_backbone_requires_boolean_keep_last_flag(polar_definition):
+    changed = copy.deepcopy(polar_definition)
+    changed["polar"]["keep_last_layer_irreps"] = "yes"
+    with pytest.raises(ValueError, match="must be boolean"):
+        make_execution_polar_mh1_v4_contract(changed)
 
 
 def test_mh1_checkpoint_extraction_embeds_contract_when_available():

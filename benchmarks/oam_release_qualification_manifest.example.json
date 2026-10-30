@@ -1,0 +1,60 @@
+{
+  "schema": "symmetrix.oam-release-qualification-manifest",
+  "version": 3,
+  "models": {
+    "S": {"path": "models/oam-s.json"},
+    "M": {"path": "models/oam-m.json"},
+    "L": {"path": "models/oam-l.json"},
+    "XL": {"path": "models/oam-xl.json"}
+  },
+  "graphs": {
+    "host-100": {"structure": "srtio3", "repeat": [2, 2, 5], "seed": 7, "rattle": 0.05, "skin": 0.5},
+    "small": {"structure": "srtio3", "repeat": 2, "seed": 7, "rattle": 0.05, "skin": 0.5},
+    "production": {"structure": "srtio3", "repeat": 10, "seed": 7, "rattle": 0.05, "skin": 0.5}
+  },
+  "samples": 9,
+  "warmups": 3,
+  "host_target": "x86-64-v3",
+  "host_floating_point_policy": "fast",
+  "cuda_target": "sm120",
+  "provenance": {
+    "source_root": "/absolute/path/to/qualified/source-tree",
+    "native_paths": {
+      "host": "/absolute/path/to/host/native-extension.so",
+      "cuda": "/absolute/path/to/cuda/native-extension.so"
+    }
+  },
+  "required_bindings": [
+    {
+      "operator_id": "replace-with-exact-operator-id",
+      "capability_key": "edge_tensor_product",
+      "implementation_id": "replace-with-exact-generated-implementation",
+      "selected_implementation_id": "replace-with-exact-generated-implementation",
+      "tier": "generated",
+      "qualified": true,
+      "portable_covered": false,
+      "artifact_required": true
+    }
+  ],
+  "required_reference_bindings": [
+    {
+      "operator_id": "replace-with-exact-reference-operator-id",
+      "capability_key": "edge_tensor_product",
+      "implementation_id": "portable_oam_kokkos_generic",
+      "selected_implementation_id": "portable_oam_kokkos_generic",
+      "tier": "portable",
+      "qualified": true,
+      "portable_covered": true,
+      "artifact_required": false
+    }
+  ],
+  "capacity_boundaries": [
+    {
+      "model_size": "XL",
+      "backend": "cuda",
+      "precision": "float32",
+      "graph_class": "production"
+    }
+  ],
+  "direct_baselines_us_per_atom": {}
+}

@@ -1,7 +1,7 @@
 #include "e3nn_product.hpp"
+#include "e3nn_product_monomial_key.hpp"
 
 #include <algorithm>
-#include <array>
 #include <functional>
 #include <limits>
 #include <map>
@@ -19,39 +19,24 @@ E3ProductBasis::Tensor tensor_from_json(const nlohmann::json& value)
     for (int dimension : tensor.shape) {
         if (dimension <= 0
             || size > std::numeric_limits<std::size_t>::max()/static_cast<std::size_t>(dimension))
-            throw std::invalid_argument("MACE_Nonlinear product tensor has an invalid shape.");
+            throw std::invalid_argument("Equivariant product tensor has an invalid shape.");
         size *= static_cast<std::size_t>(dimension);
     }
     if (size != tensor.values.size())
-        throw std::invalid_argument("MACE_Nonlinear product tensor has an invalid shape.");
+        throw std::invalid_argument("Equivariant product tensor has an invalid shape.");
     return tensor;
 }
-
-} // namespace
-
-namespace {
-
-struct MonomialKey {
-    int degree = 0;
-    std::array<int,3> indices{};
-
-    bool operator<(const MonomialKey& other) const
-    {
-        if (degree != other.degree) return degree < other.degree;
-        return indices < other.indices;
-    }
-};
 
 } // namespace
 
 int E3ProductBasis::Tensor::offset(const std::vector<int>& index) const
 {
     if (index.size() != shape.size())
-        throw std::invalid_argument("MACE_Nonlinear product tensor rank mismatch.");
+        throw std::invalid_argument("Equivariant product tensor rank mismatch.");
     int result = 0;
     for (int axis=0; axis<static_cast<int>(shape.size()); ++axis) {
         if (index[axis] < 0 || index[axis] >= shape[axis])
-            throw std::out_of_range("MACE_Nonlinear product tensor index is out of range.");
+            throw std::out_of_range("Equivariant product tensor index is out of range.");
         result = result * shape[axis] + index[axis];
     }
     return result;
@@ -66,18 +51,18 @@ E3ProductBasis::E3ProductBasis(const nlohmann::json& data)
       angular_dimension(0)
 {
     if (linear.input_dimension() != output.dimension() || linear.output_dimension() != output.dimension())
-        throw std::invalid_argument("MACE_Nonlinear product linear has incompatible irreps.");
+        throw std::invalid_argument("Equivariant product linear has incompatible irreps.");
     for (const auto& block : input.blocks) {
         if (block.multiplicity != num_features)
-            throw std::invalid_argument("MACE_Nonlinear product requires a common feature multiplicity.");
+            throw std::invalid_argument("Equivariant product requires a common feature multiplicity.");
         angular_dimension += 2*block.l + 1;
     }
     for (const auto& block : output.blocks)
         if (block.multiplicity != num_features)
-            throw std::invalid_argument("MACE_Nonlinear product output multiplicity is incompatible.");
+            throw std::invalid_argument("Equivariant product output multiplicity is incompatible.");
     const auto& serialized = data.at("symmetric_contractions").at("contractions");
     if (serialized.size() != output.blocks.size())
-        throw std::invalid_argument("MACE_Nonlinear product has incompatible contraction outputs.");
+        throw std::invalid_argument("Equivariant product has incompatible contraction outputs.");
     for (int contraction_index=0;
          contraction_index<static_cast<int>(serialized.size()); ++contraction_index) {
         const auto& value = serialized.at(contraction_index);
@@ -92,7 +77,7 @@ E3ProductBasis::E3ProductBasis(const nlohmann::json& data)
         if (contraction.correlation < 1
             || static_cast<int>(contraction.u_tensors.size()) != contraction.correlation
             || static_cast<int>(contraction.weights.size()) != contraction.correlation-1)
-            throw std::invalid_argument("MACE_Nonlinear product has invalid correlation data.");
+            throw std::invalid_argument("Equivariant product has invalid correlation data.");
         int num_elements = -1;
         for (int degree=1; degree<=contraction.correlation; ++degree) {
             const auto& u = contraction.u_tensors[degree-1];
@@ -105,18 +90,18 @@ E3ProductBasis::E3ProductBasis(const nlohmann::json& data)
                 || weights.shape.size() != 3
                 || weights.shape[1] != u.shape.back()
                 || weights.shape[2] != num_features)
-                throw std::invalid_argument("Unsupported MACE_Nonlinear product tensor layout.");
+                throw std::invalid_argument("Unsupported equivariant product tensor layout.");
             for (int axis=0; axis<degree; ++axis)
                 if (u.shape[output_axes+axis] != angular_dimension)
-                    throw std::invalid_argument("Unsupported MACE_Nonlinear product angular tensor layout.");
+                    throw std::invalid_argument("Unsupported equivariant product angular tensor layout.");
             if (num_elements < 0)
                 num_elements = weights.shape[0];
             else if (weights.shape[0] != num_elements)
-                throw std::invalid_argument("MACE_Nonlinear product element dimensions are inconsistent.");
+                throw std::invalid_argument("Equivariant product element dimensions are inconsistent.");
         }
         contractions.push_back(std::move(contraction));
     }
-    if (has_mh1_product_layout(data)) compile_mh1_product();
+    if (has_compiled_product_layout(data)) build_compiled_plan();
 }
 
 int E3ProductBasis::compiled_term_count() const
@@ -127,7 +112,7 @@ int E3ProductBasis::compiled_term_count() const
     return result;
 }
 
-bool E3ProductBasis::has_mh1_product_layout(const nlohmann::json& data) const
+bool E3ProductBasis::has_compiled_product_layout(const nlohmann::json& data) const
 {
     if (!use_sc || !data.value("use_agnostic_product", false)
         || num_features <= 0
@@ -154,8 +139,10 @@ bool E3ProductBasis::has_mh1_product_layout(const nlohmann::json& data) const
     return true;
 }
 
-void E3ProductBasis::compile_mh1_product()
+void E3ProductBasis::build_compiled_plan()
 {
+    using symmetrix::detail::ProductMonomialKey;
+
     compiled_blocks.clear();
     int angular_offset = 0;
     for (int block_index=0; block_index<static_cast<int>(output.blocks.size()); ++block_index) {
@@ -168,7 +155,7 @@ void E3ProductBasis::compile_mh1_product()
         compiled.component_offsets.push_back(0);
 
         for (int component=0; component<compiled.width; ++component) {
-            std::map<MonomialKey,std::vector<double>> coefficients;
+            std::map<ProductMonomialKey,std::vector<double>> coefficients;
             for (int degree=1; degree<=contraction.correlation; ++degree) {
                 const auto& u = contraction.u_tensors[degree-1];
                 const auto& weights = degree == contraction.correlation
@@ -181,7 +168,7 @@ void E3ProductBasis::compile_mh1_product()
                     ? 0 : component*tuples*parameters;
 
                 for (int tuple=0; tuple<tuples; ++tuple) {
-                    MonomialKey key;
+                    ProductMonomialKey key;
                     key.degree = degree;
                     int remainder = tuple;
                     for (int axis=degree-1; axis>=0; --axis) {
@@ -223,7 +210,7 @@ void E3ProductBasis::evaluate_compiled(
 {
     for (const auto& block : compiled_blocks) {
         if (element < 0 || element >= block.num_elements)
-            throw std::out_of_range("MACE_Nonlinear product element index is out of range.");
+            throw std::out_of_range("Equivariant product element index is out of range.");
         for (int component=0; component<block.width; ++component) {
             const int first = block.component_offsets[component];
             const int last = block.component_offsets[component+1];
@@ -256,7 +243,7 @@ void E3ProductBasis::reverse_compiled(
         const auto& block = compiled_blocks[block_index];
         const auto& output_block = output.blocks[block_index];
         if (element < 0 || element >= block.num_elements)
-            throw std::out_of_range("MACE_Nonlinear product element index is out of range.");
+            throw std::out_of_range("Equivariant product element index is out of range.");
         for (int component=0; component<block.width; ++component) {
             const int first = block.component_offsets[component];
             const int last = block.component_offsets[component+1];
@@ -298,7 +285,7 @@ void E3ProductBasis::make_feature_major(
     std::vector<double>& feature_major) const
 {
     if (static_cast<int>(node_features.size()) != input.dimension())
-        throw std::invalid_argument("MACE_Nonlinear product feature size is invalid.");
+        throw std::invalid_argument("Equivariant product feature size is invalid.");
     feature_major.resize(num_features*angular_dimension);
     int angular_offset = 0;
     for (const auto& block : input.blocks) {
@@ -316,7 +303,7 @@ void E3ProductBasis::make_irrep_major(
     std::span<double> result) const
 {
     if (static_cast<int>(result.size()) != output.dimension())
-        throw std::invalid_argument("MACE_Nonlinear product contracted size is invalid.");
+        throw std::invalid_argument("Equivariant product contracted size is invalid.");
     std::fill(result.begin(), result.end(), 0.0);
     int angular_offset = 0;
     for (const auto& block : output.blocks) {
@@ -342,7 +329,7 @@ double E3ProductBasis::evaluate_term(
     if (degree < 1 || u.shape.back() != weights.shape[1]
         || u.shape[output_axes] != angular_dimension
         || weights.shape.size() != 3 || feature >= weights.shape[2])
-        throw std::invalid_argument("Unsupported MACE_Nonlinear product tensor layout.");
+        throw std::invalid_argument("Unsupported equivariant product tensor layout.");
     const int parameters = u.shape.back();
     int tuples = 1;
     for (int axis=0; axis<degree; ++axis) tuples *= u.shape[output_axes+axis];
@@ -422,7 +409,7 @@ std::vector<double> E3ProductBasis::evaluate(
     auto result = linear.evaluate(contracted);
     if (use_sc) {
         if (skip_connection.size() != result.size())
-            throw std::invalid_argument("MACE_Nonlinear product skip connection size is invalid.");
+            throw std::invalid_argument("Equivariant product skip connection size is invalid.");
         for (int i=0; i<static_cast<int>(result.size()); ++i)
             result[i] += skip_connection[i];
     }
@@ -446,7 +433,7 @@ void E3ProductBasis::evaluate_contraction(
             const auto& block = output.blocks[block_index];
             const auto& contraction = contractions[block_index];
             if (element < 0 || element >= contraction.weights_max.shape[0])
-                throw std::out_of_range("MACE_Nonlinear product element index is out of range.");
+                throw std::out_of_range("Equivariant product element index is out of range.");
             for (int feature=0; feature<num_features; ++feature)
                 for (int component=0; component<2*block.l+1; ++component)
                     for (int degree=1; degree<=contraction.correlation; ++degree) {
@@ -472,7 +459,7 @@ void E3ProductBasis::reverse(
     std::vector<double>& skip_connection_adjoint) const
 {
     if (static_cast<int>(output_adjoint.size()) != output.dimension())
-        throw std::invalid_argument("MACE_Nonlinear product output adjoint size is invalid.");
+        throw std::invalid_argument("Equivariant product output adjoint size is invalid.");
     std::vector<double> contracted_adjoint;
     linear.reverse(output_adjoint, contracted_adjoint);
     node_features_adjoint.assign(input.dimension(), 0.0);
@@ -495,9 +482,9 @@ void E3ProductBasis::reverse_contraction(
     std::vector<double>& feature_major_adjoint) const
 {
     if (static_cast<int>(contracted_adjoint.size()) != linear.input_dimension())
-        throw std::invalid_argument("MACE_Nonlinear product contracted adjoint size is invalid.");
+        throw std::invalid_argument("Equivariant product contracted adjoint size is invalid.");
     if (static_cast<int>(node_features_adjoint.size()) != input.dimension())
-        throw std::invalid_argument("MACE_Nonlinear product feature adjoint size is invalid.");
+        throw std::invalid_argument("Equivariant product feature adjoint size is invalid.");
     make_feature_major(node_features, feature_major);
     feature_major_adjoint.assign(num_features*angular_dimension, 0.0);
     if (!compiled_blocks.empty()) {
@@ -548,7 +535,7 @@ void E3ProductBasis::evaluate_batch(
         || elements.size() != static_cast<std::size_t>(samples)
         || (use_sc
             && skip_connections.size() != static_cast<std::size_t>(samples)*output.dimension()))
-        throw std::invalid_argument("MACE_Nonlinear product batch input size is invalid.");
+        throw std::invalid_argument("Equivariant product batch input size is invalid.");
     workspace.contracted.resize(static_cast<std::size_t>(samples)*linear.input_dimension());
     for (int sample=0; sample<samples; ++sample) {
         const std::span<const double> node(
@@ -581,7 +568,7 @@ void E3ProductBasis::reverse_batch(
         || node_features.size() != static_cast<std::size_t>(samples)*input.dimension()
         || output_adjoint.size() != static_cast<std::size_t>(samples)*output.dimension()
         || elements.size() != static_cast<std::size_t>(samples))
-        throw std::invalid_argument("MACE_Nonlinear product batch input size is invalid.");
+        throw std::invalid_argument("Equivariant product batch input size is invalid.");
     workspace.contracted.clear();
     linear.reverse_batch(output_adjoint, samples, workspace.contracted, workspace.linear);
     node_features_adjoint.assign(

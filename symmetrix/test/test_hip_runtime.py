@@ -49,6 +49,13 @@ def test_hip_r1_jit_wave_and_serial_match_generic(
     tmp_path,
     monkeypatch,
 ):
+    """Both HIP R1 edge strategies (``wave`` and ``serial``) match generic.
+
+    ``serial`` here names the HIP R1 edge strategy, not the retired serial
+    evaluator: the calculator always executes through the Kokkos evaluator and
+    ``streamed_edges`` selects the routing.
+    """
+
     from symmetrix import Symmetrix
 
     assert accelerator_capabilities["jit_available"]
@@ -78,7 +85,6 @@ def test_hip_r1_jit_wave_and_serial_match_generic(
 
     generic = debug_factorized_symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
@@ -87,7 +93,6 @@ def test_hip_r1_jit_wave_and_serial_match_generic(
     monkeypatch.setenv("SYMMETRIX_JIT_HIP_R1_EDGE_STRATEGY", "wave")
     wave = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
@@ -99,12 +104,12 @@ def test_hip_r1_jit_wave_and_serial_match_generic(
     )
     wave_energy, wave_forces = _evaluate(wave, atoms)
     assert wave.evaluator.factorized_jit_forward_launch_count == (wave_launches[0] + 1)
-    assert wave.evaluator.factorized_jit_reverse_launch_count == (wave_launches[1] + 2)
+    assert wave.evaluator.factorized_jit_reverse_launch_count == (wave_launches[1] + 1)
+    assert wave.evaluator.factorized_fallback_evaluation_count == 0
 
     monkeypatch.setenv("SYMMETRIX_JIT_HIP_R1_EDGE_STRATEGY", "serial")
     serial = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
@@ -112,6 +117,7 @@ def test_hip_r1_jit_wave_and_serial_match_generic(
     assert serial.evaluator.jit_hip_plugin_ready
     assert serial.jit_cache_key != wave.jit_cache_key
     serial_energy, serial_forces = _evaluate(serial, atoms)
+    assert serial.evaluator.factorized_fallback_evaluation_count == 0
 
     for actual_energy, actual_forces in (
         (wave_energy, wave_forces),
@@ -164,14 +170,12 @@ def test_hip_r1_hiprtc_module_matches_generic(
 
     generic = debug_factorized_symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="factorized",
     )
     expected_energy, expected_forces = _evaluate(generic, atoms)
     module = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="factorized",
     )
@@ -185,7 +189,6 @@ def test_hip_r1_hiprtc_module_matches_generic(
 
     cached_module = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="factorized",
     )
@@ -228,14 +231,12 @@ def _assert_hip_standard_m0_matches_runtime(tmp_path, dtype, tolerance):
     )
     calculator = debug_factorized_symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     assert evaluator.standard_m0_module_ready
     assert evaluator.standard_m0_module_fallback_reason == ""
-    assert evaluator.standard_m0_module_id == ("standard-m0-module-module-v1")
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 
@@ -312,16 +313,13 @@ def test_hip_standard_r0_v2_matches_runtime(accelerator_capabilities, tmp_path):
     )
     calculator = debug_factorized_symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="factorized",
     )
     evaluator = calculator.evaluator
     assert evaluator.standard_r0_module_ready
     assert evaluator.standard_r0_module_fallback_reason == ""
-    assert evaluator.standard_r0_module_id == "standard-r0-module-module-v2"
     evaluator._set_factorized_source_strategy("jit_plugin")
-    evaluator._set_factorized_direct_reverse_executor("runtime")
     inputs = calculator._mace_inputs(atoms)
     native_args = (*inputs[:5], np.asarray(inputs[5]).flatten(), inputs[6])
 

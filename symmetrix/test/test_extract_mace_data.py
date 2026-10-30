@@ -9,7 +9,8 @@ import torch
 
 try:
     extract_mace_data_module = importlib.import_module("symmetrix.extract_mace_data")
-    from symmetrix.execution_contract import (
+    from symmetrix.mace_execution_contract import (
+        normalize_generated_m1_contract,
         normalize_jit_r1_contract,
         normalize_standard_m0_contract,
         normalize_standard_r0_contract,
@@ -18,6 +19,11 @@ try:
         _load_mace_checkpoint,
         _remove_prediction_head,
         extract_mace_data,
+    )
+    from symmetrix.mace_execution_contract import (
+        normalize_jit_r1_contract,
+        normalize_standard_m0_contract,
+        normalize_standard_r0_contract,
     )
 except ImportError as exc:
     extract_mace_data = None
@@ -29,6 +35,28 @@ pytestmark = pytest.mark.skipif(
     extract_mace_data is None,
     reason=f"extract_mace_data is not available: {extract_mace_data_import_error}",
 )
+
+
+def _reference_evaluator(path, head=None):
+    """Construct the retained MACE evaluator on its artifact-free reference routing.
+
+    The serial MACE evaluator is retired, so ``MACEKokkos`` is the only MACE
+    evaluator left.  It defaults to the prepared ``direct`` routing for a compact
+    model, which needs a loaded RTC artifact, so the artifact-free reference
+    routing is requested explicitly.
+    """
+
+    from symmetrix import symmetrix as native_symmetrix
+
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    evaluator = (
+        native_symmetrix.MACEKokkos(str(path))
+        if head is None
+        else native_symmetrix.MACEKokkos(str(path), head)
+    )
+    evaluator.set_streamed_edges("generic")
+    return evaluator
 
 
 def test_ordinary_checkpoint_does_not_import_macefield(monkeypatch):
@@ -54,6 +82,255 @@ def test_ordinary_checkpoint_does_not_import_macefield(monkeypatch):
             {"map_location": "cpu", "weights_only": False},
         )
     ]
+
+
+def _scalar_maceles_model(*, use_dipoles=False):
+    class MACELES:
+        pass
+
+    model = MACELES()
+    model.interactions = [
+        object(),
+        SimpleNamespace(linear_up=SimpleNamespace(weight=torch.tensor([2.0]))),
+    ]
+    model.les_readouts = [
+        SimpleNamespace(linear=SimpleNamespace(weight=torch.tensor([4.0]))),
+        SimpleNamespace(
+            linear_1=SimpleNamespace(weight=torch.tensor([6.0])),
+            linear_2=SimpleNamespace(weight=torch.tensor([8.0])),
+            non_linearity=SimpleNamespace(acts=[SimpleNamespace(cst=1.5)]),
+        ),
+    ]
+    model.les = SimpleNamespace(
+        sigma=1.0,
+        dl=2.0,
+        remove_self_interaction=True,
+        use_atomwise=False,
+        use_fixed_atomic_charges=False,
+        use_atomic_alpha=False,
+        use_epsilon_r_scaling=False,
+    )
+    model.les_output_scale = 0.25
+    model.use_dipoles = use_dipoles
+    model.use_quads = False
+    model.use_induced_charges = False
+    model.use_induced_dipoles = False
+    model.use_anisotropic_polarizability = False
+    model.compute_bec = False
+    return model
+
+
+def _base_contracts():
+    return {
+        "R0": {"fingerprint": "sha256:" + "1" * 64},
+        "M0": {"semantic_fingerprint": "sha256:" + "2" * 64},
+        "R1": {"fingerprint": "sha256:" + "3" * 64},
+    }
+
+
+@pytest.fixture(scope="module")
+def upstream_maceles_checkpoint_paths(tmp_path_factory):
+    pytest.importorskip("les")
+    o3 = pytest.importorskip("e3nn.o3")
+    modules = pytest.importorskip("mace.modules")
+    extensions = pytest.importorskip("mace.modules.extensions")
+
+    def build(heads):
+        num_heads = 1 if heads is None else len(heads)
+        atomic_energies = np.array(
+            [[-1.2 - 0.2 * head, -2.3 - 0.2 * head] for head in range(num_heads)]
+        )
+        if heads is None:
+            atomic_energies = atomic_energies[0]
+        previous_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float64)
+        try:
+            with torch.random.fork_rng():
+                torch.manual_seed(123)
+                return extensions.MACELES(
+                    les_arguments={
+                        "use_atomwise": False,
+                        "use_fixed_atomic_charges": False,
+                        "use_atomic_alpha": False,
+                        "use_epsilon_r_scaling": False,
+                        "sigma": 1.0,
+                        "dl": 2.0,
+                        "remove_self_interaction": True,
+                        "output_scale": 0.25,
+                    },
+                    r_max=3.5,
+                    num_bessel=4,
+                    num_polynomial_cutoff=3,
+                    max_ell=3,
+                    interaction_cls=modules.interaction_classes[
+                        "RealAgnosticResidualInteractionBlock"
+                    ],
+                    interaction_cls_first=modules.interaction_classes[
+                        "RealAgnosticInteractionBlock"
+                    ],
+                    num_interactions=2,
+                    num_elements=2,
+                    hidden_irreps=o3.Irreps("4x0e + 4x1o"),
+                    MLP_irreps=o3.Irreps("3x0e"),
+                    atomic_energies=atomic_energies,
+                    avg_num_neighbors=3.0,
+                    atomic_numbers=[7, 13],
+                    correlation=3,
+                    gate=modules.gate_dict["silu"],
+                    pair_repulsion=False,
+                    distance_transform="None",
+                    radial_type="bessel",
+                    use_reduced_cg=False,
+                    atomic_inter_scale=(
+                        1.3 if heads is None else np.linspace(1.3, 1.4, num_heads)
+                    ),
+                    atomic_inter_shift=(
+                        0.0 if heads is None else np.linspace(0.0, 0.1, num_heads)
+                    ),
+                    heads=heads,
+                ).to(torch.float64)
+        finally:
+            torch.set_default_dtype(previous_dtype)
+
+    root = tmp_path_factory.mktemp("extract-maceles")
+    paths = {}
+    for name, heads in (("single", None), ("multi", ["first", "second"])):
+        model = build(heads)
+        model.eval()
+        path = root / f"{name}.model"
+        torch.save(model, path)
+        paths[name] = path
+    return paths
+
+
+def test_extract_single_head_maceles_publishes_intrinsic_model_identity(
+    upstream_maceles_checkpoint_paths,
+):
+    data = extract_mace_data(
+        upstream_maceles_checkpoint_paths["single"],
+        species=[7, 13],
+        num_spline_points=4,
+    )
+
+    assert data["model_type"] == "MACELES"
+    assert data["les"]["schema"] == "symmetrix.model.mace_les"
+    assert data["les"]["version"] == 1
+
+
+def test_extract_multihead_maceles_publishes_les_parameters_for_every_head(
+    upstream_maceles_checkpoint_paths,
+):
+    data = extract_mace_data(
+        upstream_maceles_checkpoint_paths["multi"],
+        species=[7, 13],
+        num_spline_points=4,
+    )
+
+    assert data["model_type"] == "MACELES"
+    assert data["prediction_heads"]["names"] == ["first", "second"]
+    assert set(data["prediction_heads"]["parameters"]) == {"first", "second"}
+    for payload in data["prediction_heads"]["parameters"].values():
+        assert payload["les"]["schema"] == "symmetrix.model.mace_les"
+        assert payload["les"]["version"] == 1
+
+
+def test_extract_maceles_serializes_charge_readouts_without_energy_scaling():
+    data = extract_mace_data_module._extract_mace_les_parameters(
+        _scalar_maceles_model(),
+        num_channels=1,
+        l_max=0,
+        base_contracts=_base_contracts(),
+    )
+
+    assert data["kind"] == "monopole"
+    assert data["output_scale"] == pytest.approx(0.25)
+    assert data["readout_1_weights"] == pytest.approx([2.0])
+    assert data["readout_2_weights_1"] == pytest.approx([6.0])
+    assert data["readout_2_weights_2"] == pytest.approx([8.0])
+    assert data["mace_num_interactions"] == 2
+    assert data["mace_num_channels"] == 1
+    assert data["mace_contract_fingerprints"] == {
+        "R0": "sha256:" + "1" * 64,
+        "M0": "sha256:" + "2" * 64,
+        "R1": "sha256:" + "3" * 64,
+    }
+
+
+def test_prediction_head_payload_keeps_les_parameters_per_maceles_head():
+    data = {
+        "model_type": "MACELES",
+        "atomic_energies": [1.0],
+        "readout_1_weights": [2.0],
+        "readout_2_weights_1": [3.0],
+        "readout_2_weights_2": [4.0],
+        "les": {"schema": "symmetrix.model.mace_les", "version": 1},
+        "shared_metadata": "excluded",
+    }
+
+    payload = extract_mace_data_module._prediction_head_payload(data)
+
+    assert payload == {
+        "atomic_energies": [1.0],
+        "readout_1_weights": [2.0],
+        "readout_2_weights_1": [3.0],
+        "readout_2_weights_2": [4.0],
+        "les": {"schema": "symmetrix.model.mace_les", "version": 1},
+    }
+
+
+def test_extract_legacy_maceles_uses_nested_ewald_flag_and_default_scale():
+    model = _scalar_maceles_model()
+    model.les.ewald = SimpleNamespace(remove_self_interaction=False)
+    del model.les.remove_self_interaction
+    del model.les_output_scale
+
+    data = extract_mace_data_module._extract_mace_les_parameters(
+        model,
+        num_channels=1,
+        l_max=0,
+        base_contracts=_base_contracts(),
+    )
+
+    assert data["ewald"]["remove_self_interaction"] is False
+    assert data["output_scale"] == pytest.approx(1.0)
+
+
+def test_extract_legacy_maceles_defaults_missing_self_interaction_flag():
+    model = _scalar_maceles_model()
+    del model.les.remove_self_interaction
+
+    data = extract_mace_data_module._extract_mace_les_parameters(
+        model,
+        num_channels=1,
+        l_max=0,
+        base_contracts=_base_contracts(),
+    )
+
+    assert data["ewald"]["remove_self_interaction"] is True
+
+
+def test_extract_maceles_prefers_nested_self_interaction_flag():
+    model = _scalar_maceles_model()
+    model.les.ewald = SimpleNamespace(remove_self_interaction=False)
+
+    data = extract_mace_data_module._extract_mace_les_parameters(
+        model,
+        num_channels=1,
+        l_max=0,
+        base_contracts=_base_contracts(),
+    )
+
+    assert data["ewald"]["remove_self_interaction"] is False
+
+
+def test_extract_maceles_rejects_vector_features():
+    with pytest.raises(RuntimeError, match="use_dipoles"):
+        extract_mace_data_module._extract_mace_les_parameters(
+            _scalar_maceles_model(use_dipoles=True),
+            num_channels=1,
+            l_max=0,
+            base_contracts=_base_contracts(),
+        )
 
 
 def test_remove_prediction_head_restores_default_dtype(monkeypatch):
@@ -85,6 +362,40 @@ def test_unrelated_checkpoint_error_is_preserved(monkeypatch):
         _load_mace_checkpoint("broken.model", "cpu")
 
     assert error.value is load_error
+
+
+def test_maceles_checkpoint_missing_les_module_has_conversion_dependency_error(
+    monkeypatch,
+):
+    missing = ModuleNotFoundError("No module named 'les'", name="les")
+
+    def fake_load(*args, **kwargs):
+        raise missing
+
+    monkeypatch.setattr(extract_mace_data_module.torch, "load", fake_load)
+
+    with pytest.raises(
+        RuntimeError, match=r"MACELES.*conversion.*install.*les"
+    ) as error:
+        _load_mace_checkpoint("maceles.model", "cpu")
+
+    assert error.value.__cause__ is missing
+
+
+def test_unrelated_missing_module_checkpoint_error_is_preserved(monkeypatch):
+    missing = ModuleNotFoundError(
+        "No module named 'ordinary_dependency'", name="ordinary_dependency"
+    )
+
+    def fake_load(*args, **kwargs):
+        raise missing
+
+    monkeypatch.setattr(extract_mace_data_module.torch, "load", fake_load)
+
+    with pytest.raises(ModuleNotFoundError) as error:
+        _load_mace_checkpoint("ordinary.model", "cpu")
+
+    assert error.value is missing
 
 
 def test_legacy_macefield_checkpoint_uses_temporary_alias(monkeypatch):
@@ -267,12 +578,10 @@ def test_macefield_extractor_includes_field_schema(macefield_model_path, tmp_pat
         data["prediction_heads"]["names"]
     )
 
-    from symmetrix import symmetrix as native_symmetrix
-
     model_path = tmp_path / "multihead.json"
     model_path.write_text(json.dumps(data, separators=(",", ":")))
-    default_model = native_symmetrix.MACE(str(model_path))
-    alternate_model = native_symmetrix.MACE(str(model_path), "mp-ferroelectric")
+    default_model = _reference_evaluator(model_path)
+    alternate_model = _reference_evaluator(model_path, "mp-ferroelectric")
     assert default_model.selected_head == "mp-dielectric"
     assert alternate_model.selected_head == "mp-ferroelectric"
     assert default_model.available_heads == data["prediction_heads"]["names"]
@@ -284,7 +593,7 @@ def test_macefield_extractor_includes_field_schema(macefield_model_path, tmp_pat
     legacy_data.pop("prediction_heads")
     legacy_path = tmp_path / "legacy-single-head.json"
     legacy_path.write_text(json.dumps(legacy_data, separators=(",", ":")))
-    legacy_model = native_symmetrix.MACE(str(legacy_path))
+    legacy_model = _reference_evaluator(legacy_path)
     assert legacy_model.selected_head == "mp-dielectric"
     assert legacy_model.available_heads == ["mp-dielectric"]
     assert len(data["field_couplings"]) == 1
@@ -347,6 +656,16 @@ def test_macefield_extractor_includes_field_schema(macefield_model_path, tmp_pat
         118,
     ]
     assert m0_contract["structure_fingerprint"].startswith("sha256:")
+
+    m1_contract = data["execution_contracts"]["M1"]
+    assert normalize_generated_m1_contract(m1_contract) == m1_contract
+    assert m1_contract["interaction"] == "M1"
+    assert m1_contract["channels"] == 128
+    assert m1_contract["type_count"] == 2
+    assert m1_contract["input_l_max"] == 3
+    assert m1_contract["output_l_max"] == 0
+    assert m1_contract["correlation"] == 3
+    assert m1_contract["monomial_groups"][0]["term_count"] == len(data["M1_monomials"])
 
     r0_contract = data["execution_contracts"]["R0"]
     assert normalize_standard_r0_contract(r0_contract) == r0_contract
@@ -455,7 +774,7 @@ def test_macefield_extractor_defaults_to_all_checkpoint_elements(macefield_model
     extract_mace_data is None,
     reason=f"extract_mace_data is not available: {extract_mace_data_import_error}",
 )
-def test_compact_radial_values_and_derivatives_match_pair_splines(
+def test_compact_radial_values_match_pair_splines(
     macefield_model_path,
     tmp_path,
 ):
@@ -479,8 +798,12 @@ def test_compact_radial_values_and_derivatives_match_pair_splines(
     compact_path.write_text(json.dumps(compact, separators=(",", ":")))
     legacy_path.write_text(json.dumps(legacy))
 
-    compact_model = native_symmetrix.MACE(str(compact_path))
-    legacy_model = native_symmetrix.MACE(str(legacy_path))
+    compact_model = _reference_evaluator(compact_path)
+    # The pair-spline export is the original format (named v1 here): the native
+    # loader still admits it through the materialized representation and
+    # announces that routing, while set_streamed_edges refuses it outright.
+    with pytest.warns(UserWarning, match="original Symmetrix pair-spline format"):
+        legacy_model = native_symmetrix.MACEKokkos(str(legacy_path))
     compact_model.prepare_active_types(
         np.asarray([0, 1, 0, 1], dtype=np.int32)[::2],
     )
@@ -504,9 +827,13 @@ def test_compact_radial_values_and_derivatives_match_pair_splines(
     )
     pair_radii = np.tile(radii, 2)
 
-    for method_name, values_name, derivatives_name in (
-        ("compute_R0", "R0", "R0_deriv"),
-        ("compute_R1", "R1", "R1_deriv"),
+    # The retired serial evaluator's R0_deriv/R1_deriv buffers have no retained
+    # equivalent, so only the values are compared: both models materialize the
+    # same spline nodes, and the compact runtime derives its derivatives from
+    # those nodes.
+    for method_name, values_name in (
+        ("compute_R0", "R0"),
+        ("compute_R1", "R1"),
     ):
         for model in (compact_model, legacy_model):
             getattr(model, method_name)(
@@ -522,11 +849,4 @@ def test_compact_radial_values_and_derivatives_match_pair_splines(
             rtol=0.0,
             atol=1e-11,
         )
-        assert np.allclose(
-            getattr(compact_model, derivatives_name),
-            getattr(legacy_model, derivatives_name),
-            rtol=0.0,
-            atol=1e-9,
-        )
         assert np.all(np.isfinite(getattr(compact_model, values_name)))
-        assert np.all(np.isfinite(getattr(compact_model, derivatives_name)))

@@ -7,6 +7,9 @@
 [submodule "libsymmetrix/external/kokkos"]
 	path = libsymmetrix/external/kokkos
 	url = https://github.com/kokkos/kokkos
+[submodule "libsymmetrix/external/kokkos-fft"]
+	path = libsymmetrix/external/kokkos-fft
+	url = https://github.com/kokkos/kokkos-fft
 [submodule "libsymmetrix/external/kokkos-kernels"]
 	path = libsymmetrix/external/kokkos-kernels
 	url = https://github.com/kokkos/kokkos-kernels

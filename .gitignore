@@ -1,7 +1,11 @@
 __pycache__
 build
 *.json
+!symmetrix/source/symmetrix/foundation_oam_architectures.json
 !symmetrix/test/data/execution_contracts/*.json
+!symmetrix/test/data/nequip/*.json
+!symmetrix/test/data/polar/*.json
+!symmetrix/test/reference/fixtures/*.json
 !symmetrix/test/*_required_tests.json
 !benchmarks/foundation_model_support_manifest.json
 *.whl
@@ -15,6 +19,7 @@ build
 ._*
 plans/
 .planning/
+.superpowers/
 /task_plan.md
 /findings.md
 /progress.md

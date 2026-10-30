@@ -3,6 +3,7 @@
 #include <memory>
 #include <limits>
 #include <map>
+#include <stdexcept>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -12,25 +13,32 @@
 #include <array>
 #include <chrono>
 #include <type_traits>
+#include <tuple>
 
 #include "Kokkos_UnorderedMap.hpp"
 
 #include "compact_radial.hpp"
-#include "field_coupling.hpp"
+#include "mace_field_coupling.hpp"
 #include "cubic_spline_kokkos.hpp"
 #include "cubic_spline_set_kokkos.hpp"
 #include "device_backend.hpp"
 #include "execution_plan.hpp"
-#include "mace_streamed_edges.hpp"
+#include "family_interface.hpp"
+#include "implementation_registry.hpp"
+#include "mace_device_backend.hpp"
+#include "mace_model_document.hpp"
+#include "execution_mode.hpp"
 #include "multilayer_perceptron_kokkos.hpp"
 #include "multivariate_polynomial.hpp"//TODO
 #include "multivariate_polynomial_kokkos.hpp"
+#include "plan_candidate_space.hpp"
 #include "radial_function_set_kokkos.hpp"
-#include "jit_cuda_plugin.hpp"
-#include "jit_hip_plugin.hpp"
-#include "jit_host_plugin.hpp"
-#include "jit_m0_host_plugin.hpp"
-#include "jit_operator_module.hpp"
+#include "mace_jit_cuda_plugin.hpp"
+#include "mace_jit_hip_plugin.hpp"
+#include "mace_jit_host_plugin.hpp"
+#include "mace_jit_m0_host_plugin.hpp"
+#include "mace_jit_r0_host_plugin.hpp"
+#include "mace_jit_operator_module.hpp"
 #include "tools_kokkos.hpp"
 #include "zbl_kokkos.hpp"
 
@@ -75,6 +83,18 @@ struct KernelLaunchProfileDiagnostic {
     bool calibration_permitted = false;
 };
 
+enum class MACEModelCapability {
+    alchemical,
+    distributed_prepared,
+    fixed_workspace,
+    metal_artifact,
+};
+
+class MACEModelCapabilityError : public std::invalid_argument {
+public:
+    using std::invalid_argument::invalid_argument;
+};
+
 // True when this build includes the Apple Metal execution layer.
 bool symmetrix_metal_supported();
 // Whether a Metal device usable by the Metal layer is present: a GPU with
@@ -88,18 +108,93 @@ class MACEKokkos {
 public:
 
 MACEKokkos(std::string filename, std::string requested_head = {});
-~MACEKokkos();
+virtual ~MACEKokkos();
 void set_streamed_edges(std::string mode);
 std::string streamed_edges_mode() const;
 void set_execution_plan_request(
     std::string algorithm, std::string profile, std::string debug_plan = {});
 void resolve_execution_plan();
 const symmetrix::execution::ExecutionPlanReport& execution_plan_report() const;
+
+// --- Family adapter interface (family_interface.hpp) ------------------------
+// The neutral lifecycle, capability, program-compilation, artifact, and
+// diagnostic surface.  Each member delegates to the family entry point that
+// already exists under its MH-0 spelling, so the interface adds no second
+// execution path.
+symmetrix::execution::FamilyCapabilities family_capabilities() const;
+symmetrix::execution::Program compile_program() const;
+std::uint64_t prepare_graph(
+    int num_nodes,
+    std::span<const int> node_types,
+    std::span<const int> num_neigh,
+    std::span<const int> neigh_indices,
+    std::span<const int> neigh_types);
+void prepare_geometry(
+    std::uint64_t graph_generation,
+    std::span<const double> reference_positions,
+    std::span<const double> reference_xyz,
+    std::span<const double> cell,
+    std::span<const double> inverse_cell,
+    std::span<const int> pbc);
+void compute_prepared(
+    std::uint64_t graph_generation,
+    std::span<const double> xyz,
+    std::span<const double> distances);
+void reduce_forces(std::uint64_t graph_generation);
+void reduce_stress(double volume, std::uint64_t graph_generation);
+std::uint64_t graph_generation() const;
+std::uint64_t geometry_generation() const;
+symmetrix::execution::ArtifactReadiness load_family_artifact(
+    const symmetrix::execution::ArtifactRequest& request);
+bool family_artifact_ready() const;
+symmetrix::execution::ArtifactReadiness family_artifact_readiness() const;
+// The readiness of one artifact class, so a caller can ask about either target
+// without loading anything.
+symmetrix::execution::ArtifactReadiness artifact_readiness_for(
+    const std::string& target) const;
+symmetrix::execution::FamilyDiagnostics family_diagnostics() const;
+// --- Tiered implementation registry (implementation_registry.hpp) -----------
+symmetrix::execution::ImplementationRegistry
+family_implementation_registry() const;
+symmetrix::execution::ImplementationBindingReport family_binding_report() const;
+// The implementation id the MH-0 execution path dispatches for one operator
+// node of the compiled program: the module the loader selected while the path
+// that owns it is in use, the generated implementation while the direct JIT
+// profile is selected, and the generic implementation otherwise.  The binding
+// report records this as the node's `selected_implementation_id`, so the
+// report states what ran rather than what the readiness flags qualify.  It
+// reads dispatch state only, never a readiness flag.
+std::string dispatched_implementation_id(
+    const std::string& capability_key,
+    const symmetrix::execution::ImplementationBinding& planned) const;
+// The execution target this instance runs on: "host" for the default host
+// execution space, otherwise the accelerator backend name.
+std::string family_execution_target() const;
+
 bool supports_streamed_edges() const;
 bool supports_fused_streamed_reverse() const;
 bool supports_factorized() const;
+// Whether the CUDA strided-batched BLAS implementation serves the MH-0
+// second-interaction contractions (A1 forward and reverse) for this instance.
+// The implementation registry binds this same predicate, so the binding report
+// and the dispatch cannot disagree.
+bool admits_batched_a1_blas() const;
+// Whether the CUDA per-output-element implementation serves the MH-0 M1
+// polynomial forward for this instance: it evaluates each monomial term from
+// its leaves, so it needs no scratch memory and no team cooperation.  The
+// implementation registry binds this same predicate, so the binding report and
+// the dispatch cannot disagree.
+bool admits_m1_device_terms() const;
+// Whether the CUDA fused H2 stages serve this instance: the forward evaluates
+// both second-interaction contributions into one register accumulator and the
+// reverse does the same for both adjoint outputs, so neither reads its output
+// back from memory inside the reduction loop.  The implementation registry
+// binds this same predicate, so the binding report and the dispatch cannot
+// disagree.
+bool admits_device_h2_stages() const;
 void load_jit_cuda_plugin(
     std::string path, int persistent_blocks_per_compute_unit = 8);
+void validate_model_artifact_load(std::string_view loader) const;
 bool jit_cuda_plugin_ready() const;
 std::string jit_cuda_plugin_path() const;
 std::string jit_cuda_plugin_artifact_id() const;
@@ -123,11 +218,29 @@ void load_m0_host_plugin(std::string path);
 bool m0_host_plugin_ready() const;
 std::string m0_host_plugin_path() const;
 std::string m0_host_plugin_artifact_id() const;
+void load_m1_device_module(
+    std::string path, std::string schedule = "chunk32",
+    int persistent_blocks_per_compute_unit = 8);
+bool m1_device_module_ready() const;
+std::string m1_device_module_path() const;
+std::string m1_device_module_artifact_id() const;
+void load_m1_host_plugin(std::string path);
+bool m1_host_plugin_ready() const;
+std::string m1_host_plugin_path() const;
+std::string m1_host_plugin_artifact_id() const;
 void load_r0_device_module(
-    std::string path, int persistent_blocks_per_compute_unit = 8);
+    std::string path, int persistent_blocks_per_compute_unit = 8,
+    bool apply_edge_weights = false,
+    std::string schedule = "receiver-edge16");
 bool r0_device_module_ready() const;
 std::string r0_device_module_path() const;
 std::string r0_device_module_artifact_id() const;
+void load_r0_host_plugin(
+    std::string path, bool apply_edge_weights = false,
+    std::string target = "host");
+bool r0_host_plugin_ready() const;
+std::string r0_host_plugin_path() const;
+std::string r0_host_plugin_artifact_id() const;
 bool device_cuda_available() const;
 std::string execution_cuda_device_name() const;
 int execution_cuda_device_ordinal() const;
@@ -166,6 +279,7 @@ void load_metal_m1_module(
     int output_components,
     int term_count);
 bool metal_m1_module_ready() const;
+void set_metal_module_ready_for_testing();
 // Fills the per-degree A1 layout consumed by the Metal R1 module; returns
 // false when the model's A1 blocks fall outside its supported shape.
 bool metal_a1_layout(void* layout) const;
@@ -185,8 +299,7 @@ std::string metal_r1_device_name() const;
 std::string jit_host_plugin_path() const;
 std::string jit_host_plugin_artifact_id() const;
 void set_factorized_source_strategy(std::string strategy);
-void set_factorized_direct_forward_executor(std::string executor);
-void set_factorized_direct_reverse_executor(std::string executor);
+void set_direct_artifact_diagnostic(std::string code, std::string description);
 void set_standard_r0_executor(std::string executor);
 void set_standard_m0_executor(std::string executor);
 void set_kernel_launch_policy(std::string policy);
@@ -221,15 +334,19 @@ std::string factorized_source_strategy_name() const;
 std::string factorized_execution_strategy_name() const;
 std::string factorized_execution_profile_name() const;
 std::string factorized_derivative_signature_name() const;
-std::string factorized_direct_forward_executor_name() const;
 std::string factorized_selected_direct_forward_executor_name() const;
-std::string factorized_direct_reverse_executor_name() const;
 std::string factorized_selected_direct_reverse_executor_name() const;
 std::string standard_r0_executor_name() const;
 std::string standard_r0_selected_executor_name() const;
 std::string standard_m0_executor_name() const;
 std::string standard_m0_selected_executor_name() const;
 std::string r0_implementation_name() const;
+std::string r0_loader_implementation_name() const;
+std::string r0_backend_name() const;
+std::string r0_artifact_origin_name() const;
+std::string r0_schedule_name() const;
+std::string r0_profile_name() const;
+void set_r0_artifact_origin(std::string origin);
 std::string m0_implementation_name() const;
 std::string r0_selected_module_id() const;
 std::string m0_selected_module_id() const;
@@ -256,6 +373,8 @@ bool mh0_m0_adjoint_alias_active() const;
 std::size_t mh0_m0_forward_replacement_count_value() const;
 std::size_t mh0_m0_adjoint_allocation_count_value() const;
 std::size_t mh0_m0_alias_detach_count_value() const;
+std::size_t mh0_a0_adjoint_allocation_count = 0;
+std::size_t mh0_a1_adjoint_allocation_count = 0;
 std::string readout_policy_name() const;
 std::string phi1_policy_name() const;
 std::size_t phi1_workspace_bytes() const;
@@ -338,8 +457,16 @@ std::size_t standard_m0_poly_adjoints_active_bytes() const;
 std::size_t standard_m0_poly_adjoints_capacity_bytes() const;
 std::size_t factorized_forward_coupling_workspace_bytes() const;
 std::size_t factorized_reverse_coupling_workspace_bytes() const;
-std::size_t a1_blas_flatten_workspace_bytes() const;
 std::size_t factorized_custom_blas_launch_count() const;
+std::size_t batched_a1_blas_launch_count() const {
+    return batched_a1_blas_launches;
+}
+std::size_t m1_device_terms_launch_count() const {
+    return m1_device_terms_launches;
+}
+std::size_t device_h2_stage_launch_count() const {
+    return device_h2_stage_launches;
+}
 std::size_t factorized_blas_stream_bind_count() const;
 std::uint64_t prepare_all_interactions_graph(
     int num_nodes,
@@ -383,6 +510,14 @@ std::uint64_t prepare_factorized_graph(
     std::span<const int> num_neigh,
     std::span<const int> neigh_indices,
     std::span<const int> neigh_types);
+void set_alchemical_weights(
+    std::uint64_t graph_generation,
+    std::span<const double> node_weights,
+    std::span<const double> edge_weights);
+bool alchemical_weights_active() const;
+void validate_alchemical_execution() const;
+Kokkos::View<double*> alchemical_node_weights;
+Kokkos::View<double*> alchemical_edge_weights;
 std::uint64_t prepare_factorized_graph_device(
     int num_nodes,
     Kokkos::View<const int*> node_types,
@@ -478,7 +613,7 @@ FactorizedOperatorBenchmarkMeasurement measure_factorized_operator_benchmark(
 std::vector<Precision> factorized_operator_benchmark_radial_linear(
     std::uint64_t token) const;
 void validate_factorized_operator_benchmark(std::uint64_t token) const;
-MACEStreamedEdgesMode streamed_edges = MACEStreamedEdgesMode::materialized;
+ExecutionMode streamed_edges = ExecutionMode::materialized;
 
 // Basic model information
 int num_elements;
@@ -516,6 +651,7 @@ std::size_t single_layer_workspace_batches = 0;
 std::size_t single_layer_tiled_evaluations = 0;
 Kokkos::View<std::uint64_t*> single_layer_workspace_arena;
 Kokkos::View<Precision***,Kokkos::LayoutRight> single_layer_workspace_a0;
+Kokkos::View<Precision***,Kokkos::LayoutRight> single_layer_workspace_a0_adjoint;
 Kokkos::View<Precision***,Kokkos::LayoutRight> single_layer_workspace_equivariant_a;
 Kokkos::View<Precision***,Kokkos::LayoutRight> single_layer_workspace_equivariant_b;
 Kokkos::View<Precision**,Kokkos::LayoutRight> single_layer_workspace_m1;
@@ -558,9 +694,11 @@ std::size_t dual_layer_workspace_batches = 0;
 std::size_t dual_layer_tiled_evaluations = 0;
 Kokkos::View<std::uint64_t*> dual_layer_workspace_arena;
 Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_a0;
+Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_a0_adjoint;
 Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_equivariant_a;
 Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_equivariant_b;
 Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_a1;
+Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_a1_adjoint;
 Kokkos::View<Precision***,Kokkos::LayoutRight> dual_layer_workspace_phi1;
 Kokkos::View<Precision**,Kokkos::LayoutRight> dual_layer_workspace_m1;
 Kokkos::View<double**,Kokkos::LayoutRight> dual_layer_workspace_h2;
@@ -727,6 +865,7 @@ enum class R0Implementation {
     generic,
     builtin,
     device_module,
+    host_plugin,
 };
 enum class StandardR0Executor {
     automatic,
@@ -738,8 +877,11 @@ enum class StandardR0Executor {
 StandardR0Executor standard_r0_executor = StandardR0Executor::automatic;
 bool standard_r0_module_ready = false;
 R0Implementation selected_r0_implementation = R0Implementation::generic;
+std::string selected_r0_artifact_origin;
+std::string r0_device_module_schedule;
 bool r0_model_payload_verified = false;
 std::unique_ptr<symmetrix::execution::OperatorModule> r0_device_module;
+std::unique_ptr<symmetrix::execution::R0HostPlugin> r0_host_plugin;
 int r0_device_persistent_blocks_per_compute_unit = 8;
 std::string standard_r0_module_fallback_reason;
 bool standard_r0_module_active = false;
@@ -882,6 +1024,8 @@ std::size_t standard_m0_module_reverse_launch_count = 0;
 std::size_t standard_m0_input_scale_adjoint_launch_count = 0;
 bool use_standard_m0_module() const;
 bool use_r0_module() const;
+bool use_r0_comparison_dispatch() const;
+bool use_generated_r0_dispatch() const;
 bool use_m0_module() const;
 void ensure_m0_polynomial_workspace();
 void release_m0_polynomial_workspace();
@@ -1062,15 +1206,20 @@ Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>
     A1_channel_tile_weights;
 Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>
     A1_channel_tile_weights_trans;
-// Private staging buffers for the accelerator BLAS A1 path.  The public A1 and
-// Phi1 layouts remain node-major, so direct BLAS still pays a pack/unpack cost.
-// Keep the tile bounded because the staging buffers scale with this extent.
+static constexpr int phi1_channel_tile_size = 64;
+// Flattened A1 BLAS staging, used by the CUDA prepared-execution route only.
+// Each node tile's (2l+1) rows are gathered into one contiguous operand so a
+// single large GEMM replaces the per-node batch.  The tile is bounded because
+// these buffers scale with it, and they are grown on demand, never initialized
+// and never part of the retained state bundle.
 Kokkos::View<Precision*> A1_blas_flatten_input;
 Kokkos::View<Precision*> A1_blas_flatten_output;
 static constexpr int a1_blas_flatten_tile_nodes = 8192;
 static constexpr int a1_blas_flatten_min_nodes = 512;
+bool admits_flattened_a1_blas(int num_nodes) const;
 void ensure_a1_blas_flatten_capacity(
     std::size_t input_elements, std::size_t output_elements);
+std::size_t a1_blas_flatten_workspace_bytes() const;
 // Host owner-computes blocking of the A1 dense contractions: nodes are grouped
 // so one worker stages a contiguous Phi1 (or A1-adjoint) block, issues one
 // larger GEMM, and unpacks the result.  The staging uses transient host
@@ -1082,7 +1231,6 @@ std::size_t a1_host_blocked_forward_launch_count = 0;
 std::size_t a1_host_blocked_reverse_launch_count = 0;
 int a1_host_block_nodes_used = 0;
 std::size_t a1_host_blocked_scratch_bytes = 0;
-static constexpr int phi1_channel_tile_size = 64;
 void compute_A1(int num_nodes, bool completion_fence = true);
 void compute_A1_channel_tile(int num_nodes, int channel_begin);
 void reverse_A1(int num_nodes, bool completion_fence = true);
@@ -1101,24 +1249,12 @@ int factorized_chunk_size = factorized_default_chunk_size;
 std::string factorized_tile_selection_reason = "default tile";
 enum class FactorizedSourceStrategy {
     serial_reference,
-    team_cached,
-    tiled_coupling,
     jit_plugin,
 };
 enum class FactorizedReverseCachePolicy {
     automatic,
     recompute,
     retain,
-};
-enum class FactorizedDirectReverseExecutor {
-    automatic,
-    runtime,
-    jit,
-};
-enum class FactorizedDirectForwardExecutor {
-    automatic,
-    runtime,
-    jit_all,
 };
 enum class FactorizedOperatorBenchmarkMode {
     forward,
@@ -1136,10 +1272,6 @@ std::map<std::string,KernelLaunchProfileDiagnostic>
     kernel_launch_profile_diagnostic_records;
 bool factorized_ready = false;
 bool factorized_tiled_ready = false;
-FactorizedDirectReverseExecutor factorized_direct_reverse_executor =
-    FactorizedDirectReverseExecutor::automatic;
-FactorizedDirectForwardExecutor factorized_direct_forward_executor =
-    FactorizedDirectForwardExecutor::automatic;
 bool factorized_has_model_contract = false;
 bool factorized_model_payload_verified = false;
 int factorized_model_embedding = 0;
@@ -1155,6 +1287,7 @@ std::shared_ptr<symmetrix::execution::metal::MetalR1Module> metal_r1_module;
 std::shared_ptr<symmetrix::execution::metal::MetalR0Module> metal_r0_module;
 std::shared_ptr<symmetrix::execution::metal::MetalM0Module> metal_m0_module;
 std::shared_ptr<symmetrix::execution::metal::MetalM0Module> metal_m1_module;
+bool metal_module_ready_for_testing = false;
 // Evaluator views that Metal modules access in place; shared by all modules.
 std::shared_ptr<symmetrix::execution::metal::MetalViewRegistry> metal_views;
 #ifdef SYMMETRIX_ENABLE_METAL
@@ -1170,7 +1303,9 @@ bool metal_h1_fusion_enabled = true;
 Kokkos::View<Precision*> execution_receiver_projection;
 Kokkos::View<Precision*> execution_a1_projection_weights;
 FactorizedSourceStrategy factorized_source_strategy =
-    FactorizedSourceStrategy::team_cached;
+    FactorizedSourceStrategy::serial_reference;
+std::string direct_artifact_diagnostic_code;
+std::string direct_artifact_diagnostic_description;
 FactorizedReverseCachePolicy factorized_reverse_cache_policy =
     FactorizedReverseCachePolicy::automatic;
 static constexpr std::size_t factorized_default_planner_budget_bytes =
@@ -1335,6 +1470,10 @@ bool factorized_prepared_geometry_uses_shifts = false;
 bool use_compact_edge_geometry() const;
 bool use_y_only_direct_harmonics() const;
 std::string y_only_direct_harmonics_admission_reason() const;
+// The whole-plan candidate space MH-0 declares: the five direct plans, with the
+// ids, order, and qualification semantics the frontends and the debug-plan pin
+// match on.
+symmetrix::execution::PlanCandidateSpace plan_candidate_space() const;
 void select_low_memory_policy_for_graph(
     int num_receivers, int num_feature_nodes, std::size_t num_edges,
     std::span<const int> num_neigh);
@@ -1423,6 +1562,7 @@ std::uint64_t factorized_operator_benchmark_evaluation_epoch = 0;
 std::uint64_t factorized_completed_evaluation_epoch_counter = 0;
 std::uint64_t factorized_completed_evaluation_epoch = 0;
 std::uint64_t factorized_completed_evaluation_graph_generation = 0;
+std::uint64_t model_evaluation_graph_generation = 0;
 int factorized_operator_benchmark_num_nodes = 0;
 int factorized_operator_benchmark_num_edges = 0;
 Kokkos::View<double*> factorized_operator_benchmark_xyz;
@@ -1649,11 +1789,10 @@ void compute_factorized(
     Kokkos::View<const double*> r);
 bool use_factorized_direct_inference() const;
 bool factorized_direct_profile_requested() const;
+std::string direct_artifact_requirement_message() const;
 bool use_factorized_async_inference() const;
 bool use_gpu_field_h1_reverse() const;
 void complete_device_stage(const char* label);
-bool use_factorized_direct_jit_forward() const;
-bool use_factorized_direct_jit_reverse() const;
 bool use_channel_tiled_phi1() const;
 bool use_receiver_local_phi1() const;
 FactorizedOperatorBenchmarkMode factorized_operator_benchmark_mode(
@@ -1712,8 +1851,34 @@ enum class M1PolynomialPolicy {
 };
 M1PolynomialPolicy m1_polynomial_policy = M1PolynomialPolicy::retained;
 bool standard_m1_module_ready = false;
+enum class M1Implementation {
+    generic,
+    builtin,
+    device_module,
+    host_plugin,
+};
+M1Implementation selected_m1_implementation = M1Implementation::generic;
+bool m1_has_model_contract = false;
+bool m1_model_payload_verified = false;
+int m1_correlation = 0;
+int m1_module_term_count = 0;
+std::string m1_model_contract_fingerprint;
+std::string m1_model_semantic_fingerprint;
+std::string m1_model_structure_fingerprint;
+std::string m1_module_fallback_reason;
+Kokkos::View<Precision***,Kokkos::LayoutRight> generated_m1_module_weights;
+std::unique_ptr<symmetrix::execution::OperatorModule> m1_device_module;
+std::unique_ptr<symmetrix::execution::M0HostPlugin> m1_host_plugin;
+std::string m1_device_module_schedule = "none";
+int m1_device_persistent_blocks_per_compute_unit = 8;
+std::size_t generated_m1_module_forward_launch_count = 0;
+std::size_t generated_m1_module_reverse_launch_count = 0;
 std::size_t standard_m1_module_forward_launch_count = 0;
 std::size_t standard_m1_module_reverse_launch_count = 0;
+// Strided-batched BLAS launches the bound A1 route performed (diagnostic).
+std::size_t batched_a1_blas_launches = 0;
+std::size_t m1_device_terms_launches = 0;
+std::size_t device_h2_stage_launches = 0;
 std::string m1_polynomial_policy_request = "automatic";
 std::string m1_recompute_fallback_reason;
 int m1_recompute_tile_channels = 32;
@@ -1745,6 +1910,14 @@ Kokkos::View<int**,Kokkos::LayoutRight> M1_monomials;
 Kokkos::View<Precision***,Kokkos::LayoutRight> M1_weights;
 Kokkos::View<int**,Kokkos::LayoutRight> M1_poly_spec;
 Kokkos::View<Precision***,Kokkos::LayoutRight> M1_poly_coeff;
+// The flattened monomial specification the per-output-element M1 kernel reads:
+// one row per represented term (its leaves, -1 padded) and the coefficient row
+// that term's product feeds.  Built once at model load; empty when the model's
+// monomial lists do not fit the flattened form.
+Kokkos::View<int**,Kokkos::LayoutRight> M1_term_leaves;
+Kokkos::View<int*,Kokkos::LayoutRight> M1_term_nodes;
+int M1_term_count = 0;
+bool m1_terms_ready = false;
 Kokkos::View<Precision***,Kokkos::LayoutRight> M1_poly_values;
 Kokkos::View<Precision***,Kokkos::LayoutRight> M1_poly_adjoints;
 void compute_M1(int num_nodes, Kokkos::View<const int*> node_types);
@@ -1791,7 +1964,25 @@ double compute_readouts(
     bool compute_total_energy = true,
     bool completion_fence = true);
 
-// Initializer
-void load_from_json(std::string filename, const std::string& requested_head = {});
+protected:
+MACEKokkos(
+    const SelectedMACEModel& selected,
+    MACEModelKind expected_kind);
+void load_mace_backbone(const SelectedMACEModel& selected);
+virtual void begin_model_evaluation(int num_nodes);
+virtual void prepare_model_readouts(int num_nodes);
+virtual void evaluate_model_after_readouts(int num_nodes);
+virtual void before_model_evaluation_fence();
+virtual void after_model_evaluation_fence();
+virtual void finish_model_evaluation(int num_nodes);
+virtual void compose_model_forces(int num_nodes);
+virtual void compose_model_stress(double volume);
+virtual void validate_model_capability(MACEModelCapability capability) const;
+virtual void validate_model_execution_mode(ExecutionMode mode) const;
+virtual void on_model_execution_mode_change(
+    ExecutionMode previous,
+    ExecutionMode next);
 
 };
+
+#include "mace_model_hooks.hpp"

@@ -40,7 +40,18 @@ class TargetManifest:
     blas_root: str
     device_probe: str
     visible_devices: tuple[str, ...]
+    # Requested shared particle-mesh provider policy. The configure step owns
+    # provider discovery; this records what the build was asked for.
+    particle_mesh_policy: str = "auto"
+    prebuilt_operator_artifacts: str = "r0"
+    prebuilt_oam_artifacts: str = "off"
     schema_version: int = SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.prebuilt_operator_artifacts not in {"off", "r0", "full"}:
+            raise BuildError("prebuilt_operator_artifacts must be off, r0, or full")
+        if self.prebuilt_oam_artifacts not in {"off", "known"}:
+            raise BuildError("prebuilt_oam_artifacts must be off or known")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -75,6 +86,17 @@ class TargetManifest:
             )
             toolchain = Toolchain(**toolchain_value)
             visible = tuple(value.get("visible_devices", ()))
+            particle_mesh_policy = value.get("particle_mesh_policy")
+            legacy_policy = value.get("fourier_d3_policy")
+            if (
+                particle_mesh_policy is not None
+                and legacy_policy is not None
+                and particle_mesh_policy != legacy_policy
+            ):
+                raise BuildError(
+                    "target manifest has conflicting particle_mesh_policy and "
+                    "legacy fourier_d3_policy values"
+                )
             return cls(
                 backend=value["backend"],
                 architecture=architecture,
@@ -86,6 +108,11 @@ class TargetManifest:
                 blas_root=value.get("blas_root", ""),
                 device_probe=value.get("device_probe", "manifest"),
                 visible_devices=visible,
+                particle_mesh_policy=(particle_mesh_policy or legacy_policy or "auto"),
+                prebuilt_operator_artifacts=value.get(
+                    "prebuilt_operator_artifacts", "r0"
+                ),
+                prebuilt_oam_artifacts=value.get("prebuilt_oam_artifacts", "off"),
                 schema_version=value["schema_version"],
             )
         except (KeyError, TypeError) as error:

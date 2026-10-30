@@ -19,10 +19,18 @@ def _prediction_head_fields(model_data: Mapping[str, Any]) -> set[str]:
     }
     if model_data.get("has_zbl", False):
         fields.add("zbl_c")
+    if model_data.get("model_type") == "MACELES":
+        fields.add("les")
     return fields
 
 
 def available_prediction_heads(model_data: Mapping[str, Any]) -> tuple[str, ...]:
+    model_type = model_data.get("model_type")
+    if model_type == "MACELES":
+        if "les" not in model_data:
+            raise ValueError("MACELES model data must contain intrinsic les parameters")
+    elif "les" in model_data:
+        raise ValueError("only MACELES model data may contain les parameters")
     section = model_data.get("prediction_heads")
     if section is None:
         legacy_head = model_data.get("head")

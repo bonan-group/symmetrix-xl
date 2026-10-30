@@ -31,7 +31,7 @@
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
 #include "device_backend.hpp"
-#include "standard_m0.hpp"
+#include "mace_standard_m0.hpp"
 #include "factorized_blas.hpp"
 
 using Kokkos::ALL;

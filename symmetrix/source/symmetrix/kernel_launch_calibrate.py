@@ -188,7 +188,6 @@ def calibrate_kernel_launches(
     calculator = Symmetrix(
         model,
         dtype=precision,
-        use_kokkos=True,
         streamed_edges=streamed_edges,
         jit=jit,
         kernel_launch_policy="static",

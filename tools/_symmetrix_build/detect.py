@@ -39,6 +39,7 @@ class DetectionRequest:
     mkl_root: str = ""
     openblas_root: str = ""
     accelerator_blas_root: str = ""
+    particle_mesh: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -549,6 +550,23 @@ def _cpu_blas_policy(
     )
 
 
+def _particle_mesh_policy(requested: str) -> str:
+    """Validate the shared particle-mesh provider policy.
+
+    ``auto`` discovers a KokkosFFT provider and stays buildable when none is
+    found; ``on`` requires one and ``off`` disables particle-mesh algorithms.
+    The policy is only a request: the configure step owns the actual discovery,
+    and it never fetches a dependency to satisfy this.
+    """
+
+    normalized = requested.strip().lower()
+    if normalized not in {"auto", "on", "off"}:
+        raise BuildError(
+            f"particle-mesh policy must be auto, on, or off; got {requested!r}"
+        )
+    return normalized
+
+
 def _accelerator_blas_policy(explicit_root: str = "") -> tuple[str, str]:
     if not explicit_root:
         return "system", ""
@@ -578,6 +596,7 @@ def detect_target(
     _validate_host()
     active_runner = runner or CommandRunner()
     root = Path(repo_root).resolve()
+    particle_mesh_policy = _particle_mesh_policy(request.particle_mesh)
     backend = normalize_backend(request.backend)
     probe = devices or probe_devices(active_runner)
 
@@ -671,6 +690,7 @@ def detect_target(
         blas_root=blas_root,
         device_probe=device_probe,
         visible_devices=visible,
+        particle_mesh_policy=particle_mesh_policy,
     )
 
 
@@ -681,6 +701,7 @@ def validate_source_checkout(repo_root: str | Path, runner: CommandRunner) -> No
         root / "symmetrix/CMakeLists.txt",
         root / "libsymmetrix/external/kokkos/CMakeLists.txt",
         root / "libsymmetrix/external/kokkos-kernels/CMakeLists.txt",
+        root / "libsymmetrix/external/kokkos-fft/CMakeLists.txt",
         root / "libsymmetrix/external/sphericart/sphericart/CMakeLists.txt",
         root / "libsymmetrix/external/json/CMakeLists.txt",
         root / "symmetrix/external/pybind11/CMakeLists.txt",

@@ -1,18 +1,22 @@
 # This file was written and publicly released by Dr. Noam Bernstein as part of his
 # work for the U. S. Government, and is not subject to copyright.
 
+import builtins
 import json
 import os
 
 import numpy as np
 import pytest
+import symmetrix as native_symmetrix
 import symmetrix.calculator as calculator_module
+import symmetrix.neighbor_graph as neighbor_graph_module
 from ase import units
 from ase.atoms import Atoms
 from ase.build import bulk
 from ase.calculators.calculator import Calculator
 from ase.md.npt import NPT
 from ase.stress import full_3x3_to_voigt_6_stress
+from symmetrix.corrections import CorrectionPipeline, D2Correction, D3Correction
 
 try:
     from symmetrix import FieldAwareCalculator, FieldContributionCalculator, Symmetrix
@@ -49,10 +53,6 @@ from model_downloads import test_model_cache_dir
     [
         ({"allow_fixed_workspace": 1}, "allow_fixed_workspace must be a bool"),
         (
-            {"allow_fixed_workspace": True, "use_kokkos": False},
-            "allow_fixed_workspace=True requires use_kokkos=True",
-        ),
-        (
             {"allow_fixed_workspace": True, "streamed_edges": "materialized"},
             "allow_fixed_workspace=True requires streamed_edges='direct'",
         ),
@@ -68,15 +68,15 @@ def test_fixed_workspace_opt_in_validation(tmp_path, kwargs, message):
 
 
 def test_python_graph_cardinality_guard_rejects_unrepresentable_topology():
-    from symmetrix.calculator import _validate_int32_graph_cardinality
+    validate_graph_cardinality = neighbor_graph_module.validate_graph_cardinality
 
-    _validate_int32_graph_cardinality(1_000_188, 109_020_492)
+    validate_graph_cardinality(1_000_188, 109_020_492)
     with pytest.raises(ValueError, match="atom count.*32-bit CSR limit"):
-        _validate_int32_graph_cardinality(2**31 - 1, 0)
+        validate_graph_cardinality(2**31 - 1, 0)
     with pytest.raises(ValueError, match="directed-edge count.*32-bit topology"):
-        _validate_int32_graph_cardinality(1, 2**31)
+        validate_graph_cardinality(1, 2**31)
     with pytest.raises(ValueError, match="must be non-negative"):
-        _validate_int32_graph_cardinality(-1, 0)
+        validate_graph_cardinality(-1, 0)
 
 
 def test_mace_inputs_runs_native_model_cardinality_guard(monkeypatch):
@@ -95,11 +95,12 @@ def test_mace_inputs_runs_native_model_cardinality_guard(monkeypatch):
             guarded.append((receivers, feature_nodes, edges))
 
     calculator = Symmetrix.__new__(Symmetrix)
+    calculator._alchemical = None
     calculator.evaluator = Evaluator()
     calculator.neighbor_skin = 0.0
     calculator.cutoff = 2.0
     monkeypatch.setattr(
-        "symmetrix.calculator.neighbor_list",
+        "symmetrix.neighbor_graph.neighbor_list",
         lambda *_args: (
             np.array([0, 1], dtype=np.int64),
             np.array([1, 0], dtype=np.int64),
@@ -125,37 +126,18 @@ def test_compute_mace_uses_prepared_execution_capability_and_preserves_fallback(
         np.array([0, 1], dtype=np.int32),
     )
 
-    class PreparedEvaluator:
+    class FailingPreparedEvaluator:
         streamed_edges_mode = "direct"
 
-        def __init__(self):
-            self.prepared = []
-            self.evaluated = []
-
         def _prepare_factorized_graph(self, *topology):
-            self.prepared.append(topology)
-            return 17
+            raise RuntimeError("preparation failed")
 
-        def _compute_prepared_factorized(self, token, xyz, distances):
-            self.evaluated.append((token, xyz.copy(), distances.copy()))
-
-        def compute_node_energies_forces(self, *args):
-            raise AssertionError(
-                "prepared Execution must not use the broad entry point"
-            )
+        def _compute_prepared_factorized(self, *args):
+            raise AssertionError("graph preparation must complete first")
 
     calculator = object.__new__(Symmetrix)
-    calculator.evaluator = PreparedEvaluator()
-    calculator._compute_mace(inputs)
-    assert len(calculator.evaluator.prepared) == 1
-    assert all(
-        actual is expected
-        for actual, expected in zip(calculator.evaluator.prepared[0], inputs[:5])
-    )
-    token, xyz, distances = calculator.evaluator.evaluated[0]
-    assert token == 17
-    assert xyz.flags.c_contiguous and xyz.shape == (6,)
-    assert distances.flags.c_contiguous and distances.shape == (2,)
+    calculator._alchemical = None
+    calculator.evaluator = FailingPreparedEvaluator()
     invalid_geometry = list(inputs)
     invalid_geometry[6] = np.array([0.0, 1.0])
     with pytest.raises(ValueError, match="invalid distance"):
@@ -165,42 +147,140 @@ def test_compute_mace_uses_prepared_execution_capability_and_preserves_fallback(
     invalid_geometry[5][0, 0] = np.nan
     with pytest.raises(ValueError, match="invalid distance"):
         calculator._compute_mace(tuple(invalid_geometry))
-    assert len(calculator.evaluator.prepared) == 1
-
-    class FallbackEvaluator:
-        streamed_edges_mode = "generic"
-
-        def __init__(self):
-            self.calls = []
-
-        def _prepare_factorized_graph(self, *topology):
-            raise AssertionError("inactive Execution must not prepare a graph")
-
-        def _compute_prepared_factorized(self, *args):
-            raise AssertionError("inactive Execution must not use a graph token")
-
-        def compute_node_energies_forces(self, *args):
-            self.calls.append(args)
-
-    calculator.evaluator = FallbackEvaluator()
-    calculator._compute_mace(inputs)
-    assert len(calculator.evaluator.calls) == 1
-    assert all(
-        actual is expected
-        for actual, expected in zip(calculator.evaluator.calls[0][0:5], inputs[:5])
-    )
-
-    class FailingPreparedEvaluator(PreparedEvaluator):
-        def _prepare_factorized_graph(self, *topology):
-            raise RuntimeError("preparation failed")
-
-    calculator.evaluator = FailingPreparedEvaluator()
     with pytest.raises(RuntimeError, match="preparation failed"):
         calculator._compute_mace(inputs)
 
 
+def _prepared_inputs():
+    return (
+        2,
+        [0, 0],
+        np.array([1, 1], dtype=np.int32),
+        np.array([1, 0], dtype=np.int32),
+        [0, 0],
+        np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
+        np.array([1.0, 1.0]),
+        np.array([0, 1], dtype=np.int32),
+    )
+
+
+def test_compute_mace_rejects_a_direct_evaluator_without_the_prepared_surface():
+    """A direct request must fail, not silently run the reduced edge path."""
+
+    class UnpreparedEvaluator:
+        streamed_edges_mode = "direct"
+
+        def __init__(self):
+            self.reduced = []
+
+        def compute_node_energies_forces(self, *args):
+            self.reduced.append(args)
+
+    calculator = object.__new__(Symmetrix)
+    calculator.evaluator = UnpreparedEvaluator()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"family 'MACE' declares the 'prepared' evaluator capability, but "
+            r"the evaluator does not provide '_prepare_factorized_graph'"
+        ),
+    ):
+        calculator._compute_mace(_prepared_inputs())
+
+    assert calculator.evaluator.reduced == []
+
+
+def test_compute_mace_reports_the_missing_prepared_method_by_name():
+    class HalfPreparedEvaluator:
+        streamed_edges_mode = "direct"
+
+        def __init__(self):
+            self.reduced = []
+
+        def _prepare_factorized_graph(self, *topology):
+            return 3
+
+        def compute_node_energies_forces(self, *args):
+            self.reduced.append(args)
+
+    calculator = object.__new__(Symmetrix)
+    calculator.evaluator = HalfPreparedEvaluator()
+
+    with pytest.raises(
+        RuntimeError, match="does not provide '_compute_prepared_factorized'"
+    ):
+        calculator._compute_mace(_prepared_inputs())
+
+    assert calculator.evaluator.reduced == []
+
+
+def test_compute_mace_reports_an_unready_declared_tier():
+    class UnreadyEvaluator:
+        streamed_edges_mode = "direct"
+        family_capabilities = {"portable": False, "generated": False}
+
+        def _prepare_factorized_graph(self, *topology):
+            return 3
+
+        def _compute_prepared_factorized(self, *args):
+            raise AssertionError("an unready tier must not execute")
+
+    calculator = object.__new__(Symmetrix)
+    calculator.evaluator = UnreadyEvaluator()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"reports no ready implementation tier \('portable', 'generated'",
+    ):
+        calculator._compute_mace(_prepared_inputs())
+
+
+def test_compute_macefield_rejects_a_direct_evaluator_without_the_field_surface():
+    class UnpreparedFieldEvaluator:
+        streamed_edges_mode = "direct"
+
+        def __init__(self):
+            self.reduced = []
+
+        def compute_node_energies_forces_field(self, *args):
+            self.reduced.append(args)
+
+    calculator = object.__new__(Symmetrix)
+    calculator.evaluator = UnpreparedFieldEvaluator()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"family 'MACE' declares the 'prepared_field' evaluator capability, "
+            r"but the evaluator does not provide '_prepare_factorized_graph'"
+        ),
+    ):
+        calculator._compute_macefield(None, np.zeros(3), mace_inputs=_prepared_inputs())
+
+    assert calculator.evaluator.reduced == []
+
+
+def test_reduced_execution_reports_a_missing_broad_entry_point():
+    class UnreducedEvaluator:
+        streamed_edges_mode = "materialized"
+
+    calculator = object.__new__(Symmetrix)
+    calculator.evaluator = UnreducedEvaluator()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"family 'MACE' declares the 'reduced' evaluator capability, but the "
+            r"evaluator does not provide 'compute_node_energies_forces'"
+        ),
+    ):
+        calculator._compute_mace(_prepared_inputs())
+
+
 def _bare_neighbor_cache_calculator(cutoff=2.5, skin=0.4):
     calculator = object.__new__(Symmetrix)
+    calculator._alchemical = None
     calculator.cutoff = cutoff
     calculator.neighbor_skin = skin
     calculator._neighbor_cache = None
@@ -223,7 +303,7 @@ def test_receiver_major_neighbor_arrays_preserve_provider_order():
     sources = np.array([3, 2, 1, 0], dtype=np.int64)
     shifts = np.array([[1, 0, 0], [0, 0, 0], [0, 1, 0], [0, 0, 0]])
 
-    actual = calculator_module._receiver_major_neighbor_arrays(
+    actual = neighbor_graph_module.receiver_major_neighbor_arrays(
         receivers, sources, shifts
     )
 
@@ -239,7 +319,7 @@ def test_receiver_major_neighbor_arrays_stably_group_alternative_provider():
     sources = np.array([10, 20, 11, 21])
     shifts = np.array([[1, 0, 0], [2, 0, 0], [3, 0, 0], [4, 0, 0]])
 
-    actual = calculator_module._receiver_major_neighbor_arrays(
+    actual = neighbor_graph_module.receiver_major_neighbor_arrays(
         receivers, sources, shifts
     )
 
@@ -254,7 +334,7 @@ def test_receiver_major_neighbor_arrays_support_canonical_debug_order(monkeypatc
     sources = np.array([2, 1, 1])
     shifts = np.array([[0, 0, 0], [1, 0, 0], [-1, 0, 0]])
 
-    actual = calculator_module._receiver_major_neighbor_arrays(
+    actual = neighbor_graph_module.receiver_major_neighbor_arrays(
         receivers, sources, shifts
     )
 
@@ -266,13 +346,13 @@ def test_receiver_major_neighbor_arrays_reject_misaligned_or_unknown_policy(
     monkeypatch,
 ):
     with pytest.raises(ValueError, match="extents must match"):
-        calculator_module._receiver_major_neighbor_arrays(
+        neighbor_graph_module.receiver_major_neighbor_arrays(
             [0, 1], [1], np.zeros((2, 3), dtype=int)
         )
 
     monkeypatch.setenv("SYMMETRIX_DEBUG_NEIGHBOR_EDGE_ORDER", "invalid")
     with pytest.raises(ValueError, match="SYMMETRIX_DEBUG_NEIGHBOR_EDGE_ORDER"):
-        calculator_module._receiver_major_neighbor_arrays(
+        neighbor_graph_module.receiver_major_neighbor_arrays(
             [0], [1], np.zeros((1, 3), dtype=int)
         )
 
@@ -338,7 +418,7 @@ def test_periodic_direct_neighbor_cache_stays_device_resident(monkeypatch):
     calculator._sync_low_memory_policy_state = lambda: None
     monkeypatch.setenv("SYMMETRIX_NEIGHBOR_BACKEND", "kokkos")
     monkeypatch.setattr(
-        calculator_module,
+        neighbor_graph_module,
         "neighbor_list",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("Matscipy must not build an eligible direct graph")
@@ -409,7 +489,7 @@ def test_single_layer_neighbor_cache_can_stay_device_resident(monkeypatch):
     calculator._sync_low_memory_policy_state = lambda: None
     monkeypatch.setenv("SYMMETRIX_NEIGHBOR_BACKEND", "kokkos")
     monkeypatch.setattr(
-        calculator_module,
+        neighbor_graph_module,
         "neighbor_list",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("host connectivity must not build a forced device graph")
@@ -456,7 +536,7 @@ def test_device_neighbor_cache_falls_back_to_host_edges_when_requested(monkeypat
             np.zeros((2, 3), dtype=np.int32),
         )
 
-    monkeypatch.setattr(calculator_module, "neighbor_list", host_neighbor_list)
+    monkeypatch.setattr(neighbor_graph_module, "neighbor_list", host_neighbor_list)
     inputs = calculator._mace_inputs(
         atoms,
         native_geometry=True,
@@ -902,61 +982,6 @@ def test_native_all_interactions_geometry_prepares_candidates_once_and_submits_p
     assert len(calculator.evaluator.positions) == 3
 
 
-def test_collect_results_uses_native_force_and_stress_reductions():
-    class NativeReductionEvaluator:
-        node_energies = np.array([1.0, 2.0])
-
-        def __init__(self):
-            self.calls = []
-            self.node_force_reads = 0
-            self.stress_calls = []
-
-        def _reduce_atom_forces(self, num_nodes, receivers, sources, token):
-            self.calls.append((num_nodes, receivers.copy(), sources.copy(), token))
-            return np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
-
-        def _reduce_stress(self, volume, xyz, token):
-            self.stress_calls.append((volume, np.array(xyz, copy=True), token))
-            return np.diag([1.0, 2.0, 3.0])
-
-        @property
-        def node_forces(self):
-            self.node_force_reads += 1
-            return np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]])
-
-    calculator = object.__new__(Symmetrix)
-    calculator.evaluator = NativeReductionEvaluator()
-    calculator.implemented_properties = list(Symmetrix.implemented_properties)
-    calculator._model_has_field_coupling = False
-    inputs = (
-        2,
-        [0, 0],
-        np.array([1, 1]),
-        np.array([1, 0]),
-        [0, 0],
-        np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]),
-        np.array([1.0, 1.0]),
-        np.array([0, 1]),
-    )
-    atoms = Atoms("H2", positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
-    atoms.set_cell([5.0, 5.0, 5.0])
-
-    results = calculator._collect_mace_results(
-        atoms, inputs, ["energy", "forces"], execution_graph_generation=17
-    )
-    assert "stress" not in results
-    assert np.allclose(results["forces"], [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
-    assert calculator.evaluator.node_force_reads == 0
-    assert calculator.evaluator.calls[0][3] == 17
-
-    results = calculator._collect_mace_results(
-        atoms, inputs, ["stress"], execution_graph_generation=17
-    )
-    np.testing.assert_array_equal(results["stress"], [1.0, 2.0, 3.0, 0, 0, 0])
-    assert calculator.evaluator.node_force_reads == 0
-    assert calculator.evaluator.stress_calls[0][2] == 17
-
-
 def test_collect_results_preserves_materialized_stress_fallback():
     class MaterializedEvaluator:
         node_energies = np.array([1.0, 2.0])
@@ -966,6 +991,7 @@ def test_collect_results_preserves_materialized_stress_fallback():
             return np.zeros((num_nodes, 3))
 
     calculator = object.__new__(Symmetrix)
+    calculator._alchemical = None
     calculator.evaluator = MaterializedEvaluator()
     calculator.implemented_properties = list(Symmetrix.implemented_properties)
     calculator._model_has_field_coupling = False
@@ -997,6 +1023,7 @@ def test_collect_results_accumulates_float32_energy_and_stress_in_float64():
         )
 
     calculator = object.__new__(Symmetrix)
+    calculator._alchemical = None
     calculator.evaluator = Float32Evaluator()
     calculator.implemented_properties = list(Symmetrix.implemented_properties)
     calculator._model_has_field_coupling = False
@@ -1048,8 +1075,7 @@ def mace_foundation_model():
     return str(downloaded_model)
 
 
-@pytest.mark.parametrize("use_kokkos", [True, False])
-def test_calc_caching(monkeypatch, generated_standard_mace_zbl_model, use_kokkos):
+def test_calc_caching(monkeypatch, generated_standard_mace_zbl_model):
     atoms = Atoms("O", cell=[2] * 3, pbc=[True] * 3)
     atoms *= 4
     rng = np.random.default_rng(5)
@@ -1057,8 +1083,7 @@ def test_calc_caching(monkeypatch, generated_standard_mace_zbl_model, use_kokkos
 
     calc = Symmetrix(
         generated_standard_mace_zbl_model,
-        use_kokkos=use_kokkos,
-        streamed_edges="materialized",
+        streamed_edges="reference",
     )
     atoms.calc = calc
 
@@ -1082,6 +1107,294 @@ def test_calc_caching(monkeypatch, generated_standard_mace_zbl_model, use_kokkos
 
     atoms.get_forces()
     assert calculate_calls == 2
+
+
+def _fake_base_correction_calculator(configuration):
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    calc = object.__new__(Symmetrix)
+    Calculator.__init__(calc)
+    calc._is_mace_les = False
+    calc._alchemical = None
+    main_cache = type(
+        "MainGraphCache",
+        (),
+        {"num_edges": 777, "device_graph_generation": 0},
+    )()
+    calc._neighbor_cache = main_cache
+    calc._test_main_cache = main_cache
+    calc._correction_pipeline = CorrectionPipeline(
+        [configuration], native=native_symmetrix, dtype="float64"
+    )
+    calc.correction_diagnostics = ()
+    calc._can_use_native_geometry = lambda _properties: False
+    calc._becs_requires_host_neighbor_graph = lambda _properties: False
+    calc._mace_inputs = lambda _atoms, **_kwargs: (
+        len(_atoms),
+        [],
+        np.empty(0, dtype=np.int32),
+        np.empty(0, dtype=np.int32),
+        [],
+        np.empty((0, 3)),
+        np.empty(0),
+        np.empty(0, dtype=np.int32),
+    )
+    calc._apply_kernel_launch_tuning = lambda *_args: False
+    calc._has_native_field_coupling = lambda: False
+    calc._compute_mace = lambda *_args, **_kwargs: 0
+
+    def base_results(atoms, _inputs, properties, _generation):
+        results = {
+            "energy": 5.0,
+            "free_energy": 5.0,
+            "energies": np.array([2.0, 3.0]),
+            "forces": np.ones((len(atoms), 3)),
+            "stress": np.ones(6),
+        }
+        if "polarization" in properties:
+            results["polarization"] = np.array([0.25, 0.5, 0.75])
+        return results
+
+    calc._collect_mace_results = base_results
+    return calc
+
+
+@pytest.mark.parametrize(
+    "configuration",
+    [
+        D2Correction(cutoff=4.0, skin=0.5),
+        D3Correction(
+            damping="bj",
+            cutoff=4.0,
+            coordination_cutoff=3.5,
+            skin=0.5,
+        ),
+    ],
+    ids=("d2", "d3"),
+)
+def test_native_correction_adds_complete_ase_results_and_preserves_responses(
+    configuration,
+):
+    atoms = Atoms(
+        "CO",
+        positions=[[0.0, 0.0, 0.0], [1.4, 0.2, 0.1]],
+        cell=[8.0, 8.0, 8.0],
+        pbc=False,
+    )
+    calc = _fake_base_correction_calculator(configuration)
+
+    calc.calculate(
+        atoms,
+        properties=[
+            "energy",
+            "free_energy",
+            "energies",
+            "forces",
+            "stress",
+            "polarization",
+        ],
+    )
+
+    correction_energy = calc.results["energy"] - 5.0
+    assert correction_energy != 0.0
+    assert calc.results["free_energy"] - 5.0 == pytest.approx(correction_energy)
+    assert np.sum(calc.results["energies"] - [2.0, 3.0]) == pytest.approx(
+        correction_energy
+    )
+    assert not np.array_equal(calc.results["forces"], np.ones((2, 3)))
+    assert not np.array_equal(calc.results["stress"], np.ones(6))
+    np.testing.assert_array_equal(calc.results["polarization"], [0.25, 0.5, 0.75])
+    assert calc.correction_diagnostics[0]["method"] in {"d2", "d3"}
+    assert calc._neighbor_cache is calc._test_main_cache
+    assert calc.correction_diagnostics[0]["num_edges"] != 777
+
+
+def test_correction_direct_free_energy_and_atomic_energies_request_dependencies():
+    atoms = Atoms(
+        "CO",
+        positions=[[0.0, 0.0, 0.0], [1.4, 0.2, 0.1]],
+        cell=[8.0, 8.0, 8.0],
+        pbc=False,
+    )
+    calc = _fake_base_correction_calculator(D2Correction(cutoff=4.0))
+
+    calc.calculate(atoms, properties=["free_energy", "energies"])
+
+    correction_energy = calc.results["free_energy"] - 5.0
+    assert "energy" not in calc.results
+    assert np.sum(calc.results["energies"] - [2.0, 3.0]) == pytest.approx(
+        correction_energy
+    )
+
+
+@pytest.mark.parametrize(
+    "property_name", ["energy", "free_energy", "energies", "forces", "stress"]
+)
+@pytest.mark.parametrize(
+    "configuration",
+    [D2Correction(cutoff=4.0), D3Correction(cutoff=4.0, coordination_cutoff=3.5)],
+    ids=("d2", "d3"),
+)
+def test_native_correction_caches_only_requested_additive_property(
+    configuration, property_name
+):
+    atoms = Atoms(
+        "CO",
+        positions=[[0.0, 0.0, 0.0], [1.4, 0.2, 0.1]],
+        cell=[8.0, 8.0, 8.0],
+        pbc=False,
+    )
+    calc = _fake_base_correction_calculator(configuration)
+
+    calc.calculate(atoms, properties=[property_name])
+
+    additive = {"energy", "free_energy", "energies", "forces", "stress"}
+    assert set(calc.results) & additive == {property_name}
+
+
+def _sequential_correction_results(configuration, requested_properties):
+    atoms = Atoms(
+        "CO",
+        positions=[[0.0, 0.0, 0.0], [1.4, 0.2, 0.1]],
+        cell=[8.0, 8.0, 8.0],
+        pbc=False,
+    )
+    calc = _fake_base_correction_calculator(configuration)
+    original_calculate = calc.calculate
+    calculate_calls = 0
+
+    def counted_calculate(*args, **kwargs):
+        nonlocal calculate_calls
+        calculate_calls += 1
+        return original_calculate(*args, **kwargs)
+
+    calc.calculate = counted_calculate
+    atoms.calc = calc
+    captured = {}
+    additive = {"energy", "free_energy", "energies", "forces", "stress"}
+    for property_name in requested_properties:
+        captured[property_name] = np.array(
+            calc.get_property(property_name, atoms), copy=True
+        )
+        assert set(calc.results) & additive == {property_name}
+    return captured, calculate_calls
+
+
+@pytest.mark.parametrize(
+    "configuration",
+    [D2Correction(cutoff=4.0), D3Correction(cutoff=4.0, coordination_cutoff=3.5)],
+    ids=("d2", "d3"),
+)
+@pytest.mark.parametrize(
+    "requested_properties",
+    [
+        ("forces", "energy"),
+        ("energy", "forces"),
+        ("energies", "free_energy"),
+        ("stress", "energies"),
+    ],
+)
+def test_correction_recomputes_sequential_ase_properties_and_matches_joint_result(
+    configuration, requested_properties
+):
+    sequential, calculate_calls = _sequential_correction_results(
+        configuration, requested_properties
+    )
+    all_at_once = _fake_base_correction_calculator(configuration)
+    atoms = Atoms(
+        "CO",
+        positions=[[0.0, 0.0, 0.0], [1.4, 0.2, 0.1]],
+        cell=[8.0, 8.0, 8.0],
+        pbc=False,
+    )
+    all_at_once.calculate(atoms, properties=list(requested_properties))
+
+    assert calculate_calls == len(requested_properties)
+    for name in requested_properties:
+        np.testing.assert_allclose(sequential[name], all_at_once.results[name])
+
+
+def test_legacy_dispersion_rejects_simultaneous_corrections_before_model_load(
+    tmp_path,
+):
+    with pytest.raises(ValueError, match="corrections.*dispersion"):
+        Symmetrix(
+            tmp_path / "unused.json",
+            dispersion=True,
+            corrections=[D3Correction()],
+        )
+
+
+def test_legacy_dispersion_device_rejects_independent_backend_selection(tmp_path):
+    with pytest.raises(ValueError, match="backend selection.*Symmetrix backend"):
+        Symmetrix(
+            tmp_path / "unused.json",
+            dispersion=True,
+            dispersion_device="independent-device",
+        )
+
+
+@pytest.mark.parametrize(
+    ("dispersion_cutoff", "expected_coordination_cutoff"),
+    [
+        (7.25, 7.25),
+        (40.0 * units.Bohr, 40.0 * units.Bohr),
+        (30.0, 40.0 * units.Bohr),
+    ],
+    ids=("below-default", "at-default", "above-default"),
+)
+def test_legacy_dispersion_translates_to_native_d3_without_torch_dftd(
+    compact_mace_model,
+    monkeypatch,
+    dispersion_cutoff,
+    expected_coordination_cutoff,
+):
+    original_import = builtins.__import__
+
+    def reject_torch_dftd(name, *args, **kwargs):
+        if name == "torch_dftd" or name.startswith("torch_dftd."):
+            raise AssertionError("legacy native correction must not import torch-dftd")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_torch_dftd)
+    with pytest.warns(FutureWarning, match="corrections"):
+        calc = Symmetrix(
+            compact_mace_model,
+            streamed_edges="reference",
+            dispersion=True,
+            dispersion_damping="zero",
+            dispersion_xc="pbe",
+            dispersion_cutoff=dispersion_cutoff,
+        )
+
+    diagnostics = calc._correction_pipeline._runtimes[0]
+    assert diagnostics.method == "d3"
+    assert diagnostics.graph_requirement.pair_cutoff == pytest.approx(dispersion_cutoff)
+    assert diagnostics.graph_requirement.coordination_cutoff == pytest.approx(
+        expected_coordination_cutoff
+    )
+
+
+def test_preferred_corrections_constructor_runs_native_ase_evaluation(
+    compact_mace_model,
+):
+    atoms = Atoms(
+        "CO",
+        positions=[[0.0, 0.0, 0.0], [1.4, 0.2, 0.1]],
+        cell=[8.0, 8.0, 8.0],
+        pbc=False,
+    )
+    atoms.calc = Symmetrix(
+        compact_mace_model,
+        streamed_edges="reference",
+        corrections=[D2Correction(cutoff=4.0)],
+    )
+
+    energy = atoms.get_potential_energy()
+
+    assert np.isfinite(energy)
+    assert atoms.calc.correction_diagnostics[0]["method"] == "d2"
+    assert atoms.calc.correction_diagnostics[0]["graph_build_count"] == 1
 
 
 def test_ase_npt_reuses_stress_and_factorized_skin_topology():
@@ -1141,6 +1454,7 @@ def test_ase_npt_reuses_stress_and_factorized_skin_topology():
             return np.diag([0.02, 0.02, 0.02])
 
     calculator = object.__new__(Symmetrix)
+    calculator._alchemical = None
     Calculator.__init__(calculator)
     calculator.evaluator = NPTFactorizedEvaluator()
     calculator.cutoff = 2.0
@@ -1153,6 +1467,7 @@ def test_ase_npt_reuses_stress_and_factorized_skin_topology():
     calculator._execution_native_geometry_identity = None
     calculator._execution_native_cell_identity = None
     calculator._native_model_type = "MACE"
+    calculator._is_mace_les = False
     calculator._all_interactions_native_geometry_identity = None
     calculator._all_interactions_graph_identity = None
     calculator._all_interactions_graph_generation = 0
@@ -1197,8 +1512,7 @@ def test_ase_npt_reuses_stress_and_factorized_skin_topology():
     assert "stress" in calculator.results
 
 
-@pytest.mark.parametrize("use_kokkos", [True, False])
-def test_symmetrix_calc_finite_diff(generated_standard_mace_zbl_model, use_kokkos):
+def test_symmetrix_calc_finite_diff(generated_standard_mace_zbl_model):
     atoms = Atoms("O", cell=[2] * 3, pbc=[True] * 3)
     atoms *= 2
     rng = np.random.default_rng(5)
@@ -1211,15 +1525,13 @@ def test_symmetrix_calc_finite_diff(generated_standard_mace_zbl_model, use_kokko
     calc = Symmetrix(
         generated_standard_mace_zbl_model,
         dtype="float64",
-        use_kokkos=use_kokkos,
-        streamed_edges="materialized",
+        streamed_edges="reference",
     )
     do_grad_test(atoms, calc, True)
 
 
 @pytest.mark.skipif(mace is None, reason="mace-torch is not available")
-@pytest.mark.parametrize("use_kokkos", [True, False])
-def test_mace_onthefly_calc_finite_diff(mace_foundation_model, use_kokkos):
+def test_mace_onthefly_calc_finite_diff(mace_foundation_model):
     atoms = Atoms("O", cell=[2] * 3, pbc=[True] * 3)
     atoms *= 2
     rng = np.random.default_rng(5)
@@ -1232,15 +1544,14 @@ def test_mace_onthefly_calc_finite_diff(mace_foundation_model, use_kokkos):
     calc = Symmetrix(
         mace_foundation_model,
         species=[1, 8],
+        radial_format="compact",
         dtype="float64",
-        use_kokkos=use_kokkos,
     )
     do_grad_test(atoms, calc, True)
 
 
 @pytest.mark.skipif(mace is None, reason="mace-torch is not available")
-@pytest.mark.parametrize("use_kokkos", [True, False])
-def test_symmetrix_vs_pytorch(mace_foundation_model, use_kokkos):
+def test_symmetrix_vs_pytorch(mace_foundation_model):
     atoms = Atoms("O", cell=[2] * 3, pbc=[True] * 3)
     atoms *= 2
     rng = np.random.default_rng(5)
@@ -1255,8 +1566,8 @@ def test_symmetrix_vs_pytorch(mace_foundation_model, use_kokkos):
     calc_sym = Symmetrix(
         mace_foundation_model,
         species=[1, 8],
+        radial_format="compact",
         dtype="float64",
-        use_kokkos=use_kokkos,
     )
     atoms_s.calc = calc_sym
 
@@ -1280,7 +1591,6 @@ def test_macefield_model_requires_explicit_json_conversion(macefield_model_path)
             macefield_model_path,
             species=[7, 13],
             head="mp-dielectric",
-            use_kokkos=False,
             dtype="float64",
         )
 
@@ -1314,7 +1624,7 @@ def test_macefield_float32_checkpoint_extracts_to_float64_json(
 
     atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982)
     atoms.info["electric_field"] = np.array([0.01, -0.02, 0.03])
-    atoms.calc = Symmetrix(json_path, use_kokkos=False, dtype="float64")
+    atoms.calc = Symmetrix(json_path, dtype="float64")
 
     assert np.isfinite(atoms.get_potential_energy())
     assert atoms.get_forces().shape == (len(atoms), 3)
@@ -1343,7 +1653,7 @@ def test_macefield_native_json_ase_energy_forces_match_pytorch(
 
     atoms_sym = atoms.copy()
     atoms_torch = atoms.copy()
-    atoms_sym.calc = Symmetrix(json_path, use_kokkos=False, dtype="float64")
+    atoms_sym.calc = Symmetrix(json_path, dtype="float64")
     atoms_torch.calc = MACECalculator(
         model_paths=[str(macefield_model_path)],
         model_type="MACEField",
@@ -1359,17 +1669,11 @@ def test_macefield_native_json_ase_energy_forces_match_pytorch(
 
 
 @pytest.mark.skipif(not mace_field_available, reason="mace-field is not available")
-@pytest.mark.parametrize("use_kokkos", [False, True])
 def test_macefield_field_contribution_matches_explicit_difference(
     macefield_model_path,
     tmp_path,
-    use_kokkos,
 ):
-    from symmetrix import symmetrix as native_symmetrix
     from symmetrix.extract_mace_data import extract_mace_data
-
-    if use_kokkos and not hasattr(native_symmetrix, "MACEKokkos"):
-        pytest.skip("Symmetrix was built without Kokkos bindings.")
 
     json_path = tmp_path / "macefield.json"
     json_path.write_text(
@@ -1386,7 +1690,7 @@ def test_macefield_field_contribution_matches_explicit_difference(
     electric_field = np.array([0.01, -0.02, 0.03])
 
     direct_atoms = atoms.copy()
-    direct_calculator = Symmetrix(json_path, use_kokkos=use_kokkos, dtype="float64")
+    direct_calculator = Symmetrix(json_path, dtype="float64")
     direct_atoms.calc = direct_calculator
     direct_calculator.electric_field = electric_field
     field_results = {
@@ -1401,7 +1705,7 @@ def test_macefield_field_contribution_matches_explicit_difference(
 
     contribution_atoms = atoms.copy()
     contribution = FieldContributionCalculator(
-        Symmetrix(json_path, use_kokkos=use_kokkos, dtype="float64"),
+        Symmetrix(json_path, dtype="float64"),
         electric_field=electric_field,
     )
     contribution_atoms.calc = contribution
@@ -1436,7 +1740,7 @@ def test_macefield_field_contribution_matches_explicit_difference(
     stress_fd = (energy_plus - energy_minus) / (2.0 * step * volume)
     assert np.isclose(contribution_results["stress"][0], stress_fd, atol=1e-7)
 
-    base = Symmetrix(json_path, use_kokkos=use_kokkos, dtype="float64")
+    base = Symmetrix(json_path, dtype="float64")
     combined = FieldAwareCalculator(base, contribution)
     combined_atoms = atoms.copy()
     combined_atoms.calc = combined
@@ -1471,7 +1775,7 @@ def test_macefield_native_json_ase_response_properties_match_pytorch(
 
     atoms_sym = atoms.copy()
     atoms_torch = atoms.copy()
-    atoms_sym.calc = Symmetrix(json_path, use_kokkos=False, dtype="float64")
+    atoms_sym.calc = Symmetrix(json_path, dtype="float64")
     atoms_torch.calc = MACECalculator(
         model_paths=[str(macefield_model_path)],
         model_type="MACEField",
@@ -1499,53 +1803,6 @@ def test_macefield_native_json_ase_response_properties_match_pytorch(
     assert np.allclose(actual_polarization, expected_polarization, atol=1e-5)
     assert np.allclose(actual_becs, expected_becs, atol=5e-2)
     assert np.allclose(actual_polarizability, expected_polarizability, atol=5e-3)
-
-
-@pytest.mark.skipif(not mace_field_available, reason="mace-field is not available")
-def test_macefield_json_kokkos_response_properties_match_native(
-    macefield_model_path, tmp_path
-):
-    from symmetrix import symmetrix as native_symmetrix
-    from symmetrix.extract_mace_data import extract_mace_data
-
-    if not hasattr(native_symmetrix, "MACEKokkos"):
-        pytest.skip("Symmetrix was built without Kokkos bindings.")
-
-    json_path = tmp_path / "macefield.json"
-    json_path.write_text(
-        json.dumps(
-            extract_mace_data(
-                macefield_model_path,
-                species=[7, 13],
-                head="mp-dielectric",
-            )
-        )
-    )
-
-    atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982)
-    atoms.info["electric_field"] = np.array([0.01, -0.02, 0.03])
-
-    atoms_native = atoms.copy()
-    atoms_kokkos = atoms.copy()
-    atoms_native.calc = Symmetrix(json_path, use_kokkos=False, dtype="float64")
-    atoms_kokkos.calc = Symmetrix(json_path, use_kokkos=True, dtype="float64")
-
-    assert atoms_kokkos.calc.use_kokkos is True
-    assert "polarization" in atoms_kokkos.calc.implemented_properties
-    assert "becs" in atoms_kokkos.calc.implemented_properties
-    assert "polarizability" in atoms_kokkos.calc.implemented_properties
-
-    tolerances = {
-        "energy": 1e-8,
-        "forces": 1e-8,
-        "polarization": 1e-8,
-        "becs": 2e-6,
-        "polarizability": 2e-6,
-    }
-    for prop, tolerance in tolerances.items():
-        expected = atoms_native.calc.get_property(prop, atoms_native)
-        actual = atoms_kokkos.calc.get_property(prop, atoms_kokkos)
-        assert np.allclose(actual, expected, atol=tolerance, rtol=tolerance)
 
 
 @pytest.mark.skipif(not mace_field_available, reason="mace-field is not available")
@@ -1577,46 +1834,32 @@ def test_compact_macefield_calculator_replaces_active_composition_cache(
     partial_num_neigh = np.asarray([1, 99], dtype=np.int32)[::2]
     partial_neigh_types = np.asarray([3, 99], dtype=np.int32)[::2]
     partial_r = np.asarray([1.5, 99.0], dtype=float)[::2]
-    partial_R1 = []
-    for evaluator_type in (native_symmetrix.MACE, native_symmetrix.MACEKokkos):
-        evaluator = evaluator_type(str(json_path))
-        evaluator.compute_R1(
-            1,
-            partial_node_types,
-            partial_num_neigh,
-            partial_neigh_types,
-            partial_r,
-        )
-        assert evaluator.active_atomic_numbers == [7, 13]
-        partial_R1.append(np.asarray(evaluator.R1))
-    assert np.allclose(partial_R1[1], partial_R1[0], rtol=0.0, atol=1e-11)
+    evaluator = native_symmetrix.MACEKokkos(str(json_path))
+    evaluator.compute_R1(
+        1,
+        partial_node_types,
+        partial_num_neigh,
+        partial_neigh_types,
+        partial_r,
+    )
+    assert evaluator.active_atomic_numbers == [7, 13]
 
     structures = (
         (bulk("AlN", "wurtzite", a=3.112, c=4.982), [7, 13]),
         (bulk("MgO", "rocksalt", a=4.21), [8, 12]),
         (bulk("AlN", "wurtzite", a=3.112, c=4.982), [7, 13]),
     )
-    backend_energies = {}
-    for use_kokkos in (False, True):
-        calc = Symmetrix(json_path, use_kokkos=use_kokkos, dtype="float64")
-        energies = []
-        for atoms, expected_active in structures:
-            atoms = atoms.copy()
-            atoms.calc = calc
-            energies.append(atoms.get_potential_energy())
-            assert calc.evaluator.active_atomic_numbers == expected_active
-        assert energies[0] == pytest.approx(energies[2], abs=1e-11)
-        backend_energies[use_kokkos] = energies
-
-    assert np.allclose(
-        backend_energies[True],
-        backend_energies[False],
-        rtol=0.0,
-        atol=1e-8,
-    )
+    calc = Symmetrix(json_path, dtype="float64")
+    energies = []
+    for atoms, expected_active in structures:
+        atoms = atoms.copy()
+        atoms.calc = calc
+        energies.append(atoms.get_potential_energy())
+        assert calc.evaluator.active_atomic_numbers == expected_active
+    assert energies[0] == pytest.approx(energies[2], abs=1e-11)
 
     electric_field = np.array([0.001, -0.002, 0.003])
-    response_calc = Symmetrix(json_path, use_kokkos=True, dtype="float64")
+    response_calc = Symmetrix(json_path, dtype="float64")
     old_atoms = bulk("AlN", "rocksalt", a=4.05)
     new_atoms = bulk("MgO", "rocksalt", a=4.21)
     old_inputs = response_calc._mace_inputs(old_atoms)
@@ -1633,7 +1876,7 @@ def test_compact_macefield_calculator_replaces_active_composition_cache(
         response_calc.evaluator.electric_field_hessian,
     ).copy()
 
-    fresh_calc = Symmetrix(json_path, use_kokkos=True, dtype="float64")
+    fresh_calc = Symmetrix(json_path, dtype="float64")
     fresh_inputs = fresh_calc._mace_inputs(new_atoms)
     fresh_calc.evaluator.compute_electric_field_hessian(
         *fresh_inputs[:7],
@@ -1646,7 +1889,7 @@ def test_compact_macefield_calculator_replaces_active_composition_cache(
         atol=2e-6,
     )
 
-    same_composition_calc = Symmetrix(json_path, use_kokkos=True, dtype="float64")
+    same_composition_calc = Symmetrix(json_path, dtype="float64")
     baseline_atoms = bulk("AlN", "rocksalt", a=4.05)
     changed_atoms = baseline_atoms.copy()
     changed_atoms.positions[0, 0] += 0.05
@@ -1664,7 +1907,7 @@ def test_compact_macefield_calculator_replaces_active_composition_cache(
         same_composition_calc.evaluator.electric_field_hessian,
     ).copy()
 
-    changed_fresh_calc = Symmetrix(json_path, use_kokkos=True, dtype="float64")
+    changed_fresh_calc = Symmetrix(json_path, dtype="float64")
     changed_fresh_inputs = changed_fresh_calc._mace_inputs(changed_atoms)
     changed_fresh_calc.evaluator.compute_electric_field_hessian(
         *changed_fresh_inputs[:7],
@@ -1705,7 +1948,7 @@ def test_macefield_native_json_node_energy_matches_pytorch(
 
     atoms_sym = atoms.copy()
     atoms_torch = atoms.copy()
-    atoms_sym.calc = Symmetrix(json_path, use_kokkos=False, dtype="float64")
+    atoms_sym.calc = Symmetrix(json_path, dtype="float64")
     atoms_torch.calc = MACECalculator(
         model_paths=[str(macefield_model_path)],
         model_type="MACEField",
@@ -1748,7 +1991,7 @@ def test_macefield_native_json_requires_graph_field(macefield_model_path, tmp_pa
 
     atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982)
     atoms.info["electric_field"] = np.zeros((len(atoms), 3))
-    atoms.calc = Symmetrix(json_path, use_kokkos=False, dtype="float64")
+    atoms.calc = Symmetrix(json_path, dtype="float64")
 
     with pytest.raises(ValueError, match="graph-level electric_field"):
         atoms.get_potential_energy()
@@ -1785,7 +2028,7 @@ def test_macefield_native_json_accepts_singleton_graph_field(monkeypatch, tmp_pa
 
     evaluator = DummyFieldEvaluator()
     monkeypatch.setattr(
-        "symmetrix.calculator.symmetrix.MACE", lambda filename, head="": evaluator
+        "symmetrix.calculator.symmetrix.MACEKokkos", lambda filename, head="": evaluator
     )
 
     json_path = tmp_path / "macefield.json"
@@ -1800,9 +2043,8 @@ def test_macefield_native_json_accepts_singleton_graph_field(monkeypatch, tmp_pa
     atoms.info["electric_field"] = np.array([[0.01, -0.02, 0.03]])
     atoms.calc = Symmetrix(
         json_path,
-        use_kokkos=False,
         dtype="float64",
-        streamed_edges="materialized",
+        streamed_edges="reference",
     )
 
     assert np.isfinite(atoms.get_potential_energy())
@@ -1828,7 +2070,7 @@ def test_macefield_native_json_keeps_response_properties_selective(
 
     atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982)
     atoms.info["electric_field"] = np.array([0.01, -0.02, 0.03])
-    atoms.calc = Symmetrix(json_path, use_kokkos=False, dtype="float64")
+    atoms.calc = Symmetrix(json_path, dtype="float64")
 
     assert np.isfinite(atoms.get_potential_energy())
     assert "polarization" not in atoms.calc.results
@@ -1871,7 +2113,7 @@ def test_macefield_native_json_polarization_uses_single_native_field_call(
 
     evaluator = DummyFieldEvaluator()
     monkeypatch.setattr(
-        "symmetrix.calculator.symmetrix.MACE", lambda filename, head="": evaluator
+        "symmetrix.calculator.symmetrix.MACEKokkos", lambda filename, head="": evaluator
     )
 
     json_path = tmp_path / "macefield.json"
@@ -1886,9 +2128,8 @@ def test_macefield_native_json_polarization_uses_single_native_field_call(
     atoms.info["electric_field"] = np.array([0.01, 0.0, 0.0])
     atoms.calc = Symmetrix(
         json_path,
-        use_kokkos=False,
         dtype="float64",
-        streamed_edges="materialized",
+        streamed_edges="reference",
     )
 
     assert np.allclose(
@@ -1947,7 +2188,7 @@ def test_macefield_native_json_polarizability_uses_native_field_hessian(
 
     evaluator = DummyFieldEvaluator()
     monkeypatch.setattr(
-        "symmetrix.calculator.symmetrix.MACE", lambda filename, head="": evaluator
+        "symmetrix.calculator.symmetrix.MACEKokkos", lambda filename, head="": evaluator
     )
 
     json_path = tmp_path / "macefield.json"
@@ -1962,9 +2203,8 @@ def test_macefield_native_json_polarizability_uses_native_field_hessian(
     atoms.info["electric_field"] = np.array([0.01, 0.0, 0.0])
     atoms.calc = Symmetrix(
         json_path,
-        use_kokkos=False,
         dtype="float64",
-        streamed_edges="materialized",
+        streamed_edges="reference",
     )
 
     expected = (
@@ -2028,7 +2268,7 @@ def test_macefield_native_json_becs_use_native_force_field_derivative(
 
     evaluator = DummyFieldEvaluator()
     monkeypatch.setattr(
-        "symmetrix.calculator.symmetrix.MACE", lambda filename, head="": evaluator
+        "symmetrix.calculator.symmetrix.MACEKokkos", lambda filename, head="": evaluator
     )
 
     json_path = tmp_path / "macefield.json"
@@ -2043,9 +2283,8 @@ def test_macefield_native_json_becs_use_native_force_field_derivative(
     atoms.info["electric_field"] = np.array([0.01, 0.0, 0.0])
     atoms.calc = Symmetrix(
         json_path,
-        use_kokkos=False,
         dtype="float64",
-        streamed_edges="materialized",
+        streamed_edges="reference",
     )
 
     num_nodes, _, _, j_list, _, xyz, _, i_list = atoms.calc._mace_inputs(atoms)
@@ -2107,7 +2346,7 @@ def test_macefield_native_json_cache_tracks_only_electric_field(monkeypatch, tmp
 
     evaluator = DummyFieldEvaluator()
     monkeypatch.setattr(
-        "symmetrix.calculator.symmetrix.MACE", lambda filename, head="": evaluator
+        "symmetrix.calculator.symmetrix.MACEKokkos", lambda filename, head="": evaluator
     )
 
     json_path = tmp_path / "macefield.json"
@@ -2123,9 +2362,8 @@ def test_macefield_native_json_cache_tracks_only_electric_field(monkeypatch, tmp
     atoms.info["electric_field"] = np.array([0.01, 0.0, 0.0])
     atoms.calc = Symmetrix(
         json_path,
-        use_kokkos=False,
         dtype="float64",
-        streamed_edges="materialized",
+        streamed_edges="reference",
     )
 
     assert np.isfinite(atoms.get_potential_energy())
@@ -2175,7 +2413,7 @@ def test_macefield_native_json_calculator_electric_field_override(
 
     evaluator = DummyFieldEvaluator()
     monkeypatch.setattr(
-        "symmetrix.calculator.symmetrix.MACE", lambda filename, head="": evaluator
+        "symmetrix.calculator.symmetrix.MACEKokkos", lambda filename, head="": evaluator
     )
 
     json_path = tmp_path / "macefield.json"
@@ -2190,9 +2428,8 @@ def test_macefield_native_json_calculator_electric_field_override(
     atoms.info["electric_field"] = np.array([0.01, 0.0, 0.0])
     atoms.calc = Symmetrix(
         json_path,
-        use_kokkos=False,
         dtype="float64",
-        streamed_edges="materialized",
+        streamed_edges="reference",
     )
 
     atoms.calc.electric_field = [0.0, 0.0, 0.02]
@@ -2207,9 +2444,7 @@ def test_macefield_native_json_calculator_electric_field_override(
 
 
 @pytest.mark.skipif(not mace_field_available, reason="mace-field is not available")
-def test_macefield_native_json_uses_kokkos_field_path_when_kokkos_requested(
-    macefield_model_path, tmp_path
-):
+def test_macefield_native_json_uses_the_field_path(macefield_model_path, tmp_path):
     from symmetrix import symmetrix as native_symmetrix
     from symmetrix.extract_mace_data import extract_mace_data
 
@@ -2229,9 +2464,8 @@ def test_macefield_native_json_uses_kokkos_field_path_when_kokkos_requested(
 
     atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982)
     atoms.info["electric_field"] = np.array([0.01, 0.0, 0.0])
-    atoms.calc = Symmetrix(json_path, use_kokkos=True, dtype="float64")
+    atoms.calc = Symmetrix(json_path, dtype="float64")
 
-    assert atoms.calc.use_kokkos is True
     assert "polarization" in atoms.calc.implemented_properties
     assert np.isfinite(atoms.get_potential_energy())
     assert atoms.calc.get_property("polarization", atoms).shape == (3,)
@@ -2263,31 +2497,21 @@ def test_macefield_json_with_kokkos_requested_constructs_kokkos_evaluator(
         constructed.append("kokkos")
         return DummyKokkosEvaluator(filename)
 
-    def fake_mace(filename, head=""):
-        assert head == ""
-        constructed.append("serial")
-        raise AssertionError(
-            "field-aware use_kokkos=True should not instantiate serial MACE"
-        )
-
     monkeypatch.setattr(
         "symmetrix.calculator.symmetrix._kokkos_is_initialized", lambda: False
     )
     monkeypatch.setattr("symmetrix.calculator.symmetrix._init_kokkos", fake_init_kokkos)
     monkeypatch.setattr("symmetrix.calculator.symmetrix.MACEKokkos", fake_mace_kokkos)
-    monkeypatch.setattr("symmetrix.calculator.symmetrix.MACE", fake_mace)
 
     json_path = tmp_path / "macefield.json"
     json_path.write_text(json.dumps({"has_field_coupling": True}))
 
     calc = Symmetrix(
         json_path,
-        use_kokkos=True,
         dtype="float64",
-        streamed_edges="materialized",
+        streamed_edges="reference",
     )
 
-    assert calc.use_kokkos is True
     assert constructed == ["init", "kokkos"]
     assert isinstance(calc.evaluator, DummyKokkosEvaluator)
     assert "polarization" in calc.implemented_properties
@@ -2311,7 +2535,7 @@ def test_macefield_native_json_electric_field_changes_cached_results(
     )
 
     atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982)
-    atoms.calc = Symmetrix(json_path, use_kokkos=False, dtype="float64")
+    atoms.calc = Symmetrix(json_path, dtype="float64")
 
     atoms.info["electric_field"] = np.array([0.0, 0.0, 0.0])
     energy_zero = atoms.get_potential_energy()
@@ -2338,15 +2562,14 @@ def test_plain_mace_model_uses_native_symmetrix_path(monkeypatch, tmp_path):
 
     monkeypatch.setattr("torch.load", fake_torch_load)
     monkeypatch.setattr(
-        "symmetrix.calculator.symmetrix.MACE",
+        "symmetrix.calculator.symmetrix.MACEKokkos",
         lambda filename, head="": DummyEvaluator(),
     )
 
     calc = Symmetrix(
         tmp_path / "plain.model",
         dtype="float64",
-        use_kokkos=False,
-        streamed_edges="materialized",
+        streamed_edges="reference",
     )
 
     assert calc.evaluator.r_cut == 3.0
@@ -2368,11 +2591,11 @@ def test_unloadable_torch_model_preserves_load_error(monkeypatch, tmp_path):
     def fake_torch_load(*args, **kwargs):
         raise ValueError("checkpoint cannot be unpickled")
 
-    monkeypatch.setattr("symmetrix.calculator.symmetrix.MACE", fake_native_loader)
+    monkeypatch.setattr("symmetrix.calculator.symmetrix.MACEKokkos", fake_native_loader)
     monkeypatch.setattr("torch.load", fake_torch_load)
 
     with pytest.raises(ValueError, match="checkpoint cannot be unpickled"):
-        Symmetrix(tmp_path / "broken.model", use_kokkos=False)
+        Symmetrix(tmp_path / "broken.model")
 
 
 def test_native_schema_error_is_not_treated_as_checkpoint(monkeypatch, tmp_path):
@@ -2392,7 +2615,7 @@ def test_native_schema_error_is_not_treated_as_checkpoint(monkeypatch, tmp_path)
         "symmetrix.calculator.symmetrix._model_metadata",
         fake_metadata,
     )
-    monkeypatch.setattr("symmetrix.calculator.symmetrix.MACE", fake_native_loader)
+    monkeypatch.setattr("symmetrix.calculator.symmetrix.MACEKokkos", fake_native_loader)
     monkeypatch.setattr(
         Symmetrix, "_raise_if_macefield_checkpoint", fail_checkpoint_load
     )
@@ -2401,7 +2624,6 @@ def test_native_schema_error_is_not_treated_as_checkpoint(monkeypatch, tmp_path)
         Symmetrix(
             tmp_path / "invalid-extensionless-json",
             dtype="float64",
-            use_kokkos=False,
         )
 
 
@@ -2415,7 +2637,7 @@ def test_metadata_schema_error_is_not_suppressed(monkeypatch, tmp_path):
     )
 
     with pytest.raises(RuntimeError, match="type_error.302"):
-        Symmetrix(tmp_path / "invalid-extensionless-json", use_kokkos=False)
+        Symmetrix(tmp_path / "invalid-extensionless-json")
 
 
 def test_missing_kokkos_does_not_load_extensionless_checkpoint(monkeypatch, tmp_path):
@@ -2435,7 +2657,7 @@ def test_missing_kokkos_does_not_load_extensionless_checkpoint(monkeypatch, tmp_
     )
 
     with pytest.raises(RuntimeError, match="built without Kokkos support"):
-        Symmetrix(tmp_path / "extensionless-checkpoint", use_kokkos=True)
+        Symmetrix(tmp_path / "extensionless-checkpoint")
 
 
 def do_grad_test(atoms, calc, check, ax=None, label=None, plot_factor=1.0):
@@ -2444,91 +2666,58 @@ def do_grad_test(atoms, calc, check, ax=None, label=None, plot_factor=1.0):
 
     F0 = atoms.get_forces()
     S0 = atoms.get_stress()
-    F0_norm = np.linalg.norm(F0)
-    S0_norm = np.linalg.norm(S0)
     p0 = atoms.positions.copy()
     c0 = atoms.cell.copy()
     V0 = atoms.get_volume()
+    rng = np.random.default_rng(12491)
+    position_direction = rng.normal(size=p0.shape)
+    position_direction -= np.mean(position_direction, axis=0, keepdims=True)
+    position_direction /= np.linalg.norm(position_direction)
+    strain_direction = rng.normal(size=(3, 3))
+    strain_direction = 0.5 * (strain_direction + strain_direction.T)
+    strain_direction /= np.linalg.norm(strain_direction)
 
-    f_data = []
-    passed_f = True
-    F_scaling = None
-    for dx_exp in np.arange(1.0, 5.1, 0.5):
-        dx = 0.1**dx_exp
+    force_expected = float(np.vdot(F0, position_direction))
+    stress_tensor = np.array(
+        [
+            [S0[0], S0[5], S0[4]],
+            [S0[5], S0[1], S0[3]],
+            [S0[4], S0[3], S0[2]],
+        ]
+    )
+    stress_expected = float(np.vdot(stress_tensor, strain_direction))
+    force_errors = []
+    stress_errors = []
+    for dx in (1.0e-3, 5.0e-4):
+        atoms.cell = c0
+        atoms.positions = p0 + dx * position_direction
+        energy_plus = atoms.get_potential_energy()
+        atoms.positions = p0 - dx * position_direction
+        energy_minus = atoms.get_potential_energy()
+        force_fd = -(energy_plus - energy_minus) / (2.0 * dx)
+        force_errors.append(abs(force_fd - force_expected))
 
-        #### forces ####
         atoms.positions = p0
         atoms.cell = c0
-        F_fd = np.zeros((len(atoms), 3))
-        for i_a in range(len(atoms)):
-            for j_a in range(3):
-                p = p0.copy()
-                p[i_a, j_a] = p0[i_a, j_a] + dx
-                atoms.positions = p
-                E_p = atoms.get_potential_energy()
-                p[i_a, j_a] = p0[i_a, j_a] - dx
-                atoms.positions = p
-                E_m = atoms.get_potential_energy()
-                F_fd[i_a, j_a] = -(E_p - E_m) / (2 * dx)
-        F_err = np.linalg.norm(F0 - F_fd)
-        print(
-            f"F {dx:6f} {F0_norm:10.6e} {F_err:10.6e} {F_err / F0_norm:10.6e} {F_err / F0_norm / (dx**2):10.6e}"
-        )
-
-        f_data.append([dx, F_err])
-
-        # force error only shows expected 2nd order scaling for dx = 0.1 ** 1, 0.1 ** 1.5
-        if F_scaling is None and dx_exp >= 1.99:
-            # F_err / F0_norm < F_scaling * dx ** 2
-            F_scaling = 4.0 * F_err / F0_norm / (dx**2)
-        if F_scaling is not None and dx_exp < 4.01:
-            print("test forces", dx_exp, dx, F_err / F0_norm, "<?", F_scaling * dx**2)
-            passed_f = passed_f and (F_err / F0_norm < F_scaling * dx**2)
+        atoms.set_cell(c0 @ (np.eye(3) + dx * strain_direction), True)
+        energy_plus = atoms.get_potential_energy()
+        atoms.positions = p0
+        atoms.cell = c0
+        atoms.set_cell(c0 @ (np.eye(3) - dx * strain_direction), True)
+        energy_minus = atoms.get_potential_energy()
+        stress_fd = (energy_plus - energy_minus) / (2.0 * dx) / V0
+        stress_errors.append(abs(stress_fd - stress_expected))
 
     if ax is not None:
-        f_data = np.asarray(f_data)
-        ax.loglog(f_data[:, 0], f_data[:, 1] * plot_factor, "-", label=label)
-
-    passed_s = True
-    S_scaling = None
-    for dx_exp in np.arange(1.0, 5.1, 0.5):
-        dx = 0.1**dx_exp
-
-        #### stress ####
-        atoms.positions = p0
-        atoms.cell = c0
-        S_fd = np.zeros((3, 3))
-        for i0 in range(3):
-            for i1 in range(3):
-                F = np.eye(3)
-                F[i0, i1] += dx / 2
-                F[i1, i0] += dx / 2
-                atoms.positions = p0
-                atoms.cell = c0
-                atoms.set_cell(c0 @ F, True)
-                E_p = atoms.get_potential_energy()
-
-                F = np.eye(3)
-                F[i0, i1] -= dx / 2
-                F[i1, i0] -= dx / 2
-                atoms.positions = p0
-                atoms.cell = c0
-                atoms.set_cell(c0 @ F, True)
-                E_m = atoms.get_potential_energy()
-
-                S_fd[i0, i1] = (E_p - E_m) / (2 * dx) / V0
-
-        S_err = np.linalg.norm(S0 - full_3x3_to_voigt_6_stress(S_fd))
-        print(
-            f"S {dx:6f} {S0_norm:10.6e} {S_err:10.6e} {S_err / S0_norm:10.6e} {S_err / S0_norm / dx**2:10.6e}"
+        ax.loglog(
+            [1.0e-3, 5.0e-4],
+            np.asarray(force_errors) * plot_factor,
+            "-",
+            label=label,
         )
 
-        if S_scaling is None and dx_exp >= 1.99:
-            # S_err / S0_norm < S_scaling * dx ** 2
-            S_scaling = 1.5 * S_err / S0_norm / (dx**2)
-        if S_scaling is not None and dx_exp < 4.01:
-            print("test stress", dx_exp, dx, S_err / S0_norm, "<?", S_scaling * dx**2)
-            passed_s = passed_s and (S_err / S0_norm < S_scaling * dx**2)
-
     if check:
-        assert passed_f and passed_s
+        force_tolerance = 2.0e-6 + 2.0e-4 * abs(force_expected)
+        stress_tolerance = 2.0e-7 + 2.0e-4 * abs(stress_expected)
+        assert max(force_errors) <= force_tolerance
+        assert max(stress_errors) <= stress_tolerance

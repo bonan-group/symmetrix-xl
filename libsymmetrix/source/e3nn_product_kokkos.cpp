@@ -7,11 +7,9 @@
 #include <utility>
 
 #include "tools_kokkos.hpp"
-#include "standard_m0.hpp"
 
 namespace {
 constexpr int product_host_forward_feature_tile=4;
-constexpr int product_host_standard_feature_tile=512;
 
 template<typename Precision>
 typename E3ProductBasisKokkosT<Precision>::Tensor load_tensor(
@@ -197,48 +195,8 @@ E3ProductBasisKokkosT<Precision>::E3ProductBasisKokkosT(const nlohmann::json& da
             compiled_term_native_layout,host_term_native_layout);
         Kokkos::deep_copy(compiled_component_data,host_components);
         Kokkos::deep_copy(compiled_coefficients,host_coefficients);
-        if constexpr(std::is_same_v<
-            typename Kokkos::DefaultExecutionSpace::memory_space,
-            Kokkos::HostSpace>) {
-            const int candidate_terms=compiled_component_count==4
-                    &&compiled_terms==symmetrix::standard_m0::total_terms
-                ?symmetrix::standard_m0::total_terms
-                :(compiled_component_count==1
-                        &&compiled_terms==symmetrix::standard_m0::term_offsets[1]
-                    ?symmetrix::standard_m0::term_offsets[1]:0);
-            bool standard_plan=candidate_terms!=0
-                &&angular_dimension==symmetrix::standard_m0::input_components;
-            for(int component=0;standard_plan
-                    &&component<compiled_component_count;++component)
-                standard_plan=host_components(component,2)
-                        ==symmetrix::standard_m0::term_offsets[component]
-                    &&host_components(component,3)
-                        ==symmetrix::standard_m0::term_offsets[component+1];
-            for(int term=0;standard_plan&&term<candidate_terms;++term) {
-                standard_plan=host_terms(term,0)
-                    ==symmetrix::standard_m0::term_degrees[term];
-                for(int axis=0;standard_plan
-                        &&axis<host_terms(term,0);++axis)
-                    standard_plan=host_terms(term,axis+1)
-                        ==symmetrix::standard_m0::term_components[term][axis];
-            }
-            if(standard_plan) {
-                compiled_host_standard_term_count=candidate_terms;
-                compiled_host_standard_weights=
-                    Kokkos::View<Precision***,Kokkos::LayoutRight>(
-                        "compiled product standard host weights",
-                        num_elements,compiled_terms,num_features);
-                auto host_standard_weights=Kokkos::create_mirror_view(
-                    compiled_host_standard_weights);
-                for(int element=0;element<num_elements;++element)
-                    for(int term=0;term<compiled_terms;++term)
-                        for(int feature=0;feature<num_features;++feature)
-                            host_standard_weights(element,term,feature)=
-                                host_coefficients(term,element,feature);
-                Kokkos::deep_copy(
-                    compiled_host_standard_weights,host_standard_weights);
-            }
-        }
+        initialize_compiled_host_plan(
+            host_terms,host_components,host_coefficients);
         Kokkos::deep_copy(
             compiled_angular_native_layout,host_angular_layout);
         Kokkos::deep_copy(
@@ -352,7 +310,7 @@ void E3ProductBasisKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,K
                 },invalid_elements);
             if(invalid_elements)
                 throw std::out_of_range(
-                    "MACE_Nonlinear product element index is out of range.");
+                    "Equivariant product element index is out of range.");
         }
         auto terms=compiled_term_data;
         auto term_native_layout=compiled_term_native_layout;
@@ -410,93 +368,10 @@ void E3ProductBasisKokkosT<Precision>::evaluate(Kokkos::View<const Precision**,K
                         for(int feature=0;feature<feature_count;++feature)
                             destination[feature]=source[feature*stride];
                     });
-            if(compiled_host_standard_term_count!=0) {
-                auto standard_weights=compiled_host_standard_weights;
-                const int standard_terms=compiled_host_standard_term_count;
-                Kokkos::parallel_for(
-                    "compiled product standard host forward",
-                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
-                        Kokkos::IndexType<std::size_t>>(0,sample_count),
-                    KOKKOS_LAMBDA(const std::size_t sample) {
-                    const int element=element_data[sample];
-                    for(int feature_first=0;feature_first<feature_count;
-                        feature_first+=product_host_standard_feature_tile) {
-                        const int active_features=feature_first
-                                +product_host_standard_feature_tile<feature_count
-                            ?product_host_standard_feature_tile
-                            :feature_count-feature_first;
-                        Precision input_values[
-                            symmetrix::standard_m0::input_components]
-                            [product_host_standard_feature_tile];
-                        Precision output_values[
-                            symmetrix::standard_m0::output_components]
-                            [product_host_standard_feature_tile]={};
-                        if(reuse_compiled_block_major_input) {
-                            for(int component=0;component
-                                    <symmetrix::standard_m0::input_components;
-                                ++component) {
-                                const int block_offset=
-                                    packed_layout_data[3*component];
-                                const int block_component=
-                                    packed_layout_data[3*component+1];
-                                const int block_width=
-                                    packed_layout_data[3*component+2];
-                                const Precision* const component_input=
-                                    block_source_data
-                                    +sample_count*block_offset
-                                    +sample*block_width*feature_count
-                                    +block_component*feature_count+feature_first;
-#if defined(_OPENMP)
-#pragma omp simd
-#endif
-                                for(int lane=0;lane<active_features;++lane)
-                                    input_values[component][lane]=
-                                        component_input[lane];
-                            }
-                        } else
-                            for(int component=0;component
-                                    <symmetrix::standard_m0::input_components;
-                                ++component) {
-                                const Precision* const component_input=
-                                    angular_source_data+sample*source_stride
-                                    +component*feature_count+feature_first;
-#if defined(_OPENMP)
-#pragma omp simd
-#endif
-                                for(int lane=0;lane<active_features;++lane)
-                                    input_values[component][lane]=
-                                        component_input[lane];
-                            }
-                        if(element>=0&&element<element_count) {
-                            if(standard_terms
-                                ==symmetrix::standard_m0::total_terms)
-                                symmetrix::standard_m0::accumulate_forward_terms<
-                                    product_host_standard_feature_tile>(
-                                    element,feature_first,active_features,
-                                    input_values,standard_weights,output_values,
-                                    std::make_index_sequence<
-                                        symmetrix::standard_m0::total_terms>{});
-                            else
-                                symmetrix::standard_m0::accumulate_forward_terms<
-                                    product_host_standard_feature_tile>(
-                                    element,feature_first,active_features,
-                                    input_values,standard_weights,output_values,
-                                    std::make_index_sequence<
-                                        symmetrix::standard_m0::term_offsets[1]>{});
-                        }
-                        for(int output_component=0;
-                            output_component<component_count;++output_component) {
-                            const int* const component=
-                                component_data+6*output_component;
-                            for(int lane=0;lane<active_features;++lane)
-                                target_data[
-                                    sample*target_stride+component[0]
-                                    +(feature_first+lane)*component[1]]=
-                                    output_values[output_component][lane];
-                        }
-                    }
-                });
-        } else {
+            if(uses_standard_host_plan()) {
+                evaluate_compiled_host_plan(
+                    sample_count,elements,reuse_compiled_block_major_input);
+            } else {
             if(reuse_compiled_block_major_input)
                 throw std::invalid_argument(
                     "Compiled block-major product input is available only "
@@ -715,7 +590,7 @@ void E3ProductBasisKokkosT<Precision>::reverse(Kokkos::View<const Precision**,Ko
                 },invalid_elements);
             if(invalid_elements)
                 throw std::out_of_range(
-                    "MACE_Nonlinear product element index is out of range.");
+                    "Equivariant product element index is out of range.");
         }
         auto terms=compiled_term_data;
         auto term_native_layout=compiled_term_native_layout;
@@ -737,7 +612,7 @@ void E3ProductBasisKokkosT<Precision>::reverse(Kokkos::View<const Precision**,Ko
             if(emit_native_input_adjoint)
                 prepare_compiled_angular_adjoint(source.extent(0));
             if(!emit_native_input_adjoint) {
-                if(compiled_host_standard_term_count==0)
+                if(!uses_standard_host_plan())
                     throw std::invalid_argument(
                         "Packed product reverse requires the standard host plan.");
                 if(compiled_host_packed_input_adjoint_storage.extent(0)
@@ -794,128 +669,10 @@ void E3ProductBasisKokkosT<Precision>::reverse(Kokkos::View<const Precision**,Ko
                         for(int feature=0;feature<feature_count;++feature)
                             destination[feature]=source[feature*stride];
                     });
-            if(compiled_host_standard_term_count!=0) {
-                auto standard_weights=compiled_host_standard_weights;
-                const int standard_terms=compiled_host_standard_term_count;
-                Kokkos::parallel_for(
-                    "compiled product standard host reverse",
-                    Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
-                        Kokkos::IndexType<std::size_t>>(0,sample_count),
-                    KOKKOS_LAMBDA(const std::size_t sample) {
-                    const int element=element_data[sample];
-                    Precision* const sample_adjoint=
-                        angular_major_adjoint_data
-                        +sample*angular_major_sample_stride;
-                    const Precision* const sample_input=
-                        angular_source_data+sample*source_stride;
-                    for(int feature_first=0;feature_first<feature_count;
-                        feature_first+=product_host_standard_feature_tile) {
-                        const int active_features=feature_first
-                                +product_host_standard_feature_tile<feature_count
-                            ?product_host_standard_feature_tile
-                            :feature_count-feature_first;
-                        Precision input_values[
-                            symmetrix::standard_m0::input_components]
-                            [product_host_standard_feature_tile];
-                        Precision output_adjoints[
-                            symmetrix::standard_m0::output_components]
-                            [product_host_standard_feature_tile]={};
-                        Precision input_adjoints[
-                            symmetrix::standard_m0::input_components]
-                            [product_host_standard_feature_tile]={};
-                        if(reuse_compiled_block_major_input) {
-                            for(int component=0;component
-                                    <symmetrix::standard_m0::input_components;
-                                ++component) {
-                                const int block_offset=
-                                    packed_layout_data[3*component];
-                                const int block_component=
-                                    packed_layout_data[3*component+1];
-                                const int block_width=
-                                    packed_layout_data[3*component+2];
-                                const Precision* const component_input=
-                                    block_source_data
-                                    +sample_count*block_offset
-                                    +sample*block_width*feature_count
-                                    +block_component*feature_count+feature_first;
-#if defined(_OPENMP)
-#pragma omp simd
-#endif
-                                for(int lane=0;lane<active_features;++lane)
-                                    input_values[component][lane]=
-                                        component_input[lane];
-                            }
-                        } else
-                            for(int component=0;component
-                                    <symmetrix::standard_m0::input_components;
-                                ++component) {
-                                const Precision* const component_input=
-                                    sample_input+component*feature_count
-                                    +feature_first;
-#if defined(_OPENMP)
-#pragma omp simd
-#endif
-                                for(int lane=0;lane<active_features;++lane)
-                                    input_values[component][lane]=
-                                        component_input[lane];
-                            }
-                        for(int output_component=0;
-                            output_component<component_count;++output_component) {
-                            const int* const component=
-                                component_data+6*output_component;
-                            const Precision* const output_values=
-                                target_adjoint_data
-                                +sample*target_adjoint_stride+component[0];
-                            for(int lane=0;lane<active_features;++lane)
-                                output_adjoints[output_component][lane]=
-                                    output_values[
-                                        (feature_first+lane)*component[1]];
-                        }
-                        if(element>=0&&element<element_count) {
-                            if(standard_terms
-                                ==symmetrix::standard_m0::total_terms)
-                                symmetrix::standard_m0::accumulate_reverse_terms<
-                                    product_host_standard_feature_tile>(
-                                    element,feature_first,active_features,
-                                    input_values,output_adjoints,standard_weights,
-                                    input_adjoints,std::make_index_sequence<
-                                        symmetrix::standard_m0::total_terms>{});
-                            else
-                                symmetrix::standard_m0::accumulate_reverse_terms<
-                                    product_host_standard_feature_tile>(
-                                    element,feature_first,active_features,
-                                    input_values,output_adjoints,standard_weights,
-                                    input_adjoints,std::make_index_sequence<
-                                        symmetrix::standard_m0::term_offsets[1]>{});
-                        }
-                        for(int component=0;
-                            component<symmetrix::standard_m0::input_components;
-                            ++component) {
-                            if(emit_native_input_adjoint) {
-                                for(int lane=0;lane<active_features;++lane)
-                                    sample_adjoint[
-                                        component*feature_count+feature_first
-                                            +lane]=input_adjoints[component][lane];
-                            } else {
-                                const int block_offset=
-                                    packed_layout_data[3*component];
-                                const int block_component=
-                                    packed_layout_data[3*component+1];
-                                const int block_width=
-                                    packed_layout_data[3*component+2];
-                                for(int lane=0;lane<active_features;++lane) {
-                                    const int feature=feature_first+lane;
-                                    packed_input_adjoint_data[
-                                        sample_count*block_offset
-                                        +static_cast<std::size_t>(feature)
-                                            *sample_count*block_width
-                                        +sample*block_width+block_component]=
-                                        input_adjoints[component][lane];
-                                }
-                            }
-                        }
-                    }
-                });
+            if(uses_standard_host_plan()) {
+                reverse_compiled_host_plan(
+                    sample_count,elements,emit_native_input_adjoint,
+                    reuse_compiled_block_major_input);
             } else Kokkos::parallel_for(
                 "compiled product reverse",
                 Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,

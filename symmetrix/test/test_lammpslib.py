@@ -23,6 +23,12 @@ except ImportError:
 from ase.calculators.lammpslib import LAMMPSlib
 
 
+# The Kokkos spellings are the only pair styles Symmetrix exposes, so the ASE
+# LAMMPSlib bridge must select Kokkos on the command line; a bare `package
+# kokkos` deck line is rejected unless `-k on` was given first.
+KOKKOS_CMD_ARGS = ["-k", "on", "t", "1", "-sf", "kk"]
+
+
 def test_lammpslib_map(generated_standard_mace_zbl_model):
     calc_symmetrix = Symmetrix(generated_standard_mace_zbl_model)
     species = ["H", "O"]
@@ -30,12 +36,13 @@ def test_lammpslib_map(generated_standard_mace_zbl_model):
     for map_type in [None, "yes", "array", "hash"]:
         lammpslib_kwargs = dict(
             lmpcmds=[
-                "pair_style    symmetrix/mace",
+                "pair_style    symmetrix/mace/kk",
                 f"pair_coeff    * * {generated_standard_mace_zbl_model}     "
                 + " ".join(species),
             ],
             atom_types={sp: sp_i + 1 for sp_i, sp in enumerate(species)},
             lammps_header=["units metal", "atom_style atomic", "atom_modify sort 0 0"],
+            extra_cmd_args=KOKKOS_CMD_ARGS,
         )
         if map_type is None:
             calc_lammpslib = LAMMPSlib(**lammpslib_kwargs)
@@ -59,11 +66,12 @@ def test_lammpslib_default_header(generated_standard_mace_zbl_model):
     # use default lammps_header, should do "atom_modify map array sort 0 0"
     lammpslib_kwargs = dict(
         lmpcmds=[
-            "pair_style    symmetrix/mace",
+            "pair_style    symmetrix/mace/kk",
             f"pair_coeff    * * {generated_standard_mace_zbl_model}     "
             + " ".join(species),
         ],
         atom_types={sp: sp_i + 1 for sp_i, sp in enumerate(species)},
+        extra_cmd_args=KOKKOS_CMD_ARGS,
     )
 
     compare_lammpslib_symmetrix(calc_symmetrix, lammpslib_kwargs)
@@ -71,12 +79,13 @@ def test_lammpslib_default_header(generated_standard_mace_zbl_model):
     # confirm that without "atom_modify sort 0 0" it fails
     lammpslib_kwargs = dict(
         lmpcmds=[
-            "pair_style    symmetrix/mace",
+            "pair_style    symmetrix/mace/kk",
             f"pair_coeff    * * {generated_standard_mace_zbl_model}     "
             + " ".join(species),
         ],
         atom_types={sp: sp_i + 1 for sp_i, sp in enumerate(species)},
         lammps_header=["units metal", "atom_style atomic", "atom_modify map yes"],
+        extra_cmd_args=KOKKOS_CMD_ARGS,
     )
 
     with pytest.raises(AssertionError):

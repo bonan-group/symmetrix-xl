@@ -139,7 +139,6 @@ def make_calculator(args: argparse.Namespace):
     jit = "required" if args.symmetrix_mode == "factorized" else "off"
     calculator = Symmetrix(
         args.compact_model,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges=streamed_edges,
         jit=jit,
@@ -147,6 +146,7 @@ def make_calculator(args: argparse.Namespace):
     return calculator, {
         "implementation": f"symmetrix-{args.symmetrix_mode}",
         "execution_space": execution_space,
+        "streamed_edges_requested": calculator.streamed_edges_requested,
         "streamed_edges": calculator.streamed_edges,
         "jit_status": calculator.jit_status,
         "jit_compiler_backend": calculator.jit_compiler_backend,
@@ -350,8 +350,10 @@ def compare(args: argparse.Namespace) -> int:
     identity = symmetrix.get("identity", {})
     if identity.get("implementation") != "symmetrix-factorized":
         raise RuntimeError("Symmetrix record is not the factorized implementation")
-    if identity.get("streamed_edges") != "factorized":
-        raise RuntimeError("Symmetrix record did not use streamed_edges=factorized")
+    if identity.get("streamed_edges") != "direct":
+        raise RuntimeError(
+            "Symmetrix record did not resolve the factorized direct routing"
+        )
     if identity.get("jit_status") not in ("built", "cached"):
         raise RuntimeError("Symmetrix record did not use a JIT specialization artifact")
     if symmetrix["case"] != reference["case"]:

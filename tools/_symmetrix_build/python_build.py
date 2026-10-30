@@ -41,6 +41,12 @@ def cmake_definitions(
         "SYMMETRIX_DISTRIBUTION_NAME": identity.distribution,
         "SYMMETRIX_BACKEND_SELECTOR": identity.backend,
         "SYMMETRIX_BACKEND_ARCHITECTURE": identity.architecture,
+        "SYMMETRIX_PARTICLE_MESH": manifest.particle_mesh_policy.upper(),
+        "SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS": (manifest.prebuilt_operator_artifacts),
+        "SYMMETRIX_PREBUILT_OAM_ARTIFACTS": manifest.prebuilt_oam_artifacts,
+        # Reset a development configure that reused this fingerprinted cache;
+        # package installs and wheels must never inherit the runtime-only path.
+        "SYMMETRIX_ENABLE_DEVELOPMENT_RUNTIME_COMPONENT": "OFF",
     }
     if source_provenance is not None:
         definitions["SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256"] = str(
@@ -49,6 +55,12 @@ def cmake_definitions(
         definitions["SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256"] = str(
             source_provenance["native_content_sha256"]
         )
+        if revision := str(source_provenance.get("revision", "")):
+            definitions["SYMMETRIX_BUILD_SOURCE_COMMIT"] = revision
+        if source_provenance.get("dirty") is not None:
+            definitions["SYMMETRIX_BUILD_SOURCE_DIRTY"] = str(
+                int(bool(source_provenance["dirty"]))
+            )
     backend = manifest.backend
     if backend == "cpu":
         definitions.update(
@@ -109,6 +121,9 @@ def cmake_definitions(
             {
                 "CMAKE_CXX_COMPILER": manifest.toolchain.cxx,
                 "CMAKE_CUDA_HOST_COMPILER": manifest.toolchain.host_cxx,
+                "SYMMETRIX_DEVICE_COMPILER_TARGET": (
+                    manifest.architecture.compiler_target
+                ),
                 "SYMMETRIX_DEVICE_BACKEND": "CUDA",
                 "Kokkos_ENABLE_CUDA": "ON",
                 "Kokkos_ENABLE_HIP": "OFF",
@@ -132,6 +147,7 @@ def cmake_definitions(
         definitions.update(
             {
                 "CMAKE_CXX_COMPILER": manifest.toolchain.cxx,
+                "SYMMETRIX_DEVICE_COMPILER_TARGET": target,
                 "CMAKE_PREFIX_PATH": manifest.toolchain.toolkit_root,
                 "CMAKE_BUILD_RPATH": runtime_path,
                 "CMAKE_INSTALL_RPATH": runtime_path,

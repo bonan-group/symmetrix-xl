@@ -3,6 +3,48 @@ import json
 from pathlib import Path
 
 import numpy as np
+from symmetrix.mace_execution_contract import (
+    make_standard_m0_contract,
+    make_standard_r0_contract,
+)
+
+
+def add_standard_base_contracts(model):
+    """Attach canonical R0/M0 contracts to a synthetic R1 model."""
+    channels = model["num_channels"]
+    edge_l_max = model["l_max"]
+    output_l = list(range(edge_l_max + 1))
+    model["execution_contracts"]["R0"] = make_standard_r0_contract(
+        channels=channels,
+        radial_embedding=model["compact_radial"]["networks"]["R0"]["shape"][-2],
+        edge_l_max=edge_l_max,
+        source_irreps=f"{channels}x0e",
+        edge_irreps=" + ".join(f"1x{l}e" for l in output_l),
+        output_irreps=" + ".join(f"{channels}x{l}e" for l in output_l),
+        output_l=output_l,
+        edge_l=output_l,
+        source_l=[0] * len(output_l),
+        instructions=[
+            {
+                "connection_mode": "uvu",
+                "has_weight": True,
+                "path_shape": [channels, 1],
+            }
+            for _ in output_l
+        ],
+    )
+    correlation = max(
+        len(term) for terms in model["M0_monomials"].values() for term in terms
+    )
+    model["execution_contracts"]["M0"] = make_standard_m0_contract(
+        channels=channels,
+        type_count=model["num_elements"],
+        input_l_max=edge_l_max,
+        output_l_max=model["L_max"],
+        correlation=correlation,
+        monomials=model["M0_monomials"],
+    )
+    return model
 
 
 def foundation_r1_test_model(

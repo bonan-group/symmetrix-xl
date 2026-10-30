@@ -78,7 +78,7 @@ def _run_trajectory(
         create_atoms    2 single 7.0 3.0 7.0 units box
         mass            1 26.9815385
         mass            2 14.0067
-        pair_style      symmetrix/mace no_domain_decomposition streamed_edges {streamed_edges}{artifact_option}
+        pair_style      symmetrix/mace/kk no_domain_decomposition streamed_edges {streamed_edges}{artifact_option}
         pair_coeff      * * {model} Al N
         neighbor        1.0 bin
         neigh_modify    every 1 delay 0 check yes

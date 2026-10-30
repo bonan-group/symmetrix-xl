@@ -13,14 +13,14 @@ from compact_r1_model import foundation_r1_test_model
 from debug_jit import debug_factorized_symmetrix
 from symmetrix import Symmetrix
 from symmetrix import symmetrix as native_symmetrix
-from symmetrix.execution_contract import make_factorized_contract
+from symmetrix.mace_execution_contract import make_factorized_contract
 from symmetrix.extract_mace_data import extract_mace_data
 from symmetrix.jit import (
     JIT_GENERATION_VERSION,
     jit_nvrtc_information,
     prepare_jit_artifact,
 )
-from symmetrix.jit_codegen import (
+from symmetrix.mace_jit_codegen import (
     jit_r1_host_plugin_metadata,
     render_jit_r1_host_plugin,
 )
@@ -330,14 +330,12 @@ def test_cuda_registry_miss_jit_builds_reuses_and_survives_calculator_deletion(
     atoms = _small_structure()
     reference = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
     expected = _evaluate(reference, atoms)
     generic = debug_factorized_symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
@@ -350,7 +348,6 @@ def test_cuda_registry_miss_jit_builds_reuses_and_survives_calculator_deletion(
 
     cold = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
@@ -364,7 +361,6 @@ def test_cuda_registry_miss_jit_builds_reuses_and_survives_calculator_deletion(
     assert cold_evaluator.jit_cuda_plugin_ready
     assert cold_evaluator.jit_cuda_plugin_path == cold.jit_artifact_path
     assert cold_evaluator.factorized_model_payload_verified
-    assert cold_evaluator.factorized_jit_artifact_id.startswith("jit-r1-gen11-")
     assert cold_evaluator.factorized_jit_contract_fingerprint.startswith("sha256:")
     assert cold_evaluator.factorized_source_strategy == "jit_plugin"
 
@@ -382,7 +378,6 @@ def test_cuda_registry_miss_jit_builds_reuses_and_survives_calculator_deletion(
 
     warm = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
@@ -448,14 +443,12 @@ def test_cuda_macefield_jit_matches_runtime_and_prepared_execution(
 
     reference = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="generic",
     )
     expected = _evaluate_field(reference, atoms, electric_field)
     generated = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="direct",
     )
@@ -536,7 +529,6 @@ def test_unregistered_r1_plugin_matches_runtime_and_all_and_survives_warm_load(
     atoms = _small_structure()
     reference = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="generic",
     )
@@ -544,7 +536,6 @@ def test_unregistered_r1_plugin_matches_runtime_and_all_and_survives_warm_load(
 
     candidate = debug_factorized_symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="generic",
     )
@@ -591,7 +582,6 @@ def test_unregistered_r1_plugin_matches_runtime_and_all_and_survives_warm_load(
 
     warm_candidate = debug_factorized_symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="generic",
     )
@@ -602,7 +592,6 @@ def test_unregistered_r1_plugin_matches_runtime_and_all_and_survives_warm_load(
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "automatic-jit-cache"))
     automatic = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="direct",
     )
@@ -614,7 +603,6 @@ def test_unregistered_r1_plugin_matches_runtime_and_all_and_survives_warm_load(
 
     automatic_warm = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="direct",
     )
@@ -686,14 +674,12 @@ def test_macefield_host_plugin_matches_runtime_and_prepared_execution(
     electric_field = np.array([0.01, -0.02, 0.03], dtype=np.float64)
     reference = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="generic",
     )
     expected = _evaluate_field(reference, atoms, electric_field)
     candidate = debug_factorized_symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="generic",
     )
@@ -766,7 +752,6 @@ def test_automatic_jit_handles_different_channel_and_embedding_sizes(
     )
     reference = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
@@ -775,7 +760,6 @@ def test_automatic_jit_handles_different_channel_and_embedding_sizes(
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
     cold = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         execution_profile="speed",
@@ -783,7 +767,6 @@ def test_automatic_jit_handles_different_channel_and_embedding_sizes(
     assert cold.jit_status == "built"
     assert cold.evaluator.jit_host_plugin_ready
     assert cold.evaluator.factorized_model_payload_verified
-    assert cold.evaluator.factorized_jit_artifact_id.startswith("jit-r1-gen11-")
     assert cold.evaluator.factorized_jit_contract_fingerprint.startswith("sha256:")
     cold_result = _evaluate(cold, atoms)
     _assert_results_close(cold_result, expected)
@@ -792,7 +775,6 @@ def test_automatic_jit_handles_different_channel_and_embedding_sizes(
 
     warm = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         execution_profile="speed",

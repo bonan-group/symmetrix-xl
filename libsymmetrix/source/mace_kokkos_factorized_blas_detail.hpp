@@ -39,6 +39,7 @@
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
 #include "device_backend.hpp"
+#include "mace_device_backend.hpp"
 #include "factorized_blas.hpp"
 
 struct FactorizedBlasContext {
@@ -262,6 +263,29 @@ void launch_execution_strided_batched_gemm(
     const Precision beta = static_cast<Precision>(descriptor.beta);
     const auto operation_a = execution_cublas_operation(descriptor.transpose_a);
     const auto operation_b = execution_cublas_operation(descriptor.transpose_b);
+    // A single batch matrix is the plain GEMM: the strided entry point is only
+    // needed when a stride selects among batch matrices, and the flattened A1
+    // route calls this with one packed operand per hidden degree.  The strides
+    // are ignored for a single matrix, so the two entry points compute the same
+    // product from the same leading dimensions.
+    if (descriptor.batch_count == 1) {
+        if constexpr (std::is_same_v<Precision,float>) {
+            KOKKOSBLAS_IMPL_CUBLAS_SAFE_CALL(cublasSgemm(
+                blas.handle, operation_a, operation_b,
+                descriptor.m, descriptor.n, descriptor.k, &alpha,
+                a, descriptor.leading_a,
+                b, descriptor.leading_b,
+                &beta, c, descriptor.leading_c));
+        } else {
+            KOKKOSBLAS_IMPL_CUBLAS_SAFE_CALL(cublasDgemm(
+                blas.handle, operation_a, operation_b,
+                descriptor.m, descriptor.n, descriptor.k, &alpha,
+                a, descriptor.leading_a,
+                b, descriptor.leading_b,
+                &beta, c, descriptor.leading_c));
+        }
+        return;
+    }
     if (descriptor.batch_count > 1
         && (descriptor.stride_a == 0 || descriptor.stride_b == 0
             || descriptor.stride_c == 0)) {

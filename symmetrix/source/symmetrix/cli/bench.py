@@ -420,7 +420,6 @@ def run(args: argparse.Namespace) -> dict:
         calculator = Symmetrix(
             runtime_model,
             dtype=args.dtype,
-            use_kokkos=True,
             streamed_edges="direct",
             execution_profile=args.profile,
             neighbor_skin=args.neighbor_skin,

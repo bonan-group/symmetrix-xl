@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +45,391 @@ def test_manifest_covers_release_matrix_and_classifies_chemistry(matrix):
     assert matrix.chemistry_status(off, "C64") == (True, None)
     assert matrix.chemistry_status(off, "H2O") == (True, None)
     assert "STO40" not in off["chemistry"]
+
+
+def test_oam_release_matrix_is_explicit_per_size_backend_and_precision(matrix):
+    manifest = matrix.load_manifest(MANIFEST)
+    support = manifest["nequip_support"]
+    cells = support["release_matrix"]
+    assert len(cells) == 16
+    assert {(cell["size"], cell["backend"], cell["precision"]) for cell in cells} == {
+        (size, backend, precision)
+        for size in ("S", "M", "L", "XL")
+        for backend in ("host", "cuda")
+        for precision in ("float32", "float64")
+    }
+    for cell in cells:
+        excluded_host_pair = (
+            cell["backend"] == "host"
+            and cell["precision"] == "float64"
+            and cell["size"] in {"S", "L", "XL"}
+        )
+        assert cell["state"] == "available_unqualified"
+        assert cell["runtime_qualification"] == (
+            "available_not_runtime_qualified"
+            if excluded_host_pair
+            else "campaign_required"
+        )
+        if cell["backend"] == "host":
+            assert cell["threads"] == ([] if excluded_host_pair else [1, 4])
+            assert cell["graph_classes"] == {
+                "host-100": (
+                    "available_not_runtime_qualified"
+                    if excluded_host_pair
+                    else "required"
+                )
+            }
+            assert cell["capacity_boundary"] == "none"
+        else:
+            assert cell["threads"] == [1]
+            assert cell["graph_classes"] == {
+                "small": "required",
+                "production": "required",
+            }
+            assert cell["capacity_boundary"] == (
+                "required"
+                if cell["size"] == "XL" and cell["precision"] == "float32"
+                else "not_required"
+            )
+        assert set(cell["properties"].values()) == {"available_unqualified"}
+        assert set(cell["artifact"]) == {
+            "availability",
+            "kind",
+            "abi_version",
+            "origins",
+        }
+        assert cell["artifact"]["availability"] == "available"
+        expected_status = "not_in_campaign" if excluded_host_pair else "required"
+        assert cell["baseline"] == {"status": expected_status, "record": None}
+        assert cell["evidence"]["correctness"] == {
+            "status": expected_status,
+            "record": None,
+        }
+        assert set(cell["tolerances"]) == {
+            "energy_abs_eV_per_atom",
+            "forces_max_abs_eV_per_A",
+            "stress_max_abs_eV_per_A3",
+        }
+        assert cell["tested_compute_capabilities"] == []
+
+
+def test_current_oam_matrix_requires_fresh_full_message_qualification(matrix):
+    from symmetrix.oam_cuda_codegen import ABI_VERSION as cuda_abi_version
+    from symmetrix.oam_receiver_codegen import ABI_VERSION as host_abi_version
+
+    support = matrix.load_manifest(MANIFEST)["nequip_support"]
+
+    assert "accepted_qualification" not in support
+    for cell in support["release_matrix"]:
+        key = (cell["size"], cell["backend"], cell["precision"])
+        excluded_host_pair = key in {
+            ("S", "host", "float64"),
+            ("L", "host", "float64"),
+            ("XL", "host", "float64"),
+        }
+        assert cell["state"] == "available_unqualified"
+        assert cell["runtime_qualification"] == (
+            "available_not_runtime_qualified"
+            if excluded_host_pair
+            else "campaign_required"
+        )
+        assert set(cell["properties"].values()) == {"available_unqualified"}
+        assert cell["tested_compute_capabilities"] == []
+        assert cell["artifact"]["abi_version"] == (
+            host_abi_version if cell["backend"] == "host" else cuda_abi_version
+        )
+
+
+@pytest.mark.parametrize(
+    "field", ("accepted_qualification", "historical_qualification")
+)
+def test_oam_release_matrix_rejects_superseded_qualification(matrix, field):
+    support = json.loads(json.dumps(matrix.load_manifest(MANIFEST)["nequip_support"]))
+    support[field] = {"status": "superseded"}
+    with pytest.raises(ValueError, match="superseded accepted qualification"):
+        matrix._validate_nequip_support(support, evidence_root=MANIFEST.parent)
+
+
+def test_oam_release_matrix_declares_performance_gates(matrix):
+    support = matrix.load_manifest(MANIFEST)["nequip_support"]
+    assert support["performance_gates"] == {
+        "production_min_speedup_vs_reference": 1.10,
+        "small_min_speedup_vs_reference": 0.95,
+        "production_geomean_min_speedup_vs_reference": 1.20,
+        "approved_baseline_min_ratio": 0.95,
+        "host_100_min_speedup_vs_reference": 1.10,
+        "host_min_scaling_speedup": 1.0,
+    }
+
+
+@pytest.mark.parametrize("location", ("support", "cell"))
+def test_oam_release_tolerances_are_exact_and_contradictions_fail(
+    matrix, tmp_path, location
+):
+    manifest = matrix.load_manifest(MANIFEST)
+    expected = {
+        "float32": {
+            "energy_abs_eV_per_atom": 1.0e-5,
+            "forces_max_abs_eV_per_A": 5.0e-4,
+            "stress_max_abs_eV_per_A3": 5.0e-4,
+        },
+        "float64": {
+            "energy_abs_eV_per_atom": 5.0e-6,
+            "forces_max_abs_eV_per_A": 1.0e-5,
+            "stress_max_abs_eV_per_A3": 1.0e-6,
+        },
+    }
+    assert manifest["nequip_support"]["tolerances"] == expected
+    for cell in manifest["nequip_support"]["release_matrix"]:
+        assert cell["tolerances"] == expected[cell["precision"]]
+
+    mutated = json.loads(MANIFEST.read_text())
+    target = (
+        mutated["nequip_support"]["tolerances"]["float32"]
+        if location == "support"
+        else mutated["nequip_support"]["release_matrix"][0]["tolerances"]
+    )
+    target["forces_max_abs_eV_per_A"] *= 2
+    path = tmp_path / "contradictory-tolerances.json"
+    path.write_text(json.dumps(mutated))
+    with pytest.raises(ValueError, match="authoritative OAM release tolerances"):
+        matrix.load_manifest(path)
+
+
+def test_generic_mace_worker_tolerances_remain_independent_from_oam(matrix):
+    manifest = matrix.load_manifest(MANIFEST)
+    assert manifest["tolerances"] == {
+        "float32": {
+            "energy_abs_eV_per_atom": 5.0e-4,
+            "forces_max_abs_eV_per_A": 5.0e-3,
+            "stress_max_abs_eV_per_A3": 8.0e-3,
+        },
+        "float64": {
+            "energy_abs_eV_per_atom": 1.0e-9,
+            "forces_max_abs_eV_per_A": 1.0e-8,
+            "stress_max_abs_eV_per_A3": 1.0e-9,
+        },
+    }
+    errors = {
+        "energy_abs_eV_per_atom": 0.0,
+        "forces_max_abs_eV_per_A": 1.0e-3,
+        "stress_max_abs_eV_per_A3": 0.0,
+    }
+    assert matrix.parity_failures(errors, manifest["tolerances"]["float32"]) == []
+    assert matrix.parity_failures(
+        errors, manifest["nequip_support"]["tolerances"]["float32"]
+    ) == ["forces_max_abs_eV_per_A"]
+
+
+def test_oam_release_matrix_cannot_qualify_host_pair_outside_campaign(matrix):
+    support = json.loads(json.dumps(matrix.load_manifest(MANIFEST)["nequip_support"]))
+    cell = next(
+        cell
+        for cell in support["release_matrix"]
+        if (cell["size"], cell["backend"], cell["precision"])
+        == ("S", "host", "float64")
+    )
+    cell["state"] = "qualified"
+    with pytest.raises(ValueError, match="outside host runtime qualification"):
+        matrix._validate_nequip_support(support, evidence_root=MANIFEST.parent)
+
+
+def test_oam_release_matrix_rejects_qualification_without_empirical_records(matrix):
+    support = matrix.load_manifest(MANIFEST)["nequip_support"]
+    support = json.loads(json.dumps(support))
+    cell = support["release_matrix"][0]
+    cell["state"] = "qualified"
+    cell["runtime_qualification"] = "complete"
+    cell["graph_classes"] = {name: "complete" for name in cell["graph_classes"]}
+    cell["properties"] = {name: "qualified" for name in cell["properties"]}
+    cell["baseline"] = {"status": "required", "record": None}
+    with pytest.raises(ValueError, match="lacks complete baseline evidence"):
+        matrix._validate_nequip_support(support, evidence_root=MANIFEST.parent)
+
+
+def test_oam_release_matrix_rejects_relaxed_performance_gates(matrix):
+    support = matrix.load_manifest(MANIFEST)["nequip_support"]
+    support = json.loads(json.dumps(support))
+    support["performance_gates"]["production_min_speedup_vs_reference"] = 1.0
+    with pytest.raises(ValueError, match="approved thresholds"):
+        matrix._validate_nequip_support(support, evidence_root=MANIFEST.parent)
+
+
+def _qualified_manifest_with_evidence(
+    matrix,
+    tmp_path,
+    *,
+    target=("XL", "cuda", "float32"),
+    record_override=None,
+):
+    manifest = json.loads(json.dumps(matrix.load_manifest(MANIFEST)))
+    support = manifest["nequip_support"]
+    cell = next(
+        cell
+        for cell in support["release_matrix"]
+        if (cell["size"], cell["backend"], cell["precision"]) == target
+    )
+    cell["state"] = "qualified"
+    cell["runtime_qualification"] = "complete"
+    cell["graph_classes"] = {name: "complete" for name in cell["graph_classes"]}
+    cell["properties"] = {name: "qualified" for name in cell["properties"]}
+    if target == ("XL", "cuda", "float32"):
+        cell["capacity_boundary"] = "complete"
+    size, backend, precision = target
+    identity = {
+        "schema": "symmetrix.nequip-release-evidence",
+        "version": 1,
+        "model": f"nequip-oam-{size.lower()}",
+        "backend": backend,
+        "precision": precision,
+        "graph_classes": list(cell["graph_classes"]),
+        "properties": ["energy", "forces", "stress"],
+    }
+    metrics = (
+        {
+            "baseline": {},
+            "correctness": {},
+            "host_100_performance": {
+                "speedup_vs_reference": 1.10,
+                "ratio_vs_approved_baseline": 0.95,
+            },
+            "scaling": {"speedup_t1_over_t4": 1.01},
+        }
+        if backend == "host"
+        else {
+            "baseline": {},
+            "correctness": {},
+            "small_performance": {"speedup_vs_reference": 0.95},
+            "production_performance": {
+                "speedup_vs_reference": 1.10,
+                "geomean_speedup_vs_reference": 1.20,
+                "ratio_vs_approved_baseline": 0.95,
+            },
+            **(
+                {"capacity": {}}
+                if cell["capacity_boundary"] in {"required", "complete"}
+                else {}
+            ),
+        }
+    )
+    for name in metrics:
+        record = dict(identity, evidence_kind=name, metrics=metrics[name])
+        if record_override is not None:
+            record = record_override(name, record)
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(record, sort_keys=True))
+        entry = {
+            "status": "complete",
+            "record": {
+                "path": path.name,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            },
+        }
+        if name == "baseline":
+            cell["baseline"] = entry
+        else:
+            cell["evidence"][name] = entry
+    cell["tested_compute_capabilities"] = [] if backend == "host" else [120]
+    return manifest
+
+
+def test_qualified_host_evidence_uses_host_100_and_strict_scaling_gate(
+    matrix, tmp_path
+):
+    manifest = _qualified_manifest_with_evidence(
+        matrix, tmp_path, target=("S", "host", "float32")
+    )
+    matrix._validate_manifest_nequip_support(manifest, evidence_root=tmp_path)
+
+    scaling_path = tmp_path / "scaling.json"
+    scaling = json.loads(scaling_path.read_text())
+    scaling["metrics"]["speedup_t1_over_t4"] = 1.0
+    scaling_path.write_text(json.dumps(scaling, sort_keys=True))
+    cell = next(
+        cell
+        for cell in manifest["nequip_support"]["release_matrix"]
+        if (cell["size"], cell["backend"], cell["precision"])
+        == ("S", "host", "float32")
+    )
+    cell["evidence"]["scaling"]["record"]["sha256"] = hashlib.sha256(
+        scaling_path.read_bytes()
+    ).hexdigest()
+    with pytest.raises(ValueError, match="fails an approved performance gate"):
+        matrix._validate_manifest_nequip_support(manifest, evidence_root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "record_override,match",
+    [
+        (lambda name, record: {"arbitrary": True}, "invalid evidence record"),
+        (
+            lambda name, record: (
+                dict(record, backend="host") if name == "correctness" else record
+            ),
+            "identity mismatch",
+        ),
+        (
+            lambda name, record: (
+                dict(record, graph_classes=[*record["graph_classes"], "arbitrary"])
+                if name == "correctness"
+                else record
+            ),
+            "coverage mismatch",
+        ),
+        (
+            lambda name, record: (
+                dict(record, properties=[*record["properties"], "arbitrary"])
+                if name == "correctness"
+                else record
+            ),
+            "coverage mismatch",
+        ),
+    ],
+)
+def test_oam_qualification_rejects_hashed_but_wrong_evidence(
+    matrix, tmp_path, record_override, match
+):
+    manifest = _qualified_manifest_with_evidence(
+        matrix, tmp_path, record_override=record_override
+    )
+    with pytest.raises(ValueError, match=match):
+        matrix._validate_manifest_nequip_support(manifest, evidence_root=tmp_path)
+
+
+def test_oam_qualification_rejects_non_finite_evidence_metrics(matrix, tmp_path):
+    def non_finite_production_metric(name, record):
+        if name == "production_performance":
+            record["metrics"]["speedup_vs_reference"] = float("nan")
+        return record
+
+    manifest = _qualified_manifest_with_evidence(
+        matrix, tmp_path, record_override=non_finite_production_metric
+    )
+    with pytest.raises(ValueError, match="fails an approved performance gate"):
+        matrix._validate_manifest_nequip_support(manifest, evidence_root=tmp_path)
+
+
+def test_loaded_manifest_preserves_evidence_root_across_cwd(
+    matrix, tmp_path, monkeypatch
+):
+    manifest = _qualified_manifest_with_evidence(matrix, tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+
+    loaded = matrix.load_manifest(manifest_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    qualified = [
+        cell
+        for cell in matrix.nequip_support(loaded)["release_matrix"]
+        if cell["state"] == "qualified"
+    ]
+    assert ("XL", "cuda", "float32") in {
+        (cell["size"], cell["backend"], cell["precision"]) for cell in qualified
+    }
+    assert len(qualified) == 1
 
 
 def test_requested_structures_are_deterministic_and_have_expected_size(matrix):
@@ -119,6 +505,116 @@ def test_matrix_adds_only_the_declared_capacity_probe(matrix):
         probe["backend"] for probe in probes if probe["model"] == "mace-off23-large"
     }
     assert off23_backends == {"cpu", "cuda", "hip"}
+
+
+def _write_manifest_copy(tmp_path, mutate):
+    manifest = json.loads(MANIFEST.read_text())
+    mutate(manifest)
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest))
+    return path
+
+
+# Values cite the captured molecule fixture (symmetrix/test/data/polar/
+# mol5_manifest.json): n_k 62 over 5 atoms means 8 * 62 * 5 fp32 table bytes.
+VALID_LONG_RANGE_BLOCK = {
+    "n_k": 62,
+    "table_bytes": 2480,
+    "correction_mode": "makov-payne-dabo",
+    "rebuild_on_cell_change": True,
+}
+
+
+def test_long_range_vocabulary_is_declared_and_optional_for_probes(matrix):
+    manifest = matrix.load_manifest(MANIFEST)
+    vocabulary = manifest["long_range_capacity"]
+    assert vocabulary["version"] == matrix.LONG_RANGE_CAPACITY_VERSION
+    assert set(vocabulary["correction_modes"]) == set(
+        matrix.LONG_RANGE_CORRECTION_MODES
+    )
+    assert set(vocabulary["probe_fields"]) == {
+        "n_k",
+        "table_bytes",
+        "correction_mode",
+        "rebuild_on_cell_change",
+    }
+    # The vocabulary is additive: shipped probes carry no long-range block.
+    assert all("long_range" not in probe for probe in manifest["capacity_probes"])
+
+
+def test_probe_long_range_block_parses_and_survives_without_vocabulary(
+    matrix, tmp_path
+):
+    def attach(manifest):
+        manifest["capacity_probes"][0]["long_range"] = dict(VALID_LONG_RANGE_BLOCK)
+
+    loaded = matrix.load_manifest(_write_manifest_copy(tmp_path, attach))
+    assert loaded["capacity_probes"][0]["long_range"] == VALID_LONG_RANGE_BLOCK
+
+    def drop_vocabulary(manifest):
+        del manifest["long_range_capacity"]
+        attach(manifest)
+
+    # Old manifests without the vocabulary section still accept probe blocks.
+    loaded = matrix.load_manifest(_write_manifest_copy(tmp_path, drop_vocabulary))
+    assert loaded["capacity_probes"][0]["long_range"] == VALID_LONG_RANGE_BLOCK
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "fragment"),
+    [
+        ("n_k", 0, "long-range n_k"),
+        ("n_k", -3, "long-range n_k"),
+        ("n_k", 61.5, "long-range n_k"),
+        ("n_k", True, "long-range n_k"),
+        ("n_k", None, "long-range n_k"),
+        ("table_bytes", -8, "long-range table_bytes"),
+        ("table_bytes", 2480.0, "long-range table_bytes"),
+        ("table_bytes", True, "long-range table_bytes"),
+        ("correction_mode", "ewald", "long-range correction mode"),
+        ("correction_mode", None, "long-range correction mode"),
+        ("rebuild_on_cell_change", "yes", "long-range rebuild trigger"),
+        ("rebuild_on_cell_change", 1, "long-range rebuild trigger"),
+    ],
+)
+def test_probe_long_range_fields_are_type_checked(
+    matrix, tmp_path, field, value, fragment
+):
+    def attach(manifest):
+        block = dict(VALID_LONG_RANGE_BLOCK)
+        block[field] = value
+        manifest["capacity_probes"][0]["long_range"] = block
+
+    with pytest.raises(ValueError, match=fragment):
+        matrix.load_manifest(_write_manifest_copy(tmp_path, attach))
+
+
+def test_probe_long_range_block_requires_every_field(matrix, tmp_path):
+    for field in VALID_LONG_RANGE_BLOCK:
+
+        def attach(manifest, field=field):
+            manifest["capacity_probes"][0]["long_range"] = {
+                key: value
+                for key, value in VALID_LONG_RANGE_BLOCK.items()
+                if key != field
+            }
+
+        with pytest.raises(ValueError, match="long-range"):
+            matrix.load_manifest(_write_manifest_copy(tmp_path, attach))
+
+
+def test_long_range_vocabulary_version_and_modes_are_enforced(matrix, tmp_path):
+    def bump_version(manifest):
+        manifest["long_range_capacity"]["version"] += 1
+
+    with pytest.raises(ValueError, match="long-range capacity vocabulary"):
+        matrix.load_manifest(_write_manifest_copy(tmp_path, bump_version))
+
+    def extend_modes(manifest):
+        manifest["long_range_capacity"]["correction_modes"]["ewald3d"] = "extra"
+
+    with pytest.raises(ValueError, match="disagree"):
+        matrix.load_manifest(_write_manifest_copy(tmp_path, extend_modes))
 
 
 def test_resume_keys_can_retry_only_failures(matrix, tmp_path):
@@ -202,7 +698,12 @@ def test_direct_identity_requires_generated_execution_and_zero_fallback(matrix):
         factorized_jit_reverse_launch_count=2,
         factorized_selected_direct_forward_executor="jit_all",
         factorized_selected_direct_reverse_executor="jit",
-        r0_implementation="device_module",
+        r0_implementation="generated",
+        _r0_loader_implementation="host_plugin",
+        r0_backend="host",
+        r0_artifact_origin="runtime",
+        r0_schedule="host-owner",
+        r0_profile="owner-batched",
         r0_module_id="r0-artifact",
         m0_implementation="host_plugin",
         m0_module_id="m0-artifact",
@@ -220,6 +721,10 @@ def test_direct_identity_requires_generated_execution_and_zero_fallback(matrix):
     )
     evaluator.factorized_fallback_evaluation_count = 0
     evaluator.r0_implementation = "generic"
+    evaluator._r0_loader_implementation = "generic"
+    evaluator.r0_artifact_origin = None
+    evaluator.r0_schedule = "generic"
+    evaluator.r0_profile = "generic"
     evaluator.r0_module_id = ""
     assert matrix.direct_identity(calculator, "cpu", "speed")["gate_failures"] == []
     assert any(
@@ -228,6 +733,77 @@ def test_direct_identity_requires_generated_execution_and_zero_fallback(matrix):
             "gate_failures"
         ]
     )
+
+
+@pytest.mark.parametrize("retained_loader", ("builtin", "host_plugin", "device_module"))
+def test_direct_identity_accepts_generic_dispatch_with_retained_r0_loader(
+    matrix, retained_loader
+):
+    evaluator = SimpleNamespace(
+        streamed_edges_mode="direct",
+        factorized_jit_ready=True,
+        factorized_fallback_evaluation_count=0,
+        factorized_jit_forward_launch_count=1,
+        factorized_jit_reverse_launch_count=2,
+        factorized_selected_direct_forward_executor="jit_all",
+        factorized_selected_direct_reverse_executor="jit",
+        r0_implementation="generic",
+        _r0_loader_implementation=retained_loader,
+        r0_backend="host" if retained_loader != "device_module" else "cuda",
+        r0_artifact_origin=None,
+        r0_schedule="generic",
+        r0_profile="generic",
+        r0_module_id="",
+        m0_implementation="host_plugin",
+        m0_module_id="m0-artifact",
+        m1_recompute_tile_channels=16,
+    )
+    calculator = SimpleNamespace(
+        evaluator=evaluator, jit_status="built", jit_artifact_id="artifact"
+    )
+    backend = "cuda" if retained_loader == "device_module" else "cpu"
+
+    assert matrix.direct_identity(calculator, backend)["gate_failures"] == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("r0_backend", "cuda"),
+        ("r0_artifact_origin", None),
+        ("r0_schedule", "receiver-edge16"),
+        ("r0_profile", "persistent-4"),
+        ("r0_module_id", ""),
+        ("r0_implementation", "generic"),
+        ("_r0_loader_implementation", "device_module"),
+    ),
+)
+def test_direct_identity_rejects_inconsistent_r0_evidence(matrix, field, value):
+    evaluator = SimpleNamespace(
+        streamed_edges_mode="direct",
+        factorized_jit_ready=True,
+        factorized_fallback_evaluation_count=0,
+        factorized_jit_forward_launch_count=1,
+        factorized_jit_reverse_launch_count=2,
+        factorized_selected_direct_forward_executor="jit_all",
+        factorized_selected_direct_reverse_executor="jit",
+        r0_implementation="generated",
+        _r0_loader_implementation="host_plugin",
+        r0_backend="host",
+        r0_artifact_origin="runtime",
+        r0_schedule="host-owner",
+        r0_profile="owner-batched",
+        r0_module_id="r0-artifact",
+        m0_implementation="host_plugin",
+        m0_module_id="m0-artifact",
+        m1_recompute_tile_channels=16,
+    )
+    setattr(evaluator, field, value)
+    calculator = SimpleNamespace(
+        evaluator=evaluator, jit_status="built", jit_artifact_id="artifact"
+    )
+
+    assert matrix.direct_identity(calculator, "cpu")["gate_failures"]
 
 
 def test_mh1_identity_requires_all_generated_reverse_families(matrix):

@@ -39,8 +39,24 @@ env:
   OPENBLAS_SHA256: "38240eee1b29e2bde47ebb5d61160207dc68668a54cac62c076bb5032013b1eb"
 
 jobs:
+  release-metadata:
+    name: Verify release metadata and publication ref
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate version sources and release tag
+        run: |
+          python tools/check_release_metadata.py
+          if [[ "${{ inputs.publish_pypi }}" == "true" ]]; then
+            python tools/check_release_metadata.py --require-tag
+          fi
+
   build-cpu-v4:
     name: Build cpu avx512 ${{ matrix.python }}
+    needs: release-metadata
     runs-on: ubuntu-latest
     container: quay.io/pypa/manylinux_2_28_x86_64
     strategy:
@@ -93,6 +109,8 @@ jobs:
           export LD_LIBRARY_PATH=/usr/local/openblas/lib
           python tools/symmetrix_build.py wheel-matrix \
             --target cpu:avx512 \
+            --prebuilt-operator-artifacts r0 \
+            --prebuilt-oam-artifacts known \
             --wheel-dir dist
 
       - name: Repair the wheel to manylinux
@@ -101,6 +119,19 @@ jobs:
           auditwheel show dist/*.whl
           auditwheel repair dist/*.whl -w dist-repaired --plat manylinux_2_28_x86_64
           ls -lh dist-repaired
+
+      - name: Audit repaired wheel
+        run: |
+          set -euo pipefail
+          repaired_wheels=(dist-repaired/*.whl)
+          if [ "${#repaired_wheels[@]}" -ne 1 ] || [ ! -f "${repaired_wheels[0]}" ]; then
+            echo "expected exactly one repaired wheel" >&2
+            exit 1
+          fi
+          /opt/python/${{ matrix.python }}/bin/python \
+            tools/check_wheel_contents.py "${repaired_wheels[0]}"
+          /opt/python/${{ matrix.python }}/bin/python \
+            -m auditwheel show "${repaired_wheels[0]}"
 
       - name: Layout sentinels
         run: |
@@ -131,14 +162,17 @@ jobs:
           print("wheel layout OK:", wheel)
           PY
 
-      - name: Install wheel and prove AVX-512 codegen
+      - name: Install repaired wheel and prove metadata, catalog, and AVX-512 codegen
         run: |
           set -euo pipefail
           export PATH="/opt/python/${{ matrix.python }}/bin:/usr/local/bin:$PATH"
           python -m venv /tmp/wheelcheck
           /tmp/wheelcheck/bin/pip install --no-deps dist-repaired/*.whl
           /tmp/wheelcheck/bin/python - <<'PY'
+          import hashlib
           import importlib.metadata as md
+          import json
+          from pathlib import Path
 
           dist = md.distribution("symmetrix-xl-cpu-avx512")
           requires = dist.requires or []
@@ -155,7 +189,33 @@ jobs:
           assert points[0].value == "symmetrix_backend_cpu_avx512", points
           files = {str(item) for item in dist.files or []}
           assert "symmetrix_backend_cpu_avx512/__init__.py" in files, sorted(files)[:8]
-          print("installed wheel metadata OK")
+          package_root = Path(
+              dist.locate_file("symmetrix_backend_cpu_avx512")
+          ).resolve()
+          descriptor = json.loads((package_root / "backend.json").read_text())
+          assert descriptor["selector"] == "cpu-avx512", descriptor
+          assert descriptor["architecture"] == "x86-64-v4", descriptor
+          catalog_path = package_root / "_operator_artifacts/catalog.json"
+          catalog = json.loads(catalog_path.read_text())
+          prebuilt = descriptor["prebuilt_operator_artifacts"]
+          assert prebuilt["mode"] == "r0", prebuilt
+          assert prebuilt["backend"] == "host", prebuilt
+          assert prebuilt["target"] == "x86-64-v4", prebuilt
+          assert prebuilt["artifact_count"] == 14, prebuilt
+          assert len(catalog["artifacts"]) == 14, catalog
+          assert sum(
+              item["operator"] == "OAM" for item in catalog["artifacts"]
+          ) == 8, catalog
+          assert {
+              item["identity"]["backend"] for item in catalog["artifacts"]
+          } == {"host"}, catalog
+          assert {
+              item["identity"]["target"] for item in catalog["artifacts"]
+          } == {"x86-64-v4"}, catalog
+          assert prebuilt["catalog_sha256"] == hashlib.sha256(
+              catalog_path.read_bytes()
+          ).hexdigest(), prebuilt
+          print("installed repaired wheel metadata and catalog OK")
           PY
           so="$(find /tmp/wheelcheck -type f -name '_native_cpu_avx512*.so' | head -n 1)"
           test -n "$so"
@@ -163,6 +223,46 @@ jobs:
             echo "no AVX-512 vector code found in $so"; exit 1;
           }
           echo "AVX-512 codegen sentinel OK: $so"
+
+      - name: Probe AVX-512 runtime when host supports x86-64-v4
+        run: |
+          set -euo pipefail
+          cpu_flags=""
+          while IFS= read -r line; do
+            if [[ "$line" == flags* ]]; then
+              cpu_flags="${line#*: }"
+              break
+            fi
+          done < /proc/cpuinfo
+          missing_flags=()
+          for flag in avx512f avx512bw avx512cd avx512dq avx512vl; do
+            if ! grep -qw "$flag" <<<"$cpu_flags"; then
+              missing_flags+=("$flag")
+            fi
+          done
+          if [ "${#missing_flags[@]}" -ne 0 ]; then
+            echo "Skipping x86-64-v4 runtime probe; host lacks: ${missing_flags[*]}"
+            exit 0
+          fi
+          /tmp/wheelcheck/bin/python - <<'PY'
+          import importlib
+
+          native = importlib.import_module(
+              "symmetrix_backend_cpu_avx512._native_cpu_avx512"
+          )
+          build_info = native._backend_build_info()
+          prebuilt = build_info["prebuilt_operator_artifacts"]
+          assert prebuilt["mode"] == "r0", prebuilt
+          assert prebuilt["backend"] == "host", prebuilt
+          assert prebuilt["target"] == "x86-64-v4", prebuilt
+          assert prebuilt["artifact_count"] == 14, prebuilt
+          native._init_kokkos()
+          try:
+              assert native._kokkos_default_execution_space() == "OpenMP"
+          finally:
+              native._finalize_kokkos()
+          print("installed repaired wheel AVX-512 runtime OK")
+          PY
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4

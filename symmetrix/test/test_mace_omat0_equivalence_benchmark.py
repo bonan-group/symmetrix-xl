@@ -25,7 +25,9 @@ def write_record(path, backend, device):
     if backend == "symmetrix":
         identity = {
             "implementation": "symmetrix-factorized",
-            "streamed_edges": "factorized",
+            # A record carries the routing the frontend resolved, not the
+            # requested spelling: the ``factorized`` mode resolves to ``direct``.
+            "streamed_edges": "direct",
             "jit_status": "cached",
         }
     path.write_text(

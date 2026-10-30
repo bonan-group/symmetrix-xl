@@ -49,8 +49,7 @@ def _member_configuration(calculator):
             int(value) for value in evaluator.atomic_numbers
         ),
         "precision": calculator._kernel_launch_dtype,
-        "Kokkos selection": bool(calculator.use_kokkos),
-        "streamed-edge mode": calculator.streamed_edges,
+        "streamed-edge routing": calculator.streamed_edges,
         "low-memory policy": bool(calculator.low_memory),
         "neighbor skin": float(calculator.neighbor_skin),
         "implemented properties": frozenset(calculator.implemented_properties),

@@ -24,7 +24,7 @@ std::string symmetrix_model_type(const std::string& filename)
     return symmetrix_model_metadata(filename).first;
 }
 
-bool symmetrix_is_nonlinear_mace_model(const std::string& filename)
+bool symmetrix_is_nonlinear_model(const std::string& filename)
 {
     return symmetrix_model_type(filename) == "MACE_Nonlinear";
 }

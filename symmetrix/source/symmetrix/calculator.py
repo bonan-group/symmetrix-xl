@@ -7,6 +7,7 @@ work for the U. S. Government, and is not subject to copyright.
 
 import json
 import logging
+import operator
 import os
 import sys
 import warnings
@@ -15,13 +16,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import numpy as np
-
-try:
-    from matscipy.neighbours import neighbour_list as neighbor_list
-except ImportError:
-    logging.warning("Symmetrix using slow ase.neighborlist.neighbor_list")
-    from ase.neighborlist import neighbor_list
-
+from ase import Atoms, units
 from ase.calculators.calculator import (
     Calculator,
     PropertyNotImplementedError,
@@ -31,16 +26,50 @@ from ase.calculators.calculator import (
 )
 from ase.stress import full_3x3_to_voigt_6_stress
 
-from . import symmetrix
+from . import family_registry, neighbor_graph, symmetrix
+from .corrections import CorrectionPipeline, D3Correction
+from .mace_alchemical import (
+    expand_alchemical_topology,
+    normalize_alchemical,
+    resolve_alchemical_config,
+    validate_alchemical_model,
+)
+from .neighbor_graph import (
+    NeighborTopologyReference,
+    build_host_neighbor_graph,
+    minimum_image_displacements,
+    neighbor_topology_reuse,
+    validate_graph_cardinality,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _FIELD_ADDITIVE_PROPERTIES = ["energy", "free_energy", "energies", "forces", "stress"]
 _FIELD_RESPONSE_PROPERTIES = ["polarization", "becs", "polarizability"]
 _FIELD_NOT_SET = object()
 _LOW_MEMORY_UNSET = object()
-_JIT_POLICY_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_POLICY"
-_JIT_REQUIRED_POLICY = "required"
-_JIT_DEBUG_POLICY = "none"
+_POLAR_OPTION_UNSET = object()
+
+
+def _positive_runtime_integer(value, option):
+    """Normalize an integer-valued runtime policy without lossy coercion."""
+
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{option} must be a positive integer")
+    try:
+        normalized = operator.index(value)
+    except TypeError as error:
+        raise ValueError(f"{option} must be a positive integer") from error
+    if normalized <= 0:
+        raise ValueError(f"{option} must be a positive integer")
+    return normalized
+
+
+# ``streamed_edges`` distinguishes an unset default from an explicit
+# ``"direct"``: the documented default is ``"direct"``, but a family that
+# declares no streamed-edge mode handshake resolves the unset default through
+# its declared routings the way ``"auto"`` does, while an explicit request is
+# refused by name when the family cannot serve it.
+_STREAMED_EDGES_UNSET = object()
 _EXECUTION_MH0_STATE_POLICIES = frozenset(("full-retention-v1", "reuse-adjoints-v1"))
 _EDGE_GEOMETRY_POLICIES = frozenset(("cartesian-f64-v1", "unit-f32-radius-f64-v1"))
 _EXECUTION_MH1_NODE_STATE_POLICIES = frozenset(
@@ -55,6 +84,11 @@ _EXECUTION_MH1_NODE_ARENA_POLICIES = frozenset(("throughput-v1", "capacity-v1"))
 _KERNEL_LAUNCH_POLICIES = frozenset(("automatic", "static"))
 _M1_POLYNOMIAL_POLICIES = frozenset(("automatic", "recompute", "retained"))
 _EXECUTION_PROFILES = frozenset(("capacity", "speed"))
+# The plan ids the MH-0 family declares as its native candidate space.  The
+# native debug-plan pin validates a requested id against that same declaration
+# and the report lists the declared space, so this Python set is the frontend
+# half of one cross-language contract (see
+# ``test_declared_plan_space_is_the_cross_language_plan_id_contract``).
 _DEBUG_EXECUTION_PLANS = frozenset(
     (
         "mh0-direct-speed",
@@ -65,91 +99,19 @@ _DEBUG_EXECUTION_PLANS = frozenset(
     )
 )
 _JIT_HOST_EXECUTION_SPACES = frozenset(("Serial", "OpenMP"))
-_STREAMED_EDGE_ALIASES = {
-    "non-compiled": "generic",
-    "generic": "generic",
-    "all_interactions": "generic",
-    "factorized": "direct",
-    "direct_streamed": "direct",
-}
-_STREAMED_EDGE_CANONICAL_MODES = frozenset(("materialized", "generic", "direct"))
+# Every documented streamed-edge spelling this frontend accepts resolves through
+# the execution-mode vocabulary the family registry declares: the values are the
+# canonical cross-language strings the native parser accepts plus the
+# Python-only ``auto`` selector, and that one declaration is the single
+# acceptance source, so a mode is added or retired there and nowhere else.
+_MODE_VOCABULARY = family_registry.COMPACT_MODE_VOCABULARY
 _PREPARED_EXECUTION_MODES = frozenset(("direct",))
 _FIXED_WORKSPACE_TILED_PLANS = frozenset(
     ("mh0-single-layer-tiled-v1", "mh0-dual-layer-tiled-v1")
 )
-_NEIGHBOR_EDGE_ORDER_ENVIRONMENT_VARIABLE = "SYMMETRIX_DEBUG_NEIGHBOR_EDGE_ORDER"
-_NEIGHBOR_EDGE_ORDERS = frozenset(("receiver-major", "canonical"))
 _NEIGHBOR_BACKENDS = frozenset(("automatic", "host", "kokkos"))
 _AUTOMATIC_KOKKOS_NEIGHBOR_MIN_ATOMS = 512
 _AUTOMATIC_KOKKOS_NEIGHBOR_EXECUTION_SPACES = frozenset(("Cuda", "HIP"))
-_INT32_MAX = int(np.iinfo(np.int32).max)
-
-
-def _validate_int32_graph_cardinality(num_atoms, num_edges):
-    num_atoms = int(num_atoms)
-    num_edges = int(num_edges)
-    if num_atoms < 0 or num_edges < 0:
-        raise ValueError(
-            "MACE graph atom and directed-edge counts must be non-negative."
-        )
-    if num_atoms >= _INT32_MAX:
-        raise ValueError(
-            f"MACE graph atom count {num_atoms} exceeds the 32-bit CSR "
-            f"limit {_INT32_MAX - 1}."
-        )
-    if num_edges > _INT32_MAX:
-        raise ValueError(
-            f"MACE graph directed-edge count {num_edges} exceeds the 32-bit "
-            f"topology limit {_INT32_MAX}."
-        )
-
-
-def _receiver_major_neighbor_arrays(receivers, sources, shifts):
-    """Return aligned, contiguous edges grouped by receiver.
-
-    Matscipy and ASE already emit ascending receiver indices. Preserve their
-    within-receiver order because direct execution has no source/shift sorting
-    requirement. The canonical mode exists only for numerical A/B diagnosis.
-    """
-    receivers = np.asarray(receivers, dtype=np.int32).reshape(-1)
-    sources = np.asarray(sources, dtype=np.int32).reshape(-1)
-    shifts = np.asarray(shifts, dtype=np.int32).reshape((-1, 3))
-    if len(receivers) != len(sources) or len(receivers) != len(shifts):
-        raise ValueError("Neighbor receiver, source, and shift extents must match.")
-
-    order_policy = os.environ.get(
-        _NEIGHBOR_EDGE_ORDER_ENVIRONMENT_VARIABLE, "receiver-major"
-    )
-    if order_policy not in _NEIGHBOR_EDGE_ORDERS:
-        choices = ", ".join(sorted(_NEIGHBOR_EDGE_ORDERS))
-        raise ValueError(
-            f"{_NEIGHBOR_EDGE_ORDER_ENVIRONMENT_VARIABLE} must be one of "
-            f"{choices}; got {order_policy!r}."
-        )
-    if order_policy == "canonical":
-        order = np.lexsort(
-            (
-                shifts[:, 2],
-                shifts[:, 1],
-                shifts[:, 0],
-                sources,
-                receivers,
-            )
-        )
-    elif len(receivers) > 1 and np.any(receivers[1:] < receivers[:-1]):
-        order = np.argsort(receivers, kind="stable")
-    else:
-        order = None
-
-    if order is not None:
-        receivers = receivers[order]
-        sources = sources[order]
-        shifts = shifts[order]
-    return (
-        np.ascontiguousarray(receivers),
-        np.ascontiguousarray(sources),
-        np.ascontiguousarray(shifts),
-    )
 
 
 def _neighbor_backend_request():
@@ -171,12 +133,6 @@ def _use_device_neighbor_graph(request, eligible, num_atoms, execution_space):
         execution_space in _AUTOMATIC_KOKKOS_NEIGHBOR_EXECUTION_SPACES
         and num_atoms >= _AUTOMATIC_KOKKOS_NEIGHBOR_MIN_ATOMS
     )
-
-
-def _canonical_streamed_edges_mode(mode):
-    if mode == "auto":
-        return mode
-    return _STREAMED_EDGE_ALIASES.get(mode, mode)
 
 
 class _JitRequiredError(RuntimeError):
@@ -271,16 +227,27 @@ def _require_matching_jit_generation_version():
     return JIT_GENERATION_VERSION
 
 
-def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator):
+def _factorized_device_backend_plan(
+    backend,
+    target,
+    contract,
+    dtype,
+    evaluator,
+    *,
+    apply_edge_weights=False,
+    resolve_compiler=True,
+):
     if backend == "cuda":
         from .jit import (
+            artifact_cache_inputs,
             prepare_execution_cuda_jit_artifact,
             prepare_nvrtc_jit_artifact,
             select_execution_cuda_jit_backend,
             execution_cuda_jit_backend_request,
             execution_cuda_r1_edge_launch_policy,
         )
-        from .jit_codegen import (
+        from .mace_jit_codegen import (
+            R1_ARTIFACT_ENVELOPE,
             render_jit_r1_cuda_module,
             render_jit_r1_cuda_plugin,
             jit_r1_cuda_plugin_metadata,
@@ -296,8 +263,12 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
                     "the native evaluator reported an invalid CUDA compute capability"
                 )
             normalized_target = 10 * int(major) + int(minor)
-        policy = execution_cuda_jit_backend_request()
-        selected_compiler = select_execution_cuda_jit_backend(policy)
+        policy = (
+            execution_cuda_jit_backend_request() if resolve_compiler else "deferred"
+        )
+        selected_compiler = (
+            select_execution_cuda_jit_backend(policy) if resolve_compiler else None
+        )
         launch_policy = execution_cuda_r1_edge_launch_policy(
             default_strategy="wave",
             default_logical_subgroup_width=32,
@@ -314,6 +285,7 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
             persistent_blocks_per_compute_unit=launch_policy[
                 "persistent_blocks_per_compute_unit"
             ],
+            apply_edge_weights=apply_edge_weights,
         )
         edge_policy = {
             "strategy": metadata["edge_strategy"],
@@ -323,6 +295,7 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
                 "persistent_blocks_per_compute_unit"
             ],
         }
+        abi = artifact_cache_inputs(metadata, R1_ARTIFACT_ENVELOPE)
         variant_id = (
             f"{metadata['artifact_id']}-edge-{metadata['edge_strategy']}-w"
             f"{metadata['edge_logical_subgroup_width']}-t"
@@ -345,6 +318,7 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
                 persistent_blocks_per_compute_unit=metadata[
                     "persistent_blocks_per_compute_unit"
                 ],
+                apply_edge_weights=apply_edge_weights,
             )
             generator = (
                 "symmetrix.jit.r1-cuda-module-v2"
@@ -363,10 +337,7 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
                     else prepare_execution_cuda_jit_artifact
                 ),
                 arguments={
-                    "abi": {
-                        "tag": metadata["abi"],
-                        "version": metadata["abi_version"],
-                    },
+                    "abi": abi,
                     "build": {
                         "generator": generator,
                         "precision": dtype,
@@ -412,6 +383,7 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
 
     if backend == "hip":
         from .jit import (
+            artifact_cache_inputs,
             normalize_execution_hip_target_identity,
             prepare_execution_hip_jit_artifact,
             prepare_hiprtc_jit_artifact,
@@ -419,15 +391,18 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
             execution_hip_jit_backend_request,
             execution_hip_r1_edge_launch_policy,
         )
-        from .jit_codegen import (
+        from .mace_jit_codegen import (
+            R1_ARTIFACT_ENVELOPE,
             render_jit_r1_hip_module,
             render_jit_r1_hip_plugin,
             factorized_gpu_codegen_identity,
             factorized_hip_plugin_metadata,
         )
 
-        policy = execution_hip_jit_backend_request()
-        selected_compiler = select_execution_hip_jit_backend(policy)
+        policy = execution_hip_jit_backend_request() if resolve_compiler else "deferred"
+        selected_compiler = (
+            select_execution_hip_jit_backend(policy) if resolve_compiler else None
+        )
         normalized_target = normalize_execution_hip_target_identity(target)
         launch_policy = execution_hip_r1_edge_launch_policy(
             channels=contract.get("channels")
@@ -441,6 +416,7 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
             persistent_blocks_per_compute_unit=launch_policy[
                 "persistent_blocks_per_compute_unit"
             ],
+            apply_edge_weights=apply_edge_weights,
         )
         edge_policy = {
             "strategy": metadata["edge_strategy"],
@@ -450,6 +426,7 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
                 "persistent_blocks_per_compute_unit"
             ],
         }
+        abi = artifact_cache_inputs(metadata, R1_ARTIFACT_ENVELOPE)
         variant_id = (
             f"{metadata['artifact_id']}-edge-{metadata['edge_strategy']}-w"
             f"{metadata['edge_logical_subgroup_width']}-t"
@@ -471,6 +448,7 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
                 persistent_blocks_per_compute_unit=metadata[
                     "persistent_blocks_per_compute_unit"
                 ],
+                apply_edge_weights=apply_edge_weights,
             )
             generator = (
                 "symmetrix.jit.r1-hip-module-v2"
@@ -489,10 +467,7 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
                     else prepare_execution_hip_jit_artifact
                 ),
                 arguments={
-                    "abi": {
-                        "tag": metadata["abi"],
-                        "version": metadata["abi_version"],
-                    },
+                    "abi": abi,
                     "build": {
                         "generator": generator,
                         "precision": dtype,
@@ -536,6 +511,22 @@ def _factorized_device_backend_plan(backend, target, contract, dtype, evaluator)
     raise ValueError(f"unsupported Execution R1 device backend: {backend}")
 
 
+def _factorized_device_installed_plan(
+    backend, target, contract, dtype, evaluator, *, apply_edge_weights=False
+):
+    """Derive exact device R1 identity without selecting or probing a compiler."""
+
+    return _factorized_device_backend_plan(
+        backend,
+        target,
+        contract,
+        dtype,
+        evaluator,
+        apply_edge_weights=apply_edge_weights,
+        resolve_compiler=False,
+    )
+
+
 class Symmetrix(Calculator):
     """ASE calculator for equivariant graph neural-network potentials.
 
@@ -548,25 +539,31 @@ class Symmetrix(Calculator):
         MACEField checkpoints must be converted to compact JSON before use.
     dtype : {"float32", "float64"}, default="float32"
         Floating-point precision used by the evaluator. Select ``float64``
-        explicitly for high-precision calculations. The non-Kokkos serial
-        ``MACE_Nonlinear`` evaluator currently requires ``float64``.
-    use_kokkos : bool, default=True
-        Use the compiled Kokkos evaluator. ``False`` selects the non-Kokkos
-        serial CPU evaluator.
-    streamed_edges : {"direct", "non-compiled", "materialized"}, default="direct"
-        Evaluation algorithm for compact MACE models. For two-interaction
-        models, ``direct`` requires a model-specific RTC artifact and does not
-        fall back. Admitted single-layer models use built-in direct M0/R0
-        execution without an R1 stage, although capacity planning may still
-        specialize those operators.
-        ``non-compiled`` is an explicit compiler-free debug path with no
-        optimization or performance guarantee. ``materialized`` is the original Symmetrix
-        execution mode used by the original format (named v1 here).
-        The old ``generic`` and ``all_interactions`` spellings remain accepted
-        as deprecated aliases. ``factorized`` and ``direct_streamed`` alias
-        ``direct`` and preserve the former throughput behavior by changing an
-        otherwise-``capacity`` request to the ``speed`` profile. Use literal
-        ``direct`` for capacity behavior.
+        explicitly for high-precision calculations.
+    streamed_edges : {"direct", "reference"}, default="direct"
+        Execution routing for compact MACE models; ``auto`` resolves from model
+        capability, and every documented spelling resolves through one explicit
+        alias table onto the family's two routings. ``direct`` runs the
+        prepared factorized plan and requires a model-specific RTC artifact,
+        which does not fall back. ``reference`` runs the generic streamed
+        implementation through the whole-evaluator entry point on the default
+        host execution space with no artifact at all. Admitted single-layer
+        models use built-in direct M0/R0 execution without an R1 stage,
+        although capacity planning may still specialize those operators.
+        The ``non-compiled``, ``generic``, ``all_interactions`` and
+        ``materialized`` spellings resolve to ``reference``; ``generic`` and
+        ``all_interactions`` are deprecated. ``factorized`` and
+        ``direct_streamed`` alias ``direct`` and preserve the former throughput
+        behavior by changing an otherwise-``capacity`` request to the ``speed``
+        profile. Use literal ``direct`` for capacity behavior. A family whose
+        evaluator declares no streamed-edge mode handshake (the MACE Polar
+        family, whose models do not enter the ordinary streamed-edge stack)
+        still declares ``direct`` and ``reference`` routes. Both call the
+        family's native ``whole_model`` surface; ``direct`` supplies a
+        contract-matched generated backbone artifact and ``reference`` uses
+        the artifact-free portable backbone. This routing is distinct from
+        ``polar_electrostatics``, which is runtime boundary policy and is not
+        serialized in the model JSON.
     execution_profile : {"capacity", "speed"}, default="capacity"
         Resource objective for direct Kokkos execution. ``capacity`` chooses
         the fastest qualified direct policy estimated to fit the device; when
@@ -580,18 +577,21 @@ class Symmetrix(Calculator):
         standard MACE models on CUDA, but must be enabled explicitly. MACEField
         and MACE-MH-1 do not support fixed-workspace plans. The option does not
         force a tiled plan.
+    corrections : sequence, optional
+        Add native corrections such as :class:`symmetrix.D3Correction` through
+        the loaded Kokkos backend.
     dispersion : bool, default=False
-        Add a D3 dispersion correction using the optional ``torch-dftd``
-        package. The correction is evaluated alongside Symmetrix and added to
-        energy, forces, and stress.
+        Deprecated compatibility spelling for one native D3 correction. Use
+        ``corrections=[D3Correction(...)]`` instead.
     dispersion_damping : str, default="bj"
         D3 damping function (``zero``, ``bj``, ``zerom``, or ``bjm``).
     dispersion_xc : str, default="pbe"
         Exchange-correlation functional parameterization for D3.
     dispersion_cutoff : float, optional
-        D3 cutoff in Bohr. Defaults to 40 Bohr, matching MACE's calculator.
+        D3 cutoff in Angstrom. Defaults to 40 Bohr converted to Angstrom.
     dispersion_device : str, optional
-        Torch device for D3. Defaults to CUDA for a CUDA backend, otherwise CPU.
+        Deprecated compatibility check. Correction backend selection follows
+        the loaded Symmetrix backend.
     low_memory : bool, optional
         Deprecated compatibility spelling. ``True`` maps to
         ``execution_profile="capacity"`` and ``False`` maps to ``"speed"``.
@@ -675,16 +675,48 @@ class Symmetrix(Calculator):
         the exact compact-radial cutoff, where their radial contribution is
         zero, so the prepared schedule remains stable. Set to zero to rebuild
         the exact neighbor list every call.
+    polar_electrostatics : {"auto", "realspace", "periodic", "direct_reciprocal", "pme"}, default="auto"
+        Runtime POLAR electrostatics policy. Fully non-periodic input resolves
+        ``auto`` to real space; any periodic axis resolves it to the Delivery 1
+        direct reciprocal implementation. ``periodic`` is the compatibility
+        override for molecule-in-box evaluation. Forced ``pme`` is available
+        for fully three-dimensional periodic input on qualified CUDA builds
+        with an FFT provider; other backends and partial periodicity remain on
+        direct reciprocal space. This setting is evaluator policy and is never
+        serialized in the model JSON.
+    polar_pme_mesh : sequence of 3 int, default=(64, 64, 64)
+        Runtime PME mesh dimensions. This evaluator policy is intentionally
+        separate from the solver-neutral model artifact.
+    polar_pme_order : int, default=6
+        Runtime cardinal B-spline interpolation order for forced PME.
     head : str or None, default=None
         Prediction head selected from a multi-head Symmetrix JSON or MACE
         checkpoint. ``None`` uses the JSON's declared default head.
+    total_charge, total_spin : float or None, default=None
+        The PolarMACE family's graph-level charge and spin targets: the
+        values its closed-form Fukui equilibration normalizes the density
+        against. ``None`` takes the structure's own ``atoms.info`` entry of the
+        same name, then zero. Explicit constructor or post-construction values
+        are rejected for a family whose program does not carry this channel.
+    fermi_level : float or None, default=None
+        The PolarMACE family's graph-level fermi level. ``None`` takes the
+        structure's own ``atoms.info["fermi_level"]``, then zero.
+    electric_field : array or None, default=None
+        Graph-level electric field with shape ``(3,)`` or ``(1, 3)``. It is the
+        MACEField coupling's field and the PolarMACE family's external
+        field-projection input. ``None`` takes the structure's own
+        ``atoms.info["electric_field"]``, then a zero field. Explicit values
+        are rejected for families other than MACEField and MACE Polar.
 
     Attributes
     ----------
     jit_status : str
-        Specialization outcome: ``"unresolved"``, ``"built"``, ``"cached"``,
-        ``"failed"``, or ``"not_applicable"``. Specialization failures raise
-        during construction.
+        Specialization outcome: ``"unresolved"``, ``"loaded"``, ``"built"``,
+        ``"cached"``, ``"failed"``, or ``"not_applicable"``. Specialization
+        failures raise during construction.
+    jit_origin : str or None
+        Storage origin of an active generated artifact: ``"prebuilt"``,
+        ``"cache"``, or ``"runtime"``. This is not part of artifact identity.
     jit_reason : str or None
         Explanation when specialization is disabled or not applicable.
     jit_artifact_id : str or None
@@ -707,9 +739,20 @@ class Symmetrix(Calculator):
         Selected prediction-head name, or ``None`` for an unnamed legacy JSON.
     available_heads : list[str]
         Prediction heads stored in the JSON.
+    electric_field : array or None
+        The graph-level electric field the evaluation was told to use: the
+        MACEField coupling's field, and the PolarMACE family's external
+        field-projection input. ``None`` means the structure's own
+        ``atoms.info["electric_field"]`` (or a zero field) is used.
 
     Notes
     -----
+    The PolarMACE family adapter resolves graph-level scalars before its one
+    native whole-model transaction, and a changed value re-evaluates the
+    structure. Its dipole output is the family program's ``dipole_readout``
+    node and is advertised from the compiled program, so the frontend's output
+    surface cannot drift from the program the evaluator carries.
+
     Generated Execution specialization supports ordinary MACE and compatible
     MACE-MH-1-family models on Kokkos Serial, OpenMP, and CUDA builds. Dynamic
     compilation requires a POSIX platform; host plugins use a C++20 compiler
@@ -725,6 +768,12 @@ class Symmetrix(Calculator):
     """
 
     implemented_properties = list(_FIELD_ADDITIVE_PROPERTIES)
+    #: Compatibility tombstone for callers checking that the retired Python
+    #: scientific-program branch is not configured in production.
+    _polar_ops = None
+    _polar_contract = None
+    _polar_shapes = None
+    _polar_composition = None
     _macefield_response_properties = list(_FIELD_RESPONSE_PROPERTIES)
     _macefield_eps0 = 8.8541878128e-12 / 1.602176634e-19 / 1e10
 
@@ -732,8 +781,8 @@ class Symmetrix(Calculator):
         self,
         model_file,
         dtype="float32",
-        use_kokkos=True,
-        streamed_edges="direct",
+        *legacy_positional,
+        streamed_edges=_STREAMED_EDGES_UNSET,
         execution_profile="capacity",
         allow_fixed_workspace=False,
         low_memory=_LOW_MEMORY_UNSET,
@@ -747,15 +796,99 @@ class Symmetrix(Calculator):
         execution_mh0_state_policy="full-retention-v1",
         edge_geometry_policy="cartesian-f64-v1",
         neighbor_skin=0.5,
+        polar_electrostatics=_POLAR_OPTION_UNSET,
+        polar_pme_mesh=_POLAR_OPTION_UNSET,
+        polar_pme_order=_POLAR_OPTION_UNSET,
         head=None,
+        total_charge=_POLAR_OPTION_UNSET,
+        total_spin=_POLAR_OPTION_UNSET,
+        fermi_level=_POLAR_OPTION_UNSET,
+        corrections=None,
         dispersion=False,
         dispersion_damping="bj",
         dispersion_xc="pbe",
         dispersion_cutoff=None,
         dispersion_device=None,
         metal=False,
+        alchemical=None,
         **kwargs,
     ):
+        explicit_polar_options = {
+            name
+            for name, value in (
+                ("polar_electrostatics", polar_electrostatics),
+                ("polar_pme_mesh", polar_pme_mesh),
+                ("polar_pme_order", polar_pme_order),
+                ("total_charge", total_charge),
+                ("total_spin", total_spin),
+                ("fermi_level", fermi_level),
+            )
+            if value is not _POLAR_OPTION_UNSET
+        }
+        if "electric_field" in kwargs:
+            explicit_polar_options.add("electric_field")
+        if polar_electrostatics is _POLAR_OPTION_UNSET:
+            polar_electrostatics = "auto"
+        if polar_pme_mesh is _POLAR_OPTION_UNSET:
+            polar_pme_mesh = (64, 64, 64)
+        if polar_pme_order is _POLAR_OPTION_UNSET:
+            polar_pme_order = 6
+        if total_charge is _POLAR_OPTION_UNSET:
+            total_charge = None
+        if total_spin is _POLAR_OPTION_UNSET:
+            total_spin = None
+        if fermi_level is _POLAR_OPTION_UNSET:
+            fermi_level = None
+        if polar_electrostatics not in {
+            "auto",
+            "realspace",
+            "periodic",
+            "direct_reciprocal",
+            "pme",
+        }:
+            raise ValueError(
+                "polar_electrostatics must be one of 'auto', 'realspace', "
+                "'periodic', 'direct_reciprocal', or 'pme'."
+            )
+        try:
+            polar_pme_mesh = tuple(
+                _positive_runtime_integer(value, "polar_pme_mesh extent")
+                for value in polar_pme_mesh
+            )
+        except TypeError as error:
+            raise ValueError("polar_pme_mesh must contain three integers") from error
+        if len(polar_pme_mesh) != 3:
+            raise ValueError("polar_pme_mesh must contain three positive integers")
+        polar_pme_order = _positive_runtime_integer(polar_pme_order, "polar_pme_order")
+        # ``use_kokkos`` was the third positional argument and is retired: there
+        # is one evaluator stack, and the routing is expressed through
+        # ``streamed_edges``.  Both legacy forms are rejected explicitly rather
+        # than silently binding the third positional slot to ``streamed_edges``.
+        if legacy_positional or "use_kokkos" in kwargs:
+            raise TypeError(
+                "use_kokkos has been retired: Symmetrix always executes through "
+                "the single Kokkos evaluator stack. Pass "
+                "streamed_edges='direct' for the generated (T3) routing or "
+                "streamed_edges='reference' for single-thread generic execution "
+                "on the default host execution space."
+            )
+        if alchemical is not None:
+            alchemical = normalize_alchemical(alchemical)
+            if metal:
+                raise ValueError("Alchemical execution does not support Metal.")
+            if dispersion:
+                raise ValueError(
+                    "Alchemical execution does not support dispersion corrections."
+                )
+            if allow_fixed_workspace:
+                raise ValueError(
+                    "Alchemical execution does not support fixed workspace plans."
+                )
+        self._alchemical = alchemical
+        self._alchemical_evaluated_version = None
+        self._alchemical_topology = None
+        self._alchemical_topology_generation = None
+        self._alchemical_native_weight_identity = None
         self.metal_request = bool(metal)
         self.metal_status = "disabled"
         self.metal_device = None
@@ -794,16 +927,58 @@ class Symmetrix(Calculator):
             )()
             if not ready:
                 raise RuntimeError(f"metal=True has no usable Metal GPU: {reason}")
+        explicit_corrections = corrections is not None
+        correction_configurations = () if corrections is None else tuple(corrections)
+        if alchemical is not None and correction_configurations:
+            raise ValueError(
+                "Alchemical execution does not support additive corrections."
+            )
+        if dispersion and explicit_corrections:
+            raise ValueError(
+                "corrections cannot be combined with legacy dispersion=True"
+            )
+        if dispersion:
+            execution_space = getattr(
+                symmetrix, "_kokkos_default_execution_space", lambda: None
+            )()
+            expected_device = {
+                "Cuda": "cuda",
+                "HIP": "hip",
+            }.get(execution_space, "cpu")
+            if dispersion_device is not None and dispersion_device != expected_device:
+                raise ValueError(
+                    "dispersion_device no longer controls backend selection; "
+                    "native corrections follow the loaded Symmetrix backend "
+                    f"({expected_device!r})"
+                )
+            warnings.warn(
+                "dispersion=True is deprecated; use "
+                "corrections=[D3Correction(...)] instead",
+                FutureWarning,
+                stacklevel=2,
+            )
+            correction_arguments = {
+                "functional": dispersion_xc,
+                "damping": dispersion_damping,
+            }
+            if dispersion_cutoff is not None:
+                correction_arguments["cutoff"] = dispersion_cutoff
+                correction_arguments["coordination_cutoff"] = min(
+                    dispersion_cutoff, 40.0 * units.Bohr
+                )
+            correction_configurations = (D3Correction(**correction_arguments),)
+        self._correction_configurations = correction_configurations
         self.dispersion = bool(dispersion)
-        self._dispersion_calculator = None
-        self._dispersion_properties = ()
         Calculator.__init__(self, **kwargs)
         if dtype not in ["float32", "float64"]:
             raise ValueError(
                 f"Unsupported dtype '{dtype}'. Supported dtypes are 'float64' and 'float32'."
             )
-        requested_streamed_edges = streamed_edges
-        if requested_streamed_edges in ("generic", "all_interactions"):
+        requested_streamed_edges = (
+            "direct" if streamed_edges is _STREAMED_EDGES_UNSET else streamed_edges
+        )
+        streamed_edges_unset = streamed_edges is _STREAMED_EDGES_UNSET
+        if requested_streamed_edges in _MODE_VOCABULARY.deprecated:
             warnings.warn(
                 "streamed_edges='generic' is deprecated; use "
                 "streamed_edges='non-compiled' for the compiler-free debug path. "
@@ -811,11 +986,15 @@ class Symmetrix(Calculator):
                 DeprecationWarning,
                 stacklevel=2,
             )
-        canonical_streamed_edges = _canonical_streamed_edges_mode(streamed_edges)
-        legacy_streamed_alias = requested_streamed_edges in _STREAMED_EDGE_ALIASES
-        if canonical_streamed_edges != "auto" and (
-            canonical_streamed_edges not in _STREAMED_EDGE_CANONICAL_MODES
-        ):
+        # An unknown spelling passes through unchanged so the constructor
+        # reports the documented mode list instead of a table miss.
+        canonical_streamed_edges = _MODE_VOCABULARY.canonical_mode(
+            requested_streamed_edges
+        )
+        legacy_streamed_alias = (
+            requested_streamed_edges in _MODE_VOCABULARY.alias_spellings
+        )
+        if canonical_streamed_edges not in _MODE_VOCABULARY.canonical_modes:
             raise ValueError(
                 "streamed_edges must be one of "
                 "'auto', 'materialized', 'non-compiled', or 'direct' "
@@ -861,8 +1040,6 @@ class Symmetrix(Calculator):
             # default is the new capacity-oriented public policy.
             execution_profile = "speed"
         if allow_fixed_workspace:
-            if not use_kokkos:
-                raise ValueError("allow_fixed_workspace=True requires use_kokkos=True.")
             if canonical_streamed_edges != "direct":
                 raise ValueError(
                     "allow_fixed_workspace=True requires streamed_edges='direct'."
@@ -872,10 +1049,10 @@ class Symmetrix(Calculator):
                     "allow_fixed_workspace=True requires execution_profile='capacity'."
                 )
         if legacy_low_memory_requested:
-            if not use_kokkos:
-                raise ValueError("low_memory=True requires use_kokkos=True.")
             if canonical_streamed_edges != "direct":
                 raise ValueError("low_memory=True requires streamed_edges='direct'.")
+        if alchemical is not None and canonical_streamed_edges != "direct":
+            raise ValueError("Alchemical execution requires streamed_edges='direct'.")
         if execution_mh1_scratch_budget_bytes is not None and (
             isinstance(execution_mh1_scratch_budget_bytes, bool)
             or not isinstance(execution_mh1_scratch_budget_bytes, int)
@@ -890,6 +1067,7 @@ class Symmetrix(Calculator):
         self.low_memory_request = (
             execution_profile == "capacity" and canonical_streamed_edges == "direct"
         )
+
         self.low_memory = False
         self.low_memory_policy = "disabled"
         self.low_memory_selection_reason = "low_memory=False"
@@ -955,6 +1133,7 @@ class Symmetrix(Calculator):
         self._kernel_launch_dtype = dtype
         self._dtype = dtype
         self.jit_status = "unresolved"
+        self.jit_origin = None
         self.jit_cache_key = None
         self.jit_artifact_path = None
         self.jit_artifact_id = None
@@ -962,6 +1141,7 @@ class Symmetrix(Calculator):
         self.jit_compiler_request = None
         self.jit_diagnostics = ()
         self.jit_reason = None
+        self._direct_artifact_diagnostic = None
         self.jit_forward_policy = None
         self.jit_source_policy = None
         self.jit_edge_policy = None
@@ -971,7 +1151,50 @@ class Symmetrix(Calculator):
         self._macefield_electric_field = None
         self._macefield_response_graph_generation = 0
         self._electric_field = kwargs.get("electric_field", None)
+        # The PolarMACE family's graph-level scalar channel: the total charge
+        # and spin the Fukui equilibration targets, the fermi level, and the
+        # external electric field the field-projection node couples.  They are
+        # resolved per evaluation exactly as the MACEField field is (explicit
+        # value, then the atoms' own info, then the neutral default), and the
+        # last resolution is retained so a changed input invalidates the
+        # cached results.
+        self._total_charge = total_charge
+        self._total_spin = total_spin
+        self._fermi_level = fermi_level
+        self._polar_graph_inputs = None
+        self._explicit_polar_options = frozenset(explicit_polar_options)
+        self.polar_electrostatics = polar_electrostatics
+        self.polar_pme_mesh = polar_pme_mesh
+        self.polar_pme_order = polar_pme_order
+        self.polar_electrostatics_diagnostics = {
+            "requested_solver": polar_electrostatics,
+            "resolved_solver": "unresolved",
+            "solver_reason": "not_evaluated",
+            "automatic_atom_count": 0,
+            "automatic_reciprocal_mode_count": 0,
+            "automatic_reciprocal_mode_count_is_lower_bound": False,
+            "automatic_atom_mode_pair_count": 0,
+            "automatic_atom_mode_pair_threshold": 40_000_000,
+            "n_k": 0,
+            "reciprocal_allocation_elements": 0,
+            "reciprocal_allocation_bytes": 0,
+            "reciprocal_table_elements": 0,
+            "reciprocal_table_bytes": 0,
+            "particle_mesh_active_bytes": 0,
+            "particle_mesh_capacity_bytes": 0,
+            "particle_mesh_volume": 0,
+            "particle_mesh_shape": [0, 0, 0],
+            "particle_mesh_rebuilds": 0,
+            "particle_mesh_reuses": 0,
+            "particle_mesh_forward_plan_builds": 0,
+            "particle_mesh_forward_plan_reuses": 0,
+            "particle_mesh_inverse_plan_builds": 0,
+            "particle_mesh_inverse_plan_reuses": 0,
+        }
+        identity_model_data = self._read_json_model(model_file)
         json_metadata = self._json_metadata(model_file)
+        if alchemical is not None and json_metadata is not None:
+            validate_alchemical_model(self._read_json_model(model_file))
         self._model_has_field_coupling = (
             bool(json_metadata.get("has_field_coupling", False))
             if json_metadata is not None
@@ -983,9 +1206,8 @@ class Symmetrix(Calculator):
             else False
         )
 
-        if use_kokkos and not hasattr(symmetrix, "MACEKokkos"):
+        if not hasattr(symmetrix, "MACEKokkos"):
             raise RuntimeError("Symmetrix was built without Kokkos support.")
-        self.use_kokkos = use_kokkos
         json_model_type = (
             json_metadata.get("model_type", "MACE")
             if json_metadata is not None
@@ -998,7 +1220,6 @@ class Symmetrix(Calculator):
         MACE = self._native_evaluator_class(
             json_model_type if json_model_type is not None else "MACE",
             dtype,
-            use_kokkos,
         )
         jit_model_data = None
         try:
@@ -1024,14 +1245,15 @@ class Symmetrix(Calculator):
                 f"Converting model from pytorch model to symmetrix dict with {kwargs_extract}"
             )
             data = extract_mace_data(model_file, **kwargs_extract)
+            identity_model_data = data
+            if alchemical is not None:
+                validate_alchemical_model(data)
             jit_model_data = data
             self._native_model_type = data.get("model_type", "MACE")
             self._model_single_layer_readout = bool(
                 data.get("single_layer_readout", False)
             )
-            MACE = self._native_evaluator_class(
-                data.get("model_type", "MACE"), dtype, use_kokkos
-            )
+            MACE = self._native_evaluator_class(data.get("model_type", "MACE"), dtype)
             with NamedTemporaryFile("w") as fout:
                 logging.debug(
                     "Loading converted model through temporary JSON file %s",
@@ -1048,44 +1270,94 @@ class Symmetrix(Calculator):
                 self._model_single_layer_readout,
             )
         )
-        self._require_metal_model_family()
         selected_head = getattr(self.evaluator, "selected_head", "")
         self.head = selected_head or None
         self.available_heads = list(getattr(self.evaluator, "available_heads", []))
+        if identity_model_data is not None:
+            from .prediction_heads import select_prediction_head
 
-        if not use_kokkos and canonical_streamed_edges == "direct":
-            warnings.warn(
-                "use_kokkos=False selects serial non-compiled execution; direct "
-                "streamed execution is unavailable and performance will be "
-                "substantially lower.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            canonical_streamed_edges = "generic"
-            self.streamed_edges_resolution_reason = (
-                "use_kokkos=False selected serial non-compiled execution"
-            )
-            self.execution_profile = "serial-generic"
-            self.low_memory_request = False
+            identity_model_data = select_prediction_head(identity_model_data, self.head)
 
+        from .mace_jit_artifact_common import mace_les_evaluator_identity
+
+        model_identity = mace_les_evaluator_identity(
+            {} if identity_model_data is None else identity_model_data
+        )
+        self.model_type = model_identity["model_type"]
+        self.mace_les_parameters_sha256 = model_identity["mace_les_parameters_sha256"]
+        self.mace_les_evaluator_fingerprint = model_identity[
+            "mace_les_evaluator_fingerprint"
+        ]
+        self._is_mace_les = bool(getattr(self.evaluator, "is_mace_les", False))
+        if self._is_mace_les != (self.model_type == "MACELES"):
+            raise RuntimeError(
+                "native evaluator MACELES identity does not match the selected model"
+            )
+        self._require_metal_model_family()
+        # The family entry is resolved once here, so the prepared-path
+        # capability gate on the execution path is an attribute read.
+        self._family_entry = family_registry.declared_registry().detect(
+            model_type=self._native_model_type
+        )
+        self._family_frontend_adapter = (
+            None
+            if self._family_entry is None
+            else family_registry.frontend_adapter_of(self._family_entry)
+        )
+        unsupported_family_options = set(self._explicit_polar_options)
+        if self._has_native_field_coupling():
+            unsupported_family_options.discard("electric_field")
+        if self._family_frontend_adapter is None and unsupported_family_options:
+            names = ", ".join(sorted(unsupported_family_options))
+            raise ValueError(
+                f"Polar-only MACE_Polar option(s) {names} were supplied to "
+                f"model family {self._native_model_type!r}"
+            )
         if (
-            canonical_streamed_edges != "materialized"
-            and hasattr(self.evaluator, "set_streamed_edges")
-            and not bool(getattr(self.evaluator, "supports_streamed_edges", True))
+            self.low_memory_request
+            and not legacy_low_memory_requested
+            and not family_registry.supports_surface(
+                self._family_entry, self.evaluator, "mode_handshake"
+            )
         ):
-            warnings.warn(
-                f"streamed_edges='{canonical_streamed_edges}' is unavailable "
-                "for the original Symmetrix pair-spline format (named v1 here); using "
-                "streamed_edges='materialized'. Re-export with "
-                "radial_format='compact' to enable streamed execution.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            canonical_streamed_edges = "materialized"
-            self.streamed_edges_resolution_reason = (
-                "original Symmetrix format selected materialized execution"
-            )
+            # The implied capacity plan is the streamed-edge families' bundle
+            # (MH-0's state and edge-geometry policies, MH-1's retained
+            # interaction state), selected by the direct default.  A family
+            # that declares no mode handshake states its own routing set, so no
+            # plan is implied for it; an explicit low_memory request is still
+            # refused below.
             self.low_memory_request = False
+            self.low_memory_selection_reason = (
+                "implied low-memory plan unavailable for family "
+                f"{self._family_entry.key!r}; using default execution policies"
+            )
+
+        if alchemical is not None:
+            # The weight-aware packet surface is the family's own declaration,
+            # so a backend that lacks it fails naming the missing method rather
+            # than evaluating through an unweighted path.
+            family_registry.require_surface(
+                self._family_entry, self.evaluator, "alchemical"
+            )
+
+        if not bool(
+            getattr(self.evaluator, "supports_streamed_edges", True)
+        ) and family_registry.supports_surface(
+            self._family_entry, self.evaluator, "mode_handshake"
+        ):
+            # The original Symmetrix pair-spline format (named v1 here) was only
+            # ever served by the retired materialized edge representation.  Both
+            # routings of the families that declare the streamed-edge handshake
+            # stream edges now, so the format is refused with the conversion
+            # that enables them instead of a silent downgrade.  A family that
+            # declares no handshake (the PolarMACE family, whose reference
+            # routing is the whole-evaluator entry point) states its own
+            # routing set instead of being refused as a retired format.
+            raise ValueError(
+                "the original Symmetrix pair-spline format (named v1 here) is no "
+                "longer supported: re-export the model with "
+                "radial_format='compact' to enable streamed execution."
+            )
 
         if (
             self.low_memory_request
@@ -1109,11 +1381,12 @@ class Symmetrix(Calculator):
 
         if self.low_memory_request and self._native_model_type not in (
             "MACE",
+            "MACELES",
             "MACEField",
             "MACE_Nonlinear",
         ):
             raise ValueError(
-                "low_memory=True currently supports ordinary MACE, MACEField, "
+                "low_memory=True currently supports MACE, MACELES, MACEField, "
                 "and MACE_Nonlinear models."
             )
         if self.low_memory_request:
@@ -1132,36 +1405,78 @@ class Symmetrix(Calculator):
                     else "cartesian-f64-v1"
                 )
 
-        if hasattr(self.evaluator, "set_streamed_edges"):
+        if family_registry.supports_surface(
+            self._family_entry, self.evaluator, "mode_handshake"
+        ):
             if canonical_streamed_edges == "auto":
-                supports_direct = bool(use_kokkos) and bool(
-                    getattr(self.evaluator, "supports_factorized", False)
-                )
-                if supports_direct:
+                if bool(getattr(self.evaluator, "supports_factorized", False)):
                     canonical_streamed_edges = "direct"
                     self.streamed_edges_resolution_reason = (
-                        "auto selected direct because the Kokkos evaluator "
-                        "admits generated execution"
+                        "auto selected direct because the evaluator admits "
+                        "generated execution"
                     )
-                elif bool(getattr(self.evaluator, "supports_streamed_edges", False)):
-                    canonical_streamed_edges = "generic"
-                    self.streamed_edges_resolution_reason = "auto selected non-compiled because generated execution is unavailable"
                 else:
-                    canonical_streamed_edges = "materialized"
+                    canonical_streamed_edges = "reference"
                     self.streamed_edges_resolution_reason = (
-                        "auto selected materialized for an original Symmetrix model"
+                        "auto selected reference because generated execution is "
+                        "unavailable"
                     )
-            self.evaluator.set_streamed_edges(canonical_streamed_edges)
-            selected_streamed_edges = self.evaluator.streamed_edges_mode
-        elif canonical_streamed_edges not in ("auto", "materialized"):
-            raise ValueError(
-                "streamed_edges is only supported by compatible compact MACE, "
-                "MACEField, or MACE_Nonlinear evaluators."
+            routing = family_registry.routing_of(
+                self._family_entry, canonical_streamed_edges
             )
+            if routing is None:
+                raise ValueError(
+                    f"family {self._family_entry.key!r} serves no "
+                    f"streamed_edges={canonical_streamed_edges!r} mode through "
+                    "the compact streamed-edge handshake; its declared routings "
+                    "are "
+                    + ", ".join(routing.key for routing in self._family_entry.routings)
+                    + "."
+                )
+            self.evaluator.set_streamed_edges(routing.native_mode)
         else:
-            selected_streamed_edges = "materialized"
-        self.streamed_edges = selected_streamed_edges
-        self.execution_algorithm = selected_streamed_edges
+            # A family that declares no streamed-edge handshake still declares
+            # both routings. There is no mode to hand to the evaluator: the
+            # routing selects whether the frontend loads its generated
+            # subprogram, while the evaluator keeps its native portable plan.
+            selected_routing = (
+                "reference"
+                if canonical_streamed_edges == "auto" or streamed_edges_unset
+                else canonical_streamed_edges
+            )
+            routing = family_registry.routing_of(self._family_entry, selected_routing)
+            if routing is None:
+                raise ValueError(
+                    f"family {self._family_entry.key!r} serves no "
+                    f"streamed_edges={canonical_streamed_edges!r} routing; its "
+                    "declared routings are "
+                    + ", ".join(route.key for route in self._family_entry.routings)
+                    + "."
+                )
+            if canonical_streamed_edges == "auto" or streamed_edges_unset:
+                self.streamed_edges_resolution_reason = (
+                    "the unset default selected reference because the family "
+                    "declares no streamed-edge mode handshake"
+                    if streamed_edges_unset
+                    else "auto selected reference because the family declares no "
+                    "streamed-edge mode handshake"
+                )
+            elif selected_routing == "direct":
+                self.streamed_edges_resolution_reason = (
+                    "explicit direct selected the family's generated subprogram "
+                    "without a streamed-edge mode handshake"
+                )
+        # The routing is the public vocabulary; the native execution-mode
+        # spelling is what the evaluator's own plan and artifact APIs accept, so
+        # both are kept.
+        self.streamed_edges = routing.key
+        self._native_streamed_edges = routing.native_mode
+        self.execution_algorithm = routing.key
+        self._les_geometry_setter = None
+        if self._is_mace_les:
+            (self._les_geometry_setter,) = family_registry.require_surface(
+                self._family_entry, self.evaluator, "mace_les_geometry"
+            )
         fixed_workspace_setter = getattr(
             self.evaluator, "_set_allow_fixed_workspace", None
         )
@@ -1185,7 +1500,7 @@ class Symmetrix(Calculator):
             and self.execution_profile in _EXECUTION_PROFILES
         ):
             native_plan_request(
-                self.streamed_edges,
+                self._native_streamed_edges,
                 self.execution_profile,
                 ""
                 if self._debug_execution_plan is None
@@ -1202,8 +1517,7 @@ class Symmetrix(Calculator):
             model_file=model_file,
             model_data=jit_model_data,
             dtype=dtype,
-            use_kokkos=use_kokkos,
-            streamed_edges=self.streamed_edges,
+            streamed_edges=self._native_streamed_edges,
         )
         if self.metal_request and self.metal_status != "ready":
             raise RuntimeError(
@@ -1244,88 +1558,37 @@ class Symmetrix(Calculator):
             setter(execution_mh1_scratch_budget_bytes)
         self.cutoff = self.evaluator.r_cut
         self.implemented_properties = list(type(self).implemented_properties)
+        if self._is_mace_les:
+            self.implemented_properties.extend(
+                ("les_energy", "mace_les_energy", "latent_charges")
+            )
         if self._has_native_field_coupling():
             self.implemented_properties.append("node_energy")
             self.implemented_properties.extend(self._macefield_response_properties)
-        if self.dispersion:
-            self._configure_dispersion(
-                damping=dispersion_damping,
-                xc=dispersion_xc,
-                cutoff=dispersion_cutoff,
-                device=dispersion_device,
-            )
-
-    def _configure_dispersion(self, *, damping, xc, cutoff, device):
-        """Attach the optional torch-dftd D3 calculator."""
-        try:
-            from torch_dftd.torch_dftd3_calculator import TorchDFTD3Calculator
-        except ImportError as error:
-            raise RuntimeError(
-                "dispersion=True requires torch-dftd; install it with "
-                "`uv pip install torch-dftd`."
-            ) from error
-        if device is None:
-            device = "cuda" if self._native_backend_is_cuda() else "cpu"
-        if cutoff is None:
-            from ase import units
-
-            cutoff = 40.0 * units.Bohr
-        try:
-            import torch
-
-            dtype = torch.float32 if self._dtype == "float32" else torch.float64
-        except ImportError as error:
-            raise RuntimeError("dispersion=True requires torch.") from error
-        self._dispersion_calculator = TorchDFTD3Calculator(
-            device=device, damping=damping, dtype=dtype, xc=xc, cutoff=cutoff
+        if self._family_frontend_adapter is not None:
+            self._family_frontend_adapter.configure(self)
+        self._correction_pipeline = CorrectionPipeline(
+            correction_configurations,
+            native=symmetrix,
+            dtype=self._dtype,
         )
-        self._dispersion_properties = ("energy", "forces", "stress")
+        self._refresh_diagnostics()
 
-    def _native_backend_is_cuda(self):
-        return "cuda" in getattr(symmetrix, "__name__", "").lower()
-
-    def _add_dispersion_results(self, properties):
-        if getattr(self, "_dispersion_calculator", None) is None:
-            return
-        requested = [
-            prop for prop in ("energy", "forces", "stress") if prop in properties
-        ]
-        self._dispersion_calculator.calculate(
-            self.atoms, properties=requested, system_changes=[]
-        )
-        for prop in requested:
-            value = self._dispersion_calculator.results.get(prop)
-            if value is None:
-                continue
-            if prop == "energy":
-                self.results[prop] += float(value)
-                if "free_energy" in self.results:
-                    self.results["free_energy"] += float(value)
-            else:
-                self.results[prop] = self.results[prop] + np.asarray(value)
+    @property
+    def alchemical(self):
+        """Immutable virtual topology with explicitly mutable slot coefficients."""
+        return self._alchemical
 
     @staticmethod
     def _deprecate_jit_argument(policy):
         if policy is not None:
             warnings.warn(
                 "The jit parameter is deprecated and ignored. Direct execution "
-                "and receiver-factorized execution require RTC specialization; "
+                "requires RTC specialization; "
                 "select streamed_edges='non-compiled' for compiler-free debug execution.",
                 FutureWarning,
                 stacklevel=3,
             )
-
-    @staticmethod
-    def _jit_policy_from_environment():
-        selected = os.environ.get(
-            _JIT_POLICY_ENVIRONMENT_VARIABLE, _JIT_REQUIRED_POLICY
-        )
-        if selected not in (_JIT_REQUIRED_POLICY, _JIT_DEBUG_POLICY):
-            raise ValueError(
-                f"{_JIT_POLICY_ENVIRONMENT_VARIABLE} must be "
-                f"'{_JIT_REQUIRED_POLICY}' or '{_JIT_DEBUG_POLICY}'."
-            )
-        return selected
 
     @staticmethod
     def _normalize_kernel_launch_policy(policy):
@@ -1580,7 +1843,7 @@ class Symmetrix(Calculator):
         return "+".join(sorted(set(values)))
 
     def _kernel_launch_model_identity(self):
-        values = []
+        values = [self.mace_les_evaluator_fingerprint]
         for name in (
             "standard_m0_model_structure_fingerprint",
             "standard_r0_model_structure_fingerprint",
@@ -1689,39 +1952,75 @@ class Symmetrix(Calculator):
         return dict(diagnostics) if isinstance(diagnostics, dict) else {}
 
     @property
+    def r0_diagnostics(self):
+        """Semantic R0 selection with backend and artifact metadata separated."""
+
+        from .r0_reporting import r0_diagnostics
+
+        return r0_diagnostics(self.evaluator)
+
+    @property
     def execution_plan(self):
         """Current native execution selection and graph-time diagnostics.
 
         The report is pending until the first prepared graph has been sized.
         Private debug pins are deliberately surfaced as their selection source.
+        The candidate list is the family-declared plan space; a family that
+        declares none reports the single implicit candidate it selected.
         """
         report = getattr(self.evaluator, "execution_plan_report", None)
         if isinstance(report, dict):
-            return dict(report)
-        if self.execution_profile == "serial-generic":
-            return {
-                "requested_algorithm": "direct",
-                "requested_profile": "serial-generic",
-                "selection_source": "serial_fallback",
-                "state": "active",
-                "selected_id": "serial-generic",
-                "selection_reason": self.streamed_edges_resolution_reason,
-                "available_bytes": 0,
-                "reserve_bytes": 0,
-                "boundary_attempt": False,
-                "candidates": [],
+            result = dict(report)
+        else:
+            result = self._implicit_plan_report(
+                requested_algorithm=self.execution_algorithm,
+                requested_profile=self.execution_profile,
+                selection_source="legacy_adapter",
+                selected_id=self.execution_algorithm,
+                selection_reason="native execution-plan reporting is unavailable",
+            )
+        result.update(
+            {
+                "model_type": self.model_type,
+                "mace_les_parameters_sha256": self.mace_les_parameters_sha256,
+                "mace_les_evaluator_fingerprint": (self.mace_les_evaluator_fingerprint),
             }
+        )
+        return result
+
+    @staticmethod
+    def _implicit_plan_report(
+        *,
+        requested_algorithm,
+        requested_profile,
+        selection_source,
+        selected_id,
+        selection_reason,
+    ):
+        """The report of a family that declares no plan space.
+
+        Without a candidate space there is no alternative to qualify and no
+        byte estimator to consult, so the selected plan is reported as the one
+        implicit candidate, carrying the selection reason as its own.
+        """
         return {
-            "requested_algorithm": self.execution_algorithm,
-            "requested_profile": self.execution_profile,
-            "selection_source": "legacy_adapter",
+            "requested_algorithm": requested_algorithm,
+            "requested_profile": requested_profile,
+            "selection_source": selection_source,
             "state": "active",
-            "selected_id": self.execution_algorithm,
-            "selection_reason": "native execution-plan reporting is unavailable",
+            "selected_id": selected_id,
+            "selection_reason": selection_reason,
             "available_bytes": 0,
             "reserve_bytes": 0,
             "boundary_attempt": False,
-            "candidates": [],
+            "candidates": [
+                {
+                    "id": selected_id,
+                    "qualified": True,
+                    "estimated_bytes": 0,
+                    "reason": selection_reason,
+                }
+            ],
         }
 
     @staticmethod
@@ -1743,112 +2042,65 @@ class Symmetrix(Calculator):
                 self.jit_diagnostics
             )
         message += (
-            "\nRTC specialization for direct and receiver-factorized execution "
-            "does not fall back. Select "
+            "\nRTC specialization for direct execution does not fall back. Select "
             "streamed_edges='non-compiled' for compiler-free debug execution."
         )
+        if self._direct_artifact_diagnostic is not None:
+            from .jit import direct_artifact_diagnostic_text
+
+            message += direct_artifact_diagnostic_text(self._direct_artifact_diagnostic)
         raise _JitRequiredError(message)
 
-    def _configure_receiver_factorized_jit(
-        self, *, model_file, model_data, dtype, use_kokkos
+    @staticmethod
+    def _direct_artifact_failure_cause(
+        *,
+        artifact_rejected,
+        cache_entry_present,
+        artifact_present,
+        compiler_available,
+        backend="host",
     ):
-        if not use_kokkos:
-            self._jit_failed("use_kokkos is false")
-        if dtype != "float32":
-            self._jit_failed(
-                "receiver-factorized host RTC currently requires dtype 'float32'"
-            )
-        if model_data is None:
-            model_data = self._read_json_model(model_file)
-        if model_data is None:
-            self._jit_failed("the loaded model JSON is unavailable")
-            return
-        from .prediction_heads import select_prediction_head
+        """Classify a direct-mode R1 artifact failure into its four documented causes.
 
-        model_data = select_prediction_head(model_data, self.head)
-        model_type = model_data.get("model_type", "MACE")
-        if model_type not in ("MACE", "MACEField"):
-            self._jit_failed(
-                "receiver-factorized RTC currently supports ordinary MACE and "
-                "MACEField models"
-            )
-            return
-        contract = model_data.get("execution_contracts", {}).get("R1")
-        if not isinstance(contract, dict):
-            self._jit_failed("the model does not contain an Execution R1 contract")
-            return
-        execution_space_query = getattr(
-            symmetrix, "_kokkos_default_execution_space", None
-        )
-        execution_space = (
-            execution_space_query() if execution_space_query is not None else None
-        )
-        if execution_space not in _JIT_HOST_EXECUTION_SPACES:
-            self._jit_failed(
-                "receiver-factorized RTC currently requires a host OpenMP or "
-                "Serial Kokkos backend"
-            )
-            return
-        loader = getattr(self.evaluator, "_load_receiver_factorized_host_plugin", None)
-        if not callable(loader):
-            self._jit_failed(
-                "the native evaluator does not provide the receiver-factorized "
-                "host-plugin ABI"
-            )
-            return
-        try:
-            from .jit import native_source_content_sha256, prepare_jit_artifact
-            from .receiver_factorized_rtc import (
-                receiver_factorized_host_plugin_metadata,
-                render_receiver_factorized_host_source,
-            )
+        The classification is the execution layer's, so every family's frontend
+        reports the same four causes for the same observable signals.
+        """
 
-            generation_version = _require_matching_jit_generation_version()
-            metadata = receiver_factorized_host_plugin_metadata(contract)
-            source = render_receiver_factorized_host_source(contract)
-            result = prepare_jit_artifact(
-                source,
-                source_content_sha256=native_source_content_sha256(symmetrix),
-                abi={"tag": metadata["abi"], "version": metadata["abi_version"]},
-                build={
-                    "generator": "symmetrix.receiver-factorized.host-v1",
-                    "precision": dtype,
-                    "contract": metadata,
-                    "jit_generation_version": generation_version,
-                },
-                cxx_flags=None,
-                artifact_name="receiver_factorized_host_plugin",
-            )
-            self.jit_cache_key = result.cache_key
-            self.jit_diagnostics = (*self.jit_diagnostics, *result.diagnostics)
-            if not result.available or result.artifact_path is None:
-                self._jit_failed(
-                    result.reason
-                    or "the receiver-factorized JIT cache did not produce an artifact",
-                    self.jit_diagnostics,
-                )
-                return
-            loader(str(result.artifact_path))
-            if not bool(
-                getattr(self.evaluator, "receiver_factorized_host_plugin_ready", False)
-            ):
-                raise RuntimeError(
-                    "the evaluator did not retain the receiver-factorized host plugin"
-                )
-            self.jit_status = result.status
-            self.jit_artifact_path = str(result.artifact_path)
-            self.jit_artifact_id = getattr(
-                self.evaluator,
-                "receiver_factorized_host_plugin_artifact_id",
-                metadata["artifact_id"],
-            )
-            self.jit_compiler_backend = "host-cxx"
-            self.jit_reason = None
-        except _JitRequiredError:
-            raise
-        except Exception as exc:
-            diagnostics = (*self.jit_diagnostics, f"{type(exc).__name__}: {exc}")
-            self._jit_failed(exc, diagnostics)
+        from .jit import direct_artifact_failure_cause
+
+        return direct_artifact_failure_cause(
+            artifact_rejected=artifact_rejected,
+            cache_entry_present=cache_entry_present,
+            artifact_present=artifact_present,
+            compiler_available=compiler_available,
+            backend=backend,
+        )
+
+    @staticmethod
+    def _direct_artifact_compiler_available(backend):
+        """Report whether the R1 compiler for ``backend`` can build an artifact."""
+
+        from .jit import direct_artifact_compiler_available
+
+        return direct_artifact_compiler_available(backend)
+
+    def _record_direct_artifact_diagnostic(
+        self, *, artifact_rejected, cache_key, artifact_path, backend
+    ):
+        """Record the four-way R1 artifact cause for a failed direct preparation."""
+
+        from .jit import direct_artifact_cache_entry_present
+
+        self._direct_artifact_diagnostic = self._direct_artifact_failure_cause(
+            artifact_rejected=artifact_rejected,
+            cache_entry_present=direct_artifact_cache_entry_present(cache_key),
+            artifact_present=artifact_path is not None,
+            compiler_available=self._direct_artifact_compiler_available(backend),
+            backend=backend,
+        )
+        publisher = getattr(self.evaluator, "_set_direct_artifact_diagnostic", None)
+        if callable(publisher):
+            publisher(*self._direct_artifact_diagnostic)
 
     def _configure_low_memory_operator_modules(
         self,
@@ -1861,7 +2113,7 @@ class Symmetrix(Calculator):
         prefer_host_m0_plugin=False,
     ):
         from .jit import native_source_content_sha256
-        from .jit_operator_artifact import (
+        from .mace_jit_operator_artifact import (
             prepare_low_memory_operator_modules,
         )
 
@@ -1874,6 +2126,7 @@ class Symmetrix(Calculator):
             jit_generation_version=jit_generation_version,
             source_content_sha256=native_source_content_sha256(symmetrix),
             prefer_host_m0_plugin=prefer_host_m0_plugin,
+            apply_edge_weights=self.alchemical is not None,
         )
         self.jit_operator_modules.update(modules)
         self.jit_diagnostics = (*self.jit_diagnostics, *diagnostics)
@@ -1959,7 +2212,6 @@ class Symmetrix(Calculator):
         model_file,
         model_data,
         dtype,
-        use_kokkos,
         streamed_edges,
     ):
         if streamed_edges not in ("direct",):
@@ -1968,15 +2220,20 @@ class Symmetrix(Calculator):
             self.jit_reason = "streamed_edges does not require RTC"
             return
 
-        self.jit_policy = self._jit_policy_from_environment()
-        if self.jit_policy == _JIT_DEBUG_POLICY:
+        from .jit import (
+            JIT_DISABLED_POLICY,
+            JIT_POLICY_ENVIRONMENT_VARIABLE,
+            load_validated_jit_artifact,
+            remove_jit_quarantine,
+            resolve_jit_policy,
+        )
+
+        self.jit_policy = resolve_jit_policy()
+        if self.jit_policy == JIT_DISABLED_POLICY:
             self._jit_failed(
-                f"{_JIT_POLICY_ENVIRONMENT_VARIABLE}=none is incompatible "
+                f"{JIT_POLICY_ENVIRONMENT_VARIABLE}=none is incompatible "
                 f"with streamed_edges={streamed_edges!r}"
             )
-
-        if not use_kokkos:
-            self._jit_failed("use_kokkos is false")
 
         if model_data is None:
             model_data = self._read_json_model(model_file)
@@ -1987,7 +2244,15 @@ class Symmetrix(Calculator):
 
         model_data = select_prediction_head(model_data, self.head)
         model_type = model_data.get("model_type", "MACE")
-        if model_type == "MACE" and bool(model_data.get("single_layer_readout")):
+        family = family_registry.declared_registry().detect(model_type=model_type)
+        route = family.generated_contract if family is not None else None
+        if route is None or route.json_key is None or route.specialization is None:
+            self._jit_failed(
+                "Execution JIT currently supports ordinary MACE, MACEField, and "
+                "compatible MACE-MH-1-family models"
+            )
+            return
+        if family_registry.variant_of(family, model_data) == "single_layer":
             execution_space_query = getattr(
                 symmetrix, "_kokkos_default_execution_space", None
             )
@@ -2036,18 +2301,8 @@ class Symmetrix(Calculator):
                 "without an R1 specialization"
             )
             return
-        if model_type in ("MACE", "MACEField"):
-            specialization = "r1"
-            contract_name = "R1"
-        elif model_type == "MACE_Nonlinear":
-            specialization = "mh1"
-            contract_name = "MH1_UVU"
-        else:
-            self._jit_failed(
-                "Execution JIT currently supports ordinary MACE, MACEField, and "
-                "compatible MACE-MH-1-family models"
-            )
-            return
+        specialization = route.specialization
+        contract_name = route.json_key
         contract = model_data.get("execution_contracts", {}).get(contract_name)
         if not isinstance(contract, dict):
             self._jit_failed(
@@ -2065,14 +2320,18 @@ class Symmetrix(Calculator):
         try:
             jit_generation_version = _require_matching_jit_generation_version()
             if specialization == "mh1":
-                from .execution_mh1_contract import (
+                from .mace_nonlinear_execution_contract import (
                     project_execution_mh1_v3_contract,
-                    validate_execution_mh1_v4_contract_for_model,
                 )
 
-                contract = validate_execution_mh1_v4_contract_for_model(
-                    model_data, contract
-                )
+                validator_symbol = route.validator
+                if validator_symbol is None:
+                    raise ValueError(
+                        f"the {family.key} family does not declare an MH-1 "
+                        "contract validator"
+                    )
+                validator = family_registry.resolve_symbol(validator_symbol)
+                contract = validator(model_data, contract)
                 mh1_v3_contract = project_execution_mh1_v3_contract(contract)
                 set_contract_identity = getattr(
                     self.evaluator,
@@ -2085,6 +2344,7 @@ class Symmetrix(Calculator):
                         mh1_v3_contract["generation_fingerprint"],
                         mh1_v3_contract["semantic_fingerprint"],
                         mh1_v3_contract["structure_fingerprint"],
+                        mh1_v3_contract["interaction_count"],
                     )
                 set_v4_contract_identity = getattr(
                     self.evaluator,
@@ -2098,6 +2358,7 @@ class Symmetrix(Calculator):
                         contract["semantic_fingerprint"],
                         contract["structure_fingerprint"],
                         contract["runtime_layout_fingerprint"],
+                        contract["interaction_count"],
                     )
             execution_space_query = getattr(
                 symmetrix, "_kokkos_default_execution_space", None
@@ -2124,11 +2385,10 @@ class Symmetrix(Calculator):
                 )
             execution_backend = device_environment.get("backend")
             if execution_space in _JIT_HOST_EXECUTION_SPACES:
-                loader_name = (
-                    "_load_jit_mh1_host_plugin_v5"
-                    if specialization == "mh1"
-                    else "_load_jit_host_plugin"
-                )
+                if specialization == "mh1":
+                    loader_name = "_load_jit_mh1_host_plugin_v7"
+                else:
+                    loader_name = "_load_jit_host_plugin"
                 if not hasattr(self.evaluator, loader_name):
                     raise RuntimeError(
                         "the native evaluator does not provide the host-plugin ABI"
@@ -2137,7 +2397,7 @@ class Symmetrix(Calculator):
                 cuda_environment = None
             elif execution_backend == "cuda" or execution_space == "Cuda":
                 loader_name = (
-                    "_load_jit_mh1_cuda_plugin_v4"
+                    "_load_jit_mh1_cuda_plugin_v5"
                     if specialization == "mh1"
                     else "_load_jit_cuda_plugin"
                 )
@@ -2162,7 +2422,7 @@ class Symmetrix(Calculator):
                 jit_backend = "cuda"
             elif execution_backend == "hip" or execution_space == "HIP":
                 loader_name = (
-                    "_load_jit_mh1_cuda_plugin_v4"
+                    "_load_jit_mh1_cuda_plugin_v5"
                     if specialization == "mh1"
                     else "_load_jit_hip_plugin"
                 )
@@ -2190,43 +2450,119 @@ class Symmetrix(Calculator):
                     "currently requires a generated CUDA or HIP module"
                 )
 
-            from .jit import (
-                native_source_content_sha256,
-                quarantine_jit_artifact,
-                remove_jit_quarantine,
-            )
+            from .jit import native_source_content_sha256
 
             device_plan = None
+            installed_resolution = None
             if specialization == "r1" and jit_backend in ("cuda", "hip"):
                 plan_target = (
                     cuda_environment if jit_backend == "cuda" else device_environment
                 )
-                device_plan = _factorized_device_backend_plan(
-                    jit_backend,
-                    plan_target,
-                    contract,
-                    dtype,
-                    self.evaluator,
+                from .installed_operator_artifact import (
+                    installed_operator_build_target,
+                    resolve_installed_operator_artifact,
                 )
+
+                if (
+                    installed_operator_build_target(
+                        native_module=symmetrix, backend=jit_backend
+                    )
+                    is not None
+                ):
+                    device_plan = _factorized_device_installed_plan(
+                        jit_backend,
+                        plan_target,
+                        contract,
+                        dtype,
+                        self.evaluator,
+                        apply_edge_weights=self.alchemical is not None,
+                    )
+                    installed_loader = device_plan.loader
+                    if jit_backend == "cuda":
+                        installed_blocks = device_plan.metadata[
+                            "persistent_blocks_per_compute_unit"
+                        ]
+
+                        def installed_loader(path):
+                            device_plan.loader(path, installed_blocks)
+
+                    installed_resolution = resolve_installed_operator_artifact(
+                        operator="R1",
+                        identity=device_plan.metadata["generated_identity"],
+                        abi={
+                            "tag": device_plan.metadata["abi"],
+                            "version": device_plan.metadata["abi_version"],
+                        },
+                        required_capabilities=device_plan.metadata["capabilities"],
+                        loader=installed_loader,
+                        admitted=lambda: bool(
+                            getattr(
+                                self.evaluator,
+                                device_plan.ready_attribute,
+                                False,
+                            )
+                        ),
+                        native_module=symmetrix,
+                        policy=self.jit_policy,
+                    )
+                    self.jit_diagnostics = (
+                        *self.jit_diagnostics,
+                        *installed_resolution.diagnostics,
+                    )
+                if (
+                    installed_resolution is None
+                    or installed_resolution.status != "resolved"
+                ):
+                    device_plan = _factorized_device_backend_plan(
+                        jit_backend,
+                        plan_target,
+                        contract,
+                        dtype,
+                        self.evaluator,
+                        apply_edge_weights=self.alchemical is not None,
+                    )
                 self.jit_compiler_request = device_plan.policy
                 self.jit_compiler_backend = device_plan.selected_compiler
+                if (
+                    installed_resolution is not None
+                    and installed_resolution.status == "resolved"
+                ):
+                    self.jit_compiler_request = "prebuilt"
+                    self.jit_compiler_backend = "prebuilt"
                 metadata = device_plan.metadata
                 selected_edge_policy = device_plan.edge_policy
                 selected_variant_id = device_plan.variant_id
                 ready_attribute = device_plan.ready_attribute
                 artifact_attribute = device_plan.artifact_attribute
                 load_plugin = device_plan.loader
-                attempt = device_plan.build_attempt(self.jit_compiler_backend)
-                source = attempt.source
-                prepare = attempt.prepare
-                prepare_arguments = attempt.arguments
+                if (
+                    installed_resolution is not None
+                    and installed_resolution.status == "resolved"
+                ):
+                    source = "installed-prebuilt-r1"
+
+                    def prepare(*args, **kwargs):
+                        return None
+
+                    prepare_arguments = {
+                        "abi": {
+                            "tag": metadata["abi"],
+                            "version": metadata["abi_version"],
+                        },
+                        "build": {"generator": "installed-prebuilt-r1"},
+                    }
+                else:
+                    attempt = device_plan.build_attempt(self.jit_compiler_backend)
+                    source = attempt.source
+                    prepare = attempt.prepare
+                    prepare_arguments = attempt.arguments
             elif specialization == "mh1" and jit_backend == "hip":
                 from .jit import (
                     execution_hip_jit_backend_request,
                     prepare_hiprtc_jit_artifact,
                     select_execution_hip_jit_backend,
                 )
-                from .mh1_jit_codegen import (
+                from .mace_nonlinear_jit_codegen import (
                     MH1_HIP_MODULE_ABI,
                     MH1_HIP_MODULE_ABI_VERSION,
                     execution_mh1_hip_module_v4_launch_plan,
@@ -2284,7 +2620,7 @@ class Symmetrix(Calculator):
                     "target": device_environment,
                     "artifact_name": "execution_mh1_hip_module",
                 }
-                ready_attribute = "jit_mh1_cuda_plugin_v4_ready"
+                ready_attribute = "jit_mh1_cuda_plugin_v5_ready"
                 artifact_attribute = "jit_mh1_cuda_plugin_artifact_id"
                 load_plugin = getattr(self.evaluator, loader_name)
             elif jit_backend == "cuda":
@@ -2309,22 +2645,17 @@ class Symmetrix(Calculator):
                 self.jit_compiler_backend = select_execution_cuda_jit_backend(
                     self.jit_compiler_request
                 )
-                if (
-                    specialization == "mh1"
-                    and dtype != "float32"
-                    and self.jit_compiler_backend != "nvrtc"
-                ):
+                if specialization == "mh1" and self.jit_compiler_backend != "nvrtc":
                     raise RuntimeError(
-                        "generated FP64 MACE-MH-1 CUDA specialization requires NVRTC"
+                        "generation-19 MACE-MH-1 CUDA specialization requires "
+                        "the composed NVRTC module; the retired monolithic "
+                        "plugin renderer is unavailable"
                     )
                 if specialization == "mh1":
-                    from . import mh1_jit_codegen as jit_codegen
+                    from . import mace_nonlinear_jit_codegen as jit_codegen
 
                     metadata_function = getattr(
-                        jit_codegen, "jit_mh1_cuda_plugin_v4_metadata", None
-                    )
-                    render_function = getattr(
-                        jit_codegen, "render_jit_mh1_cuda_plugin_v4", None
+                        jit_codegen, "jit_mh1_cuda_plugin_v5_metadata", None
                     )
                     module_render_function = getattr(
                         jit_codegen, "render_execution_mh1_cuda_module_v4", None
@@ -2351,7 +2682,6 @@ class Symmetrix(Calculator):
                     )
                     if (
                         metadata_function is None
-                        or render_function is None
                         or module_render_function is None
                         or launch_plan_function is None
                         or forward_policy_function is None
@@ -2379,33 +2709,24 @@ class Symmetrix(Calculator):
                         edge_policy=edge_policy,
                         node_state_policy=self.execution_mh1_node_state_policy,
                     )
-                    source = render_function(
+                    source = module_render_function(
                         contract,
                         compute_capability,
                         forward_policy=forward_policy,
                         source_policy=source_policy,
                         edge_policy=edge_policy,
                         node_state_policy=self.execution_mh1_node_state_policy,
+                        precision=dtype,
                     )
-                    if self.jit_compiler_backend == "nvrtc":
-                        source = module_render_function(
-                            contract,
-                            compute_capability,
-                            forward_policy=forward_policy,
-                            source_policy=source_policy,
-                            edge_policy=edge_policy,
-                            node_state_policy=self.execution_mh1_node_state_policy,
-                            precision=dtype,
-                        )
-                        launch_plan = launch_plan_function(
-                            contract,
-                            compute_capability,
-                            forward_policy=forward_policy,
-                            source_policy=source_policy,
-                            edge_policy=edge_policy,
-                            node_state_policy=self.execution_mh1_node_state_policy,
-                            precision=dtype,
-                        )
+                    launch_plan = launch_plan_function(
+                        contract,
+                        compute_capability,
+                        forward_policy=forward_policy,
+                        source_policy=source_policy,
+                        edge_policy=edge_policy,
+                        node_state_policy=self.execution_mh1_node_state_policy,
+                        precision=dtype,
+                    )
                     selected_forward_policy = forward_policy
                     selected_source_policy = source_policy
                     selected_edge_policy = edge_policy
@@ -2419,13 +2740,9 @@ class Symmetrix(Calculator):
                         f"{edge_policy['policy_id'].removeprefix('sha256:')[:12]}"
                         f"-node-{metadata['node_state_policy']}"
                     )
-                    if self.jit_compiler_backend == "nvrtc":
-                        generator = "symmetrix.jit.mh1-cuda-module-v1"
-                        artifact_name = "execution_mh1_cuda_module"
-                    else:
-                        generator = "symmetrix.jit.mh1-cuda-v13"
-                        artifact_name = "jit_mh1_cuda_plugin"
-                    ready_attribute = "jit_mh1_cuda_plugin_v4_ready"
+                    generator = "symmetrix.jit.mh1-cuda-module-v1"
+                    artifact_name = "execution_mh1_cuda_module"
+                    ready_attribute = "jit_mh1_cuda_plugin_v5_ready"
                     artifact_attribute = "jit_mh1_cuda_plugin_artifact_id"
                 prepare = (
                     prepare_nvrtc_jit_artifact
@@ -2457,12 +2774,20 @@ class Symmetrix(Calculator):
                 from .jit import prepare_jit_artifact
 
                 if specialization == "mh1":
-                    from . import mh1_jit_codegen as jit_codegen
-                    from .mh1_jit_codegen import (
-                        render_jit_mh1_host_plugin_v5 as render_function,
-                    )
-                    from .mh1_jit_codegen import (
+                    from . import mace_nonlinear_jit_codegen as jit_codegen
+                    from .mace_nonlinear_jit_codegen import (
                         execution_mh1_node_program_metadata,
+                    )
+
+                    from .mace_nonlinear_jit_codegen import (
+                        render_jit_mh1_host_plugin_v7 as render_function,
+                    )
+
+                    generator = "symmetrix.jit.mh1-host-v7-composed"
+                    ready_attribute = "jit_mh1_host_plugin_v7_ready"
+                    mh1_abi = (
+                        jit_codegen.MH1_HOST_PLUGIN_V7_ABI,
+                        jit_codegen.MH1_HOST_PLUGIN_V7_ABI_VERSION,
                     )
 
                     def metadata_function(value):
@@ -2472,15 +2797,13 @@ class Symmetrix(Calculator):
                             node_state_policy=self.execution_mh1_node_state_policy,
                         )
 
-                    generator = "symmetrix.jit.mh1-host-v5"
                     artifact_name = "jit_mh1_host_plugin"
-                    ready_attribute = "jit_mh1_host_plugin_v5_ready"
                     artifact_attribute = "jit_mh1_host_plugin_artifact_id"
                 else:
-                    from .jit_codegen import (
+                    from .mace_jit_codegen import (
                         render_jit_r1_host_plugin as render_function,
                     )
-                    from .jit_codegen import (
+                    from .mace_jit_codegen import (
                         jit_r1_host_plugin_metadata as metadata_function,
                     )
 
@@ -2489,8 +2812,48 @@ class Symmetrix(Calculator):
                     ready_attribute = "jit_host_plugin_ready"
                     artifact_attribute = "jit_host_plugin_artifact_id"
                 if specialization == "r1":
-                    metadata = metadata_function(contract, precision=dtype)
-                    source = render_function(contract, precision=dtype)
+                    from .installed_operator_artifact import (
+                        installed_operator_build_target,
+                    )
+                    from .jit import probe_compiler_identity, resolve_host_jit_policy
+
+                    installed_r1_target = installed_operator_build_target(
+                        native_module=symmetrix, backend="host"
+                    )
+                    requested_host_target = device_environment.get("cpu_target")
+                    if requested_host_target is None:
+                        requested_host_target = device_environment.get("host_target")
+                    if requested_host_target is not None and (
+                        not isinstance(requested_host_target, str)
+                        or not requested_host_target
+                    ):
+                        raise RuntimeError(
+                            "the host Execution R1 target must be a nonempty string"
+                        )
+                    host_compiler_command = None
+                    host_policy = None
+                    if installed_r1_target is None:
+                        host_compiler_command, _ = probe_compiler_identity()
+                        host_policy = resolve_host_jit_policy(
+                            host_compiler_command, target=requested_host_target
+                        )
+                    initial_r1_target = (
+                        installed_r1_target
+                        if host_policy is None
+                        else host_policy.effective_target
+                    )
+                    metadata = metadata_function(
+                        contract,
+                        precision=dtype,
+                        apply_edge_weights=self.alchemical is not None,
+                        target=initial_r1_target,
+                    )
+                    source = render_function(
+                        contract,
+                        precision=dtype,
+                        apply_edge_weights=self.alchemical is not None,
+                        target=initial_r1_target,
+                    )
                 else:
                     metadata = metadata_function(contract)
                     source = render_function(
@@ -2502,8 +2865,8 @@ class Symmetrix(Calculator):
                         selected_node_state_policy = metadata["node_state_policy"]
                         metadata = {
                             **metadata,
-                            "abi": jit_codegen.MH1_HOST_PLUGIN_V5_ABI,
-                            "abi_version": jit_codegen.MH1_HOST_PLUGIN_V5_ABI_VERSION,
+                            "abi": mh1_abi[0],
+                            "abi_version": mh1_abi[1],
                         }
                 prepare = prepare_jit_artifact
                 prepare_arguments = {
@@ -2521,67 +2884,272 @@ class Symmetrix(Calculator):
                 }
                 load_plugin = getattr(self.evaluator, loader_name)
 
-            result = None
+            if device_plan is None:
+                # The device plan above already derived its ABI block from the
+                # envelope; every other publication path validates it here, so no
+                # published artifact can carry an incomplete identity.
+                from .jit import validate_artifact_envelope
+
+                if specialization == "mh1":
+                    from .mace_nonlinear_jit_codegen import (
+                        NONLINEAR_ARTIFACT_ENVELOPE,
+                    )
+
+                    envelope = NONLINEAR_ARTIFACT_ENVELOPE
+                else:
+                    from .mace_jit_codegen import R1_ARTIFACT_ENVELOPE
+
+                    envelope = R1_ARTIFACT_ENVELOPE
+                validate_artifact_envelope(metadata, envelope)
+
             prepare_arguments["build"] = {
                 **prepare_arguments["build"],
                 "jit_generation_version": jit_generation_version,
             }
-            prepare_arguments["source_content_sha256"] = native_source_content_sha256(
-                symmetrix
-            )
-            retained_quarantines = []
-            failed_load_artifacts = set()
-            for _load_attempt in range(4):
-                result = prepare(source, **prepare_arguments)
-                self.jit_cache_key = result.cache_key
+            source_content_sha256 = native_source_content_sha256(symmetrix)
+            prepare_arguments["source_content_sha256"] = source_content_sha256
+            prepare_arguments["show_progress"] = True
+            if jit_backend == "cuda":
+                if self.jit_compiler_backend == "nvrtc":
+                    prepare_arguments["nvrtc_options"] = ("--split-compile=2",)
+                elif self.jit_compiler_backend == "nvcc":
+                    prepare_arguments["nvcc_flags"] = ("--split-compile=2",)
+            if specialization == "mh1" and launch_plan is not None:
+                launch_plan_json = json.dumps(
+                    launch_plan, sort_keys=True, separators=(",", ":")
+                )
+
+                def load_artifact(path):
+                    load_plugin(path, launch_plan_json)
+
+            elif specialization == "r1" and jit_backend == "cuda":
+                blocks_per_compute_unit = metadata["persistent_blocks_per_compute_unit"]
+
+                def load_artifact(path):
+                    load_plugin(path, blocks_per_compute_unit)
+
+            else:
+                load_artifact = load_plugin
+
+            if specialization == "r1" and installed_resolution is None:
+                from .installed_operator_artifact import (
+                    resolve_installed_operator_artifact,
+                )
+
+                installed_resolution = resolve_installed_operator_artifact(
+                    operator="R1",
+                    identity=metadata.get(
+                        "generated_identity",
+                        {"artifact_id": metadata["artifact_id"]},
+                    ),
+                    abi=prepare_arguments["abi"],
+                    required_capabilities=metadata.get("capabilities", 0),
+                    loader=load_artifact,
+                    admitted=lambda: bool(
+                        getattr(self.evaluator, ready_attribute, False)
+                    ),
+                    native_module=symmetrix,
+                    policy=self.jit_policy,
+                )
                 self.jit_diagnostics = (
                     *self.jit_diagnostics,
-                    *result.diagnostics,
+                    *installed_resolution.diagnostics,
                 )
-                if not result.available or result.artifact_path is None:
+
+            if (
+                specialization == "r1"
+                and jit_backend == "host"
+                and installed_resolution is not None
+                and installed_resolution.status != "resolved"
+            ):
+                if host_policy is None:
+                    host_compiler_command, _ = probe_compiler_identity()
+                    host_policy = resolve_host_jit_policy(
+                        host_compiler_command, target=requested_host_target
+                    )
+                runtime_target = host_policy.effective_target
+                if runtime_target != initial_r1_target:
+                    metadata = metadata_function(
+                        contract,
+                        precision=dtype,
+                        apply_edge_weights=self.alchemical is not None,
+                        target=runtime_target,
+                    )
+                    source = render_function(
+                        contract,
+                        precision=dtype,
+                        apply_edge_weights=self.alchemical is not None,
+                        target=runtime_target,
+                    )
+                    validate_artifact_envelope(metadata, R1_ARTIFACT_ENVELOPE)
+                    prepare_arguments["abi"] = {
+                        "tag": metadata["abi"],
+                        "version": metadata["abi_version"],
+                    }
+                    prepare_arguments["build"] = {
+                        **prepare_arguments["build"],
+                        "contract": metadata,
+                    }
+                prepare_arguments.update(
+                    cxx=host_compiler_command,
+                    cxx_flags=None,
+                    host_policy=host_policy,
+                )
+
+            def prepare_r1():
+                return prepare(source, **prepare_arguments)
+
+            operator_plan = None
+            operator_futures = {}
+            r1_future = None
+            execution_contracts = model_data.get("execution_contracts", {})
+            parallel_operator_backend = None
+            product_requests = None
+            if specialization == "mh1" and isinstance(
+                contract.get("node_program"), dict
+            ):
+                from .mace_jit_operator_artifact import (
+                    _mh1_product_artifact_requests,
+                )
+                from .mace_nonlinear_execution_contract import (
+                    project_execution_mh1_product_contract,
+                )
+
+                mh1_product_descriptors = tuple(
+                    layer["product"] for layer in contract["node_program"]["layers"]
+                )
+                retain_last_product_irreps = bool(
+                    model_data.get("polar", {}).get("keep_last_layer_irreps", False)
+                )
+                projected_products = tuple(
+                    project_execution_mh1_product_contract(
+                        product,
+                        final=(
+                            index == len(mh1_product_descriptors) - 1
+                            and not retain_last_product_irreps
+                        ),
+                    )
+                    for index, product in enumerate(mh1_product_descriptors)
+                )
+                product_requests = _mh1_product_artifact_requests(projected_products)
+                parallel_operator_backend = jit_backend
+            elif (
+                specialization == "r1"
+                and self.low_memory_request
+                and jit_backend == "cuda"
+            ):
+                parallel_operator_backend = "cuda"
+            elif (
+                specialization == "r1"
+                and self.low_memory_request
+                and jit_backend == "host"
+                and isinstance(execution_contracts.get("M0"), dict)
+            ):
+                parallel_operator_backend = "host"
+            if parallel_operator_backend is not None and (
+                installed_resolution is None
+                or installed_resolution.status != "resolved"
+            ):
+                from concurrent.futures import ThreadPoolExecutor
+
+                from .mace_jit_operator_artifact import (
+                    _plan_low_memory_operator_modules,
+                    _prepare_with_initial_future,
+                    _submit_operator_artifact_jobs,
+                )
+
+                operator_plan = _plan_low_memory_operator_modules(
+                    self.evaluator,
+                    model_data=model_data,
+                    precision=dtype,
+                    backend=parallel_operator_backend,
+                    target=(
+                        cuda_environment
+                        if parallel_operator_backend == "cuda"
+                        else device_environment
+                    ),
+                    jit_generation_version=jit_generation_version,
+                    source_content_sha256=source_content_sha256,
+                    prefer_host_m0_plugin=parallel_operator_backend == "host",
+                    apply_edge_weights=self.alchemical is not None,
+                    operator_requests=product_requests,
+                )
+                if operator_plan.jobs:
+                    with ThreadPoolExecutor(
+                        max_workers=(
+                            1 + len(operator_plan.jobs)
+                            if parallel_operator_backend == "cuda"
+                            else 2
+                        ),
+                        thread_name_prefix="symmetrix-jit",
+                    ) as executor:
+                        r1_future = executor.submit(prepare_r1)
+                        operator_futures = _submit_operator_artifact_jobs(
+                            executor, operator_plan.jobs
+                        )
+                    prepare_r1 = _prepare_with_initial_future(prepare_r1, r1_future)
+
+            if (
+                installed_resolution is not None
+                and installed_resolution.status == "resolved"
+            ):
+                result = installed_resolution
+                retained_quarantines = ()
+                self.jit_cache_key = None
+                self.jit_status = "loaded"
+                self.jit_origin = "prebuilt"
+            else:
+                attempt = load_validated_jit_artifact(
+                    prepare_r1,
+                    load_artifact,
+                    artifact_key=lambda loaded: (
+                        self.jit_compiler_backend,
+                        loaded.cache_key,
+                        str(loaded.artifact_path),
+                    ),
+                )
+                self.jit_cache_key = attempt.cache_key
+                self.jit_diagnostics = (
+                    *self.jit_diagnostics,
+                    *attempt.diagnostics,
+                )
+                if attempt.status == "unavailable":
+                    self._record_direct_artifact_diagnostic(
+                        artifact_rejected=False,
+                        cache_key=attempt.cache_key,
+                        artifact_path=attempt.result.artifact_path,
+                        backend=jit_backend,
+                    )
                     self._jit_failed(
-                        result.reason or "the JIT cache did not produce an artifact",
+                        attempt.result.reason
+                        or "the JIT cache did not produce an artifact",
                         self.jit_diagnostics,
                     )
                     return
-                try:
-                    if specialization == "mh1" and launch_plan is not None:
-                        load_plugin(
-                            str(result.artifact_path),
-                            json.dumps(
-                                launch_plan, sort_keys=True, separators=(",", ":")
-                            ),
-                        )
-                    elif specialization == "r1" and jit_backend == "cuda":
-                        load_plugin(
-                            str(result.artifact_path),
-                            metadata["persistent_blocks_per_compute_unit"],
-                        )
-                    else:
-                        load_plugin(str(result.artifact_path))
-                    break
-                except Exception as load_error:
-                    failed_artifact = (
-                        self.jit_compiler_backend,
-                        result.cache_key,
-                        str(result.artifact_path),
+                if attempt.status == "load-failed":
+                    raise attempt.error
+                if attempt.status == "exhausted":
+                    self._record_direct_artifact_diagnostic(
+                        artifact_rejected=True,
+                        cache_key=attempt.cache_key,
+                        artifact_path=None,
+                        backend=jit_backend,
                     )
-                    if failed_artifact in failed_load_artifacts:
-                        raise
-                    failed_load_artifacts.add(failed_artifact)
-                    retained_quarantine = quarantine_jit_artifact(
-                        result, f"{type(load_error).__name__}: {load_error}"
+                    self._jit_failed(
+                        "the loaded R1 artifact was rejected as stale",
+                        self.jit_diagnostics,
                     )
-                    retained_quarantines.append(retained_quarantine)
-                    self.jit_diagnostics = (
-                        *self.jit_diagnostics,
-                        *retained_quarantine.diagnostics,
-                    )
-            else:
-                raise RuntimeError(
-                    "Execution JIT artifact recovery attempts were exhausted"
+                result = attempt.result
+                retained_quarantines = attempt.quarantines
+                self.jit_status = result.status
+                self.jit_origin = "cache" if result.status == "cached" else "runtime"
+                self.jit_diagnostics = (
+                    *self.jit_diagnostics,
+                    "origin="
+                    + self.jit_origin
+                    + " status="
+                    + ("hit" if self.jit_origin == "cache" else "compiled"),
                 )
-            assert result is not None
             if hasattr(self.evaluator, ready_attribute) and not bool(
                 getattr(self.evaluator, ready_attribute)
             ):
@@ -2593,7 +3161,6 @@ class Symmetrix(Calculator):
                     *self.jit_diagnostics,
                     *remove_jit_quarantine(retained_quarantine),
                 )
-            self.jit_status = result.status
             self.jit_artifact_path = str(result.artifact_path)
             self.jit_artifact_id = getattr(
                 self.evaluator, artifact_attribute, metadata["artifact_id"]
@@ -2603,10 +3170,59 @@ class Symmetrix(Calculator):
             self.jit_edge_policy = selected_edge_policy
             self.jit_node_state_policy = selected_node_state_policy
             self.jit_variant_id = selected_variant_id
+            if specialization == "mh1" and product_requests is not None:
+                from .mace_jit_operator_artifact import (
+                    _load_low_memory_operator_modules,
+                    _validate_mh1_product_module_records,
+                )
+
+                if operator_plan is None:
+                    raise RuntimeError("MH-1 product artifact plan is incomplete")
+                modules, diagnostics = _load_low_memory_operator_modules(
+                    self.evaluator,
+                    operator_plan,
+                    prepared=operator_futures,
+                )
+                module_target = next(iter(modules.values())).get("target")
+                validated_modules = _validate_mh1_product_module_records(
+                    modules,
+                    product_requests,
+                    backend=jit_backend,
+                    precision=dtype,
+                    target=module_target,
+                )
+                if not bool(
+                    getattr(
+                        self.evaluator,
+                        "execution_mh1_product_modules_ready",
+                        False,
+                    )
+                ):
+                    raise RuntimeError(
+                        "the evaluator did not retain the complete MH-1 product "
+                        "artifact set"
+                    )
+                self.jit_operator_modules.update(validated_modules)
+                self.jit_diagnostics = (*self.jit_diagnostics, *diagnostics)
             if specialization == "r1" and jit_backend == "host" and self.metal_request:
                 self._configure_metal_r1(model_data)
             if specialization == "r1" and self.low_memory_request:
-                if jit_backend in ("cuda", "hip"):
+                if operator_plan is not None:
+                    from .mace_jit_operator_artifact import (
+                        _load_low_memory_operator_modules,
+                    )
+
+                    modules, diagnostics = _load_low_memory_operator_modules(
+                        self.evaluator,
+                        operator_plan,
+                        prepared=operator_futures,
+                    )
+                    self.jit_operator_modules.update(modules)
+                    self.jit_diagnostics = (
+                        *self.jit_diagnostics,
+                        *diagnostics,
+                    )
+                elif jit_backend in ("cuda", "hip"):
                     self._configure_low_memory_operator_modules(
                         model_data=model_data,
                         dtype=dtype,
@@ -2637,39 +3253,32 @@ class Symmetrix(Calculator):
             self._jit_failed(exc, diagnostics)
 
     @staticmethod
-    def _native_evaluator_class(model_type, dtype, use_kokkos):
-        if model_type == "MACE_Nonlinear":
-            if use_kokkos:
-                evaluator_name = (
-                    "MACENonlinearKokkos"
-                    if dtype == "float64"
-                    else "MACENonlinearKokkosFloat"
-                )
-                if not hasattr(symmetrix, evaluator_name):
-                    raise RuntimeError(
-                        "This Symmetrix build does not provide the requested "
-                        "native MACE_Nonlinear Kokkos evaluator."
-                    )
-                if not symmetrix._kokkos_is_initialized():
-                    symmetrix._init_kokkos()
-                return getattr(symmetrix, evaluator_name)
-            if dtype != "float64":
-                raise ValueError(
-                    "Native serial MACE_Nonlinear models currently require "
-                    "dtype 'float64'."
-                )
-            return symmetrix.MACENonlinear
-        if model_type not in ("MACE", "MACEField"):
+    def _native_evaluator_class(model_type, dtype):
+        """Return the native evaluator class the model's family declares."""
+
+        return family_registry.resolve_model_evaluator_class(
+            model_type=model_type,
+            dtype=dtype,
+            native=symmetrix,
+        )
+
+    def _resolved_family_entry(self):
+        """Return the family entry this calculator's evaluator was resolved from.
+
+        A constructed calculator carries the entry its model type resolved to;
+        a calculator assembled directly for a focused test resolves it from its
+        model type on first use, so the capability gate reads one declaration
+        either way.
+        """
+
+        entry = getattr(self, "_family_entry", None)
+        if entry is not None:
+            return entry
+        model_type = getattr(self, "_native_model_type", "MACE")
+        entry = family_registry.declared_registry().detect(model_type=model_type)
+        if entry is None:
             raise ValueError(f"Unsupported Symmetrix model_type '{model_type}'.")
-        if use_kokkos:
-            if not symmetrix._kokkos_is_initialized():
-                symmetrix._init_kokkos()
-            return (
-                symmetrix.MACEKokkos
-                if dtype == "float64"
-                else symmetrix.MACEKokkosFloat
-            )
-        return symmetrix.MACE if dtype == "float64" else symmetrix.MACEFloat
+        return entry
 
     @staticmethod
     def _is_native_json_parse_error(error):
@@ -2751,6 +3360,12 @@ class Symmetrix(Calculator):
     def check_state(self, atoms, tol=1e-15):
         state = super().check_state(atoms, tol=tol)
         if (
+            self.alchemical is not None
+            and self._alchemical_evaluated_version != self.alchemical.version
+            and "info" not in state
+        ):
+            state.append("info")
+        if (
             self._has_native_field_coupling()
             and not state
             and (
@@ -2763,11 +3378,525 @@ class Symmetrix(Calculator):
             )
         ):
             state.append("info")
+        if (
+            not state
+            and getattr(self, "_family_frontend_adapter", None) is not None
+            and not self._family_frontend_adapter.inputs_unchanged(self, atoms, tol)
+        ):
+            state.append("info")
         return state
 
     def _has_native_field_coupling(self):
         return hasattr(self, "evaluator") and getattr(
             self.evaluator, "has_field_coupling", False
+        )
+
+    def _validate_family_input_mutation(self, name):
+        """Reject a family-specific input after family detection selected none."""
+
+        if not hasattr(self, "_family_frontend_adapter"):
+            return
+        if self._family_frontend_adapter is not None:
+            return
+        if name == "electric_field" and self._has_native_field_coupling():
+            return
+        raise ValueError(
+            f"Polar-only MACE_Polar option {name} cannot be assigned to "
+            f"model family {self._native_model_type!r}"
+        )
+
+    @property
+    def polar_electrostatics(self):
+        """Runtime electrostatics policy for the MACE Polar family."""
+
+        return self._polar_electrostatics
+
+    @polar_electrostatics.setter
+    def polar_electrostatics(self, value):
+        if value not in {
+            "auto",
+            "realspace",
+            "periodic",
+            "direct_reciprocal",
+            "pme",
+        }:
+            raise ValueError(
+                "polar_electrostatics must be one of 'auto', 'realspace', "
+                "'periodic', 'direct_reciprocal', or 'pme'"
+            )
+        self._validate_family_input_mutation("polar_electrostatics")
+        self._polar_electrostatics = value
+        if hasattr(self, "results"):
+            self.results.clear()
+
+    @property
+    def polar_pme_mesh(self):
+        """Runtime PME mesh dimensions for the MACE Polar family."""
+
+        return self._polar_pme_mesh
+
+    @polar_pme_mesh.setter
+    def polar_pme_mesh(self, value):
+        try:
+            mesh = tuple(
+                _positive_runtime_integer(extent, "polar_pme_mesh extent")
+                for extent in value
+            )
+        except TypeError as error:
+            raise ValueError("polar_pme_mesh must contain three integers") from error
+        if len(mesh) != 3:
+            raise ValueError("polar_pme_mesh must contain three positive integers")
+        self._validate_family_input_mutation("polar_pme_mesh")
+        self._polar_pme_mesh = mesh
+        if hasattr(self, "results"):
+            self.results.clear()
+
+    @property
+    def polar_pme_order(self):
+        """Runtime PME cardinal B-spline interpolation order."""
+
+        return self._polar_pme_order
+
+    @polar_pme_order.setter
+    def polar_pme_order(self, value):
+        order = _positive_runtime_integer(value, "polar_pme_order")
+        self._validate_family_input_mutation("polar_pme_order")
+        self._polar_pme_order = order
+        if hasattr(self, "results"):
+            self.results.clear()
+
+    @property
+    def total_charge(self):
+        """The total charge the PolarMACE equilibration targets, if set."""
+        return self._total_charge
+
+    @total_charge.setter
+    def total_charge(self, value):
+        self._validate_family_input_mutation("total_charge")
+        self._total_charge = value
+        self.results.clear()
+
+    @property
+    def total_spin(self):
+        """The total spin the PolarMACE equilibration targets, if set."""
+        return self._total_spin
+
+    @total_spin.setter
+    def total_spin(self, value):
+        self._validate_family_input_mutation("total_spin")
+        self._total_spin = value
+        self.results.clear()
+
+    @property
+    def fermi_level(self):
+        """The fermi level the PolarMACE graph carries, if set."""
+        return self._fermi_level
+
+    @fermi_level.setter
+    def fermi_level(self, value):
+        self._validate_family_input_mutation("fermi_level")
+        self._fermi_level = value
+        self.results.clear()
+
+    def _program_declares_polar_dipole_output(self):
+        """Report whether this family's compiled program carries a dipole.
+
+        The dipole is the PolarMACE family's own output (its ``dipole_readout``
+        node, fed by the equilibrated density); reading it off the program the
+        evaluator compiles is what keeps the frontend's output surface and the
+        program from drifting apart.
+        """
+
+        if not hasattr(self, "evaluator"):
+            return False
+        if not family_registry.supports_surface(
+            self._resolved_family_entry(), self.evaluator, "polar_graph_inputs"
+        ):
+            return False
+        program = getattr(self.evaluator, "family_program", None)
+        if not isinstance(program, dict):
+            return False
+        return any(
+            isinstance(node, dict) and node.get("kind") == "dipole_readout"
+            for node in program.get("operators", ())
+        )
+
+    def _polar_graph_inputs_unchanged(self, atoms, tol):
+        """Report whether the resolved polar graph inputs are the last ones."""
+
+        resolved = self._resolve_polar_graph_inputs(atoms)
+        previous = self._polar_graph_inputs
+        return bool(equal(previous, resolved, atol=tol))
+
+    def _resolve_polar_graph_inputs(self, atoms=None):
+        """Resolve the PolarMACE family's graph-level scalar program inputs.
+
+        Precedence is the MACEField field's: an explicitly set value wins, then
+        the structure's own ``atoms.info`` entry, then the neutral default
+        (zero charge and spin, zero fermi level, and a zero field).  The result
+        is the tuple the family's declared input surface takes.
+        """
+
+        if atoms is None:
+            atoms = getattr(self, "atoms", None)
+        info = getattr(atoms, "info", None) or {}
+        return {
+            "total_charge": self._resolve_polar_scalar(
+                "total_charge", info, self._total_charge, 0.0
+            ),
+            "total_spin": self._resolve_polar_scalar(
+                "total_spin", info, self._total_spin, 0.0
+            ),
+            "fermi_level": self._resolve_polar_scalar(
+                "fermi_level", info, self._fermi_level, 0.0
+            ),
+            "electric_field": self._resolve_electric_field(atoms),
+        }
+
+    @staticmethod
+    def _resolve_polar_scalar(name, info, explicit, default):
+        if explicit is not None:
+            value = explicit
+        elif name in info:
+            value = info[name]
+        else:
+            return default
+        if isinstance(value, bool) or not np.isscalar(value):
+            raise ValueError(
+                f"the PolarMACE {name} input must be a graph-level scalar."
+            )
+        resolved = float(value)
+        if not np.isfinite(resolved):
+            raise ValueError(f"the PolarMACE {name} input must be finite.")
+        return resolved
+
+    def _apply_polar_graph_inputs(self, atoms=None):
+        """Hand the family's graph inputs to its declared input surface.
+
+        The channel is the family's own: a family that declares no polar input
+        surface (every other family) leaves the evaluation untouched.
+        """
+
+        family = self._resolved_family_entry()
+        if not family_registry.supports_surface(
+            family, self.evaluator, "polar_graph_inputs"
+        ):
+            return
+        (set_polar_graph_inputs,) = family_registry.require_surface(
+            family, self.evaluator, "polar_graph_inputs"
+        )
+        inputs = self._resolve_polar_graph_inputs(atoms)
+        set_polar_graph_inputs(
+            inputs["total_charge"],
+            inputs["total_spin"],
+            inputs["fermi_level"],
+            np.asarray(inputs["electric_field"], dtype=float).reshape(-1),
+        )
+        self._polar_graph_inputs = inputs
+
+    def _compose_polar(
+        self,
+        atoms,
+        mace_inputs,
+        compute_reverse=False,
+        materialize_diagnostics=False,
+    ):
+        """The family's chain and long-range composition for this evaluation.
+
+        The backbone half is the atomic reference plus the interaction energy
+        the evaluator already produced; what the family adds is the oracle's
+        own composition of the chain and the global nodes:
+
+            E = e0 + inter + local_electron(chain) + kspace + correction
+                + sum_lanes E_lane . mu_lane
+
+        with the chain's equilibrated density feeding the k-space energy, the
+        pbc-selected analytic correction, and the dipole readout.  The lanes
+        are the family's graph-input channel (``total_charge``, ``total_spin``,
+        the electric field in lanes 1..3, and the fermi level in lane 0, which
+        the oracle fills and never couples).
+        """
+
+        num_nodes = int(mace_inputs[0])
+        node_types = np.asarray(mace_inputs[1], dtype=np.int64).reshape(-1)
+        native_program = getattr(self.evaluator, "polar_delta_native_program", None)
+        if not callable(native_program):
+            raise family_registry.MissingCapabilityError(
+                "the MACE Polar staged test oracle requires the native "
+                "polar_delta_native_program capability; retained-layer "
+                "materialization is not a supported compatibility path"
+            )
+        positions = np.ascontiguousarray(atoms.get_positions(), dtype=np.float64)
+        cell = np.ascontiguousarray(np.asarray(atoms.cell, dtype=np.float64)).reshape(
+            1, 3, 3
+        )
+        pbc = np.asarray(atoms.pbc, dtype=bool).reshape(1, 3).astype(np.int32)
+        # The composition is one graph per evaluation: the frontend's atoms are
+        # one structure, so the node-to-graph index it hands the chain, the
+        # cache and every readout is a single all-zero column, and the
+        # graph-level reads below (``[0]`` on the energy, the correction, the
+        # dipole, and the stress tensor) address that one graph.
+        node_graph_index = np.zeros(num_nodes, dtype=np.int32)
+        inputs = self._polar_graph_inputs or {}
+        total_charge = float(inputs.get("total_charge", 0.0))
+        # The channel's own default is the resolution's, so an unset spin means
+        # the same thing here as it does in ``_resolve_polar_graph_inputs``.
+        total_spin = float(inputs.get("total_spin", 0.0))
+        electric_field = np.asarray(
+            inputs.get("electric_field", (0.0, 0.0, 0.0)), dtype=np.float64
+        ).reshape(3)
+        # Lane 0 is the fermi level, which the oracle's external-potential
+        # buffer carries as zeros and never couples: the record's fermi-lane
+        # channel is bit-identical to its singlet, so the composition passes
+        # zeros there too rather than coupling a lane the model ignores.
+        external_potential = np.array(
+            [[0.0, electric_field[0], electric_field[1], electric_field[2]]],
+            dtype=np.float64,
+        )
+        state = native_program(
+            node_types=node_types,
+            positions=positions,
+            cell=cell,
+            graph_pbc=pbc,
+            node_graph_index=node_graph_index,
+            total_charge=[total_charge],
+            total_spin=[total_spin],
+            external_potential=external_potential,
+            compute_reverse=compute_reverse,
+            materialize_outputs=materialize_diagnostics,
+            polar_electrostatics=self.polar_electrostatics,
+        )
+        solver_keys = (
+            "requested_solver",
+            "resolved_solver",
+            "solver_reason",
+            "automatic_atom_count",
+            "automatic_reciprocal_mode_count",
+            "automatic_reciprocal_mode_count_is_lower_bound",
+            "automatic_atom_mode_pair_count",
+            "automatic_atom_mode_pair_threshold",
+            "n_k",
+            "reciprocal_allocation_elements",
+            "reciprocal_allocation_bytes",
+            "reciprocal_table_elements",
+            "reciprocal_table_bytes",
+            "particle_mesh_active_bytes",
+            "particle_mesh_capacity_bytes",
+            "particle_mesh_volume",
+            "particle_mesh_shape",
+            "particle_mesh_rebuilds",
+            "particle_mesh_reuses",
+            "particle_mesh_forward_plan_builds",
+            "particle_mesh_forward_plan_reuses",
+            "particle_mesh_inverse_plan_builds",
+            "particle_mesh_inverse_plan_reuses",
+        )
+        # Staged programs can report the selected solver without allocating a
+        # particle mesh.  Merge the workspace and call result per field rather
+        # than replacing the complete result when one optional PME field is
+        # absent.  Explicit zero values prevent diagnostics from a preceding
+        # PME evaluation leaking into a later direct-solver evaluation.
+        diagnostic_source = {
+            **self.evaluator.polar_delta_workspace(),
+            **state,
+        }
+        particle_mesh_defaults = {
+            "particle_mesh_active_bytes": 0,
+            "particle_mesh_capacity_bytes": 0,
+            "particle_mesh_volume": 0,
+            "particle_mesh_shape": [0, 0, 0],
+            "particle_mesh_rebuilds": 0,
+            "particle_mesh_reuses": 0,
+            "particle_mesh_forward_plan_builds": 0,
+            "particle_mesh_forward_plan_reuses": 0,
+            "particle_mesh_inverse_plan_builds": 0,
+            "particle_mesh_inverse_plan_reuses": 0,
+        }
+        solver_diagnostics = {
+            key: diagnostic_source.get(key, particle_mesh_defaults[key])
+            if key in particle_mesh_defaults
+            else diagnostic_source[key]
+            for key in solver_keys
+        }
+        self.polar_electrostatics_diagnostics = solver_diagnostics
+        if not materialize_diagnostics:
+            return {
+                "positions": positions,
+                "pbc": pbc,
+                "electric_field": electric_field,
+                "total_charge": total_charge,
+                "total_spin": total_spin,
+                "cell": cell,
+                "node_graph_index": node_graph_index,
+                "external_potential": external_potential,
+                "_native_layer_seed_installed": compute_reverse,
+                "_native_resident_outputs": True,
+                **solver_diagnostics,
+            }
+        kspace = float(np.asarray(state["electrostatic_energy_kspace"]).reshape(-1)[0])
+        correction = float(
+            np.asarray(state["electrostatic_energy_correction"]).reshape(-1)[0]
+        )
+        dipole = np.asarray(state["dipole"], dtype=np.float64).reshape(3)
+        local_electron = float(
+            np.asarray(state["local_electron_energy"]).reshape(-1)[0]
+        )
+        field_energy = float(np.asarray(state["external_field_energy"]).reshape(-1)[0])
+        result = {
+            "positions": positions,
+            "pbc": pbc,
+            "electric_field": electric_field,
+            "energy": float(np.asarray(state["energy"]).reshape(-1)[0]),
+            "local_electron_energy": local_electron,
+            "electrostatic_energy_kspace": kspace,
+            "electrostatic_energy_correction": correction,
+            "external_field_energy": field_energy,
+            "dipole": dipole,
+            "total_charge": total_charge,
+            "total_spin": total_spin,
+            "cell": cell,
+            "node_graph_index": node_graph_index,
+            "external_potential": external_potential,
+            "_native_layer_seed_installed": compute_reverse,
+            **solver_diagnostics,
+        }
+        if compute_reverse:
+            result.update(
+                {
+                    "positions_adjoint": np.asarray(
+                        state["positions_adjoint"], dtype=np.float64
+                    ),
+                    "strain_adjoint": np.asarray(
+                        state["strain_adjoint"], dtype=np.float64
+                    ).reshape(-1, 3, 3),
+                    "stress": np.asarray(state["stress"], dtype=np.float64).reshape(
+                        -1, 3, 3
+                    ),
+                }
+            )
+            if "node_features_adjoint" in state:
+                result["node_features_adjoint"] = np.asarray(
+                    state["node_features_adjoint"], dtype=np.float64
+                )
+        return result
+
+    def _compose_polar_reverse(self):
+        """Run the native reverse of the complete polar energy program.
+
+        Python supplies compact model inputs and receives compact final
+        adjoints.  The density, phase-table, geometry, correction, dipole, and
+        stress composition stays in libsymmetrix, including its shared device
+        accumulators.
+
+        Three products come back, and each has an owner:
+
+        * ``energy_gradient``/``forces`` -- the *fixed-feature* position
+          gradient of the polar terms, added to the backbone's;
+        * ``layer_product_seed`` -- the chain's seed of the node features it
+          was handed, i.e. of the backbone's retained per-layer products,
+          split per layer for the reverse tap.  Positions move the products,
+          the products move the chain, and only the backbone's own reverse can
+          carry that half;
+        * ``stress`` -- the complete polar stress, including cell metadata,
+          analytic correction, and the position virial.
+        """
+
+        composition = self._polar_composition
+        # The granular long-range adjoints remain exposed for reference tests,
+        # but production's forward state feeds its reverse before the native
+        # call returns; Python only reshapes the compact final products.
+        position_seed = np.asarray(composition["positions_adjoint"], dtype=np.float64)
+        # The chain's seed of its own node features is a seed of the
+        # backbone's per-layer products (the features it was handed are the
+        # retained products), so it is returned split per layer, in the
+        # retention's order and basis: the family adopts it on the backbone's
+        # reverse to collect the cross term its composition owns but cannot
+        # differentiate -- positions change the products, the products change
+        # the chain, and only the backbone's own reverse can carry that.
+        layer_product_seed = None
+        if not composition.get("_native_layer_seed_installed", False):
+            feature_seed = np.asarray(
+                composition["node_features_adjoint"], dtype=np.float64
+            )
+            width = int(self._polar_shapes["node_feature_dimension"])
+            layers = int(self._polar_shapes["interaction_count"])
+            layer_product_seed = [
+                np.ascontiguousarray(
+                    feature_seed[:, index * width : (index + 1) * width]
+                )
+                for index in range(layers)
+            ]
+            if feature_seed.shape[1] != layers * width:
+                raise RuntimeError(
+                    "the chain's node-feature seed carries "
+                    f"{feature_seed.shape[1]} columns but the contract's "
+                    f"{layers} layer(s) of width {width} account for "
+                    f"{layers * width}: the seed and the retention disagree on the "
+                    "backbone's product layout."
+                )
+        return {
+            "energy_gradient": position_seed,
+            "forces": -position_seed,
+            "layer_product_seed": layer_product_seed,
+            "strain": composition["strain_adjoint"],
+            "stress": composition["stress"],
+        }
+
+    def _materialize_polar_diagnostics(self):
+        """Explicitly materialize private polar state for diagnostic callers.
+
+        Normal energy/force/stress evaluation deliberately keeps this state in
+        native memory. This opt-in path recomputes a matching unseeded backbone
+        forward, asks the native polar program for its diagnostic outputs, and
+        leaves the already served public results unchanged.
+        """
+
+        if self._family_frontend_adapter is None or self.atoms is None:
+            raise RuntimeError(
+                "polar diagnostics require a completed PolarMACE evaluation."
+            )
+        mace_inputs = self._mace_inputs(self.atoms)
+        self.evaluator.clear_layer_product_seed()
+        self._compute_mace(mace_inputs, atoms=self.atoms)
+        try:
+            diagnostic = self._compose_polar(
+                self.atoms,
+                mace_inputs,
+                compute_reverse=True,
+                materialize_diagnostics=True,
+            )
+        finally:
+            self.evaluator.clear_layer_product_seed()
+        diagnostic["polar_stress"] = np.array(
+            diagnostic["stress"], dtype=np.float64, copy=True
+        )
+        self._polar_composition = diagnostic
+        return diagnostic
+
+    def _compose_polar_stress(self, seeds):
+        """Return the complete polar stress produced by libsymmetrix."""
+
+        return np.asarray(seeds["stress"], dtype=np.float64).reshape(-1, 3, 3)
+
+    def _polar_dipole_output(self):
+        """Return the PolarMACE program's dipole output for this evaluation.
+
+        The composition produces the dipole (the program's ``dipole_readout``
+        node fed by the chain's equilibrated density), so this is a readout of
+        the evaluation that ran; a dipole requested before any evaluation of
+        this calculator is refused by name rather than answered with a number
+        the model did not produce.
+        """
+
+        composition = self._polar_composition
+        if composition is not None:
+            return np.asarray(composition["dipole"], dtype=float).reshape(3)
+        raise PropertyNotImplementedError(
+            "the PolarMACE dipole output is produced by the family's own "
+            "composition (the program's dipole_readout node, fed by the "
+            "chain's equilibrated density), and no evaluation of this "
+            "calculator has run it yet: request the energy and the composition "
+            "produces the dipole with it."
         )
 
     @property
@@ -2776,6 +3905,7 @@ class Symmetrix(Calculator):
 
     @electric_field.setter
     def electric_field(self, value):
+        self._validate_family_input_mutation("electric_field")
         self._electric_field = value
         self.results.clear()
 
@@ -2803,18 +3933,6 @@ class Symmetrix(Calculator):
                 "with shape (3,) or (1, 3); per-atom fields are not supported."
             )
         raise ValueError("electric_field must have shape (3,) or (1, 3).")
-
-    @staticmethod
-    def _minimum_image_displacements(positions, reference_positions, cell, pbc):
-        displacements = np.asarray(positions) - np.asarray(reference_positions)
-        if not np.any(pbc):
-            return displacements
-        try:
-            fractional = np.linalg.solve(cell.T, displacements.T).T
-        except np.linalg.LinAlgError:
-            return None
-        fractional[:, pbc] -= np.rint(fractional[:, pbc])
-        return fractional @ cell
 
     def _materialize_neighbor_cache_geometry(self):
         cache = self._neighbor_cache
@@ -2846,59 +3964,41 @@ class Symmetrix(Calculator):
         displacements = None
         cell_changed = False
         geometry_reference_positions = None
-        if (
-            cache is not None
-            and np.array_equal(atomic_numbers, cache.atomic_numbers)
-            and np.array_equal(pbc, cache.pbc)
-            and positions.shape == cache.reference_positions.shape
-            and (allow_device_neighbor_graph or cache.device_graph_generation == 0)
+        if cache is not None and (
+            allow_device_neighbor_graph or cache.device_graph_generation == 0
         ):
-            cell_changed = not np.array_equal(cell, cache.cell)
-            if np.all(pbc) and cache.fractional_geometry_eligible:
-                try:
-                    topology_fractional = cache.topology_fractional_positions
-                    non_affine = positions - topology_fractional @ cell
-                    non_affine_fractional = np.linalg.solve(cell.T, non_affine.T).T
-                except np.linalg.LinAlgError:
-                    displacements = None
+            reference = NeighborTopologyReference(
+                atomic_numbers=cache.atomic_numbers,
+                pbc=cache.pbc,
+                topology_cell=cache.topology_cell,
+                topology_reference_positions=cache.topology_reference_positions,
+                topology_fractional_positions=cache.topology_fractional_positions,
+                cell=cache.cell,
+                reference_positions=cache.reference_positions,
+            )
+            reuse = neighbor_topology_reuse(
+                reference=reference,
+                atomic_numbers=atomic_numbers,
+                positions=positions,
+                cell=cell,
+                pbc=pbc,
+                cutoff=self.cutoff,
+                skin=self.neighbor_skin,
+            )
+            cell_changed = reuse.cell_changed
+            geometry_reference_positions = reuse.geometry_reference_positions
+            if reuse.reusable:
+                if cell_changed:
+                    displacements = np.zeros_like(positions)
                 else:
-                    non_affine_fractional[:, pbc] -= np.rint(
-                        non_affine_fractional[:, pbc]
+                    displacement_reference = (
+                        cache.reference_positions
+                        if cache.fractional_geometry_eligible
+                        else cache.topology_reference_positions
                     )
-                    non_affine = non_affine_fractional @ cell
-                    max_non_affine_displacement = (
-                        0.0
-                        if len(non_affine) == 0
-                        else float(np.linalg.norm(non_affine, axis=1).max())
+                    displacements = minimum_image_displacements(
+                        positions, displacement_reference, cell, pbc
                     )
-                    deformation = np.linalg.solve(cell, cache.topology_cell)
-                    contraction = float(np.linalg.norm(deformation, ord=2))
-                    topology_valid = (
-                        contraction * (self.cutoff + 2.0 * max_non_affine_displacement)
-                        <= self.cutoff + self.neighbor_skin
-                    )
-                    if topology_valid and not cell_changed:
-                        displacements = self._minimum_image_displacements(
-                            positions, cache.reference_positions, cell, pbc
-                        )
-                    elif topology_valid:
-                        geometry_reference_positions = (
-                            topology_fractional @ cell + non_affine
-                        )
-                        displacements = np.zeros_like(positions)
-            else:
-                if not cell_changed:
-                    displacements = self._minimum_image_displacements(
-                        positions, cache.topology_reference_positions, cell, pbc
-                    )
-                if displacements is not None and len(displacements) != 0:
-                    max_displacement = float(
-                        np.linalg.norm(displacements, axis=1).max()
-                    )
-                    if max_displacement > 0.5 * self.neighbor_skin:
-                        displacements = None
-
-            if displacements is not None:
                 self.neighbor_cache_reuse_count += 1
 
         if displacements is None:
@@ -2960,7 +4060,7 @@ class Symmetrix(Calculator):
                 )
                 self._sync_low_memory_policy_state()
                 num_edges = int(device_graph["num_edges"])
-                _validate_int32_graph_cardinality(len(atomic_numbers), num_edges)
+                validate_graph_cardinality(len(atomic_numbers), num_edges)
                 receivers = np.empty(0, dtype=np.int32)
                 sources = np.empty(0, dtype=np.int32)
                 shifts = np.empty((0, 3), dtype=np.int32)
@@ -2970,19 +4070,15 @@ class Symmetrix(Calculator):
                 topology_fractional_xyz = np.empty((0, 3), dtype=float)
                 self.neighbor_graph_backend = "kokkos"
             else:
-                receivers, sources, shifts = neighbor_list(
-                    "ijS", atoms, self.cutoff + self.neighbor_skin
+                graph = build_host_neighbor_graph(
+                    atoms, self.cutoff + self.neighbor_skin
                 )
-                _validate_int32_graph_cardinality(len(atomic_numbers), len(receivers))
-                receivers, sources, shifts = _receiver_major_neighbor_arrays(
-                    receivers, sources, shifts
-                )
-                num_edges = len(receivers)
-                num_neigh = np.asarray(
-                    np.bincount(receivers, minlength=len(positions)),
-                    dtype=np.int32,
-                )
-                neigh_types = np.ascontiguousarray(node_types[sources])
+                receivers = graph.receivers
+                sources = graph.sources
+                shifts = graph.shifts
+                num_edges = graph.num_edges
+                num_neigh = graph.num_neigh
+                neigh_types = graph.neighbor_types(node_types)
                 device_graph_generation = 0
                 self.neighbor_graph_backend = "host"
                 if fractional_geometry_eligible:
@@ -3033,13 +4129,12 @@ class Symmetrix(Calculator):
                 raise RuntimeError(
                     "Cell-aware neighbor reuse requires normalized reference positions."
                 )
-            try:
-                inverse_cell = np.linalg.inv(cell)
-            except np.linalg.LinAlgError:
-                inverse_cell = np.zeros((3, 3), dtype=float)
-                native_geometry_eligible = False
-            else:
-                native_geometry_eligible = True
+            inverse_cell = reuse.inverse_cell
+            if inverse_cell is None:
+                raise RuntimeError(
+                    "Cell-aware neighbor reuse requires an invertible cell."
+                )
+            native_geometry_eligible = True
             cache.cell = np.array(cell, copy=True)
             cache.reference_positions = np.array(
                 geometry_reference_positions, copy=True
@@ -3092,9 +4187,50 @@ class Symmetrix(Calculator):
             np.ascontiguousarray(xyz[active]),
         )
 
+    def _alchemical_inputs(self, atoms):
+        config = self.alchemical
+        resolved_config = resolve_alchemical_config(
+            config, atoms.numbers, self.evaluator.atomic_numbers
+        )
+        receivers, sources, distances, xyz = self._cached_neighbor_geometry(
+            atoms, native_geometry=False, allow_device_neighbor_graph=False
+        )
+        cache = self._neighbor_cache
+        if self._alchemical_topology_generation != cache.generation:
+            self._alchemical_topology = expand_alchemical_topology(
+                atomic_numbers=atoms.numbers,
+                receivers=receivers,
+                sources=sources,
+                shifts=cache.shifts,
+                config=resolved_config,
+            )
+            self._alchemical_topology_generation = cache.generation
+        topology = self._alchemical_topology
+        type_by_number = {
+            number: index for index, number in enumerate(self.evaluator.atomic_numbers)
+        }
+        node_types = np.asarray(
+            [type_by_number[number] for number in topology.node_atomic_numbers],
+            dtype=np.int32,
+        )
+        edge_map = topology.edge_to_original_edge
+        validate_graph_cardinality(len(node_types), len(edge_map))
+        return (
+            len(node_types),
+            node_types,
+            topology.num_neigh,
+            topology.edge_sources,
+            np.ascontiguousarray(node_types[topology.edge_sources]),
+            np.ascontiguousarray(xyz[edge_map]),
+            np.ascontiguousarray(distances[edge_map]),
+            topology.edge_receivers,
+        )
+
     def _mace_inputs(
         self, atoms, native_geometry=False, allow_device_neighbor_graph=True
     ):
+        if self.alchemical is not None:
+            return self._alchemical_inputs(atoms)
         ase_atomic_numbers = atoms.get_atomic_numbers().tolist()
         mace_atomic_numbers = self.evaluator.atomic_numbers
         unsupported = sorted(set(ase_atomic_numbers) - set(mace_atomic_numbers))
@@ -3123,7 +4259,9 @@ class Symmetrix(Calculator):
                     "SYMMETRIX_NEIGHBOR_BACKEND=kokkos requires a positive "
                     "neighbor_skin and native prepared geometry."
                 )
-            i_list, j_list, r, xyz = neighbor_list("ijdD", atoms, self.cutoff)
+            i_list, j_list, r, xyz = neighbor_graph.host_neighbor_list(
+                atoms, self.cutoff, "ijdD"
+            )
             self.neighbor_graph_backend = "host"
         num_nodes = len(atoms)
         cache = getattr(self, "_neighbor_cache", None)
@@ -3132,7 +4270,7 @@ class Symmetrix(Calculator):
             if cache is not None and cache.device_graph_generation != 0
             else len(i_list)
         )
-        _validate_int32_graph_cardinality(num_nodes, graph_edges)
+        validate_graph_cardinality(num_nodes, graph_edges)
         native_cardinality_guard = getattr(
             self.evaluator, "_validate_graph_cardinality", None
         )
@@ -3161,31 +4299,23 @@ class Symmetrix(Calculator):
 
     def _compute_mace(self, mace_inputs, atoms=None):
         num_nodes, node_types, num_neigh, j_list, neigh_types, xyz, r, _ = mace_inputs
-        if (
-            getattr(self.evaluator, "streamed_edges_mode", None) == "generic"
-            and xyz is None
-            and r is None
-        ):
-            prepare_graph = getattr(
-                self.evaluator, "_prepare_all_interactions_graph", None
-            )
-            prepare_geometry = getattr(
-                self.evaluator, "_prepare_all_interactions_geometry", None
-            )
-            compute_positions = getattr(
-                self.evaluator, "_compute_prepared_all_interactions_positions", None
+        family = self._resolved_family_entry()
+        # The family's graph-level scalar channel is input to whatever routing
+        # follows, so it enters here, before the graph is prepared: the same
+        # prepared lifecycle the graph itself travels.
+        self._apply_polar_graph_inputs(atoms)
+        mode = getattr(self.evaluator, "streamed_edges_mode", None)
+        if mode == "generic" and xyz is None and r is None:
+            prepare_graph, prepare_geometry, compute_positions = (
+                family_registry.require_surface(
+                    family, self.evaluator, "all_interactions"
+                )
             )
             cache = self._neighbor_cache
-            if (
-                atoms is None
-                or cache is None
-                or not callable(prepare_graph)
-                or not callable(prepare_geometry)
-                or not callable(compute_positions)
-            ):
+            if atoms is None or cache is None:
                 raise RuntimeError(
-                    "Native streamed all geometry requires atoms and the "
-                    "prepared-position API."
+                    "Native streamed all geometry requires atoms and a prepared "
+                    "neighbor cache."
                 )
             graph_identity = (id(self.evaluator), cache.generation)
             if graph_identity != self._all_interactions_graph_identity:
@@ -3221,43 +4351,29 @@ class Symmetrix(Calculator):
             )
             return graph_generation
 
-        prepare_graph = getattr(self.evaluator, "_prepare_factorized_graph", None)
-        compute_prepared = getattr(self.evaluator, "_compute_prepared_factorized", None)
-        if (
-            getattr(self.evaluator, "streamed_edges_mode", None)
-            in _PREPARED_EXECUTION_MODES
-            and callable(prepare_graph)
-            and callable(compute_prepared)
-        ):
+        if mode in _PREPARED_EXECUTION_MODES:
+            prepare_graph, compute_prepared = family_registry.require_surface(
+                family, self.evaluator, "prepared"
+            )
             native_geometry = xyz is None and r is None
             if (xyz is None) != (r is None):
                 raise ValueError("MACE geometry must provide both xyz and distances.")
             if native_geometry:
-                prepare_geometry = getattr(
-                    self.evaluator, "_prepare_factorized_geometry", None
-                )
-                prepare_fractional_geometry = getattr(
-                    self.evaluator,
-                    "_prepare_factorized_fractional_geometry",
-                    None,
-                )
-                update_cell = getattr(self.evaluator, "_update_factorized_cell", None)
-                compute_positions = getattr(
-                    self.evaluator, "_compute_prepared_factorized_positions", None
+                (compute_positions,) = family_registry.require_surface(
+                    family, self.evaluator, "prepared_positions"
                 )
                 cache = self._neighbor_cache
-                if atoms is None or cache is None or not callable(compute_positions):
+                if atoms is None or cache is None:
                     raise RuntimeError(
-                        "Native Execution geometry requires atoms and the prepared-position API."
+                        "Native Execution geometry requires atoms and a prepared "
+                        "neighbor cache."
                     )
                 if cache.device_graph_generation != 0:
                     graph_generation = cache.device_graph_generation
                     if cache.device_geometry_generation != cache.geometry_generation:
-                        if not callable(update_cell):
-                            raise RuntimeError(
-                                "Device-resident neighbor geometry requires the "
-                                "fractional cell-update API."
-                            )
+                        (update_cell,) = family_registry.require_surface(
+                            family, self.evaluator, "prepared_cell_update"
+                        )
                         update_cell(
                             graph_generation,
                             np.ascontiguousarray(cache.cell, dtype=float).reshape(-1),
@@ -3276,15 +4392,16 @@ class Symmetrix(Calculator):
                 )
                 self._sync_low_memory_policy_state()
                 if self._compute_fixed_workspace_shift_geometry(
-                    graph_generation, atoms, compute_positions
+                    family, graph_generation, atoms
                 ):
                     return graph_generation
-                use_fractional_geometry = (
-                    self._can_use_fractional_geometry(cache)
-                    and callable(prepare_fractional_geometry)
-                    and callable(update_cell)
-                )
-                if use_fractional_geometry:
+                if self._can_use_fractional_geometry(cache):
+                    (prepare_fractional_geometry,) = family_registry.require_surface(
+                        family, self.evaluator, "prepared_fractional_geometry"
+                    )
+                    (update_cell,) = family_registry.require_surface(
+                        family, self.evaluator, "prepared_cell_update"
+                    )
                     geometry_identity = (
                         id(self.evaluator),
                         graph_generation,
@@ -3323,11 +4440,9 @@ class Symmetrix(Calculator):
                         )
                         self._execution_native_cell_identity = cell_identity
                 else:
-                    if not callable(prepare_geometry):
-                        raise RuntimeError(
-                            "Native Execution geometry requires the Cartesian "
-                            "prepared-geometry API."
-                        )
+                    (prepare_geometry,) = family_registry.require_surface(
+                        family, self.evaluator, "prepared_geometry"
+                    )
                     cache = self._materialize_neighbor_cache_geometry()
                     geometry_identity = (
                         id(self.evaluator),
@@ -3371,12 +4486,20 @@ class Symmetrix(Calculator):
             graph_generation = prepare_graph(
                 num_nodes, node_types, num_neigh, j_list, neigh_types
             )
+            if self.alchemical is not None:
+                weight_identity = (graph_generation, self.alchemical.version)
+                if weight_identity != self._alchemical_native_weight_identity:
+                    topology = self._alchemical_topology
+                    node_weights, edge_weights = topology.resolve_weights(
+                        self.alchemical.weights
+                    )
+                    self.evaluator._set_alchemical_weights(
+                        graph_generation, node_weights, edge_weights
+                    )
+                    self._alchemical_native_weight_identity = weight_identity
             self._sync_low_memory_policy_state()
-            compute_positions = getattr(
-                self.evaluator, "_compute_prepared_factorized_positions", None
-            )
             if self._compute_fixed_workspace_shift_geometry(
-                graph_generation, atoms, compute_positions
+                family, graph_generation, atoms
             ):
                 return graph_generation
             compute_prepared(
@@ -3391,7 +4514,10 @@ class Symmetrix(Calculator):
             )
         xyz_flat = np.ascontiguousarray(xyz, dtype=float).reshape(-1)
         distances = np.ascontiguousarray(r, dtype=float)
-        self.evaluator.compute_node_energies_forces(
+        (compute_reduced,) = family_registry.require_surface(
+            family, self.evaluator, "reduced"
+        )
+        compute_reduced(
             num_nodes,
             node_types,
             num_neigh,
@@ -3405,6 +4531,7 @@ class Symmetrix(Calculator):
     def _can_use_fractional_geometry(self, cache=None):
         if cache is None:
             cache = self._neighbor_cache
+        family = self._resolved_family_entry()
         return (
             getattr(self, "_native_model_type", "MACE") == "MACE"
             and cache is not None
@@ -3412,14 +4539,12 @@ class Symmetrix(Calculator):
             and getattr(self.evaluator, "streamed_edges_mode", None)
             in _PREPARED_EXECUTION_MODES
             and not self._has_native_field_coupling()
-            and callable(
-                getattr(
-                    self.evaluator,
-                    "_prepare_factorized_fractional_geometry",
-                    None,
-                )
+            and family_registry.supports_surface(
+                family, self.evaluator, "prepared_fractional_geometry"
             )
-            and callable(getattr(self.evaluator, "_update_factorized_cell", None))
+            and family_registry.supports_surface(
+                family, self.evaluator, "prepared_cell_update"
+            )
         )
 
     def _fixed_workspace_plan_selected(self):
@@ -3432,25 +4557,21 @@ class Symmetrix(Calculator):
     def _fixed_workspace_geometry_eligible(self):
         return self._model_single_layer_readout or self._fixed_workspace_plan_selected()
 
-    def _compute_fixed_workspace_shift_geometry(
-        self, graph_generation, atoms, compute_positions
-    ):
-        prepare_shift_geometry = getattr(
-            self.evaluator, "_prepare_factorized_shift_geometry", None
-        )
+    def _compute_fixed_workspace_shift_geometry(self, family, graph_generation, atoms):
         if not self._fixed_workspace_plan_selected():
             return False
         cache = getattr(self, "_neighbor_cache", None)
-        if (
-            not callable(prepare_shift_geometry)
-            or not callable(compute_positions)
-            or atoms is None
-            or cache is None
-        ):
+        if atoms is None or cache is None:
             raise RuntimeError(
-                "Fixed-workspace tiled execution requires shift geometry, atoms, "
-                "and a prepared neighbor cache."
+                "Fixed-workspace tiled execution requires atoms and a prepared "
+                "neighbor cache."
             )
+        (prepare_shift_geometry,) = family_registry.require_surface(
+            family, self.evaluator, "prepared_shift_geometry"
+        )
+        (compute_positions,) = family_registry.require_surface(
+            family, self.evaluator, "prepared_positions"
+        )
         geometry_identity = (
             id(self.evaluator),
             graph_generation,
@@ -3477,10 +4598,13 @@ class Symmetrix(Calculator):
         return True
 
     def _can_use_native_geometry(self, properties):
+        if self.alchemical is not None:
+            return False
         if self.neighbor_skin <= 0.0 and not self._fixed_workspace_geometry_eligible():
             return False
-        if "stress" in properties and not callable(
-            getattr(self.evaluator, "_reduce_stress", None)
+        family = self._resolved_family_entry()
+        if "stress" in properties and not family_registry.supports_surface(
+            family, self.evaluator, "reduced_stress"
         ):
             return False
         mode = getattr(self.evaluator, "streamed_edges_mode", None)
@@ -3488,43 +4612,36 @@ class Symmetrix(Calculator):
             requires_response = any(
                 prop in ("becs", "polarizability") for prop in properties
             )
-            if requires_response and not callable(
-                getattr(
-                    self.evaluator,
-                    "_compute_prepared_factorized_field_response",
-                    None,
-                )
+            if requires_response and not family_registry.supports_surface(
+                family, self.evaluator, "prepared_field_response"
             ):
                 return False
             return (
                 mode in _PREPARED_EXECUTION_MODES
-                and callable(getattr(self.evaluator, "_prepare_factorized_graph", None))
-                and callable(
-                    getattr(self.evaluator, "_prepare_factorized_geometry", None)
+                and family_registry.supports_surface(
+                    family, self.evaluator, "prepared_graph"
                 )
-                and callable(
-                    getattr(
-                        self.evaluator,
-                        "_compute_prepared_factorized_positions_field",
-                        None,
-                    )
+                and family_registry.supports_surface(
+                    family, self.evaluator, "prepared_geometry"
+                )
+                and family_registry.supports_surface(
+                    family, self.evaluator, "prepared_field_positions"
                 )
             )
         if mode == "generic":
-            return all(
-                callable(getattr(self.evaluator, name, None))
-                for name in (
-                    "_prepare_all_interactions_graph",
-                    "_prepare_all_interactions_geometry",
-                    "_compute_prepared_all_interactions_positions",
-                )
+            return family_registry.supports_surface(
+                family, self.evaluator, "all_interactions"
             )
         return (
             mode in _PREPARED_EXECUTION_MODES
-            and callable(getattr(self.evaluator, "_prepare_factorized_graph", None))
-            and callable(getattr(self.evaluator, "_prepare_factorized_geometry", None))
-            and callable(
-                getattr(self.evaluator, "_compute_prepared_factorized_positions", None)
+            and family_registry.supports_surface(
+                family, self.evaluator, "prepared_graph"
+            )
+            and family_registry.supports_surface(
+                family, self.evaluator, "prepared_geometry"
+            )
+            and family_registry.supports_surface(
+                family, self.evaluator, "prepared_positions"
             )
         )
 
@@ -3535,49 +4652,36 @@ class Symmetrix(Calculator):
             mace_inputs
         )
         field = np.ascontiguousarray(electric_field, dtype=float).reshape(-1)
-        prepare_graph = getattr(self.evaluator, "_prepare_factorized_graph", None)
-        compute_prepared = getattr(
-            self.evaluator, "_compute_prepared_factorized_field", None
-        )
-        compute_positions = getattr(
-            self.evaluator, "_compute_prepared_factorized_positions_field", None
-        )
+        family = self._resolved_family_entry()
+        mode = getattr(self.evaluator, "streamed_edges_mode", None)
         self._macefield_response_graph_generation = 0
-        if (
-            getattr(self.evaluator, "streamed_edges_mode", None)
-            in _PREPARED_EXECUTION_MODES
-            and callable(prepare_graph)
-            and callable(compute_prepared)
-        ):
+        if mode in _PREPARED_EXECUTION_MODES:
+            prepare_graph, compute_prepared = family_registry.require_surface(
+                family, self.evaluator, "prepared_field"
+            )
             native_geometry = xyz is None and r is None
             if (xyz is None) != (r is None):
                 raise ValueError(
                     "MACEField geometry must provide both xyz and distances."
                 )
             if native_geometry:
-                prepare_geometry = getattr(
-                    self.evaluator, "_prepare_factorized_geometry", None
+                (compute_positions,) = family_registry.require_surface(
+                    family, self.evaluator, "prepared_field_positions"
+                )
+                (prepare_geometry,) = family_registry.require_surface(
+                    family, self.evaluator, "prepared_geometry"
                 )
                 cache = self._neighbor_cache
-                if (
-                    cache is None
-                    or not callable(prepare_geometry)
-                    or not callable(compute_positions)
-                ):
+                if cache is None:
                     raise RuntimeError(
-                        "Native MACEField geometry requires the prepared-position API."
+                        "Native MACEField geometry requires a prepared neighbor cache."
                     )
                 if cache.device_graph_generation != 0:
                     graph_generation = cache.device_graph_generation
-                    update_cell = getattr(
-                        self.evaluator, "_update_factorized_cell", None
-                    )
                     if cache.device_geometry_generation != cache.geometry_generation:
-                        if not callable(update_cell):
-                            raise RuntimeError(
-                                "Device-resident MACEField geometry requires the "
-                                "fractional cell-update API."
-                            )
+                        (update_cell,) = family_registry.require_surface(
+                            family, self.evaluator, "prepared_cell_update"
+                        )
                         update_cell(
                             graph_generation,
                             np.ascontiguousarray(cache.cell, dtype=float).reshape(-1),
@@ -3653,7 +4757,10 @@ class Symmetrix(Calculator):
             )
         xyz_flat = np.ascontiguousarray(xyz, dtype=float).reshape(-1)
         distances = np.ascontiguousarray(r, dtype=float)
-        self.evaluator.compute_node_energies_forces_field(
+        (compute_reduced_field,) = family_registry.require_surface(
+            family, self.evaluator, "reduced_field"
+        )
+        compute_reduced_field(
             num_nodes,
             node_types,
             num_neigh,
@@ -3833,6 +4940,12 @@ class Symmetrix(Calculator):
         node_energies = np.array(
             self.evaluator.node_energies, dtype=np.float64, copy=True
         )
+        if self.alchemical is not None:
+            node_energies = np.bincount(
+                self._alchemical_topology.node_to_original_atom,
+                weights=node_energies,
+                minlength=len(atoms),
+            )
         total_energy = np.sum(node_energies, dtype=np.float64)
         results = {
             "energy": float(total_energy),
@@ -3872,7 +4985,17 @@ class Symmetrix(Calculator):
                     weights=pair_forces[:, component],
                     minlength=num_nodes,
                 )
+        if self.alchemical is not None:
+            physical_forces = np.zeros((len(atoms), 3), dtype=float)
+            np.add.at(
+                physical_forces,
+                self._alchemical_topology.node_to_original_atom,
+                atom_forces,
+            )
+            atom_forces = physical_forces
         results["forces"] = atom_forces
+        if "dipole" in properties:
+            results["dipole"] = self._polar_dipole_output()
         if "stress" in properties:
             reduce_stress = getattr(self.evaluator, "_reduce_stress", None)
             if callable(reduce_stress):
@@ -3931,10 +5054,55 @@ class Symmetrix(Calculator):
         )
         return not (callable(bins) and callable(prepared_response))
 
-    def calculate(self, atoms=None, properties=["energy"], system_changes=all_changes):
-        Calculator.calculate(self, atoms, properties, system_changes)
+    def _refresh_diagnostics(self):
+        if self._is_mace_les:
+            native_diagnostics = dict(self.evaluator.les_diagnostics)
+            native_diagnostics.update(
+                {
+                    "workspace": dict(self.evaluator.les_charge_workspace_diagnostics),
+                }
+            )
+            self.les_diagnostics = native_diagnostics
+        else:
+            self.les_diagnostics = None
+        self.correction_diagnostics = self._correction_pipeline.diagnostics()
 
-        evaluation_properties = list(dict.fromkeys(properties))
+    def _set_current_les_geometry(self, atoms):
+        if not self._is_mace_les:
+            return
+        self._les_geometry_setter(
+            np.ascontiguousarray(atoms.positions, dtype=np.float64),
+            np.ascontiguousarray(atoms.cell.array, dtype=np.float64),
+            np.ascontiguousarray(atoms.pbc, dtype=np.int32),
+        )
+
+    def _publish_les_results(self, atoms):
+        if not self._is_mace_les:
+            return
+        les_energy = float(self.evaluator.les_energy)
+        if not np.isfinite(les_energy):
+            raise ValueError("native LES energy must be finite")
+        self.results["les_energy"] = les_energy
+        self.results["mace_les_energy"] = float(self.results["energy"])
+        latent_charges = np.array(self.evaluator.latent_charges, dtype=float, copy=True)
+        if latent_charges.shape != (len(atoms),):
+            raise ValueError(
+                "native LES latent charges must have shape "
+                f"({len(atoms)},), got {latent_charges.shape}"
+            )
+        if not np.all(np.isfinite(latent_charges)):
+            raise ValueError("native LES latent charges must be finite")
+        self.results["latent_charges"] = latent_charges
+        self._refresh_diagnostics()
+
+    def calculate(self, atoms=None, properties=["energy"], system_changes=all_changes):
+        if self._is_mace_les and atoms is not None and not isinstance(atoms, Atoms):
+            raise ValueError("MACELES evaluates one ASE Atoms structure at a time")
+        Calculator.calculate(self, atoms, properties, system_changes)
+        family_frontend_adapter = getattr(self, "_family_frontend_adapter", None)
+
+        requested_properties = list(dict.fromkeys(properties))
+        evaluation_properties = list(requested_properties)
         stress_properties = [*evaluation_properties, "stress"]
         if (
             self.atoms.cell.rank == 3
@@ -3943,7 +5111,14 @@ class Symmetrix(Calculator):
         ):
             evaluation_properties.append("stress")
 
-        if self._can_use_native_geometry(evaluation_properties):
+        if family_frontend_adapter is not None:
+            native_geometry = self._can_use_native_geometry(evaluation_properties)
+            mace_inputs = self._mace_inputs(
+                self.atoms,
+                native_geometry=native_geometry,
+                allow_device_neighbor_graph=True,
+            )
+        elif self._can_use_native_geometry(evaluation_properties):
             mace_inputs = self._mace_inputs(
                 self.atoms,
                 native_geometry=True,
@@ -4001,7 +5176,11 @@ class Symmetrix(Calculator):
                 r,
                 i_list,
             ) = mace_inputs
-        if self._has_native_field_coupling():
+        if family_frontend_adapter is not None:
+            self.results = family_frontend_adapter.evaluate(
+                self, self.atoms, requested_properties, mace_inputs
+            )
+        elif self._has_native_field_coupling():
             electric_field = self._resolve_electric_field()
             self.results = self._calculate_macefield_results(
                 self.atoms,
@@ -4011,6 +5190,7 @@ class Symmetrix(Calculator):
             )
             self._macefield_electric_field = np.array(electric_field, copy=True)
         else:
+            self._set_current_les_geometry(self.atoms)
             graph_generation = self._compute_mace(mace_inputs, atoms=self.atoms)
             self.results = self._collect_mace_results(
                 self.atoms,
@@ -4018,7 +5198,37 @@ class Symmetrix(Calculator):
                 evaluation_properties,
                 graph_generation,
             )
-        self._add_dispersion_results(evaluation_properties)
+            self._publish_les_results(self.atoms)
+        if self.alchemical is not None:
+            self._alchemical_evaluated_version = self.alchemical.version
+        correction_pipeline = getattr(self, "_correction_pipeline", None)
+        if correction_pipeline:
+            correction_properties = [
+                name
+                for name in requested_properties
+                if name in _FIELD_ADDITIVE_PROPERTIES
+            ]
+            requested_additive = set(correction_properties)
+            for name in _FIELD_ADDITIVE_PROPERTIES:
+                if name not in requested_additive:
+                    self.results.pop(name, None)
+            correction_pipeline.add_results(
+                self.atoms, self.results, correction_properties
+            )
+            if self._is_mace_les and (
+                "energy" in requested_properties
+                or "free_energy" in requested_properties
+            ):
+                corrected_energy = self.results.get(
+                    "energy", self.results.get("free_energy")
+                )
+                if corrected_energy is not None:
+                    additive = self._correction_configurations
+                    if additive and isinstance(additive[0], D3Correction):
+                        self.results["d3_energy"] = (
+                            float(corrected_energy) - self.results["mace_les_energy"]
+                        )
+            self._refresh_diagnostics()
 
 
 class FieldContributionCalculator(Calculator):

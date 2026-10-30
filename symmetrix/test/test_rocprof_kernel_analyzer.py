@@ -423,3 +423,59 @@ def test_cli_writes_json_and_prints_table(analyzer, tmp_path, capsys):
     document = json.loads(output.read_text(encoding="utf-8"))
     assert document["schema"] == "symmetrix.rocprof-kernel-summary"
     assert document["kernels"][0]["name"] == "unknown, templated<one, two>"
+
+
+def test_les_profile_categories_report_per_evaluation(analyzer, tmp_path):
+    path = tmp_path / "les.csv"
+    _write_csv(
+        path,
+        ["Name", "Calls", "TotalDurationNs"],
+        [
+            {"Name": "LES reciprocal table", "Calls": 1, "TotalDurationNs": 100},
+            {"Name": "LES structure factors", "Calls": 4, "TotalDurationNs": 800},
+            {"Name": "LES periodic atom outputs", "Calls": 4, "TotalDurationNs": 1200},
+            {
+                "Name": "LES analytic reciprocal strain",
+                "Calls": 4,
+                "TotalDurationNs": 400,
+            },
+            {"Name": "LES charge readout gradient", "Calls": 8, "TotalDurationNs": 800},
+            {"Name": "LES compose adjoints", "Calls": 4, "TotalDurationNs": 200},
+        ],
+    )
+    summary = analyzer.summarize(path, evaluation_count=4)
+    categories = {item["category"]: item for item in summary["les_stage_categories"]}
+    assert summary["selected_evaluation_count"] == 4
+    assert categories["structure_factors"]["calls_per_evaluation"] == 1
+    assert categories["atom_outputs"]["duration_ns_per_evaluation"] == 300
+    assert "assemble_maceles" in categories
+    assert categories["assemble_maceles"]["display_name"] == "assemble MACELES"
+    assert categories["structure_factors"]["display_name"].startswith("LES stage:")
+
+
+def test_les_profile_rejects_dispersion_kernel(analyzer, tmp_path):
+    path = tmp_path / "bad-les.csv"
+    _write_csv(
+        path,
+        ["Name", "Calls", "TotalDurationNs"],
+        [{"Name": "D3 reciprocal kernel", "Calls": 1, "TotalDurationNs": 20}],
+    )
+    with pytest.raises(analyzer.AnalysisError, match="dispersion"):
+        analyzer.summarize(path, evaluation_count=1)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [{"Name": "unrelated kernel", "Calls": 1, "TotalDurationNs": 20}],
+        [
+            {"Name": "LES structure factors", "Calls": 1, "TotalDurationNs": 20},
+            {"Name": "LES periodic atom outputs", "Calls": 1, "TotalDurationNs": 20},
+        ],
+    ],
+)
+def test_les_profile_rejects_missing_steady_state_categories(analyzer, tmp_path, rows):
+    path = tmp_path / "incomplete-les.csv"
+    _write_csv(path, ["Name", "Calls", "TotalDurationNs"], rows)
+    with pytest.raises(analyzer.AnalysisError, match="missing.*LES categories"):
+        analyzer.summarize(path, evaluation_count=1)

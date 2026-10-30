@@ -212,7 +212,9 @@ void ZBLKokkos::compute_ZBL(
     Kokkos::View<const double*> xyz,
     Kokkos::View<double*> node_energies,
     Kokkos::View<double*> node_forces,
-    const int workspace_edge_begin)
+    const int workspace_edge_begin,
+    Kokkos::View<const double*> node_weights,
+    Kokkos::View<const double*> edge_weights)
 {
     Kokkos::parallel_for(
         "ZBLKokkos::compute_ZBL_prepared",
@@ -221,6 +223,8 @@ void ZBLKokkos::compute_ZBL(
             const int i = team_member.league_rank();
             const int i0 = first_neigh(i);
             const int Z_i = atomic_numbers(node_types(i));
+            const double node_weight = node_weights.data() == nullptr
+                ? 1.0 : node_weights(i);
             double e_i;
             Kokkos::parallel_reduce(
                 Kokkos::TeamThreadRange(team_member, num_neigh(i)),
@@ -230,13 +234,16 @@ void ZBLKokkos::compute_ZBL(
                     const int Z_j = atomic_numbers(neigh_types(edge));
                     const auto result = compute_value_gradient(
                         Z_i, Z_j, r(edge));
-                    local_energy += result.value;
+                    const double edge_weight = edge_weights.data() == nullptr
+                        ? 1.0 : edge_weights(edge);
+                    local_energy += edge_weight*result.value;
+                    const double force_weight = node_weight*edge_weight;
                     node_forces(3*workspace_edge) -=
-                        xyz(3*edge)/r(edge)*result.gradient;
+                        force_weight*xyz(3*edge)/r(edge)*result.gradient;
                     node_forces(3*workspace_edge+1) -=
-                        xyz(3*edge+1)/r(edge)*result.gradient;
+                        force_weight*xyz(3*edge+1)/r(edge)*result.gradient;
                     node_forces(3*workspace_edge+2) -=
-                        xyz(3*edge+2)/r(edge)*result.gradient;
+                        force_weight*xyz(3*edge+2)/r(edge)*result.gradient;
                 }, e_i);
             Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
                 node_energies(i) += e_i;
@@ -256,7 +263,9 @@ void ZBLKokkos::compute_ZBL(
     Kokkos::View<const float*> unit_direction,
     Kokkos::View<double*> node_energies,
     Kokkos::View<double*> node_forces,
-    const int workspace_edge_begin)
+    const int workspace_edge_begin,
+    Kokkos::View<const double*> node_weights,
+    Kokkos::View<const double*> edge_weights)
 {
     Kokkos::parallel_for(
         "ZBLKokkos::compute_ZBL_prepared_compact",
@@ -265,6 +274,8 @@ void ZBLKokkos::compute_ZBL(
             const int i = team_member.league_rank();
             const int i0 = first_neigh(i);
             const int Z_i = atomic_numbers(node_types(i));
+            const double node_weight = node_weights.data() == nullptr
+                ? 1.0 : node_weights(i);
             double e_i;
             Kokkos::parallel_reduce(
                 Kokkos::TeamThreadRange(team_member, num_neigh(i)),
@@ -274,13 +285,16 @@ void ZBLKokkos::compute_ZBL(
                     const int Z_j = atomic_numbers(neigh_types(edge));
                     const auto result = compute_value_gradient(
                         Z_i, Z_j, r(edge));
-                    local_energy += result.value;
+                    const double edge_weight = edge_weights.data() == nullptr
+                        ? 1.0 : edge_weights(edge);
+                    local_energy += edge_weight*result.value;
+                    const double force_weight = node_weight*edge_weight;
                     node_forces(3*workspace_edge) -=
-                        unit_direction(3*edge)*result.gradient;
+                        force_weight*unit_direction(3*edge)*result.gradient;
                     node_forces(3*workspace_edge+1) -=
-                        unit_direction(3*edge+1)*result.gradient;
+                        force_weight*unit_direction(3*edge+1)*result.gradient;
                     node_forces(3*workspace_edge+2) -=
-                        unit_direction(3*edge+2)*result.gradient;
+                        force_weight*unit_direction(3*edge+2)*result.gradient;
                 }, e_i);
             Kokkos::single(Kokkos::PerTeam(team_member), [&] () {
                 node_energies(i) += e_i;

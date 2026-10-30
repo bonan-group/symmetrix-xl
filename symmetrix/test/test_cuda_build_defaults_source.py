@@ -117,3 +117,30 @@ def test_gpu_backends_never_apply_native_host_architecture():
     "Try to use -march=native when compiling SpheriCart." FORCE)"""
         in core_source
     )
+
+
+def test_gpu_build_metadata_does_not_embed_source_tree_compiler_wrapper():
+    source = (ROOT / "symmetrix/CMakeLists.txt").read_text()
+
+    assert (
+        """if(_symmetrix_resolved_device_backend STREQUAL "NONE")
+  file(REAL_PATH "${CMAKE_CXX_COMPILER}" SYMMETRIX_BUILD_CXX_COMPILER_PATH)
+else()
+  # Device builds commonly use a source-tree nvcc_wrapper/hipcc shim.  Keep
+  # the diagnostic compiler name without baking that non-relocatable build
+  # path into the extension and wheel.
+  get_filename_component(SYMMETRIX_BUILD_CXX_COMPILER_PATH
+    "${CMAKE_CXX_COMPILER}" NAME)
+endif()"""
+        in source
+    )
+
+
+def test_exact_accelerator_blas_archive_remains_the_direct_link_input():
+    source = (ROOT / "libsymmetrix/CMakeLists.txt").read_text()
+
+    preserve = 'set(_symmetrix_blas_link_libraries "${BLAS_LIBRARIES}")'
+    normalize = 'set(_symmetrix_blas_normalized_libraries "")'
+    link = "PRIVATE ${_symmetrix_blas_link_libraries}"
+    assert source.index(preserve) < source.index(normalize)
+    assert link in source

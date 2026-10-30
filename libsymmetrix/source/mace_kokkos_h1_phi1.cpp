@@ -37,6 +37,7 @@
 #endif
 #include "cblas.hpp"
 #include "device_backend.hpp"
+#include "mace_device_backend.hpp"
 #include "kernel_launch_profile.hpp"
 #include "host_dense_kernels.hpp"
 #include "host_worker_blas.hpp"
@@ -1091,6 +1092,7 @@ void MACEKokkos<Precision>::compute_Phi1_streamed(
     const auto Phi1_lm2 = this->Phi1_lm2;
     const auto path_row_offsets = this->Phi1_path_row_offsets;
     const auto radial_1 = this->radial_1;
+    const auto edge_weights = alchemical_edge_weights;
     const auto Y = this->Y;
     const auto H1 = this->H1;
     auto Phi1r = this->Phi1r;
@@ -1129,7 +1131,9 @@ void MACEKokkos<Precision>::compute_Phi1_streamed(
                     Kokkos::TeamVectorRange(team_member, num_channels),
                     [=] (const int k) {
                         const Precision radial = radial_1.evaluate_function(
-                            edge_type, point, path*num_channels+k);
+                            edge_type, point, path*num_channels+k)
+                            * (edge_weights.data() == nullptr ? Precision(1)
+                                : static_cast<Precision>(edge_weights(edge)));
                         for (int row=row_begin; row<row_end; ++row)
                             phi1r_data[node*phi1r_row_stride
                                 +static_cast<std::size_t>(row)*phi1r_channels
@@ -1181,7 +1185,7 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
     Kokkos::View<const int*> neigh_types,
     Kokkos::View<const double*> r)
 {
-    if (!use_factorized_direct_jit_forward())
+    if (!use_factorized_direct_inference())
         throw std::logic_error(
             "Generated Execution R1 forward was called without an admitted artifact.");
     const bool receiver_local_phi1 = use_receiver_local_phi1();
@@ -1256,7 +1260,8 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                         H1.data(),
                         execution_a1_projection_weights.data(),
                         A1.data(),
-                        r_cut};
+                        r_cut,
+                        alchemical_edge_weights.data()};
                     const int persistent_blocks =
                         resolve_jit_device_plugin_persistent_blocks(
                             *jit_device_plugin,
@@ -1340,7 +1345,8 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                             Y.data(),
                             H1.data(),
                             Phi1.data(),
-                            r_cut};
+                            r_cut,
+                            alchemical_edge_weights.data()};
                         ExecutionDeviceBackend::check_status(
                             jit_device_plugin->launch_r1_tiled_forward(
                                 &args,
@@ -1444,7 +1450,8 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                     Y.data(),
                     H1.data(),
                     Phi1.data(),
-                    r_cut};
+                    r_cut,
+                    alchemical_edge_weights.data()};
                 const int persistent_blocks =
                     resolve_jit_device_plugin_persistent_blocks(
                         *jit_device_plugin,
@@ -1575,7 +1582,8 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                     Y.data(),
                     H1.data(),
                     Phi1.data(),
-                    r_cut};
+                    r_cut,
+                    alchemical_edge_weights.data()};
 #ifdef SYMMETRIX_ENABLE_METAL
                 if constexpr (std::is_same_v<Precision, float>) {
                     if (metal_r1_module) {

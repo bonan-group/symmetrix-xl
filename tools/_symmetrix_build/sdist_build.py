@@ -7,6 +7,7 @@ import re
 import shutil
 import sys
 import tarfile
+from collections import Counter
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -20,6 +21,7 @@ SUBMODULE_PATHS = (
     "libsymmetrix/external/json",
     "libsymmetrix/external/kokkos",
     "libsymmetrix/external/kokkos-kernels",
+    "libsymmetrix/external/kokkos-fft",
     "libsymmetrix/external/sphericart",
     "symmetrix/external/pybind11",
 )
@@ -32,9 +34,17 @@ SUPERPROJECT_ARCHIVE_PATHS = (
     "README.md",
 )
 
+SDIST_BUILD_TOOL_FILES = (
+    "generated_operator_codegen.py",
+    "prebuilt_operator_artifacts.py",
+)
+
 VENDOR_LICENSE_PATTERNS = ("LICENSE*", "LICENCE*", "COPYING*")
 VENDOR_NOTICE_OVERRIDES = {
     "libsymmetrix/external/cblas-prototypes": "README.md",
+    # KokkosFFT follows the REUSE specification: COPYRIGHT.md states the
+    # dual license and points at the per-license texts under LICENSES/.
+    "libsymmetrix/external/kokkos-fft": "COPYRIGHT.md",
 }
 
 REQUIRED_SDIST_MEMBERS = (
@@ -42,12 +52,42 @@ REQUIRED_SDIST_MEMBERS = (
     "pyproject.toml",
     "LICENSE",
     "source/symmetrix/__init__.py",
+    "source/symmetrix/mace_jit_cuda_plugin_abi.h",
+    "source/symmetrix/mace_nonlinear_jit_cuda_plugin_abi.h",
+    "source/symmetrix/foundation_oam_architectures.json",
+    "source/symmetrix/oam_architecture.py",
+    "source/symmetrix/oam_cuda_codegen.py",
+    "source/symmetrix/oam_cuda_plugin_abi.h",
+    "source/symmetrix/oam_installed_artifact.py",
+    "source/symmetrix/oam_jit_codegen.py",
+    "source/symmetrix/oam_jit_host_plugin_abi.h",
+    "source/symmetrix/oam_receiver_codegen.py",
     "external/pybind11/CMakeLists.txt",
     "libsymmetrix/CMakeLists.txt",
     "libsymmetrix/external/kokkos/CMakeLists.txt",
     "libsymmetrix/external/kokkos-kernels/CMakeLists.txt",
+    "libsymmetrix/external/kokkos-fft/CMakeLists.txt",
+    "libsymmetrix/external/kokkos-fft/LICENSES/MIT.txt",
+    "libsymmetrix/external/kokkos-fft/LICENSES/Apache-2.0.txt",
     "libsymmetrix/external/sphericart/sphericart/CMakeLists.txt",
     "libsymmetrix/external/json/CMakeLists.txt",
+    "tools/_symmetrix_build/generated_operator_codegen.py",
+    "tools/_symmetrix_build/prebuilt_operator_artifacts.py",
+)
+
+FORBIDDEN_SDIST_COMPONENTS = frozenset(
+    {
+        ".agents",
+        ".artifacts",
+        ".cache",
+        ".codex",
+        ".pytest_cache",
+        ".ruff_cache",
+        "__pycache__",
+    }
+)
+FORBIDDEN_SDIST_SUFFIXES = frozenset(
+    {".cubin", ".model", ".nequip", ".pt", ".pth", ".pyc", ".so"}
 )
 
 
@@ -197,7 +237,7 @@ def verify_vendored_licenses(
 
 
 def make_sdist_tree_self_contained(staged_tree: Path) -> None:
-    """Move the core beside the frontend files used as the sdist root."""
+    """Place core and build-only generation adapters inside the sdist root."""
     source = staged_tree / "libsymmetrix"
     destination = staged_tree / "symmetrix" / "libsymmetrix"
     if not source.is_dir():
@@ -205,6 +245,14 @@ def make_sdist_tree_self_contained(staged_tree: Path) -> None:
     if destination.exists():
         raise BuildError(f"staged core destination already exists: {destination}")
     source.rename(destination)
+    build_tool_source = staged_tree / "tools" / "_symmetrix_build"
+    build_tool_destination = staged_tree / "symmetrix" / "tools" / "_symmetrix_build"
+    build_tool_destination.mkdir(parents=True)
+    for filename in SDIST_BUILD_TOOL_FILES:
+        source_file = build_tool_source / filename
+        if not source_file.is_file():
+            raise BuildError(f"sdist build adapter is missing: {source_file}")
+        shutil.copy2(source_file, build_tool_destination / filename)
 
 
 def verify_sdist_rebuilds_from_itself(
@@ -241,14 +289,14 @@ def verify_sdist_rebuilds_from_itself(
         raise BuildError(
             f"{sdist_path.name} does not contain the expected project root {root}"
         )
-    print(f"[sdist] smoke check: rebuilding {root} from itself", flush=True)
+    print(f"[sdist] smoke check: building a wheel from {root}", flush=True)
     result = runner.run_logged(
-        (python, "-m", "build", "--sdist", "--outdir", str(output), str(source)),
+        (python, "-m", "build", "--wheel", "--outdir", str(output), str(source)),
         staging_root / "sdist-smoke.log",
     )
     if result.returncode != 0:
         raise BuildError(
-            f"smoke check failed: {sdist_path.name} cannot be rebuilt from "
+            f"smoke check failed: {sdist_path.name} cannot build a wheel from "
             f"itself; see {staging_root / 'sdist-smoke.log'}"
         )
 
@@ -311,6 +359,16 @@ def verify_sdist_contents(sdist_path: Path, version: str) -> dict[str, Any]:
         raise BuildError(
             f"cannot read source distribution {sdist_path}: {error}"
         ) from error
+    counts = Counter(names)
+    duplicates = sorted(name for name, count in counts.items() if count > 1)
+    if duplicates:
+        detail = ", ".join(duplicates[:10])
+        if len(duplicates) > 10:
+            detail += f", ... ({len(duplicates)} duplicate paths total)"
+        raise BuildError(
+            f"source distribution {sdist_path.name} contains duplicate archive "
+            f"member paths: {detail}"
+        )
     members = set(names)
     missing = [
         f"{root}/{member}"
@@ -334,13 +392,41 @@ def verify_sdist_contents(sdist_path: Path, version: str) -> dict[str, Any]:
             f"source distribution {sdist_path.name} does not record VENDORED_DEPS.json"
         )
     for name in names:
-        if ".git" in PurePosixPath(name).parts:
+        member = PurePosixPath(name)
+        forbidden = FORBIDDEN_SDIST_COMPONENTS.intersection(member.parts)
+        if forbidden:
+            raise BuildError(
+                f"source distribution {sdist_path.name} contains cache, benchmark, "
+                f"or private-work member: {name}"
+            )
+        if len(member.parts) > 1 and member.parts[1] == "benchmarks":
+            raise BuildError(
+                f"source distribution {sdist_path.name} contains cache, benchmark, "
+                f"or private-work member: {name}"
+            )
+        if ".git" in member.parts:
             raise BuildError(
                 f"source distribution {sdist_path.name} contains VCS metadata: {name}"
+            )
+        if "_operator_artifacts" in member.parts:
+            raise BuildError(
+                f"source distribution {sdist_path.name} contains a generated "
+                f"operator package data member: {name}"
+            )
+        if "generated-operator-artifacts" in member.parts:
+            raise BuildError(
+                f"source distribution {sdist_path.name} contains generated "
+                f"operator build-tree content: {name}"
+            )
+        if member.suffix.lower() in FORBIDDEN_SDIST_SUFFIXES:
+            raise BuildError(
+                f"source distribution {sdist_path.name} contains a generated "
+                f"binary or private-model member: {name}"
             )
     return {
         "filename": sdist_path.name,
         "members": len(names),
+        "unique_members": len(members),
         "sha256": sha256_file(sdist_path),
         "size": sdist_path.stat().st_size,
     }
@@ -406,12 +492,13 @@ def run_sdist_command(
             f"found {len(produced)}"
         )
     version = frontend_version(repo_root)
+    sdist_record = verify_sdist_contents(produced[0], version)
     verify_sdist_rebuilds_from_itself(produced[0], python, runner, staging, version)
     record = {
         "source_commit": source_commit,
         "submodules": pinned,
         "licenses": licenses,
-        "sdist": verify_sdist_contents(produced[0], version),
+        "sdist": sdist_record,
     }
     (staging / "sdist-record.json").write_text(
         json.dumps(record, indent=2, sort_keys=True) + "\n"

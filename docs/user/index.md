@@ -12,6 +12,7 @@ getting_started
 installation
 models
 execution
+dispersion_corrections
 backends
 metal
 lammps

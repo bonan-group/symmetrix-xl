@@ -18,12 +18,12 @@ class DummySymmetrix(Symmetrix):
         cutoff=6.0,
         atomic_numbers=(1, 8),
         dtype="float64",
-        use_kokkos=True,
         streamed_edges="direct",
         low_memory=True,
         neighbor_skin=0.5,
     ):
         Calculator.__init__(self)
+        self._alchemical = None
         self.offset = float(offset)
         self.evaluator = SimpleNamespace(
             has_field_coupling=field_aware,
@@ -32,7 +32,6 @@ class DummySymmetrix(Symmetrix):
         )
         self._native_model_type = "MACEField" if field_aware else "MACE"
         self._kernel_launch_dtype = dtype
-        self.use_kokkos = use_kokkos
         self.streamed_edges = streamed_edges
         self.low_memory = low_memory
         self.neighbor_skin = neighbor_skin
@@ -122,8 +121,7 @@ def test_model_files_construct_members_with_shared_options(monkeypatch):
         ("cutoff", 5.0, "cutoff"),
         ("atomic_numbers", (1, 6, 8), "atomic-number mapping"),
         ("dtype", "float32", "precision"),
-        ("use_kokkos", False, "Kokkos selection"),
-        ("streamed_edges", "generic", "streamed-edge mode"),
+        ("streamed_edges", "reference", "streamed-edge routing"),
         ("low_memory", False, "low-memory policy"),
         ("neighbor_skin", 0.0, "neighbor skin"),
     ],

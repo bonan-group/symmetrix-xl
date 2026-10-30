@@ -27,6 +27,33 @@ The authoritative build list is the `SYMMETRIX_KOKKOS` source block in
 scheduling contract: with the current equal-priority Ninja graph, longer CUDA
 owners are listed first so they enter the ready queue before shorter owners.
 
+## The MACE_Nonlinear (MH-1) partition
+
+The MH-1 evaluator is partitioned the same way, and the same test covers it.
+Three translation units instantiate `MaceNonlinearKokkosT` from one
+implementation body:
+
+| Source | Responsibility |
+|---|---|
+| `mace_nonlinear_kokkos_components.cpp` | `SYMMETRIX_MACE_NONLINEAR_KOKKOS_PART 1`; includes the body |
+| `mace_nonlinear_kokkos_runtime.cpp` | `SYMMETRIX_MACE_NONLINEAR_KOKKOS_PART 2`; includes the body and asserts the family-adapter interface |
+| `mace_nonlinear_kokkos_evaluate.cpp` | `SYMMETRIX_MACE_NONLINEAR_KOKKOS_PART 3`; includes the body |
+
+`mace_nonlinear_kokkos_impl.tpp` is an implementation body, not a shared
+header: it is included only by those three owners, so it is listed in no build
+file and carried by no shared layer.
+
+`mace_nonlinear_stage.hpp` is the family's stage description. The interaction
+layer count, every layer's R and M forward and reverse profiling region name,
+and the ordered forward and reverse execution schedules are its **data**, built
+from a layer count, so an evaluator that admits a different interaction count
+profiles and dispatches it through the same value instead of a compiled-in
+two-layer table. The region spelling it emits is the one
+`benchmarks/analyze_rocprof_kernels.py` decodes, so a description built for any
+count keeps the profile contract readable. The evaluator holds one description
+built from the validated model's layer count and reads its regions and phase
+ordinals from it.
+
 ## Private shared contracts
 
 Four headers under `libsymmetrix/source/` carry implementation details that
@@ -60,6 +87,22 @@ unrelated owners parse the same implementation.
 - Keep the standard M0/R0 module bodies and launch profiles under
   `libsymmetrix/source/`. Runtime-generated R1 code belongs to the JIT compiler
   and cache rather than a checked-in generated-source directory.
+- A family-owned extension point on a shared class stays behind an opaque
+  handle: the shared class declares the handle and the entry points, the family
+  layer defines them and owns the state. `E3TensorProductKokkosT`
+  (`e3nn_kokkos.hpp`) holds `direct_execution_plan_` this way, with the plan
+  layout and every kernel that reads it in
+  `mace_nonlinear_mh1_fast_path.{hpp,cpp}`, and `E3ProductBasisKokkosT`
+  (`e3nn_product_kokkos.hpp`) holds `compiled_host_plan_` this way, with the
+  frozen term plan and its accumulation kernels in
+  `mace_nonlinear_product_host_plan.cpp`. Shared translation units and shared
+  headers must not include family headers or carry family state, so a consumer
+  that never installs a plan keeps the generic schedule.
+- A family-owned specialization of a shared template lives with the family that
+  owns the types it names: `device_backend.hpp` keeps the host-neutral
+  environment probes and the primary `DeviceBackendTraits` template, while the
+  CUDA/HIP specializations and device-scope guards that alias the MACE JIT ABI
+  packet structs and plugin classes live in `mace_device_backend.{hpp,cpp}`.
 
 ## Rebuild expectations
 

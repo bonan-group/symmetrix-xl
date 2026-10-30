@@ -47,6 +47,7 @@ public:
         const std::vector<double>& first_contribution,
         const std::vector<double>& second_contribution,
         const std::vector<double>& output_adjoint) const;
+    const std::vector<double>& runtime_parameters() const;
     const std::vector<double>& evaluate_conditioned_batch(
         const std::vector<double>& input,
         int samples,
@@ -59,6 +60,7 @@ public:
         std::vector<double>& input_adjoint,
         AffineMLPBatchWorkspace& workspace) const;
 
+
 private:
     struct Layer {
         enum class Type { Linear, LayerNorm, SiLU };
@@ -70,6 +72,7 @@ private:
         std::vector<double> bias;
     };
 
+    mutable std::vector<double> runtime_parameters_cache_;
     std::vector<Layer> layers;
     std::vector<double> evaluate_impl(
         const std::vector<double>& input,

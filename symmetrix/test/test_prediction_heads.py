@@ -1,11 +1,17 @@
+import shutil
+import subprocess
+from pathlib import Path
+
 import pytest
 from symmetrix.prediction_heads import (
     available_prediction_heads,
     select_prediction_head,
 )
 
+ROOT = Path(__file__).resolve().parents[2]
 
-def _multihead_model():
+
+def _multihead_model(model_type="MACE"):
     def payload(energy):
         return {
             "atomic_energies": [energy],
@@ -15,7 +21,7 @@ def _multihead_model():
         }
 
     return {
-        "model_type": "MACE",
+        "model_type": model_type,
         "atomic_energies": [1.0],
         "prediction_heads": {
             "schema_version": 1,
@@ -80,3 +86,117 @@ def test_prediction_head_schema_rejects_invalid_metadata(mutation, message):
 def test_select_prediction_head_rejects_unknown_name():
     with pytest.raises(ValueError, match="available heads"):
         select_prediction_head(_multihead_model(), "missing")
+
+
+def test_select_prediction_head_projects_matching_maceles_parameters():
+    model = _multihead_model("MACELES")
+    model["les"] = {"schema": "symmetrix.model.mace_les", "version": 1}
+    for index, payload in enumerate(
+        model["prediction_heads"]["parameters"].values(), 1
+    ):
+        payload["les"] = {
+            "schema": "symmetrix.model.mace_les",
+            "version": 1,
+            "readout_1_weights": [11.0 * index],
+        }
+
+    selected = select_prediction_head(model, "second")
+
+    assert selected["les"]["readout_1_weights"] == [22.0]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda payload: payload.pop("les"),
+        lambda payload: payload.update(extra_les_parameter=[]),
+    ],
+)
+def test_maceles_prediction_head_rejects_missing_or_extra_parameters(mutation):
+    model = _multihead_model("MACELES")
+    model["les"] = {"schema": "symmetrix.model.mace_les", "version": 1}
+    for payload in model["prediction_heads"]["parameters"].values():
+        payload["les"] = {"schema": "symmetrix.model.mace_les", "version": 1}
+    mutation(model["prediction_heads"]["parameters"]["first"])
+
+    with pytest.raises(ValueError, match="supported fields"):
+        available_prediction_heads(model)
+
+
+def test_ordinary_mace_rejects_intrinsic_les_parameters():
+    model = _multihead_model()
+    model["les"] = {"schema": "symmetrix.model.mace_les", "version": 1}
+
+    with pytest.raises(ValueError, match="MACELES"):
+        available_prediction_heads(model)
+
+
+@pytest.fixture(scope="module")
+def prediction_head_cpp_probe(tmp_path_factory):
+    compiler = shutil.which("c++") or shutil.which("g++")
+    if compiler is None:
+        pytest.skip("a C++ compiler is required for the prediction-head contract probe")
+    directory = tmp_path_factory.mktemp("prediction-head-cpp")
+    source = directory / "probe.cpp"
+    executable = directory / "probe"
+    source.write_text(
+        r"""
+#include <stdexcept>
+#include <string>
+
+#include "mace_prediction_heads.hpp"
+
+int main(int argc, char** argv)
+{
+    const std::string mode = argc > 1 ? argv[1] : "valid";
+    nlohmann::json payload = {
+        {"atomic_energies", {1.0}},
+        {"readout_1_weights", {2.0}},
+        {"readout_2_weights_1", {3.0}},
+        {"readout_2_weights_2", {4.0}},
+    };
+    if (mode != "missing")
+        payload["les"] = {{"schema", "symmetrix.model.mace_les"}, {"version", 1}};
+    if (mode == "extra")
+        payload["extra_les_parameter"] = nlohmann::json::array();
+    nlohmann::json data = {
+        {"model_type", "MACELES"},
+        {"les", {{"schema", "symmetrix.model.mace_les"}, {"version", 1}}},
+        {"prediction_heads", {
+            {"schema_version", 1},
+            {"names", {"only"}},
+            {"default", "only"},
+            {"parameters", {{"only", payload}}},
+        }},
+    };
+    const bool expect_error = mode != "valid";
+    try {
+        const auto selected = select_prediction_head(data);
+        return expect_error || !selected.contains("les") ? 2 : 0;
+    } catch (const std::invalid_argument&) {
+        return expect_error ? 0 : 3;
+    }
+}
+"""
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++20",
+            "-I",
+            str(ROOT / "libsymmetrix/source"),
+            "-I",
+            str(ROOT / "libsymmetrix/external/json/single_include"),
+            str(source),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+        cwd=ROOT,
+    )
+    return executable
+
+
+@pytest.mark.parametrize("mode", ["valid", "missing", "extra"])
+def test_cpp_maceles_prediction_head_contract(prediction_head_cpp_probe, mode):
+    subprocess.run([prediction_head_cpp_probe, mode], check=True)

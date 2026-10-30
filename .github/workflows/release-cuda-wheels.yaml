@@ -28,8 +28,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release-metadata:
+    name: Verify release metadata and publication ref
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate version sources and release tag
+        run: |
+          python tools/check_release_metadata.py
+          if [[ "${{ inputs.publish_pypi }}" == "true" ]]; then
+            python tools/check_release_metadata.py --require-tag
+          fi
+
   build:
     name: Build CUDA ${{ matrix.cuda_major }} ${{ matrix.target }}
+    needs: release-metadata
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

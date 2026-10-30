@@ -1,10 +1,14 @@
 import json
+import gc
+import shutil
 from pathlib import Path
 
 import numpy as np
 import pytest
 from compact_r1_model import foundation_r1_test_model
 from symmetrix import symmetrix as native_symmetrix
+from symmetrix.mace_jit_device_artifact import prepare_jit_device_artifact
+from symmetrix.mace_jit_host_artifact import prepare_jit_host_artifact
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2] / "libsymmetrix" / "source"
@@ -81,8 +85,167 @@ def test_native_graph_cardinality_guard_covers_counts_and_model_strides(
         evaluator._validate_graph_cardinality(2, 1, 0)
 
 
-def test_prepared_factorized_graph_passes_cardinality_admission(compact_model_path):
+def test_exact_target_generated_r0_host_plugin_is_admitted(
+    compact_model_path, tmp_path, monkeypatch
+):
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    if native_symmetrix._kokkos_default_execution_space() not in ("OpenMP", "Serial"):
+        pytest.skip("generated R0 host plugins require a host Kokkos build")
+    if shutil.which("c++") is None:
+        pytest.skip("generated R0 host plugins require a host C++ compiler")
+
+    from symmetrix.jit import (
+        HOST_TARGET_ENVIRONMENT_VARIABLE,
+        artifact_cache_inputs,
+        prepare_jit_artifact,
+        probe_compiler_identity,
+        resolve_host_jit_policy,
+    )
+    from symmetrix.mace_jit_operator_codegen import (
+        OPERATOR_ARTIFACT_ENVELOPE,
+        render_jit_r0_host_plugin,
+    )
+
+    environment = native_symmetrix._execution_device_execution_environment()
+    assert environment["backend"] == "host"
+    monkeypatch.setenv(HOST_TARGET_ENVIRONMENT_VARIABLE, "x86-64-v3")
+    compiler_command, _ = probe_compiler_identity()
+    host_policy = resolve_host_jit_policy(compiler_command)
+    model_data = json.loads(compact_model_path.read_text())
+    source, metadata = render_jit_r0_host_plugin(
+        model_data["execution_contracts"]["R0"],
+        precision="float32",
+        target=host_policy.effective_target,
+    )
+    artifact = prepare_jit_artifact(
+        source,
+        abi=artifact_cache_inputs(metadata, OPERATOR_ARTIFACT_ENVELOPE),
+        build={"operator": metadata},
+        cxx=compiler_command,
+        cxx_flags=None,
+        host_policy=host_policy,
+        cache_root=tmp_path / "r0-cache",
+        artifact_name="r0_host_x86_64_v3",
+    )
+    assert artifact.available, (artifact.reason, artifact.diagnostics)
+
     evaluator = native_symmetrix.MACEKokkosFloat(str(compact_model_path))
+    evaluator._load_r0_host_plugin(
+        str(artifact.artifact_path), False, host_policy.effective_target
+    )
+
+    assert metadata["generated_identity"]["target"] == host_policy.effective_target
+    assert host_policy.effective_target == "host-isa-x86-64-v3"
+    assert evaluator.r0_host_plugin_ready
+    assert evaluator.r0_host_plugin_artifact_id == metadata["artifact_id"]
+
+
+def test_calculator_uses_exact_m0_resolution_for_package_mode(
+    compact_model_path, tmp_path, monkeypatch
+):
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    if native_symmetrix._kokkos_default_execution_space() not in ("OpenMP", "Serial"):
+        pytest.skip("generated R0 host plugins require a host Kokkos build")
+    if shutil.which("c++") is None:
+        pytest.skip("generated R0 host plugins require a host C++ compiler")
+
+    from symmetrix import Symmetrix
+    from symmetrix.jit import (
+        CACHE_ENVIRONMENT_VARIABLE,
+        HOST_TARGET_ENVIRONMENT_VARIABLE,
+    )
+
+    environment = native_symmetrix._execution_device_execution_environment()
+    assert environment["backend"] == "host"
+    assert environment["architecture"] == "host"
+    monkeypatch.setenv(CACHE_ENVIRONMENT_VARIABLE, str(tmp_path / "calculator-cache"))
+    monkeypatch.delenv(HOST_TARGET_ENVIRONMENT_VARIABLE, raising=False)
+
+    calculator = Symmetrix(
+        compact_model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        low_memory=True,
+    )
+
+    try:
+        m0 = calculator.jit_operator_modules["M0"]
+        if m0["implementation"] == "host_plugin":
+            from symmetrix.installed_operator_artifact import (
+                installed_operator_build_target,
+            )
+
+            assert m0["target"] == installed_operator_build_target(
+                native_module=native_symmetrix, backend="host"
+            )
+            assert m0["target"] != "host"
+            assert calculator.evaluator.m0_host_plugin_ready
+            assert calculator.evaluator.m0_host_plugin_artifact_id == m0["artifact_id"]
+        else:
+            # Standard M0 stays compiler-free for off/r0 packages. Full packages
+            # may instead take the exact installed host plugin above.
+            assert m0["status"] == "builtin"
+            assert m0["implementation"] == "builtin"
+            assert m0["compiler"] is None
+            assert calculator.evaluator.m0_implementation == "builtin"
+    finally:
+        del calculator
+        gc.collect()
+
+
+def _load_direct_artifact(evaluator, model_path, execution_space, cache_root):
+    """Load the generated R1 artifact the build's execution space serves.
+
+    The direct routing is the contract-bound generated plan, and the family
+    prepares one artifact per execution space: the host R1 library on a host
+    build and the device R1 module on a CUDA/HIP build, each loaded through its
+    own entry point.  A device build has no host plugin path at all, so the
+    backend decides which adapter is exercised rather than which is preferred.
+    """
+    if execution_space in ("OpenMP", "Serial"):
+        artifact = prepare_jit_host_artifact(
+            model_path, precision="float32", cache_root=cache_root
+        )
+        evaluator._load_jit_host_plugin(str(artifact.artifact_path))
+        return
+    backend = execution_space.lower()
+    artifact = prepare_jit_device_artifact(
+        model_path, precision="float32", backend=backend, cache_root=cache_root
+    )
+    loader = getattr(evaluator, f"_load_jit_{backend}_plugin")
+    if backend == "cuda":
+        loader(
+            str(artifact.artifact_path),
+            artifact.edge_policy["persistent_blocks_per_compute_unit"],
+        )
+    else:
+        loader(str(artifact.artifact_path))
+
+
+def test_prepared_factorized_graph_passes_cardinality_admission(
+    compact_model_path, tmp_path
+):
+    """A valid graph is admitted on the prepared routing and scheduled.
+
+    The prepared (direct) routing is the plan against a contract-bound generated
+    R1 artifact, so the graph is admitted only once that artifact is loaded:
+    without it the entry point fails closed instead of scheduling a graph.  The
+    test therefore drives the routing the way the family conformance cases do,
+    preparing the artifact the build's own execution space serves, and
+    initializes Kokkos itself because the evaluator aborts without an
+    initialized runtime.
+    """
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    execution_space = native_symmetrix._kokkos_default_execution_space()
+    if execution_space in ("OpenMP", "Serial") and shutil.which("c++") is None:
+        pytest.skip("the compact model's R1 host artifact requires a host C++ compiler")
+    evaluator = native_symmetrix.MACEKokkosFloat(str(compact_model_path))
+    _load_direct_artifact(
+        evaluator, compact_model_path, execution_space, tmp_path / "jit-cache"
+    )
     evaluator.set_streamed_edges("direct")
     token = evaluator._prepare_factorized_graph(
         2,

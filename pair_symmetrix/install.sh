@@ -51,10 +51,36 @@ case $script_dir in
         ;;
 esac
 
-ln -sfn -- "$script_dir/pair_symmetrix_mace.h" \
-    "$lammps_dir/src/pair_symmetrix_mace.h"
-ln -sfn -- "$script_dir/pair_symmetrix_mace.cpp" \
-    "$lammps_dir/src/pair_symmetrix_mace.cpp"
+# Retired pair-style sources: the serial `symmetrix/mace` style is gone, so a
+# checkout that installed an earlier revision still carries its symlinks and
+# LAMMPS's own source glob would keep compiling them.  Remove the link (never a
+# regular file the user put there) before linking the retained sources.  The
+# base-header link is kept when it already points at the anchor installed below.
+anchor_target="$script_dir/pair_symmetrix_mace_anchor.h"
+for retired in pair_symmetrix_mace.h pair_symmetrix_mace.cpp; do
+    destination="$lammps_dir/src/$retired"
+    if [ -L "$destination" ]; then
+        if [ "$destination" -ef "$anchor_target" ]; then
+            continue
+        fi
+        rm -f -- "$destination"
+    fi
+done
+
+# LAMMPS discovers a package style by pairing the base header
+# src/pair_<name>.h with src/KOKKOS/pair_<name>_kokkos.h, so the Kokkos pair
+# style needs a base header even though no non-Kokkos style exists.  Install the
+# anchor under that name; a file the user placed there is left untouched.
+if [ ! -e "$lammps_dir/src/pair_symmetrix_mace.h" ]; then
+    ln -sfn -- "$anchor_target" "$lammps_dir/src/pair_symmetrix_mace.h"
+fi
+
+polar_anchor_target="$script_dir/pair_symmetrix_mace_polar_anchor.h"
+if [ ! -e "$lammps_dir/src/pair_symmetrix_mace_polar.h" ]; then
+    ln -sfn -- "$polar_anchor_target" \
+        "$lammps_dir/src/pair_symmetrix_mace_polar.h"
+fi
+
 ln -sfn -- "$script_dir/compute_symmetrix_timing.h" \
     "$lammps_dir/src/compute_symmetrix_timing.h"
 ln -sfn -- "$script_dir/compute_symmetrix_timing.cpp" \
@@ -63,6 +89,12 @@ ln -sfn -- "$script_dir/pair_symmetrix_mace_kokkos.h" \
     "$lammps_dir/src/KOKKOS/pair_symmetrix_mace_kokkos.h"
 ln -sfn -- "$script_dir/pair_symmetrix_mace_kokkos.cpp" \
     "$lammps_dir/src/KOKKOS/pair_symmetrix_mace_kokkos.cpp"
+ln -sfn -- "$script_dir/pair_symmetrix_mace_polar_admission.hpp" \
+    "$lammps_dir/src/KOKKOS/pair_symmetrix_mace_polar_admission.hpp"
+ln -sfn -- "$script_dir/pair_symmetrix_mace_polar_kokkos.h" \
+    "$lammps_dir/src/KOKKOS/pair_symmetrix_mace_polar_kokkos.h"
+ln -sfn -- "$script_dir/pair_symmetrix_mace_polar_kokkos.cpp" \
+    "$lammps_dir/src/KOKKOS/pair_symmetrix_mace_polar_kokkos.cpp"
 
 cmake_file="$lammps_dir/cmake/CMakeLists.txt"
 temporary_file=$(mktemp "$lammps_dir/cmake/CMakeLists.symmetrix.XXXXXX")

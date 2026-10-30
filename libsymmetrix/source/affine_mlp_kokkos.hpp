@@ -104,14 +104,19 @@ public:
 
 private:
     enum LayerType : int { Linear = 0, LayerNorm = 1, SiLU = 2 };
-    Kokkos::View<int*,Kokkos::SharedSpace> types;
-    Kokkos::View<int*,Kokkos::SharedSpace> input_sizes;
-    Kokkos::View<int*,Kokkos::SharedSpace> output_sizes;
-    Kokkos::View<Precision*,Kokkos::SharedSpace> eps;
-    Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace> weights;
-    Kokkos::View<Kokkos::View<Precision*>*,Kokkos::SharedSpace> biases;
-    Kokkos::View<TapeView*,Kokkos::SharedSpace> values;
-    Kokkos::View<TapeView*,Kokkos::SharedSpace> adjoints;
+    // These arrays hold view handles and scalar layer metadata selected by the
+    // host before each launch. Device kernels receive the selected inner views
+    // directly, so unified ownership only makes their pages ping-pong between
+    // host and device without making any data more accessible.
+    Kokkos::View<int*,Kokkos::HostSpace> types;
+    Kokkos::View<int*,Kokkos::HostSpace> input_sizes;
+    Kokkos::View<int*,Kokkos::HostSpace> output_sizes;
+    Kokkos::View<Precision*,Kokkos::HostSpace> eps;
+    Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::HostSpace>
+        weights;
+    Kokkos::View<Kokkos::View<Precision*>*,Kokkos::HostSpace> biases;
+    Kokkos::View<TapeView*,Kokkos::HostSpace> values;
+    Kokkos::View<TapeView*,Kokkos::HostSpace> adjoints;
     std::shared_ptr<Workspace> workspace_=std::make_shared<Workspace>();
     mutable Kokkos::View<Precision**,Kokkos::LayoutRight> conditioned_weight;
     mutable int conditioned_input_size=-1;

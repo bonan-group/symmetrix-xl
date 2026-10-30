@@ -345,7 +345,6 @@ def _worker(args: argparse.Namespace) -> int:
     try:
         setup_started = time.perf_counter()
         calculator_options = {
-            "use_kokkos": True,
             "dtype": args.dtype,
             "streamed_edges": "direct" if is_mh1 else "factorized",
             "neighbor_skin": args.neighbor_skin,

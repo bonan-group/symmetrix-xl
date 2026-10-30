@@ -33,6 +33,7 @@
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
 #include "device_backend.hpp"
+#include "mace_device_backend.hpp"
 #include "factorized_blas.hpp"
 
 namespace {

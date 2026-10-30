@@ -36,6 +36,47 @@ constexpr FactorizedBlasScalar factorized_blas_scalar =
     std::is_same_v<Precision,float>
         ? FactorizedBlasScalar::float32 : FactorizedBlasScalar::float64;
 
+// The MH-0 second-interaction contraction, expressed for the column-major BLAS
+// API from the row-major operands the M1/A1 views carry.  The row-major problem
+//     C(m x n) = A(m x k) * B(k x n)
+// is computed as its transpose
+//     C^T(n x m) = B^T(n x k) * A^T(k x m),
+// so the caller passes the operands in the order (B, A, C) and each leading
+// dimension is the row stride of the row-major operand it describes.  A stride
+// of zero on the first operand is the shared-weight broadcast: one weight
+// matrix serves every node in the batch.
+template<typename Precision>
+constexpr FactorizedStridedBatchedGemmDescriptor
+make_mh0_second_interaction_gemm_descriptor(
+    const std::int32_t batch,
+    const std::int32_t rows,
+    const std::int32_t inner,
+    const std::int32_t columns,
+    const std::int64_t stride_a,
+    const std::int64_t stride_b,
+    const std::int64_t stride_c)
+{
+    static_assert(
+        std::is_same_v<Precision,float> || std::is_same_v<Precision,double>);
+    return {
+        FactorizedBlasTranspose::none,
+        FactorizedBlasTranspose::none,
+        factorized_blas_scalar<Precision>,
+        columns,
+        rows,
+        inner,
+        columns,
+        inner,
+        columns,
+        stride_b,
+        stride_a,
+        stride_c,
+        batch,
+        1.0,
+        0.0,
+    };
+}
+
 template<typename Precision>
 constexpr FactorizedStridedBatchedGemmDescriptor
 make_execution_reverse_gemm_descriptor(

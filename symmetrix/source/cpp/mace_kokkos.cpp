@@ -4,8 +4,10 @@
 #include <pybind11/stl.h>
 
 #include "device_environment.hpp"
+#include "mace_kokkos_binding_helpers.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <memory>
 #include <numeric>
@@ -19,57 +21,63 @@ using ContiguousIntArray =
     py::array_t<int, py::array::c_style | py::array::forcecast>;
 using ContiguousDoubleArray =
     py::array_t<double, py::array::c_style | py::array::forcecast>;
+using symmetrix::python::detail::shaped_array;
+using symmetrix::python::detail::view_prefix_1d;
+using symmetrix::python::detail::view_prefix_3d;
 
-template <typename T>
-py::array_t<T> shaped_array(
-    const std::vector<T>& values,
-    const std::initializer_list<py::ssize_t> shape)
+// Serialization of the neutral family-interface data the evaluators expose.
+// The dict keys are the cross-language spelling of the interface, so they live
+// in one place per binding unit rather than inline in each property.
+
+py::list operand_contracts_to_python(
+    const std::vector<symmetrix::execution::BufferContract>& contracts)
 {
-    std::size_t expected_size = 1;
-    for (const py::ssize_t extent : shape) {
-        if (extent < 0)
-            throw std::invalid_argument("A NumPy export extent is negative.");
-        expected_size *= static_cast<std::size_t>(extent);
+    py::list result;
+    for (const auto& contract : contracts) {
+        py::dict entry;
+        entry["name"] = contract.name;
+        entry["dtype"] = contract.dtype;
+        entry["shape"] = contract.shape;
+        entry["layout"] = contract.layout.order;
+        entry["irreps"] = contract.layout.irreps;
+        result.append(entry);
     }
-    if (expected_size != values.size())
-        throw std::logic_error("A NumPy export shape is inconsistent.");
-    py::array_t<T> result(shape);
-    std::copy(values.begin(), values.end(), result.mutable_data());
     return result;
 }
 
-template <typename ViewType>
-auto view_prefix_1d(const ViewType& view, const std::size_t extent)
+py::dict implementation_precision_to_python(
+    const symmetrix::execution::PrecisionPolicy& precision)
 {
-    using T = typename ViewType::non_const_value_type;
-    if (view.extent(0) < extent)
-        throw std::logic_error("A benchmark export view is too small.");
-    const auto host = Kokkos::create_mirror_view_and_copy(
-        Kokkos::HostSpace(), view);
-    auto result = std::vector<T>(extent);
-    for (std::size_t i=0; i<extent; ++i)
-        result[i] = host(i);
+    py::dict result;
+    result["compute"] = precision.compute;
+    result["accumulator"] = precision.accumulator;
     return result;
 }
 
-template <typename ViewType>
-auto view_prefix_3d(
-    const ViewType& view,
-    const std::size_t extent_0,
-    const std::size_t extent_1,
-    const std::size_t extent_2)
+py::list family_bindings_to_python(
+    const std::vector<symmetrix::execution::ImplementationBinding>& bindings)
 {
-    using T = typename ViewType::non_const_value_type;
-    if (view.extent(0) < extent_0
-        || view.extent(1) != extent_1
-        || view.extent(2) != extent_2)
-        throw std::logic_error("A benchmark export tensor extent is invalid.");
-    auto host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), view);
-    auto result = std::vector<T>(extent_0*extent_1*extent_2);
-    for (std::size_t i=0; i<extent_0; ++i)
-        for (std::size_t j=0; j<extent_1; ++j)
-            for (std::size_t k=0; k<extent_2; ++k)
-                result[(i*extent_1+j)*extent_2+k] = host(i,j,k);
+    py::list result;
+    for (const auto& binding : bindings) {
+        py::dict entry;
+        entry["operator_id"] = binding.operator_id;
+        entry["kind"] = !binding.custom_kind.empty()
+            ? binding.custom_kind
+            : operator_kind_name(binding.kind);
+        entry["capability_key"] = binding.capability_key;
+        entry["implementation_id"] = binding.implementation_id;
+        entry["selected_implementation_id"] = binding.selected_implementation_id;
+        entry["tier"] = implementation_tier_name(binding.tier);
+        entry["target"] = binding.target;
+        entry["precision"] = implementation_precision_to_python(
+            binding.precision);
+        entry["identity_fingerprint"] = binding.identity_fingerprint;
+        entry["qualified"] = binding.qualified;
+        entry["portable_covered"] = binding.portable_covered;
+        entry["artifact_required"] = binding.artifact_required;
+        entry["reason"] = binding.reason;
+        result.append(entry);
+    }
     return result;
 }
 
@@ -263,6 +271,12 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
         .def(py::init(&load_mace_kokkos<Precision>),
             py::arg("filename"), py::arg("head") = "")
         .def("set_streamed_edges", &MACEKokkos<Precision>::set_streamed_edges)
+        .def("_begin_factorized_distributed_evaluation_for_testing",
+            [] (MACEKokkos<Precision>& self) {
+                const auto empty = Kokkos::View<const double*>();
+                self.begin_factorized_distributed_evaluation(
+                    0, 0, empty, empty, 0);
+            })
         .def("_set_execution_plan_request",
             &MACEKokkos<Precision>::set_execution_plan_request,
             py::arg("algorithm"), py::arg("profile"),
@@ -273,7 +287,7 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                 const auto& report = self.execution_plan_report();
                 py::dict result;
                 result["requested_algorithm"] =
-                    mace_streamed_edges_mode_name(report.requested_algorithm);
+                    execution_mode_name(report.requested_algorithm);
                 result["requested_profile"] =
                     symmetrix::execution::execution_profile_name(
                         report.requested_profile);
@@ -289,13 +303,114 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                     py::dict entry;
                     entry["id"] = candidate.id;
                     entry["qualified"] = candidate.qualified;
-                    entry["estimated_bytes"] = candidate.estimated_bytes;
+                    entry["estimated_bytes"] = candidate.estimated_bytes
+                        ? py::cast(*candidate.estimated_bytes) : py::none();
                     entry["reason"] = candidate.reason;
                     candidates.append(entry);
                 }
                 result["candidates"] = candidates;
+                // Additive tier-binding fields.  Every key above is unchanged;
+                // these two state which tier serves each operator node.
+                result["binding_report_version"] = report.binding_report_version;
+                result["bindings"] = family_bindings_to_python(report.bindings);
                 return result;
             })
+        .def_property_readonly("family_capabilities",
+            [] (const MACEKokkos<Precision>& self) {
+                const auto capabilities = self.family_capabilities();
+                py::dict result;
+                result["target"] = capabilities.target;
+                result["precision"] = capabilities.precision;
+                result["reference"] = capabilities.reference_ready;
+                result["portable"] = capabilities.portable_ready;
+                result["generated"] = capabilities.generated_ready;
+                result["stress"] = capabilities.stress;
+                result["field"] = capabilities.field;
+                result["parameter_gradients"] = capabilities.parameter_gradients;
+                result["host_artifact"] = capabilities.loads_host_artifact;
+                result["device_artifact"] = capabilities.loads_device_artifact;
+                return result;
+            })
+        .def_property_readonly("family_program",
+            [] (const MACEKokkos<Precision>& self) {
+                const auto program = self.compile_program();
+                py::dict result;
+                result["family"] = program.family;
+                result["precision"] = program.precision;
+                result["version"] = program.version;
+                result["fingerprint"] = program.fingerprint;
+                py::list operators;
+                for (const auto& node : program.operators) {
+                    py::dict entry;
+                    entry["kind"] = operator_kind_name(node);
+                    entry["id"] = node.id;
+                    entry["capability_key"] = node.capability_key;
+                    py::dict parameters;
+                    for (const auto& [name, value] : node.parameters)
+                        parameters[py::str(name)] = value;
+                    entry["parameters"] = parameters;
+                    entry["inputs"] = operand_contracts_to_python(node.inputs);
+                    entry["outputs"] = operand_contracts_to_python(node.outputs);
+                    operators.append(entry);
+                }
+                result["operators"] = operators;
+                return result;
+            })
+        .def_property_readonly("family_binding_report",
+            [] (const MACEKokkos<Precision>& self) {
+                const auto report = self.family_binding_report();
+                py::dict result;
+                result["version"] = report.version;
+                result["target"] = report.target;
+                result["precision"] = report.precision;
+                result["artifact_ready"] = report.artifact_ready;
+                result["admitted"] = report.admitted;
+                result["node_count"] = report.node_count;
+                result["portable_node_count"] = report.portable_node_count;
+                result["bindings"] = family_bindings_to_python(report.bindings);
+                return result;
+            })
+        .def_property_readonly("family_artifact_ready",
+            &MACEKokkos<Precision>::family_artifact_ready)
+        .def_property_readonly("family_artifact_readiness",
+            [] (const MACEKokkos<Precision>& self) {
+                const auto readiness = self.family_artifact_readiness();
+                py::dict result;
+                result["ready"] = readiness.ready;
+                result["target"] = readiness.target;
+                result["artifact_id"] = readiness.artifact_id;
+                result["generation_fingerprint"] = readiness.generation_fingerprint;
+                result["semantic_fingerprint"] = readiness.semantic_fingerprint;
+                result["structure_fingerprint"] = readiness.structure_fingerprint;
+                result["reason"] = readiness.reason;
+                return result;
+            })
+        .def_property_readonly("family_diagnostics",
+            [] (const MACEKokkos<Precision>& self) {
+                const auto diagnostics = self.family_diagnostics();
+                py::dict result;
+                result["fallback_count"] = diagnostics.fallback_count;
+                result["diagnostic"] = diagnostics.diagnostic;
+                return result;
+            })
+        .def("load_family_artifact",
+            [] (MACEKokkos<Precision>& self, const std::string& path,
+                const std::string& target) {
+                symmetrix::execution::ArtifactRequest request;
+                request.path = path;
+                request.target = target;
+                const auto readiness = self.load_family_artifact(request);
+                py::dict result;
+                result["ready"] = readiness.ready;
+                result["target"] = readiness.target;
+                result["artifact_id"] = readiness.artifact_id;
+                result["generation_fingerprint"] = readiness.generation_fingerprint;
+                result["semantic_fingerprint"] = readiness.semantic_fingerprint;
+                result["structure_fingerprint"] = readiness.structure_fingerprint;
+                result["reason"] = readiness.reason;
+                return result;
+            },
+            py::arg("path"), py::arg("target") = "host")
         .def("_load_jit_cuda_plugin",
             &MACEKokkos<Precision>::load_jit_cuda_plugin,
             py::arg("path"),
@@ -313,12 +428,29 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             py::arg("persistent_blocks_per_compute_unit") = 8)
         .def("_load_m0_host_plugin",
             &MACEKokkos<Precision>::load_m0_host_plugin)
+        .def("_load_m1_device_module",
+            &MACEKokkos<Precision>::load_m1_device_module,
+            py::arg("path"),
+            py::arg("schedule") = "chunk32",
+            py::arg("persistent_blocks_per_compute_unit") = 8)
+        .def("_load_m1_host_plugin",
+            &MACEKokkos<Precision>::load_m1_host_plugin)
         .def("_load_r0_device_module",
             &MACEKokkos<Precision>::load_r0_device_module,
             py::arg("path"),
-            py::arg("persistent_blocks_per_compute_unit") = 8)
+            py::arg("persistent_blocks_per_compute_unit") = 8,
+            py::arg("apply_edge_weights") = false,
+            py::arg("schedule") = "receiver-edge16")
+        .def("_load_r0_host_plugin",
+            &MACEKokkos<Precision>::load_r0_host_plugin,
+            py::arg("path"), py::arg("apply_edge_weights") = false,
+            py::arg("target") = "host")
+        .def("_set_r0_artifact_origin",
+            &MACEKokkos<Precision>::set_r0_artifact_origin)
         .def("_load_jit_host_plugin",
             &MACEKokkos<Precision>::load_jit_host_plugin)
+        .def("_set_direct_artifact_diagnostic",
+            &MACEKokkos<Precision>::set_direct_artifact_diagnostic)
         .def("_load_metal_r1_module",
             &MACEKokkos<Precision>::load_metal_r1_module,
             py::arg("source"),
@@ -352,14 +484,12 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             py::arg("term_count"))
         .def("_metal_m1_module_ready",
             &MACEKokkos<Precision>::metal_m1_module_ready)
+        .def("_set_metal_module_ready_for_testing",
+            &MACEKokkos<Precision>::set_metal_module_ready_for_testing)
         .def("_metal_statistics",
             &MACEKokkos<Precision>::metal_statistics)
         .def("_metal_r1_device_name",
             &MACEKokkos<Precision>::metal_r1_device_name)
-        .def("_set_factorized_direct_forward_executor",
-            &MACEKokkos<Precision>::set_factorized_direct_forward_executor)
-        .def("_set_factorized_direct_reverse_executor",
-            &MACEKokkos<Precision>::set_factorized_direct_reverse_executor)
         .def("_set_standard_r0_executor",
             &MACEKokkos<Precision>::set_standard_r0_executor)
         .def("_set_standard_m0_executor",
@@ -492,6 +622,22 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             [] (const MACEKokkos<Precision>& self) {
                 return self.standard_m1_module_reverse_launch_count;
             })
+        .def_property_readonly("generated_m1_module_forward_launch_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.generated_m1_module_forward_launch_count;
+            })
+        .def_property_readonly("generated_m1_module_reverse_launch_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.generated_m1_module_reverse_launch_count;
+            })
+        .def_property_readonly("m1_model_payload_verified",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.m1_model_payload_verified;
+            })
+        .def_property_readonly("m1_module_fallback_reason",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.m1_module_fallback_reason;
+            })
         .def_property_readonly("mh0_state_policy",
             &MACEKokkos<Precision>::mh0_state_policy_name)
         .def_property_readonly("mh0_state_policy_request",
@@ -514,8 +660,24 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             &MACEKokkos<Precision>::mh0_m0_adjoint_allocation_count_value)
         .def_property_readonly("mh0_m0_alias_detach_count",
             &MACEKokkos<Precision>::mh0_m0_alias_detach_count_value)
+        .def_readonly("mh0_a0_adjoint_allocation_count",
+            &MACEKokkos<Precision>::mh0_a0_adjoint_allocation_count)
+        .def_readonly("mh0_a1_adjoint_allocation_count",
+            &MACEKokkos<Precision>::mh0_a1_adjoint_allocation_count)
+        .def("_test_mh0_adjoint_addresses",
+            [] (const MACEKokkos<Precision>& self) {
+                return py::make_tuple(
+                    reinterpret_cast<std::uintptr_t>(self.M0_adj.data()),
+                    reinterpret_cast<std::uintptr_t>(self.M0.data()),
+                    reinterpret_cast<std::uintptr_t>(self.A0_adj.data()),
+                    reinterpret_cast<std::uintptr_t>(self.A0.data()),
+                    reinterpret_cast<std::uintptr_t>(self.A1_adj.data()),
+                    reinterpret_cast<std::uintptr_t>(self.A1.data()));
+            })
         .def_property_readonly("readout_workspace_bytes",
             &MACEKokkos<Precision>::readout_workspace_bytes)
+        .def_property_readonly("a1_blas_flatten_workspace_bytes",
+            &MACEKokkos<Precision>::a1_blas_flatten_workspace_bytes)
         .def_property_readonly("readout_policy",
             &MACEKokkos<Precision>::readout_policy_name)
         .def_property_readonly("phi1_policy",
@@ -796,8 +958,35 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             "m0_device_module_schedule",
             &MACEKokkos<Precision>::m0_device_module_schedule_name)
         .def_property_readonly(
+            "m1_device_module_ready",
+            &MACEKokkos<Precision>::m1_device_module_ready)
+        .def_property_readonly(
+            "m1_host_plugin_ready",
+            &MACEKokkos<Precision>::m1_host_plugin_ready)
+        .def_property_readonly(
+            "m1_host_plugin_path",
+            &MACEKokkos<Precision>::m1_host_plugin_path)
+        .def_property_readonly(
+            "m1_host_plugin_artifact_id",
+            &MACEKokkos<Precision>::m1_host_plugin_artifact_id)
+        .def_property_readonly(
+            "m1_device_module_path",
+            &MACEKokkos<Precision>::m1_device_module_path)
+        .def_property_readonly(
+            "m1_device_module_artifact_id",
+            &MACEKokkos<Precision>::m1_device_module_artifact_id)
+        .def_property_readonly(
             "r0_device_module_ready",
             &MACEKokkos<Precision>::r0_device_module_ready)
+        .def_property_readonly(
+            "r0_host_plugin_ready",
+            &MACEKokkos<Precision>::r0_host_plugin_ready)
+        .def_property_readonly(
+            "r0_host_plugin_path",
+            &MACEKokkos<Precision>::r0_host_plugin_path)
+        .def_property_readonly(
+            "r0_host_plugin_artifact_id",
+            &MACEKokkos<Precision>::r0_host_plugin_artifact_id)
         .def_property_readonly(
             "r0_device_module_path",
             &MACEKokkos<Precision>::r0_device_module_path)
@@ -1040,6 +1229,18 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             })
         .def_property_readonly("factorized_custom_blas_launch_count",
             &MACEKokkos<Precision>::factorized_custom_blas_launch_count)
+        .def_property_readonly("batched_a1_blas_launch_count",
+            &MACEKokkos<Precision>::batched_a1_blas_launch_count)
+        .def_property_readonly("admits_batched_a1_blas",
+            &MACEKokkos<Precision>::admits_batched_a1_blas)
+        .def_property_readonly("m1_device_terms_launch_count",
+            &MACEKokkos<Precision>::m1_device_terms_launch_count)
+        .def_property_readonly("admits_m1_device_terms",
+            &MACEKokkos<Precision>::admits_m1_device_terms)
+        .def_property_readonly("device_h2_stage_launch_count",
+            &MACEKokkos<Precision>::device_h2_stage_launch_count)
+        .def_property_readonly("admits_device_h2_stages",
+            &MACEKokkos<Precision>::admits_device_h2_stages)
         .def_property_readonly("factorized_blas_stream_bind_count",
             &MACEKokkos<Precision>::factorized_blas_stream_bind_count)
         .def_property_readonly("factorized_last_graph_prepare_ms",
@@ -1052,7 +1253,7 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             })
         .def_property_readonly("factorized_source_owned_reverse",
             [] (const MACEKokkos<Precision>& self) {
-                return mace_uses_prepared_execution(self.streamed_edges)
+                return uses_prepared_execution(self.streamed_edges)
                     && self.factorized_schedule_build_count > 0;
             })
         .def_property_readonly("standard_r0_module_ready",
@@ -1097,6 +1298,19 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             &MACEKokkos<Precision>::standard_m0_selected_executor_name)
         .def_property_readonly("r0_implementation",
             &MACEKokkos<Precision>::r0_implementation_name)
+        .def_property_readonly("_r0_loader_implementation",
+            &MACEKokkos<Precision>::r0_loader_implementation_name)
+        .def_property_readonly("r0_backend",
+            &MACEKokkos<Precision>::r0_backend_name)
+        .def_property_readonly("r0_artifact_origin",
+            [] (const MACEKokkos<Precision>& self) -> py::object {
+                const auto origin = self.r0_artifact_origin_name();
+                return origin.empty() ? py::none() : py::cast(origin);
+            })
+        .def_property_readonly("r0_schedule",
+            &MACEKokkos<Precision>::r0_schedule_name)
+        .def_property_readonly("r0_profile",
+            &MACEKokkos<Precision>::r0_profile_name)
         .def_property_readonly("m0_implementation",
             &MACEKokkos<Precision>::m0_implementation_name)
         .def_property_readonly("r0_module_id",
@@ -1190,12 +1404,8 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
         .def_property_readonly(
             "factorized_derivative_signature",
             &MACEKokkos<Precision>::factorized_derivative_signature_name)
-        .def_property_readonly("factorized_direct_forward_executor",
-            &MACEKokkos<Precision>::factorized_direct_forward_executor_name)
         .def_property_readonly("factorized_selected_direct_forward_executor",
             &MACEKokkos<Precision>::factorized_selected_direct_forward_executor_name)
-        .def_property_readonly("factorized_direct_reverse_executor",
-            &MACEKokkos<Precision>::factorized_direct_reverse_executor_name)
         .def_property_readonly("factorized_selected_direct_reverse_executor",
             &MACEKokkos<Precision>::factorized_selected_direct_reverse_executor_name)
         .def_property_readonly("factorized_jit_ready",
@@ -1213,7 +1423,7 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             })
         .def_property_readonly("execution_phi1r_active_bytes",
             [] (const MACEKokkos<Precision>& self) {
-                return self.use_factorized_direct_jit_forward()
+                return self.use_factorized_direct_inference()
                     ? std::size_t(0)
                     : sizeof(Precision)*self.Phi1r.size();
             })
@@ -1227,7 +1437,7 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             })
         .def_property_readonly("execution_dphi1r_active_bytes",
             [] (const MACEKokkos<Precision>& self) {
-                return self.use_factorized_direct_jit_reverse()
+                return self.use_factorized_direct_inference()
                     ? std::size_t(0)
                     : sizeof(Precision)*self.dPhi1r.size();
             })
@@ -1558,6 +1768,23 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                     std::span<const double>(positions.data(), positions.size()));
             },
             py::arg("graph_generation"), py::arg("positions"))
+        .def("_set_alchemical_weights",
+            [] (MACEKokkos<Precision>& self,
+                    const std::uint64_t graph_generation,
+                    ContiguousDoubleArray node_weights,
+                    ContiguousDoubleArray edge_weights) {
+                if (node_weights.ndim() != 1 || edge_weights.ndim() != 1)
+                    throw std::invalid_argument(
+                        "Alchemical coefficient arrays must be one-dimensional.");
+                self.set_alchemical_weights(
+                    graph_generation,
+                    std::span<const double>(node_weights.data(), node_weights.size()),
+                    std::span<const double>(edge_weights.data(), edge_weights.size()));
+            },
+            py::arg("graph_generation"), py::arg("node_weights"),
+            py::arg("edge_weights"))
+        .def_property_readonly("alchemical_weights_active",
+            &MACEKokkos<Precision>::alchemical_weights_active)
         .def("_prepare_factorized_graph",
             [] (MACEKokkos<Precision>& self,
                     const int num_nodes,
@@ -2105,7 +2332,7 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                     ContiguousIntArray edge_sources,
                     const std::uint64_t execution_graph_generation) {
                 if (execution_graph_generation != 0) {
-                    if (self.streamed_edges == MACEStreamedEdgesMode::generic)
+                    if (self.streamed_edges == ExecutionMode::generic)
                         self.reduce_prepared_all_interactions_node_forces(
                             execution_graph_generation);
                     else
@@ -2135,7 +2362,7 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                     ContiguousDoubleArray xyz,
                     const std::uint64_t execution_graph_generation) {
                 if (execution_graph_generation != 0) {
-                    if (self.streamed_edges == MACEStreamedEdgesMode::generic)
+                    if (self.streamed_edges == ExecutionMode::generic)
                         self.reduce_prepared_all_interactions_stress(
                             volume, execution_graph_generation);
                     else

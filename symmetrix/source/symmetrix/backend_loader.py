@@ -113,9 +113,15 @@ _native_module = None
 
 
 def _cpu_descriptor(frontend_version: str) -> BackendDescriptor:
-    installed = Path(__file__).with_name("_backend_cpu.json")
-    if installed.is_file():
-        return _read_descriptor(installed)
+    package = sys.modules.get(__package__)
+    package_paths = getattr(package, "__path__", ())
+    candidates = [Path(value) / "_backend_cpu.json" for value in package_paths]
+    adjacent = Path(__file__).with_name("_backend_cpu.json")
+    if adjacent not in candidates:
+        candidates.append(adjacent)
+    for installed in candidates:
+        if installed.is_file():
+            return _read_descriptor(installed)
     return BackendDescriptor(
         selector="cpu",
         backend="cpu",
@@ -511,6 +517,21 @@ def load_backend(frontend_version: str, request: str | None = None):
                 f"loaded module {module_name} reports source content "
                 f"{built_source!r}, expected {descriptor.source_content_sha256!r}"
             )
+        built_commit = str(build_info.get("source_commit", ""))
+        if descriptor.source_commit and built_commit != descriptor.source_commit:
+            raise BackendError(
+                f"loaded module {module_name} reports source commit "
+                f"{built_commit!r}, expected {descriptor.source_commit!r}"
+            )
+        if descriptor.source_dirty is not None:
+            built_dirty = build_info.get("source_dirty")
+            if not isinstance(built_dirty, bool) or (
+                built_dirty != descriptor.source_dirty
+            ):
+                raise BackendError(
+                    f"loaded module {module_name} reports source_dirty "
+                    f"{built_dirty!r}, expected {descriptor.source_dirty!r}"
+                )
     _selected = descriptor
     _native_module = native
     sys.modules["symmetrix.symmetrix"] = native

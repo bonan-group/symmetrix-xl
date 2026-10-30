@@ -217,6 +217,7 @@ def test_mh0_state_report_tracks_reused_and_auxiliary_bytes(monkeypatch):
         "reused_state_bytes": 17_252_352,
         "auxiliary_state_bytes": 13_824,
         "readout_workspace_bytes": 0,
+        "a1_blas_flatten_workspace_bytes": 0,
         "readout_policy": "retained",
     }
 

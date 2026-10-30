@@ -40,6 +40,8 @@ mkdir -p "$raw_dir" "$repaired_dir"
 "$build_python" tools/symmetrix_build.py wheel \
   --backend cpu \
   --cpu-target "$CPU_TARGET" \
+  --prebuilt-operator-artifacts r0 \
+  --prebuilt-oam-artifacts known \
   --build-root /tmp/build \
   --wheel-dir "$raw_dir" \
   --jobs "${JOBS:-4}"

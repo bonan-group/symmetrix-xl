@@ -14,9 +14,10 @@ struct E3ProductBasisBatchWorkspace {
     std::vector<double> feature_adjoint;
 };
 
-// Product-basis evaluation used by EquivariantProductBasisBlock.  The MACE
-// schema stores the U tensors emitted by mace.tools.cg, allowing this class to
-// evaluate arbitrary correlation order without Python or e3nn at runtime.
+// Product-basis evaluation used by EquivariantProductBasisBlock.  The
+// serialized schema stores the U tensors emitted by the model's Clebsch-Gordan
+// tooling, allowing this class to evaluate arbitrary correlation order without
+// Python or e3nn at runtime.
 class E3ProductBasis {
 public:
     struct Tensor {
@@ -102,8 +103,8 @@ private:
         int element,
         double output_adjoint,
         std::vector<double>& feature_major_adjoint) const;
-    bool has_mh1_product_layout(const nlohmann::json& data) const;
-    void compile_mh1_product();
+    bool has_compiled_product_layout(const nlohmann::json& data) const;
+    void build_compiled_plan();
     void evaluate_compiled(
         const std::vector<double>& feature_major,
         int element,

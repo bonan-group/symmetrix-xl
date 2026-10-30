@@ -1,0 +1,18 @@
+{
+  "architecture": "@SYMMETRIX_BACKEND_ARCHITECTURE@",
+  "backend": "@SYMMETRIX_DEVELOPMENT_BACKEND@",
+  "compiler": "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@",
+  "distribution": "@SYMMETRIX_DISTRIBUTION_NAME@",
+  "frontend_version": "@SYMMETRIX_FRONTEND_VERSION@",
+  "module": "@SYMMETRIX_PYTHON_MODULE_NAME@",
+  "native_abi": 1,
+  "native_source_content_sha256": "@SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256@",
+  "package": "@SYMMETRIX_PYTHON_INSTALL_PACKAGE@",
+  "schema_version": 1,
+  "selector": "@SYMMETRIX_DEVELOPMENT_DESCRIPTOR_SELECTOR@",
+  "source_commit": "@SYMMETRIX_BUILD_SOURCE_COMMIT@",
+  "source_content_sha256": "@SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256@",
+  "source_dirty": @SYMMETRIX_BUILD_SOURCE_DIRTY@,
+  "target_manifest_fingerprint": "@SYMMETRIX_TARGET_MANIFEST_FINGERPRINT@",
+  "toolkit": "@SYMMETRIX_DEVELOPMENT_TOOLKIT@"
+}

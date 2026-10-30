@@ -1,0 +1,467 @@
+{
+  "adopted_convention": "continuous",
+  "adopted_convention_expression": "abs(sinc(m/N))**p",
+  "adopted_convention_rationale": "specification section 5.2: v1 follows the NVIDIA v0.5.0 continuous cardinal B-spline symbol because the acceptance criterion is v0.5.0 fixture agreement",
+  "binding_expectations": {
+    "cardinal_bspline_integer_values": "exact Eulerian-number ratios A(p-1, t)/(p-1)!, derived by integer recursion rather than by the module's Cox-de Boor recursion",
+    "discrete_symbol_closed_form": "the same independent route at an on-node fractional coordinate, which is where the discrete symbol is exact",
+    "exact_attenuation": "exact DFT of the centred cardinal B-spline sampled at the mesh nodes, evaluated from its truncated-power closed form"
+  },
+  "cardinal_bspline_integer_values": {
+    "2": [
+      1.0,
+      0.0
+    ],
+    "3": [
+      0.5,
+      0.5,
+      0.0
+    ],
+    "4": [
+      0.16666666666666666,
+      0.6666666666666666,
+      0.16666666666666666,
+      0.0
+    ],
+    "5": [
+      0.041666666666666664,
+      0.4583333333333333,
+      0.4583333333333333,
+      0.041666666666666664,
+      0.0
+    ],
+    "6": [
+      0.008333333333333333,
+      0.21666666666666667,
+      0.55,
+      0.21666666666666667,
+      0.008333333333333333,
+      0.0
+    ]
+  },
+  "non_binding_expectations": {
+    "continuous_symbol": "self-consistency only: abs(sinc(m/N))**p, the same expression as the module under test",
+    "discrete_symbol": "self-consistency only: sampled-stencil DFT, the same construction as the module under test",
+    "measured_attenuation": "self-consistency only: this generator's stencil placement and Cox-de Boor recursion duplicate the module under test, so agreement is not evidence"
+  },
+  "open_item": "specification section 5.2: the discrete symbol is the exact attenuation only when the stencil aligns with integer node offsets; for a generic fractional coordinate the assignment attenuation matches neither closed form exactly",
+  "probes": [
+    {
+      "cell_length_angstrom": 8.0,
+      "continuous_symbol": [
+        1.0,
+        0.9496412035517837,
+        0.8105694691387021,
+        0.6149905055064261,
+        0.40528473456935116
+      ],
+      "discrete_symbol": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "discrete_symbol_closed_form": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "exact_attenuation": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "fractional_coordinate": 0.0,
+      "measured_attenuation": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "mesh_size": 8,
+      "miller": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "spacing_angstrom": 1.0,
+      "spline_order": 2
+    },
+    {
+      "cell_length_angstrom": 8.0,
+      "continuous_symbol": [
+        1.0,
+        0.9496412035517837,
+        0.8105694691387021,
+        0.6149905055064261,
+        0.40528473456935116
+      ],
+      "discrete_symbol": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "discrete_symbol_closed_form": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "exact_attenuation": [
+        1.0,
+        0.992891121139398,
+        0.9755152894752599,
+        0.9578242957675218,
+        0.9504000000000001
+      ],
+      "fractional_coordinate": 0.3719,
+      "measured_attenuation": [
+        1.0,
+        0.992891121139398,
+        0.9755152894752599,
+        0.9578242957675218,
+        0.9504000000000001
+      ],
+      "mesh_size": 8,
+      "miller": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "spacing_angstrom": 1.0,
+      "spline_order": 2
+    },
+    {
+      "cell_length_angstrom": 8.0,
+      "continuous_symbol": [
+        1.0,
+        0.9018184154832803,
+        0.6570228642997974,
+        0.37821332186304946,
+        0.1642557160749494
+      ],
+      "discrete_symbol": [
+        0.9999999999999999,
+        0.9023689270621825,
+        0.6666666666666666,
+        0.43096440627115085,
+        0.33333333333333337
+      ],
+      "discrete_symbol_closed_form": [
+        0.9999999999999999,
+        0.9023689270621824,
+        0.6666666666666665,
+        0.4309644062711508,
+        0.33333333333333337
+      ],
+      "exact_attenuation": [
+        0.9999999999999999,
+        0.9023689270621824,
+        0.6666666666666665,
+        0.4309644062711508,
+        0.33333333333333337
+      ],
+      "fractional_coordinate": 0.0,
+      "measured_attenuation": [
+        0.9999999999999999,
+        0.9023689270621824,
+        0.6666666666666665,
+        0.4309644062711508,
+        0.33333333333333337
+      ],
+      "mesh_size": 8,
+      "miller": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "spacing_angstrom": 1.0,
+      "spline_order": 4
+    },
+    {
+      "cell_length_angstrom": 8.0,
+      "continuous_symbol": [
+        1.0,
+        0.9018184154832803,
+        0.6570228642997974,
+        0.37821332186304946,
+        0.1642557160749494
+      ],
+      "discrete_symbol": [
+        0.9999999999999999,
+        0.9023689270621825,
+        0.6666666666666666,
+        0.43096440627115085,
+        0.33333333333333337
+      ],
+      "discrete_symbol_closed_form": [
+        0.9999999999999999,
+        0.9023689270621824,
+        0.6666666666666665,
+        0.4309644062711508,
+        0.33333333333333337
+      ],
+      "exact_attenuation": [
+        1.0000000000000469,
+        0.9023596155047843,
+        0.6665180643520777,
+        0.4302865256418628,
+        0.3321235906560657
+      ],
+      "fractional_coordinate": 0.3719,
+      "measured_attenuation": [
+        0.9999999999999999,
+        0.9023596155047385,
+        0.6665180643520733,
+        0.4302865256418006,
+        0.33212359065599995
+      ],
+      "mesh_size": 8,
+      "miller": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "spacing_angstrom": 1.0,
+      "spline_order": 4
+    },
+    {
+      "cell_length_angstrom": 12.0,
+      "continuous_symbol": [
+        1.0,
+        0.9552354156601234,
+        0.8315445626294311,
+        0.6570228642997974,
+        0.46774381647905516,
+        0.29649719458133195,
+        0.1642557160749494
+      ],
+      "discrete_symbol": [
+        0.9999999999999999,
+        0.9553418012614795,
+        0.8333333333333334,
+        0.6666666666666666,
+        0.5,
+        0.3779915320718539,
+        0.33333333333333337
+      ],
+      "discrete_symbol_closed_form": [
+        0.9999999999999999,
+        0.9553418012614794,
+        0.8333333333333329,
+        0.6666666666666662,
+        0.4999999999999992,
+        0.37799153207185365,
+        0.33333333333333337
+      ],
+      "exact_attenuation": [
+        0.9999999999999999,
+        0.9553418012614794,
+        0.8333333333333329,
+        0.6666666666666662,
+        0.4999999999999992,
+        0.37799153207185365,
+        0.33333333333333337
+      ],
+      "fractional_coordinate": 0.0,
+      "measured_attenuation": [
+        0.9999999999999999,
+        0.9553418012614794,
+        0.8333333333333329,
+        0.6666666666666662,
+        0.4999999999999992,
+        0.37799153207185365,
+        0.33333333333333337
+      ],
+      "mesh_size": 12,
+      "miller": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "spacing_angstrom": 1.0,
+      "spline_order": 4
+    },
+    {
+      "cell_length_angstrom": 12.0,
+      "continuous_symbol": [
+        1.0,
+        0.9552354156601234,
+        0.8315445626294311,
+        0.6570228642997974,
+        0.46774381647905516,
+        0.29649719458133195,
+        0.1642557160749494
+      ],
+      "discrete_symbol": [
+        0.9999999999999999,
+        0.9553418012614795,
+        0.8333333333333334,
+        0.6666666666666666,
+        0.5,
+        0.3779915320718539,
+        0.33333333333333337
+      ],
+      "discrete_symbol_closed_form": [
+        0.9999999999999999,
+        0.9553418012614794,
+        0.8333333333333329,
+        0.6666666666666662,
+        0.4999999999999992,
+        0.37799153207185365,
+        0.33333333333333337
+      ],
+      "exact_attenuation": [
+        0.9999999999999822,
+        0.9551439327067257,
+        0.8299799704970121,
+        0.6484028315569871,
+        0.43831185363050407,
+        0.22124022533512386,
+        0.037131361536241414
+      ],
+      "fractional_coordinate": 0.3719,
+      "measured_attenuation": [
+        1.0,
+        0.9551439327067393,
+        0.8299799704971262,
+        0.6484028315570664,
+        0.43831185363026687,
+        0.22124022533493337,
+        0.0371313615360004
+      ],
+      "mesh_size": 12,
+      "miller": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "spacing_angstrom": 1.0,
+      "spline_order": 4
+    },
+    {
+      "cell_length_angstrom": 8.0,
+      "continuous_symbol": [
+        1.0,
+        0.8564039254647049,
+        0.5325626743274763,
+        0.23259760200182142,
+        0.06657033429093458
+      ],
+      "discrete_symbol": [
+        1.0,
+        0.8564129385141707,
+        0.5333333333333334,
+        0.24358706148582948,
+        0.13333333333333336
+      ],
+      "discrete_symbol_closed_form": [
+        1.0,
+        0.8564129385141707,
+        0.5333333333333333,
+        0.24358706148582954,
+        0.13333333333333336
+      ],
+      "exact_attenuation": [
+        1.0,
+        0.8564129385141707,
+        0.5333333333333333,
+        0.24358706148582954,
+        0.13333333333333336
+      ],
+      "fractional_coordinate": 0.0,
+      "measured_attenuation": [
+        1.0,
+        0.8564129385141704,
+        0.5333333333333332,
+        0.24358706148582943,
+        0.13333333333333325
+      ],
+      "mesh_size": 8,
+      "miller": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "spacing_angstrom": 1.0,
+      "spline_order": 6
+    },
+    {
+      "cell_length_angstrom": 8.0,
+      "continuous_symbol": [
+        1.0,
+        0.8564039254647049,
+        0.5325626743274763,
+        0.23259760200182142,
+        0.06657033429093458
+      ],
+      "discrete_symbol": [
+        1.0,
+        0.8564129385141707,
+        0.5333333333333334,
+        0.24358706148582948,
+        0.13333333333333336
+      ],
+      "discrete_symbol_closed_form": [
+        1.0,
+        0.8564129385141707,
+        0.5333333333333333,
+        0.24358706148582954,
+        0.13333333333333336
+      ],
+      "exact_attenuation": [
+        0.9999999999987665,
+        0.8564128239032931,
+        0.5333237465649442,
+        0.24345796414572268,
+        0.13292355634646025
+      ],
+      "fractional_coordinate": 0.3719,
+      "measured_attenuation": [
+        0.9999999999999999,
+        0.8564128239036934,
+        0.5333237465647261,
+        0.24345796414646567,
+        0.13292355634781441
+      ],
+      "mesh_size": 8,
+      "miller": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "spacing_angstrom": 1.0,
+      "spline_order": 6
+    }
+  ],
+  "schema": "symmetrix.fourier-d3-bspline-symbol/1"
+}

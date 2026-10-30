@@ -1,10 +1,18 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <mutex>
+
 #include "jit_nvrtc.hpp"
 #include "jit_hiprtc.hpp"
 
 namespace py = pybind11;
+
+namespace {
+
+std::mutex hiprtc_compile_mutex;
+
+}  // namespace
 
 void bind_jit_nvrtc(py::module_& module)
 {
@@ -22,8 +30,10 @@ void bind_jit_nvrtc(py::module_& module)
     module.def(
         "_execution_compile_cuda_with_nvrtc",
         [] (const std::string& source, const std::vector<std::string>& options) {
-            const auto compilation =
-                symmetrix::execution::compile_cuda_with_nvrtc(source, options);
+            const auto compilation = [&] {
+                py::gil_scoped_release release;
+                return symmetrix::execution::compile_cuda_with_nvrtc(source, options);
+            }();
             py::dict result;
             result["cubin"] = py::bytes(
                 reinterpret_cast<const char*>(compilation.cubin.data()),
@@ -47,8 +57,11 @@ void bind_jit_nvrtc(py::module_& module)
     module.def(
         "_execution_compile_hip_with_hiprtc",
         [] (const std::string& source, const std::vector<std::string>& options) {
-            const auto compilation =
-                symmetrix::execution::compile_hip_with_hiprtc(source, options);
+            const auto compilation = [&] {
+                py::gil_scoped_release release;
+                const std::scoped_lock lock(hiprtc_compile_mutex);
+                return symmetrix::execution::compile_hip_with_hiprtc(source, options);
+            }();
             py::dict result;
             result["code"] = py::bytes(
                 reinterpret_cast<const char*>(compilation.code.data()),

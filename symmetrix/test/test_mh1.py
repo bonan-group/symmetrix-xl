@@ -1,3 +1,4 @@
+import copy
 import gc
 import json
 import os
@@ -9,22 +10,19 @@ import pytest
 from ase import Atoms
 from ase.build import bulk
 from ase.stress import full_3x3_to_voigt_6_stress
-
 from symmetrix import Symmetrix
 from symmetrix import symmetrix as native_symmetrix
 from symmetrix.jit import jit_nvrtc_information
 
-
 try:
     import torch
     from mace.calculators import MACECalculator
-    from mace.tools.scripts_utils import remove_pt_head
-    from symmetrix.extract_mace_data import extract_mace_data
+    from symmetrix.extract_mace_data import _remove_prediction_head, extract_mace_data
 except ImportError as exc:
     torch = None
     MACECalculator = None
-    remove_pt_head = None
     extract_mace_data = None
+    _remove_prediction_head = None
     mace_import_error = exc
 else:
     mace_import_error = None
@@ -41,6 +39,25 @@ MH1_HEADS = (
 
 MH1_GENERATED_FLOAT32_ATOL = 1e-3
 
+# The exported float64 evaluator and upstream MACE intentionally use different
+# contraction implementations.  On the universal checkpoint that difference
+# reaches 6.7e-5 in forces for a periodic two-atom cell, while the independently
+# checked Symmetrix direct/reference paths remain within their backend-specific
+# bound below.
+MH1_UPSTREAM_ATOL = 2e-4
+
+#: Agreement bound for a comparison against the ``mlp_reference`` edge executor.
+#:
+#: The pair-spline and ``mlp_reference`` executors interpolate the same
+#: certified radial table along different paths, so their difference is an
+#: algorithmic spline-interpolation difference and not a property of the
+#: execution space: the five-species universal cluster below deviates by
+#: 3.2186e-06 in forces, measured identically on the host and on CUDA.  The
+#: backend-dependent direct/reference bound therefore does not apply to these
+#: comparisons; the host bound covers both backends.
+MH1_SPLINE_REFERENCE_ATOL = 2e-4
+MH1_SHARED_SPLINE_FLOAT32_ATOL = 2e-4
+
 
 def _require_cuda_nvrtc(monkeypatch):
     try:
@@ -55,20 +72,20 @@ def _require_cuda_nvrtc(monkeypatch):
     monkeypatch.setenv("SYMMETRIX_JIT_CUDA_JIT_BACKEND", "nvrtc")
 
 
-def _mh1_streamed_edge_block_size(use_kokkos):
-    if use_kokkos and native_symmetrix._kokkos_default_execution_space() == "Cuda":
+def _mh1_streamed_edge_block_size():
+    if native_symmetrix._kokkos_default_execution_space() == "Cuda":
         return 16384
     return 1024
 
 
 def _mh1_cross_backend_atol():
-    """Full-evaluator serial/Kokkos float64 agreement bound.
+    """Full-evaluator direct/reference float64 agreement bound.
 
     The Kokkos MH-1 fast path evaluates compiled products through its own
-    packed pipeline, so host Kokkos backends agree with the serial evaluator
-    only at the fast-path product precision instead of float64 rounding (the
-    deviation is amplified to ~1e-4 in forces on the repulsive wall); the
-    CUDA backend keeps the tighter historical bound.
+    packed pipeline, so host backends agree with the single-thread generic
+    reference only at the fast-path product precision instead of float64
+    rounding (the deviation is amplified to ~1e-4 in forces on the repulsive
+    wall); the CUDA backend keeps the tighter historical bound.
     """
     if native_symmetrix._kokkos_default_execution_space() == "Cuda":
         return 2e-11
@@ -128,6 +145,21 @@ def _mh1_model_path():
     return path
 
 
+def _mh1_reference_model(head="matpes_r2scan"):
+    """Load the checkpoint as the single-head float64 autograd reference.
+
+    ``mace.tools.scripts_utils.remove_pt_head`` rebuilds the model from its
+    configuration, so the new parameters take the *process* default dtype
+    instead of the checkpoint's and the state dict is downcast into them.
+    Build the reference under the checkpoint dtype and cast to float64, as the
+    production conversion does, so the reference stays float64.
+    """
+    model = torch.load(
+        _mh1_model_path(), map_location=torch.device("cpu"), weights_only=False
+    )
+    return _remove_prediction_head(model, head, torch.device("cpu"))
+
+
 @pytest.fixture(scope="module")
 def mh1_si_artifact(tmp_path_factory):
     data = extract_mace_data(
@@ -150,7 +182,7 @@ def mh1_h_si_artifact(tmp_path_factory):
     return data, path
 
 
-def _make_generalized_mh1(parameters):
+def _make_generalized_mh1(parameters, *, num_interactions=2):
     if mace_import_error is not None:
         pytest.skip(f"mace-torch is not available: {mace_import_error}")
     from e3nn import o3
@@ -162,7 +194,9 @@ def _make_generalized_mh1(parameters):
     previous_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch.float64)
-        torch.manual_seed(1701 + node_channels + edge_channels + num_bessel + l_max)
+        torch.manual_seed(
+            1701 + node_channels + edge_channels + num_bessel + l_max + num_interactions
+        )
         model = ScaleShiftMACE(
             atomic_inter_scale=1.0,
             atomic_inter_shift=0.0,
@@ -172,7 +206,7 @@ def _make_generalized_mh1(parameters):
             max_ell=l_max,
             interaction_cls=RealAgnosticResidualNonLinearInteractionBlock,
             interaction_cls_first=RealAgnosticResidualNonLinearInteractionBlock,
-            num_interactions=2,
+            num_interactions=num_interactions,
             num_elements=2,
             hidden_irreps=o3.Irreps(f"{node_channels}x0e+{node_channels}x1o"),
             MLP_irreps=o3.Irreps(f"{max(4, node_channels // 2)}x0e"),
@@ -215,6 +249,34 @@ def generalized_mh1_artifact(request, tmp_path_factory):
         )
         / "model.json"
     )
+    path.write_text(json.dumps(data, separators=(",", ":")))
+    return model, data, path
+
+
+@pytest.fixture(scope="module")
+def generalized_mh1_three_layer_artifact(tmp_path_factory):
+    """A model with three interaction layers.
+
+    The topology admission is no longer one-or-two, so a layer count outside
+    the admitted pair carries its own coverage: it is described by the same
+    contract, generated by the composed ABI-v7 host plugin, and evaluated by the same
+    prepared path.
+    """
+
+    model, data = _make_generalized_mh1((4, 2, 4, 2, []), num_interactions=3)
+    assert len(data["interactions"]) == 3
+    path = tmp_path_factory.mktemp("mh1-general-three-layer") / "model.json"
+    path.write_text(json.dumps(data, separators=(",", ":")))
+    return model, data, path
+
+
+@pytest.fixture(scope="module")
+def generalized_mh1_two_layer_artifact(tmp_path_factory):
+    """The admitted two-interaction topology, for the adapter's v5 path."""
+
+    model, data = _make_generalized_mh1((4, 2, 4, 2, []))
+    assert len(data["interactions"]) == 2
+    path = tmp_path_factory.mktemp("mh1-general-two-layer") / "model.json"
     path.write_text(json.dumps(data, separators=(",", ":")))
     return model, data, path
 
@@ -306,7 +368,7 @@ def test_generalized_mh1_native_evaluator_requires_validated_v3_contract(
         pytest.skip("Symmetrix was built without Kokkos Float32 support")
     if not native_symmetrix._kokkos_is_initialized():
         native_symmetrix._init_kokkos()
-    from symmetrix.execution_mh1_contract import (
+    from symmetrix.mace_nonlinear_execution_contract import (
         validate_execution_mh1_contract_for_model,
     )
 
@@ -321,15 +383,44 @@ def test_generalized_mh1_native_evaluator_requires_validated_v3_contract(
         contract["generation_fingerprint"],
         contract["semantic_fingerprint"],
         contract["structure_fingerprint"],
+        contract["interaction_count"],
     )
     assert evaluator.has_execution_mh1_contract
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
-def test_generalized_mh1_matches_upstream_and_streamed_modes(
-    generalized_mh1_artifact, use_kokkos
+def test_generation_19_native_evaluator_rejects_retired_mh1_load_methods(
+    generalized_mh1_artifact,
 ):
-    if use_kokkos and not hasattr(native_symmetrix, "MACENonlinearKokkos"):
+    if not hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
+        pytest.skip("Symmetrix was built without Kokkos Float32 support")
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    _, _, model_path = generalized_mh1_artifact
+    evaluator = native_symmetrix.MACENonlinearKokkosFloat(str(model_path))
+    try:
+        for method in (
+            evaluator._load_jit_mh1_host_plugin_v4,
+            evaluator._load_jit_mh1_host_plugin_v5,
+            evaluator._load_jit_mh1_host_plugin_v6,
+        ):
+            with pytest.raises(ValueError, match="retired in generation 19"):
+                method("retired.so")
+        with pytest.raises(ValueError, match="retired in generation 19"):
+            evaluator._load_jit_mh1_cuda_plugin_v4("retired.so", "{}")
+
+        assert not evaluator.jit_mh1_host_plugin_v4_ready
+        assert not evaluator.jit_mh1_host_plugin_v5_ready
+        assert not evaluator.jit_mh1_host_plugin_v6_ready
+        assert not evaluator.jit_mh1_cuda_plugin_v4_ready
+    finally:
+        del evaluator
+        gc.collect()
+
+
+def test_generalized_mh1_matches_upstream_and_streamed_modes(
+    generalized_mh1_artifact,
+):
+    if not hasattr(native_symmetrix, "MACENonlinearKokkos"):
         pytest.skip("Symmetrix was built without Kokkos support")
     model, data, model_path = generalized_mh1_artifact
     atoms = _generalized_mh1_atoms()
@@ -345,7 +436,6 @@ def test_generalized_mh1_matches_upstream_and_streamed_modes(
     for mode in modes:
         calculator = Symmetrix(
             model_path,
-            use_kokkos=use_kokkos,
             dtype="float64",
             streamed_edges=mode,
         )
@@ -355,18 +445,31 @@ def test_generalized_mh1_matches_upstream_and_streamed_modes(
         assert evaluator.supports_streamed_edges
         assert evaluator.mh1_uses_compiled_products
         assert evaluator.mh1_uses_pair_conditioning
-        if use_kokkos:
-            assert evaluator.mh1_uses_external_uvu_tensors
-            assert evaluator.supports_factorized
+        assert evaluator.mh1_uses_external_uvu_tensors
+        assert evaluator.supports_factorized
         if hasattr(evaluator, "set_mh1_edge_executor"):
             evaluator.set_mh1_edge_executor("mlp_reference")
         assert evaluator.mh1_fast_path_rejection_reason == ""
         assert evaluator.mh1_node_channels == int(
             data["interactions"][0]["node_feats_irreps"].split("x", 1)[0]
         )
-        assert evaluator.mh1_edge_channels == int(
+        assert evaluator.mh1_first_layer_edge_channels == int(
             data["interactions"][0]["edge_irreps"].split("x", 1)[0]
         )
+        assert evaluator.mh1_layer_count == len(data["interactions"])
+        for layer_index, interaction in enumerate(data["interactions"]):
+            layer_descriptor = evaluator.mh1_layer_descriptor(layer_index)
+            assert layer_descriptor["interaction_index"] == layer_index
+            assert layer_descriptor["uvu_channels"] == int(
+                interaction["conv_tp"]["irreps_in1"].split("x", 1)[0]
+            )
+            assert layer_descriptor["final_output_policy"] == (
+                "scalar"
+                if layer_index == len(data["interactions"]) - 1
+                else "not_final"
+            )
+        with pytest.raises(IndexError, match="MH-1 layer index is out of range"):
+            evaluator.mh1_layer_descriptor(evaluator.mh1_layer_count)
         assert evaluator.mh1_radial_size == len(
             data["radial_embedding"]["basis"]["weights"]["values"]
         )
@@ -385,6 +488,86 @@ def test_generalized_mh1_matches_upstream_and_streamed_modes(
         )
 
 
+@pytest.mark.parametrize(
+    ("requested", "routing", "alias", "native_mode"),
+    (
+        ("direct", "direct", None, "direct"),
+        ("auto", "direct", None, "direct"),
+        ("generic", "reference", "generic", "generic"),
+        ("non-compiled", "reference", "non-compiled", "generic"),
+        ("all_interactions", "reference", "all_interactions", "generic"),
+        ("factorized", "direct", "factorized", "direct"),
+        ("direct_streamed", "direct", "direct_streamed", "direct"),
+        ("materialized", "reference", "materialized", "generic"),
+        ("reference", "reference", None, "generic"),
+    ),
+)
+def test_mh1_documented_mode_spellings_resolve_on_the_evaluator(
+    generalized_mh1_artifact, requested, routing, alias, native_mode
+):
+    """Every admitted MH-1 spelling resolves to one of the two routings.
+
+    ``streamed_edges`` reports the routing, ``streamed_edges_requested`` and
+    ``streamed_edges_alias`` keep the spelling the caller asked for, and the
+    evaluator reports the native mode that routing selected.  The Kokkos MH-1
+    evaluator admits ``generic`` and ``direct`` only, so the frontend resolves
+    ``materialized`` to the reference routing and hands the evaluator the
+    ``generic`` mode; the evaluator's own admission rule still refuses
+    ``materialized``, which ``test_mh1_rejects_materialized_edge_mode`` covers.
+    """
+    _, _, model_path = generalized_mh1_artifact
+    calculator = Symmetrix(
+        model_path,
+        dtype="float64",
+        streamed_edges=requested,
+    )
+
+    assert calculator.streamed_edges_requested == requested
+    assert calculator.streamed_edges_alias == alias
+    assert calculator.streamed_edges == routing
+    assert calculator.evaluator.is_mh1_family
+    assert calculator.evaluator.streamed_edges_mode == native_mode
+
+
+@pytest.mark.parametrize("mode", ("debug_v1", "mlp_reference", "Direct", ""))
+def test_mh1_rejects_family_foreign_and_unknown_mode_spellings(
+    generalized_mh1_artifact, mode
+):
+    _, _, model_path = generalized_mh1_artifact
+    with pytest.raises(ValueError, match="streamed_edges must be one of"):
+        Symmetrix(
+            model_path,
+            dtype="float64",
+            streamed_edges=mode,
+        )
+
+
+def test_generalized_mh1_reports_one_implicit_plan_candidate(
+    generalized_mh1_artifact,
+):
+    """A family that declares no plan space reports one implicit candidate."""
+    _, _, model_path = generalized_mh1_artifact
+    calculator = Symmetrix(
+        model_path,
+        dtype="float64",
+        streamed_edges="generic",
+    )
+    assert not hasattr(calculator.evaluator, "execution_plan_report")
+
+    report = calculator.execution_plan
+
+    assert report["selection_source"] == "legacy_adapter"
+    assert report["selected_id"] == "reference"
+    assert report["candidates"] == [
+        {
+            "id": "reference",
+            "qualified": True,
+            "estimated_bytes": 0,
+            "reason": "native execution-plan reporting is unavailable",
+        }
+    ]
+
+
 def test_generalized_mh1_low_memory_retained_interaction_matches_upstream(
     generalized_mh1_artifact,
 ):
@@ -400,11 +583,11 @@ def test_generalized_mh1_low_memory_retained_interaction_matches_upstream(
     )
     actual = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         low_memory=True,
     )
+    actual.evaluator._set_execution_mh1_node_arena_tile_rows_for_testing(2)
 
     upstream.calculate(atoms.copy(), properties=properties)
     actual.calculate(atoms.copy(), properties=properties)
@@ -417,16 +600,252 @@ def test_generalized_mh1_low_memory_retained_interaction_matches_upstream(
         dimension > 0
         for dimension in evaluator.execution_mh1_retained_interaction_output_dimensions
     )
+    assert evaluator.execution_mh1_retained_interaction_output_bytes > 0
+    assert evaluator.execution_mh1_product_tile_scratch_bytes > 0
+    # Three nodes at tile_rows=2 produce two tiles.  CUDA reconstructs any
+    # reverse prerequisites inside the composed device reverse launch, so the
+    # public common module records one forward per tile.  The host split phase
+    # reconstructs them with another common forward before reverse and records
+    # two forwards per tile.  Reverse records once per tile on both paths and
+    # the same public-counter scope applies to retained and recomputed policy.
+    expected_common_forward_launches = (
+        2 if native_symmetrix._kokkos_default_execution_space() == "Cuda" else 4
+    )
+    assert [
+        evaluator._execution_mh1_product_module_forward_launch_count(layer)
+        for layer in range(2)
+    ] == [expected_common_forward_launches] * 2
+    assert [
+        evaluator._execution_mh1_product_module_reverse_launch_count(layer)
+        for layer in range(2)
+    ] == [2, 2]
     metrics = {
         name: _effective_decimal_digits(actual.results[name], upstream.results[name])
+        for name in properties
+    }
+    assert metrics["energy"]["max_absolute_error"] < MH1_SHARED_SPLINE_FLOAT32_ATOL
+    assert metrics["energies"]["max_absolute_error"] < MH1_SHARED_SPLINE_FLOAT32_ATOL
+    assert metrics["forces"]["max_absolute_error"] < MH1_SHARED_SPLINE_FLOAT32_ATOL
+    # This compares the shared generated float32 contractions and spline path
+    # with a float64 upstream model.  The deterministic absolute bound is the
+    # meaningful criterion for this tiny-force fixture.
+    assert metrics["stress"]["max_absolute_error"] < MH1_SHARED_SPLINE_FLOAT32_ATOL
+
+    recomputed = Symmetrix(
+        model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        low_memory=False,
+        execution_mh1_node_state_policy="recompute-v1",
+    )
+    recomputed.evaluator._set_execution_mh1_node_arena_tile_rows_for_testing(2)
+    recomputed.calculate(atoms.copy(), properties=properties)
+    for name in properties:
+        np.testing.assert_allclose(
+            recomputed.results[name],
+            actual.results[name],
+            rtol=2e-5,
+            atol=MH1_SHARED_SPLINE_FLOAT32_ATOL,
+        )
+    recomputed_evaluator = recomputed.evaluator
+    assert recomputed_evaluator.mh1_edge_executor == "pair_spline_v1"
+    assert recomputed_evaluator.execution_mh1_retained_interaction_output_bytes == 0
+    assert recomputed_evaluator.execution_mh1_layer_up_adjoint_storage_bytes == 0
+    assert recomputed_evaluator.execution_mh1_up_adjoint_scratch_bytes > 0
+    # CUDA's composed module owns its per-layer adjoint workspace; the host
+    # route reuses the evaluator's one scratch slot across the two layers.
+    expected_up_adjoint_reuses = (
+        0 if native_symmetrix._kokkos_default_execution_space() == "Cuda" else 2
+    )
+    assert (
+        recomputed_evaluator.execution_mh1_up_adjoint_scratch_reuse_count
+        == expected_up_adjoint_reuses
+    )
+    assert [
+        recomputed_evaluator._execution_mh1_product_module_forward_launch_count(layer)
+        for layer in range(2)
+    ] == [expected_common_forward_launches] * 2
+    assert [
+        recomputed_evaluator._execution_mh1_product_module_reverse_launch_count(layer)
+        for layer in range(2)
+    ] == [2, 2]
+    assert recomputed_evaluator.factorized_fallback_evaluation_count == 0
+
+
+def test_generalized_mh1_retained_output_dimensions_are_defined_on_every_route(
+    generalized_mh1_artifact,
+):
+    """The retained-output-dimension accessor answers on a non-direct route.
+
+    The dimensions describe the prepared node runtime, which only the direct
+    route builds; every other routing leaves that runtime empty.  Reading the
+    accessor there used to index the empty vector and abort the process, so the
+    two routings are pinned against each other: the admission route reports its
+    retained width, and the non-direct route reports the field's own "not
+    retained" default instead of dying.
+    """
+
+    if not hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
+        pytest.skip("Symmetrix was built without Kokkos Float32 support")
+    _, _, model_path = generalized_mh1_artifact
+    atoms = _generalized_mh1_atoms()
+
+    reference = Symmetrix(model_path, dtype="float32", streamed_edges="reference")
+    reference.calculate(atoms.copy(), properties=["energy"])
+    assert reference.streamed_edges == "reference"
+    assert list(
+        reference.evaluator.execution_mh1_retained_interaction_output_dimensions
+    ) == [0, 0]
+
+    direct = Symmetrix(model_path, dtype="float32", streamed_edges="direct")
+    direct.calculate(atoms.copy(), properties=["energy"])
+    assert direct.streamed_edges == "direct"
+    assert all(
+        dimension > 0
+        for dimension in direct.evaluator.execution_mh1_retained_interaction_output_dimensions
+    )
+
+
+@pytest.mark.host
+def test_generalized_mh1_three_interaction_topology_matches_its_reference(
+    generalized_mh1_three_layer_artifact,
+):
+    """A topology outside the admitted pair carries its own parity coverage.
+
+    The interaction-count admission is no longer one-or-two: a model with three
+    interaction layers is described by the same contract, generated as the
+    composed ABI-v7 host plugin whose per-interaction tables carry the contract's
+    count, and evaluated through the same prepared path.  The admitted-count parity
+    cannot validate that, so this case asserts its own.
+    """
+
+    from symmetrix.mace_nonlinear_execution_contract import (
+        maybe_make_execution_mh1_v4_contract,
+    )
+
+    model, data, model_path = generalized_mh1_three_layer_artifact
+    assert len(data["interactions"]) == 3
+
+    contract = maybe_make_execution_mh1_v4_contract(data)
+    assert contract is not None
+    assert contract["interaction_count"] == 3
+    assert contract["node_program"]["layer_count"] == 3
+    assert [
+        entry["kind"]
+        for entry in contract["node_program"]["execution"]["forward_schedule"]
+    ] == [
+        "node_program",
+        "edge_tensor_product",
+        "node_program",
+        "edge_tensor_product",
+        "node_program",
+        "edge_tensor_product",
+        "node_program",
+    ]
+
+    # The contract assertions above are backend-independent; the parity below
+    # runs the ABI-v7 host plugin through generated host execution, which a
+    # device build does not provide, so this case carries the same host-build
+    # gate as its siblings in this file.
+    if native_symmetrix._kokkos_default_execution_space() not in (
+        "Serial",
+        "OpenMP",
+    ):
+        pytest.skip("generated host Execution requires a host Kokkos build")
+    if shutil.which("c++") is None:
+        pytest.skip("generated host Execution requires a C++20 compiler")
+
+    properties = ["energy", "energies", "forces", "stress"]
+    atoms = _generalized_mh1_atoms()
+    reference = Symmetrix(model_path, dtype="float64", streamed_edges="reference")
+    reference.calculate(atoms.copy(), properties=properties)
+    generated = Symmetrix(model_path, dtype="float64", streamed_edges="direct")
+    generated.calculate(atoms.copy(), properties=properties)
+
+    evaluator = generated.evaluator
+    # Generation 19 serves every admitted topology through the composed ABI-v7
+    # plugin; the retired product-bearing generations must not be loaded.
+    assert evaluator.jit_mh1_host_plugin_v7_ready
+    assert not evaluator.jit_mh1_host_plugin_v5_ready
+    assert not evaluator.jit_mh1_host_plugin_v6_ready
+
+    metrics = {
+        name: _effective_decimal_digits(
+            generated.results[name], reference.results[name]
+        )
         for name in properties
     }
     assert metrics["energy"]["max_absolute_error"] / len(atoms) < 1e-4
     assert metrics["energies"]["max_absolute_error"] < 1e-4
     assert metrics["forces"]["max_absolute_error"] < 1e-4
-    assert metrics["forces"]["l2_digits"] > 3.0
-    assert metrics["forces"]["minimum_component_digits"] > 3.0
     assert metrics["stress"]["max_absolute_error"] < 1e-4
+
+
+def _mh1_host_plugin_interaction_count(artifact_path):
+    """Read the interaction count a prepared host plugin publishes."""
+
+    import ctypes
+
+    library = ctypes.CDLL(str(artifact_path))
+    query = library.symmetrix_jit_mh1_host_plugin_query_v7
+    query.restype = ctypes.c_void_p
+    descriptor = query()
+    assert descriptor, "the v7 query returned a null descriptor"
+    # The descriptor's leading fields are all uint32: abi_version, struct_size,
+    # pointer_size, byte_order, capabilities, interaction_count.
+    return ctypes.c_uint32.from_address(descriptor + 20).value
+
+
+@pytest.mark.host
+def test_mh1_host_artifact_adapter_serves_the_lifted_topology(
+    generalized_mh1_three_layer_artifact, tmp_path
+):
+    """The declared adapter prepares the topology this stage unlocked.
+
+    The calculator selects the host plugin generation from the contract's
+    interaction count, so the registry adapter must make the same choice: a
+    consumer that resolves the declaration has to be able to prepare a model
+    the framework otherwise serves.
+    """
+
+    from symmetrix.mace_nonlinear_jit_artifact import prepare_mh1_host_artifact
+
+    _, data, model_path = generalized_mh1_three_layer_artifact
+    assert len(data["interactions"]) == 3
+
+    result = prepare_mh1_host_artifact(
+        model_path, precision="float64", cache_root=tmp_path
+    )
+
+    assert result.abi == "symmetrix.jit.mh1.host-plugin/7"
+    assert result.abi_version == 7
+    assert _mh1_host_plugin_interaction_count(result.artifact_path) == 3
+
+
+@pytest.mark.host
+def test_mh1_host_artifact_adapter_uses_composed_v7_for_admitted_topology(
+    generalized_mh1_two_layer_artifact, tmp_path
+):
+    """Two-interaction artifacts use the active widened packet ABI."""
+
+    import ctypes
+
+    from symmetrix.mace_nonlinear_jit_artifact import prepare_mh1_host_artifact
+
+    _, data, model_path = generalized_mh1_two_layer_artifact
+    assert len(data["interactions"]) == 2
+
+    result = prepare_mh1_host_artifact(
+        model_path, precision="float64", cache_root=tmp_path
+    )
+
+    assert result.abi == "symmetrix.jit.mh1.host-plugin/7"
+    assert result.abi_version == 7
+    assert result.artifact_id.startswith("jit-mh1-gen")
+    library = ctypes.CDLL(str(result.artifact_path))
+    assert library.symmetrix_jit_mh1_host_plugin_query_v7
+    assert not hasattr(library, "symmetrix_jit_mh1_host_plugin_query_v5")
+    assert not hasattr(library, "symmetrix_jit_mh1_host_plugin_query_v6")
 
 
 def test_generalized_mh1_kokkos_float32_factorized_matches_float64(
@@ -437,12 +856,9 @@ def test_generalized_mh1_kokkos_float32_factorized_matches_float64(
     _, _, model_path = generalized_mh1_artifact
     atoms = _generalized_mh1_atoms()
     properties = ["energy", "energies", "forces", "stress"]
-    reference = Symmetrix(
-        model_path, use_kokkos=True, dtype="float64", streamed_edges="generic"
-    )
+    reference = Symmetrix(model_path, dtype="float64", streamed_edges="generic")
     actual = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
@@ -484,7 +900,6 @@ def test_generalized_mh1_generated_host_execution_matches_generic(
 
     generic = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
@@ -494,18 +909,15 @@ def test_generalized_mh1_generated_host_execution_matches_generic(
 
     generated = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
     generated.evaluator.set_mh1_edge_executor("mlp_reference")
+    generated.evaluator._set_execution_mh1_node_arena_tile_rows_for_testing(2)
     assert generated.jit_status == "built"
     assert generated.evaluator.has_execution_mh1_contract
-    assert generated.evaluator.jit_mh1_host_plugin_v4_ready
-    assert generated.evaluator.execution_mh1_execution_backend == "generated_host_v4"
-    assert generated.evaluator.jit_mh1_host_plugin_artifact_id.startswith(
-        "jit-mh1-gen11-v4-"
-    )
+    assert generated.evaluator.jit_mh1_host_plugin_v7_ready
+    assert generated.evaluator.execution_mh1_execution_backend == "generated_host_v7"
     generated.calculate(atoms.copy(), properties=properties)
     for name in properties:
         np.testing.assert_allclose(
@@ -517,6 +929,18 @@ def test_generalized_mh1_generated_host_execution_matches_generic(
     assert generated.evaluator.execution_mh1_generated_forward_launch_count == 2
     assert generated.evaluator.execution_mh1_generated_source_reverse_launch_count == 2
     assert generated.evaluator.execution_mh1_generated_edge_reverse_launch_count == 2
+    # Three nodes at tile_rows=2 produce two tiles.  Forward runs once per
+    # tile, and reverse reconstructs each tile's common contraction before its
+    # reverse callback: four forward and two reverse launches per layer.
+    assert [
+        generated.evaluator._execution_mh1_product_module_forward_launch_count(layer)
+        for layer in range(2)
+    ] == [4, 4]
+    assert [
+        generated.evaluator._execution_mh1_product_module_reverse_launch_count(layer)
+        for layer in range(2)
+    ] == [2, 2]
+    assert generated.evaluator.factorized_fallback_evaluation_count == 0
     expected_conditioning = _generated_conditioning_interaction_count(data)
     assert (
         generated.evaluator.execution_mh1_generated_conditioning_forward_launch_count
@@ -528,24 +952,49 @@ def test_generalized_mh1_generated_host_execution_matches_generic(
     )
     if expected_conditioning == len(data["interactions"]):
         assert generated.evaluator.conditioned_mlp_workspace_bytes == 0
-
     retained_results = {
         name: np.array(generated.results[name], copy=True) for name in properties
     }
     retained_edge_workspace = generated.evaluator.edge_workspace_bytes
+    assert generated.evaluator.execution_mh1_retained_interaction_output_bytes > 0
+    assert generated.evaluator.execution_mh1_product_tile_scratch_bytes > 0
     assert generated.evaluator.execution_mh1_scratch_recomputed_bytes == 0
     assert generated.evaluator.execution_mh1_scratch_recomputed_layer_count == 0
     assert generated.evaluator.execution_mh1_conditioning_recomputation_count == 0
 
+    recomputed = Symmetrix(
+        model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        low_memory=False,
+        execution_mh1_node_state_policy="recompute-v1",
+    )
+    recomputed.evaluator.set_mh1_edge_executor("mlp_reference")
+    recomputed.evaluator._set_execution_mh1_node_arena_tile_rows_for_testing(2)
+    assert recomputed.jit_node_state_policy == "recompute-v1"
+    recomputed.calculate(atoms.copy(), properties=properties)
+    for name in properties:
+        np.testing.assert_allclose(
+            recomputed.results[name], retained_results[name], rtol=2e-5, atol=5e-4
+        )
+    assert recomputed.evaluator.execution_mh1_retained_interaction_output_bytes == 0
+    assert recomputed.evaluator.execution_mh1_product_tile_scratch_bytes > 0
+    assert [
+        recomputed.evaluator._execution_mh1_product_module_forward_launch_count(layer)
+        for layer in range(2)
+    ] == [4, 4]
+    assert [
+        recomputed.evaluator._execution_mh1_product_module_reverse_launch_count(layer)
+        for layer in range(2)
+    ] == [2, 2]
     bounded = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         execution_mh1_scratch_budget_bytes=0,
     )
     bounded.evaluator.set_mh1_edge_executor("mlp_reference")
-    assert bounded.jit_artifact_id == generated.jit_artifact_id
+    assert bounded.jit_node_state_policy == "retain-interaction-v1"
     bounded.calculate(atoms.copy(), properties=properties)
     for name in properties:
         np.testing.assert_allclose(
@@ -564,6 +1013,8 @@ def test_generalized_mh1_generated_host_execution_matches_generic(
         == planner.execution_mh1_scratch_minimum_bytes
     )
     assert planner.execution_mh1_scratch_retained_bytes == 0
+    assert planner.execution_mh1_retained_interaction_output_bytes > 0
+    assert planner.execution_mh1_product_tile_scratch_bytes > 0
     assert planner.execution_mh1_scratch_recomputed_bytes == (
         2 * planner.execution_mh1_scratch_minimum_bytes
     )
@@ -578,6 +1029,7 @@ def test_generalized_mh1_generated_host_execution_matches_generic(
     planner._set_execution_mh1_scratch_budget_bytes(minimum)
     bounded.calculate(atoms.copy(), properties=properties)
     assert planner.execution_mh1_scratch_budget_satisfied
+
     assert planner.execution_mh1_scratch_planned_bytes == minimum
     assert planner.execution_mh1_scratch_retained_bytes == 0
     assert planner.execution_mh1_scratch_recomputed_layer_count == 2
@@ -634,6 +1086,144 @@ def test_generalized_mh1_generated_host_execution_matches_generic(
     assert planner.execution_mh1_scratch_budget_satisfied
 
 
+def test_generated_retention_and_reverse_tap_match_portable(
+    generalized_mh1_artifact, monkeypatch, tmp_path
+):
+    """The shared layer map serves generated ir-mul forward and reverse."""
+
+    if not hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
+        pytest.skip("Symmetrix was built without Kokkos Float32 support")
+    execution_space = native_symmetrix._kokkos_default_execution_space()
+    if execution_space == "Cuda":
+        _require_cuda_nvrtc(monkeypatch)
+    elif execution_space in ("Serial", "OpenMP"):
+        if shutil.which("c++") is None:
+            pytest.skip("generated host Execution requires a C++20 compiler")
+    else:
+        pytest.skip("generated retention requires a host or CUDA Kokkos build")
+
+    _, _, model_path = generalized_mh1_artifact
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
+    atoms = _generalized_mh1_atoms()
+
+    calculators = {}
+    for name, mode in (("portable", "generic"), ("generated", "direct")):
+        calculator = Symmetrix(model_path, dtype="float32", streamed_edges=mode)
+        calculator.evaluator.set_mh1_edge_executor("mlp_reference")
+        calculator.evaluator.set_retain_layer_features(True)
+        calculator.calculate(atoms.copy(), properties=["energy", "forces"])
+        calculators[name] = calculator
+
+    portable_layers = [
+        np.asarray(layer).copy()
+        for layer in calculators["portable"].evaluator.layer_features()
+    ]
+    generated_layers = [
+        np.asarray(layer).copy()
+        for layer in calculators["generated"].evaluator.layer_features()
+    ]
+    assert len(portable_layers) == len(generated_layers) == 2
+    for actual, expected in zip(generated_layers, portable_layers):
+        np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=5e-4)
+
+    generator = np.random.default_rng(7107)
+    reverse_inputs = [
+        np.ascontiguousarray(generator.normal(size=layer.shape), dtype=np.float32)
+        for layer in portable_layers
+    ]
+    for calculator in calculators.values():
+        calculator.evaluator.set_layer_product_seed(reverse_inputs)
+        calculator.calculate(atoms.copy(), properties=["energy", "forces"])
+    np.testing.assert_allclose(
+        calculators["generated"].results["forces"],
+        calculators["portable"].results["forces"],
+        rtol=2e-5,
+        atol=5e-4,
+    )
+    evaluator = calculators["generated"].evaluator
+    if execution_space == "Cuda":
+        assert evaluator.jit_mh1_cuda_plugin_v5_ready
+    else:
+        assert evaluator.jit_mh1_host_plugin_v7_ready
+
+
+def test_generalized_mh1_bad_v7_replacement_preserves_loaded_composition(
+    generalized_mh1_artifact, monkeypatch, tmp_path
+):
+    if not hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
+        pytest.skip("Symmetrix was built without Kokkos Float32 support")
+    if native_symmetrix._kokkos_default_execution_space() not in ("Serial", "OpenMP"):
+        pytest.skip("generated host Execution requires a host Kokkos build")
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("generated host Execution requires a C++20 compiler")
+    _, data, model_path = generalized_mh1_artifact
+    if "mh1-general-c4-" not in str(model_path):
+        pytest.skip("the replacement test runs once on the c4 fixture")
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
+
+    calculator = Symmetrix(model_path, dtype="float32", streamed_edges="direct")
+    calculator.evaluator.set_mh1_edge_executor("mlp_reference")
+    atoms = _generalized_mh1_atoms()
+    calculator.calculate(atoms.copy(), properties=["energy", "forces"])
+    expected_energy = calculator.results["energy"]
+    expected_forces = np.array(calculator.results["forces"], copy=True)
+    previous_path = calculator.evaluator.jit_mh1_host_plugin_path
+    previous_id = calculator.evaluator.jit_mh1_host_plugin_artifact_id
+
+    from symmetrix.jit import prepare_jit_artifact
+    from symmetrix.mace_nonlinear_execution_contract import (
+        maybe_make_execution_mh1_v4_contract,
+    )
+    from symmetrix.mace_nonlinear_jit_codegen import (
+        execution_mh1_node_program_metadata,
+        render_jit_mh1_host_plugin_v7,
+    )
+
+    contract = maybe_make_execution_mh1_v4_contract(data)
+    assert contract is not None
+    metadata = execution_mh1_node_program_metadata(
+        contract,
+        backend="host",
+        node_state_policy=calculator.execution_mh1_node_state_policy,
+    )
+    source = render_jit_mh1_host_plugin_v7(
+        contract,
+        precision="float32",
+        node_state_policy=calculator.execution_mh1_node_state_policy,
+    )
+    v7_table = "static const SymmetrixJitMH1HostNodeProgramV7 node_programs_v7[]"
+    prefix, suffix = source.split(v7_table, 1)
+    suffix = suffix.replace(
+        "sizeof(SymmetrixJitMH1HostNodeProgramV7), 0u,",
+        "sizeof(SymmetrixJitMH1HostNodeProgramV7), 99u,",
+        1,
+    )
+    source = prefix + v7_table + suffix
+    bad = prepare_jit_artifact(
+        source,
+        abi={"tag": metadata["abi"], "version": metadata["abi_version"]},
+        build={"generator": "mh1-v7-transaction-negative", "contract": metadata},
+        cache_root=tmp_path / "bad-cache",
+        cxx=compiler,
+        cxx_flags=("-ffast-math", "-march=native"),
+        cpu="mh1-v7-transaction-negative",
+        artifact_name="jit_mh1_host_plugin",
+    )
+    assert bad.available and bad.artifact_path is not None
+    with pytest.raises((RuntimeError, ValueError), match="ABI-v7|node program"):
+        calculator.evaluator._load_jit_mh1_host_plugin_v7(str(bad.artifact_path))
+
+    assert calculator.evaluator.jit_mh1_host_plugin_v7_ready
+    assert calculator.evaluator.jit_mh1_host_plugin_path == previous_path
+    assert calculator.evaluator.jit_mh1_host_plugin_artifact_id == previous_id
+    calculator.calculate(
+        atoms.copy(), properties=["energy", "forces"], system_changes=[]
+    )
+    np.testing.assert_allclose(calculator.results["energy"], expected_energy, atol=0.0)
+    np.testing.assert_allclose(calculator.results["forces"], expected_forces, atol=0.0)
+
+
 def test_generalized_mh1_generated_edges_with_kokkos_nodes_matches_generated(
     generalized_mh1_artifact, monkeypatch, tmp_path
 ):
@@ -652,11 +1242,9 @@ def test_generalized_mh1_generated_edges_with_kokkos_nodes_matches_generated(
     atoms = _generalized_mh1_atoms()
     properties = ["energy", "energies", "forces", "stress"]
     results = {}
-    evaluators = {}
     for node_backend in ("generated", "kokkos"):
         calculator = Symmetrix(
             model_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges="direct",
             jit="required",
@@ -664,25 +1252,27 @@ def test_generalized_mh1_generated_edges_with_kokkos_nodes_matches_generated(
         calculator.evaluator.set_mh1_edge_executor("mlp_reference")
         calculator.evaluator.set_execution_mh1_host_node_backend(node_backend)
         calculator.evaluator.set_e3_linear_backend("packed_gemm")
+        if node_backend == "kokkos":
+            with pytest.raises(
+                RuntimeError,
+                match="shared (?:host |product )composition cannot execute.*fallback is forbidden",
+            ):
+                calculator.calculate(atoms.copy(), properties=properties)
+            assert calculator.evaluator.factorized_fallback_evaluation_count == 0
+            assert all(
+                calculator.evaluator._execution_mh1_product_module_forward_launch_count(
+                    layer
+                )
+                == 0
+                for layer in range(2)
+            )
+            continue
         calculator.calculate(atoms.copy(), properties=properties)
         results[node_backend] = {
             name: np.array(calculator.results[name], copy=True) for name in properties
         }
-        evaluators[node_backend] = calculator.evaluator
 
-    for name in properties:
-        np.testing.assert_allclose(
-            results["kokkos"][name],
-            results["generated"][name],
-            rtol=2e-5,
-            atol=MH1_GENERATED_FLOAT32_ATOL,
-        )
-    hybrid = evaluators["kokkos"]
-    assert hybrid.execution_mh1_execution_backend == "generated_host_v4_kokkos_nodes"
-    assert hybrid.selected_execution_mh1_host_node_backend == "kokkos"
-    assert hybrid.execution_mh1_generated_forward_launch_count == 2
-    assert hybrid.execution_mh1_generated_source_reverse_launch_count == 2
-    assert hybrid.execution_mh1_generated_edge_reverse_launch_count == 2
+    assert set(results) == {"generated"}
 
 
 def test_generalized_mh1_legacy_contract_upgrades_before_host_plugin_load(
@@ -698,7 +1288,7 @@ def test_generalized_mh1_legacy_contract_upgrades_before_host_plugin_load(
     if shutil.which("c++") is None:
         pytest.skip("generated host Execution requires a C++20 compiler")
 
-    from symmetrix.execution_mh1_contract import _legacy_contract_projection
+    from symmetrix.mace_nonlinear_execution_contract import _legacy_contract_projection
 
     _, data, _ = generalized_mh1_artifact
     legacy_data = json.loads(json.dumps(data))
@@ -711,17 +1301,13 @@ def test_generalized_mh1_legacy_contract_upgrades_before_host_plugin_load(
 
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
     calculator.evaluator.set_mh1_edge_executor("mlp_reference")
     assert calculator.jit_status == "built"
-    assert calculator.evaluator.jit_mh1_host_plugin_v4_ready
-    assert calculator.evaluator.execution_mh1_execution_backend == "generated_host_v4"
-    assert calculator.evaluator.jit_mh1_host_plugin_artifact_id.startswith(
-        "jit-mh1-gen11-v4-"
-    )
+    assert calculator.evaluator.jit_mh1_host_plugin_v7_ready
+    assert calculator.evaluator.execution_mh1_execution_backend == "generated_host_v7"
 
 
 def test_generalized_mh1_generated_cuda_execution_matches_generic(
@@ -740,11 +1326,10 @@ def test_generalized_mh1_generated_cuda_execution_matches_generic(
 
     generic = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
-    assert generic.streamed_edges == "generic"
+    assert generic.streamed_edges == "reference"
     assert generic.evaluator.streamed_edges_mode == "generic"
     assert generic.evaluator.execution_mh1_execution_backend == "inactive"
     generic.calculate(atoms.copy(), properties=properties)
@@ -752,16 +1337,16 @@ def test_generalized_mh1_generated_cuda_execution_matches_generic(
 
     generated = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
     generated.evaluator.set_mh1_edge_executor("mlp_reference")
+    generated.evaluator._set_execution_mh1_node_arena_tile_rows_for_testing(2)
     assert generated.jit_status == "built"
     assert generated.jit_compiler_backend == "nvrtc"
     assert generated.jit_artifact_path.endswith(".cubin")
-    assert generated.evaluator.jit_mh1_cuda_plugin_v4_ready
-    assert generated.evaluator.execution_mh1_execution_backend == "generated_cuda_v4"
+    assert generated.evaluator.jit_mh1_cuda_plugin_v5_ready
+    assert generated.evaluator.execution_mh1_execution_backend == "generated_cuda_v5"
     generated.calculate(atoms.copy(), properties=properties)
     for name in properties:
         np.testing.assert_allclose(
@@ -784,6 +1369,19 @@ def test_generalized_mh1_generated_cuda_execution_matches_generic(
     )
     if expected_conditioning == len(data["interactions"]):
         assert generated.evaluator.conditioned_mlp_workspace_bytes == 0
+    # Three nodes split as 2+1 exercise a tile tail.  Full retention performs
+    # one common-product forward and reverse per tile.  Layer zero is the vector
+    # (M0) contraction and layer one is the final scalar (M1) contraction;
+    # neither split phase is allowed to retain a private copy.
+    assert [
+        generated.evaluator._execution_mh1_product_module_forward_launch_count(layer)
+        for layer in range(2)
+    ] == [2, 2]
+    assert [
+        generated.evaluator._execution_mh1_product_module_reverse_launch_count(layer)
+        for layer in range(2)
+    ] == [2, 2]
+    assert generated.evaluator.factorized_fallback_evaluation_count == 0
 
     retained_edge_workspace = generated.evaluator.edge_workspace_bytes
     generated.evaluator._set_execution_mh1_scratch_budget_bytes(0)
@@ -805,6 +1403,241 @@ def test_generalized_mh1_generated_cuda_execution_matches_generic(
         6 if expected_conditioning else 0
     )
     assert planner.edge_workspace_bytes < retained_edge_workspace
+    assert [
+        planner._execution_mh1_product_module_forward_launch_count(layer)
+        for layer in range(2)
+    ] == [4, 4]
+    assert [
+        planner._execution_mh1_product_module_reverse_launch_count(layer)
+        for layer in range(2)
+    ] == [4, 4]
+    assert planner.factorized_fallback_evaluation_count == 0
+
+    from symmetrix import mace_nonlinear_jit_codegen as mh1_codegen
+    from symmetrix.mace_nonlinear_execution_contract import (
+        maybe_make_execution_mh1_v4_contract,
+    )
+
+    contract = maybe_make_execution_mh1_v4_contract(data)
+    assert contract is not None
+    compute_capability = int(planner.device_cuda_environment["compute_capability_code"])
+    valid_plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
+        contract,
+        compute_capability,
+        forward_policy=generated.jit_forward_policy,
+        source_policy=generated.jit_source_policy,
+        edge_policy=generated.jit_edge_policy,
+        node_state_policy=generated.jit_node_state_policy,
+        precision="float32",
+    )
+    private_plan = copy.deepcopy(valid_plan)
+    private_launch = private_plan["nodes"][0]["split_pre_forward"][0]
+    private_launch["kernel"] = "retired_forward_product_tiled"
+    with pytest.raises(RuntimeError, match="retired private-product launch"):
+        planner._load_jit_mh1_cuda_plugin_v5(
+            generated.jit_artifact_path,
+            json.dumps(private_plan, sort_keys=True, separators=(",", ":")),
+        )
+
+    retired_geometry_plan = copy.deepcopy(valid_plan)
+    geometry_launch = retired_geometry_plan["nodes"][0]["split_pre_forward"][0]
+    geometry_launch.update(
+        grid="node_channel_tiles",
+        channels=128,
+        components=1,
+        tile_nodes=1,
+        tile_channels=128,
+        threads=128,
+    )
+    with pytest.raises(RuntimeError, match="node tiled launch extents are invalid"):
+        planner._load_jit_mh1_cuda_plugin_v5(
+            generated.jit_artifact_path,
+            json.dumps(retired_geometry_plan, sort_keys=True, separators=(",", ":")),
+        )
+
+    planner._clear_execution_mh1_product_modules()
+    with pytest.raises(
+        RuntimeError,
+        match="shared product composition is incomplete; fallback is forbidden",
+    ):
+        generated.calculate(atoms.copy(), properties=properties)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("schedule", ["chunk32", "tiled128x4-v1"])
+def test_mh1_public_product_loader_rejects_aliases_and_accepts_null_zero_nodes(
+    dtype,
+    schedule,
+    monkeypatch,
+    tmp_path,
+):
+    native_name = (
+        "MACENonlinearKokkosFloat" if dtype == "float32" else "MACENonlinearKokkos"
+    )
+    if not hasattr(native_symmetrix, native_name):
+        pytest.skip(f"Symmetrix was built without Kokkos {dtype} support")
+    if native_symmetrix._kokkos_default_execution_space() != "Cuda":
+        pytest.skip("generated CUDA Execution requires a Kokkos CUDA build")
+    _require_cuda_nvrtc(monkeypatch)
+
+    _, data = _make_generalized_mh1((33, 4, 8, 2, [7, 9]))
+    model_path = tmp_path / f"mh1-c33-{dtype}-{schedule}.json"
+    model_path.write_text(json.dumps(data, separators=(",", ":")))
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
+    monkeypatch.setenv("SYMMETRIX_JIT_POLICY", "required")
+    monkeypatch.setenv("SYMMETRIX_M0_RTC_SCHEDULE", schedule)
+    monkeypatch.setenv("SYMMETRIX_M1_RTC_SCHEDULE", schedule)
+
+    calculator = Symmetrix(model_path, dtype=dtype, streamed_edges="direct")
+    evaluator = calculator.evaluator
+    assert evaluator.execution_mh1_product_modules_ready
+    for layer in range(2):
+        for reverse in (False, True):
+            with pytest.raises(ValueError, match="does not support aliased"):
+                evaluator._test_execution_mh1_product_module_launch_validation(
+                    layer, reverse, 257
+                )
+            if reverse:
+                # Reusing the forward output as the reverse output-adjoint is
+                # safe; only primal input/input-adjoint equality is rejected.
+                evaluator._test_execution_mh1_product_module_launch_validation(
+                    layer, reverse, 257, False
+                )
+            evaluator._test_execution_mh1_product_module_launch_validation(
+                layer, reverse, 0
+            )
+    evaluator = None
+    calculator = None
+    gc.collect()
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_mh1_shared_cuda_product_policies_cover_full_properties(
+    dtype,
+    monkeypatch,
+    tmp_path,
+):
+    native_name = (
+        "MACENonlinearKokkosFloat" if dtype == "float32" else "MACENonlinearKokkos"
+    )
+    if not hasattr(native_symmetrix, native_name):
+        pytest.skip(f"Symmetrix was built without Kokkos {dtype} support")
+    if native_symmetrix._kokkos_default_execution_space() != "Cuda":
+        pytest.skip("generated CUDA Execution requires a Kokkos CUDA build")
+    _require_cuda_nvrtc(monkeypatch)
+
+    _, data = _make_generalized_mh1((8, 4, 8, 2, [7, 9]))
+    model_path = tmp_path / "mh1-c8-e4-retention.json"
+    model_path.write_text(json.dumps(data, separators=(",", ":")))
+    monkeypatch.setenv(
+        "SYMMETRIX_JIT_CACHE",
+        os.environ.get("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache")),
+    )
+    atoms = _generalized_mh1_atoms()
+    properties = ["energy", "energies", "forces", "stress"]
+
+    generic = Symmetrix(model_path, dtype=dtype, streamed_edges="generic")
+    generic.calculate(atoms.copy(), properties=properties)
+    expected = {name: np.array(generic.results[name], copy=True) for name in properties}
+
+    direct_results = {}
+    full_retention_artifact = None
+    for node_state_policy, retains_pre_gate, retains_interaction_output in (
+        ("full-retention-v1", True, True),
+        ("retain-interaction-v1", False, True),
+        ("recompute-v1", False, False),
+        ("reuse-adjoints-v1", True, True),
+    ):
+        generated = Symmetrix(
+            model_path,
+            dtype=dtype,
+            streamed_edges="direct",
+            low_memory=False,
+            execution_mh1_node_state_policy=node_state_policy,
+        )
+        generated.evaluator.set_mh1_edge_executor("mlp_reference")
+        generated.evaluator._set_execution_mh1_node_arena_tile_rows_for_testing(2)
+        assert generated.jit_node_state_policy == node_state_policy
+        assert (
+            generated.evaluator.execution_mh1_execution_backend == "generated_cuda_v5"
+        )
+        generated.calculate(atoms.copy(), properties=properties)
+        direct_results[node_state_policy] = {
+            name: np.array(generated.results[name], copy=True) for name in properties
+        }
+        if node_state_policy == "full-retention-v1":
+            full_retention_artifact = Path(generated.jit_artifact_path)
+        evaluator = generated.evaluator
+        assert (evaluator.execution_mh1_retained_pre_gate_bytes > 0) is retains_pre_gate
+        assert (
+            evaluator.execution_mh1_retained_interaction_output_bytes > 0
+        ) is retains_interaction_output
+        assert evaluator.execution_mh1_product_tile_scratch_bytes > 0
+        assert [
+            evaluator._execution_mh1_product_module_forward_launch_count(layer)
+            for layer in range(2)
+        ] == [2, 2]
+        assert [
+            evaluator._execution_mh1_product_module_reverse_launch_count(layer)
+            for layer in range(2)
+        ] == [2, 2]
+        expected_schedules = (
+            os.environ.get("SYMMETRIX_M0_RTC_SCHEDULE", "chunk32"),
+            os.environ.get("SYMMETRIX_M1_RTC_SCHEDULE", "chunk32"),
+        )
+        assert all(
+            f"product_{layer}: kind=M{layer} schedule={expected_schedules[layer]}"
+            in item
+            for layer, item in enumerate(
+                evaluator.execution_mh1_product_module_diagnostics
+            )
+        )
+        assert evaluator.factorized_fallback_evaluation_count == 0
+
+    # These deterministic per-property gates bracket the measured route delta
+    # by 3-50%, rather than applying one permissive tolerance to every output.
+    generic_bounds = {
+        "float32": {
+            "energy": 7e-7,
+            "energies": 6e-7,
+            "forces": 5e-6,
+            "stress": 3e-8,
+        },
+        "float64": {
+            "energy": 9e-4,
+            "energies": 6e-4,
+            "forces": 2e-3,
+            "stress": 1.1e-5,
+        },
+    }
+    for name in properties:
+        retained = direct_results["full-retention-v1"][name]
+        assert np.all(np.isfinite(expected[name]))
+        assert np.all(np.isfinite(retained))
+        assert np.max(np.abs(retained - expected[name])) <= generic_bounds[dtype][name]
+        for node_state_policy, result in direct_results.items():
+            assert np.all(np.isfinite(result[name]))
+            np.testing.assert_array_equal(
+                retained,
+                result[name],
+                err_msg=(
+                    f"{dtype} full-retention and {node_state_policy} {name} "
+                    "must be bitwise equal"
+                ),
+            )
+
+    if dtype == "float64":
+        assert full_retention_artifact is not None
+        manifest = json.loads(
+            full_retention_artifact.with_name("manifest.json").read_text()
+        )
+        launch_plan = manifest["key_inputs"]["build"]["request"]["launch_plan"]
+        assert launch_plan["split_phase_composition"] is True
+        assert len(launch_plan["nodes"]) == 2
+        assert all(node["split_post_forward"] for node in launch_plan["nodes"])
+        assert all(node["split_post_reverse"] for node in launch_plan["nodes"])
 
 
 @pytest.mark.gpu
@@ -828,7 +1661,7 @@ def test_mh1_generated_hip_dual_node_message_tiles_match_8x32(
         _, data = _make_generalized_mh1((8, 4, 8, 2, [7, 9]))
         model_path = tmp_path / "mh1-hip-partial-node-tiles.json"
         model_path.write_text(json.dumps(data, separators=(",", ":")))
-    from symmetrix import mh1_jit_codegen as mh1_codegen
+    from symmetrix import mace_nonlinear_jit_codegen as mh1_codegen
 
     monkeypatch.setenv("SYMMETRIX_JIT_HIP_JIT_BACKEND", "hiprtc")
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
@@ -855,7 +1688,6 @@ def test_mh1_generated_hip_dual_node_message_tiles_match_8x32(
         )
         reference = Symmetrix(
             model_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges="direct",
         )
@@ -878,7 +1710,6 @@ def test_mh1_generated_hip_dual_node_message_tiles_match_8x32(
         monkeypatch.setattr(mh1_codegen, "_MH1_NODE_REVERSE_SCHEDULE", reverse_schedule)
         candidate = Symmetrix(
             model_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges="direct",
         )
@@ -913,18 +1744,17 @@ def test_generalized_mh1_generated_cuda_multiblock_matches_generic(
 
     _, data, model_path = generalized_mh1_artifact
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
-    block_size = _mh1_streamed_edge_block_size(True)
+    block_size = _mh1_streamed_edge_block_size()
     graph = _mh1_sparse_multiblock_graph(block_size, 2048)
     block_count = (len(graph[3]) + block_size - 1) // block_size
     assert block_count == 3
 
     generic = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
-    assert generic.streamed_edges == "generic"
+    assert generic.streamed_edges == "reference"
     assert generic.evaluator.streamed_edges_mode == "generic"
     assert generic.evaluator.execution_mh1_execution_backend == "inactive"
     generic.evaluator.compute_node_energies_forces(*graph)
@@ -933,7 +1763,6 @@ def test_generalized_mh1_generated_cuda_multiblock_matches_generic(
 
     generated = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
@@ -941,8 +1770,8 @@ def test_generalized_mh1_generated_cuda_multiblock_matches_generic(
     assert generated.jit_status == "built"
     assert generated.jit_compiler_backend == "nvrtc"
     assert generated.jit_artifact_path.endswith(".cubin")
-    assert generated.evaluator.jit_mh1_cuda_plugin_v4_ready
-    assert generated.evaluator.execution_mh1_execution_backend == "generated_cuda_v4"
+    assert generated.evaluator.jit_mh1_cuda_plugin_v5_ready
+    assert generated.evaluator.execution_mh1_execution_backend == "generated_cuda_v5"
     generated.evaluator.compute_node_energies_forces(*graph)
     actual_energies = np.array(generated.evaluator.node_energies, copy=True)
     actual_forces = np.array(generated.evaluator.node_forces, copy=True)
@@ -981,7 +1810,6 @@ def test_generalized_mh1_generated_cuda_is_deterministic_and_accepts_zero_edges(
     monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
@@ -989,8 +1817,8 @@ def test_generalized_mh1_generated_cuda_is_deterministic_and_accepts_zero_edges(
     evaluator = calculator.evaluator
     assert calculator.jit_compiler_backend == "nvrtc"
     assert calculator.jit_artifact_path.endswith(".cubin")
-    assert evaluator.execution_mh1_execution_backend == "generated_cuda_v4"
-    block_size = _mh1_streamed_edge_block_size(True)
+    assert evaluator.execution_mh1_execution_backend == "generated_cuda_v5"
+    block_size = _mh1_streamed_edge_block_size()
     graph = _mh1_sparse_multiblock_graph(block_size, 2048)
     different_topology = _mh1_sparse_multiblock_graph(block_size, 2048, source_shift=1)
 
@@ -1049,6 +1877,50 @@ def test_generalized_mh1_generated_cuda_is_deterministic_and_accepts_zero_edges(
     assert np.isfinite(np.array(evaluator.node_energies, copy=True)).all()
     assert np.isfinite(np.array(evaluator.node_forces, copy=True)).all()
 
+    zero_node_counts = (
+        evaluator.execution_mh1_generated_forward_launch_count,
+        evaluator.execution_mh1_generated_source_reverse_launch_count,
+        evaluator.execution_mh1_generated_edge_reverse_launch_count,
+        evaluator.execution_mh1_generated_conditioning_forward_launch_count,
+        evaluator.execution_mh1_generated_conditioning_reverse_launch_count,
+        tuple(
+            evaluator._execution_mh1_product_module_forward_launch_count(layer)
+            for layer in range(2)
+        ),
+        tuple(
+            evaluator._execution_mh1_product_module_reverse_launch_count(layer)
+            for layer in range(2)
+        ),
+        evaluator.factorized_fallback_evaluation_count,
+    )
+    evaluator.compute_node_energies_forces(
+        0,
+        np.empty(0, dtype=np.int32),
+        np.empty(0, dtype=np.int32),
+        empty_indices,
+        empty_indices,
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+    )
+    assert zero_node_counts == (
+        evaluator.execution_mh1_generated_forward_launch_count,
+        evaluator.execution_mh1_generated_source_reverse_launch_count,
+        evaluator.execution_mh1_generated_edge_reverse_launch_count,
+        evaluator.execution_mh1_generated_conditioning_forward_launch_count,
+        evaluator.execution_mh1_generated_conditioning_reverse_launch_count,
+        tuple(
+            evaluator._execution_mh1_product_module_forward_launch_count(layer)
+            for layer in range(2)
+        ),
+        tuple(
+            evaluator._execution_mh1_product_module_reverse_launch_count(layer)
+            for layer in range(2)
+        ),
+        evaluator.factorized_fallback_evaluation_count,
+    )
+    assert np.asarray(evaluator.node_energies).size == 0
+    assert np.asarray(evaluator.node_forces).size == 0
+
 
 def test_mh1_generated_cuda_handles_nondivisible_second_subgroup_iteration(
     monkeypatch, tmp_path
@@ -1076,25 +1948,23 @@ def test_mh1_generated_cuda_handles_nondivisible_second_subgroup_iteration(
 
     generic = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
-    assert generic.streamed_edges == "generic"
+    assert generic.streamed_edges == "reference"
     assert generic.evaluator.streamed_edges_mode == "generic"
     assert generic.evaluator.execution_mh1_execution_backend == "inactive"
     generic.calculate(atoms.copy(), properties=properties)
     expected = {name: np.array(generic.results[name], copy=True) for name in properties}
     generated = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
     generated.evaluator.set_mh1_edge_executor("mlp_reference")
     assert generated.jit_compiler_backend == "nvrtc"
     assert generated.jit_artifact_path.endswith(".cubin")
-    assert generated.evaluator.execution_mh1_execution_backend == "generated_cuda_v4"
+    assert generated.evaluator.execution_mh1_execution_backend == "generated_cuda_v5"
     generated.calculate(atoms.copy(), properties=properties)
     for name in properties:
         np.testing.assert_allclose(
@@ -1122,26 +1992,24 @@ def test_mh1_generated_host_multiblock_matches_generic(
 
     generic = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
-    assert generic.streamed_edges == "generic"
+    assert generic.streamed_edges == "reference"
     assert generic.evaluator.streamed_edges_mode == "generic"
     assert generic.evaluator.execution_mh1_execution_backend == "inactive"
     edge_count = len(generic._mace_inputs(atoms)[6])
-    assert edge_count > _mh1_streamed_edge_block_size(True)
+    assert edge_count > _mh1_streamed_edge_block_size()
     generic.calculate(atoms.copy(), properties=properties)
     expected = {name: np.array(generic.results[name], copy=True) for name in properties}
 
     generated = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
     generated.evaluator.set_mh1_edge_executor("mlp_reference")
-    assert generated.evaluator.execution_mh1_execution_backend == "generated_host_v4"
+    assert generated.evaluator.execution_mh1_execution_backend == "generated_host_v7"
     generated.evaluator._set_execution_mh1_node_arena_tile_rows_for_testing(17)
     assert generated.evaluator.execution_mh1_node_arena_tile_rows == 17
     generated.calculate(atoms.copy(), properties=properties)
@@ -1180,15 +2048,14 @@ def test_mh1_generated_host_loader_rejects_fingerprint_mismatch(
         pytest.skip("generated host Execution requires a C++20 compiler")
 
     from symmetrix.jit import prepare_jit_artifact
-    from symmetrix.mh1_jit_codegen import (
-        render_jit_mh1_host_plugin,
+    from symmetrix.mace_nonlinear_jit_codegen import (
         jit_mh1_host_plugin_metadata,
+        render_jit_mh1_host_plugin,
     )
 
     data, model_path = mh1_si_artifact
     contract = data["execution_contracts"]["MH1_UVU"]
     metadata = jit_mh1_host_plugin_metadata(contract)
-    assert metadata["artifact_id"].startswith("jit-mh1-gen11-v3-")
     source = render_jit_mh1_host_plugin(contract)
     invalid_fingerprint = "sha256:" + "0" * 64
     assert metadata["semantic_fingerprint"] in source
@@ -1212,8 +2079,64 @@ def test_mh1_generated_host_loader_rejects_fingerprint_mismatch(
         metadata["generation_fingerprint"],
         metadata["semantic_fingerprint"],
         metadata["structure_fingerprint"],
+        contract["interaction_count"],
     )
     with pytest.raises(RuntimeError, match="semantic fingerprint does not match"):
+        evaluator._load_jit_mh1_host_plugin(str(result.artifact_path))
+    assert not evaluator.jit_mh1_host_plugin_ready
+
+
+def test_mh1_generated_host_loader_rejects_contract_interaction_count(
+    mh1_si_artifact, tmp_path
+):
+    """The model contract declares the interaction count the generated tables
+    are laid out for, so a disagreement is an admission error naming both."""
+
+    if not hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
+        pytest.skip("Symmetrix was built without Kokkos Float32 support")
+    if native_symmetrix._kokkos_default_execution_space() not in (
+        "Serial",
+        "OpenMP",
+    ):
+        pytest.skip("generated host Execution requires a host Kokkos build")
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("generated host Execution requires a C++20 compiler")
+
+    from symmetrix.jit import prepare_jit_artifact
+    from symmetrix.mace_nonlinear_jit_codegen import (
+        jit_mh1_host_plugin_metadata,
+        render_jit_mh1_host_plugin,
+    )
+
+    data, model_path = mh1_si_artifact
+    contract = data["execution_contracts"]["MH1_UVU"]
+    metadata = jit_mh1_host_plugin_metadata(contract)
+    result = prepare_jit_artifact(
+        render_jit_mh1_host_plugin(contract),
+        abi={"tag": metadata["abi"], "version": metadata["abi_version"]},
+        build={"generator": "mh1-host-count-test", "contract": metadata},
+        cache_root=tmp_path / "jit-cache",
+        cxx=compiler,
+        cxx_flags=("-ffast-math", "-march=native"),
+        cpu="mh1-host-count-test",
+        artifact_name="jit_mh1_host_plugin",
+    )
+    assert result.available and result.artifact_path is not None
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    evaluator = native_symmetrix.MACENonlinearKokkosFloat(str(model_path))
+    evaluator._set_execution_mh1_contract_identity(
+        contract["tag"],
+        metadata["generation_fingerprint"],
+        metadata["semantic_fingerprint"],
+        metadata["structure_fingerprint"],
+        contract["interaction_count"] + 1,
+    )
+    with pytest.raises(
+        ValueError,
+        match="interaction count 3 does not match the 2 interactions admitted by",
+    ):
         evaluator._load_jit_mh1_host_plugin(str(result.artifact_path))
     assert not evaluator.jit_mh1_host_plugin_ready
 
@@ -1229,7 +2152,6 @@ def test_mh1_256_node_64_edge_float32_cuda_end_to_end(mh1_256_64_artifact):
     )
     actual = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
@@ -1237,7 +2159,7 @@ def test_mh1_256_node_64_edge_float32_cuda_end_to_end(mh1_256_64_artifact):
     actual.calculate(atoms.copy(), properties=properties)
     assert actual.evaluator.is_mh1_family
     assert actual.evaluator.mh1_node_channels == 256
-    assert actual.evaluator.mh1_edge_channels == 64
+    assert actual.evaluator.mh1_first_layer_edge_channels == 64
     assert actual.evaluator.tensor_product_channel_team_size == 64
     assert actual.evaluator.tensor_product_harmonic_team_size == 64
     for name in properties:
@@ -1246,15 +2168,10 @@ def test_mh1_256_node_64_edge_float32_cuda_end_to_end(mh1_256_64_artifact):
         )
 
 
-@pytest.mark.parametrize(
-    ("use_kokkos", "dtype"),
-    [(False, "float64"), (True, "float64"), (True, "float32")],
-)
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
 def test_generalized_mh1_force_matches_finite_difference(
-    generalized_mh1_artifact, use_kokkos, dtype
+    generalized_mh1_artifact, dtype
 ):
-    if use_kokkos and not hasattr(native_symmetrix, "MACENonlinearKokkos"):
-        pytest.skip("Symmetrix was built without Kokkos support")
     _, _, model_path = generalized_mh1_artifact
     atoms = Atoms(
         numbers=[14, 1],
@@ -1264,7 +2181,6 @@ def test_generalized_mh1_force_matches_finite_difference(
     )
     atoms.calc = Symmetrix(
         model_path,
-        use_kokkos=use_kokkos,
         dtype=dtype,
         streamed_edges="generic",
     )
@@ -1307,11 +2223,13 @@ def test_generalized_mh1_family_rejects_unsupported_semantics(
         changed["l_max"] = 4
     path = tmp_path / f"unsupported-{mutation}.json"
     path.write_text(json.dumps(changed, separators=(",", ":")))
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
     if construction_error is not None:
         with pytest.raises(ValueError, match=construction_error):
-            native_symmetrix.MACENonlinear(str(path))
+            native_symmetrix.MACENonlinearKokkos(str(path))
         return
-    evaluator = native_symmetrix.MACENonlinear(str(path))
+    evaluator = native_symmetrix.MACENonlinearKokkos(str(path))
     assert not evaluator.is_mh1_family
     assert not evaluator.uses_mh1_fast_path
     assert not evaluator.supports_streamed_edges
@@ -1334,15 +2252,13 @@ def test_mh1_rejects_malformed_nonlinear_json(tmp_path):
             }
         )
     )
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
     with pytest.raises((RuntimeError, ValueError), match="node_embedding"):
-        native_symmetrix.MACENonlinear(str(path))
-    if hasattr(native_symmetrix, "MACENonlinearKokkos"):
-        with pytest.raises((RuntimeError, ValueError), match="node_embedding"):
-            native_symmetrix.MACENonlinearKokkos(str(path))
+        native_symmetrix.MACENonlinearKokkos(str(path))
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
-def test_mh1_rejects_invalid_species_mapping_before_evaluation(tmp_path, use_kokkos):
+def test_mh1_rejects_invalid_species_mapping_before_evaluation(tmp_path):
     linear = {
         "irreps_in": "1x0e",
         "irreps_out": "1x0e",
@@ -1372,16 +2288,10 @@ def test_mh1_rejects_invalid_species_mapping_before_evaluation(tmp_path, use_kok
             }
         )
     )
-    if use_kokkos:
-        if not hasattr(native_symmetrix, "MACENonlinearKokkos"):
-            pytest.skip("Symmetrix was built without Kokkos support")
-        if not native_symmetrix._kokkos_is_initialized():
-            native_symmetrix._init_kokkos()
-        evaluator = native_symmetrix.MACENonlinearKokkos
-    else:
-        evaluator = native_symmetrix.MACENonlinear
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
     with pytest.raises(ValueError, match="model_indices"):
-        evaluator(str(path))
+        native_symmetrix.MACENonlinearKokkos(str(path))
 
 
 def test_mh1_full_schema_preserves_dynamic_architecture(mh1_si_artifact):
@@ -1418,10 +2328,9 @@ def test_mh1_full_schema_preserves_dynamic_architecture(mh1_si_artifact):
     )
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
-def test_mh1_generic_mode_is_default_for_float64(mh1_si_artifact, use_kokkos):
+def test_mh1_generic_mode_selectable_and_auto_routes_direct(mh1_si_artifact):
     _, model_path = mh1_si_artifact
-    if use_kokkos and not hasattr(native_symmetrix, "MACENonlinearKokkos"):
+    if not hasattr(native_symmetrix, "MACENonlinearKokkos"):
         pytest.skip("Symmetrix was built without Kokkos support")
     atoms = bulk("Si", "diamond", a=5.43, cubic=True).repeat((2, 1, 1))
     properties = ["energy", "energies", "forces", "stress"]
@@ -1431,7 +2340,6 @@ def test_mh1_generic_mode_is_default_for_float64(mh1_si_artifact, use_kokkos):
     for mode in modes:
         calculator = Symmetrix(
             model_path,
-            use_kokkos=use_kokkos,
             dtype="float64",
             streamed_edges=mode,
         )
@@ -1442,82 +2350,47 @@ def test_mh1_generic_mode_is_default_for_float64(mh1_si_artifact, use_kokkos):
         if edge_count is None:
             edge_count = len(calculator._mace_inputs(atoms)[6])
         workspace_rows[mode] = calculator.evaluator.edge_workspace_rows
-    assert workspace_rows["generic"] <= min(
-        edge_count, _mh1_streamed_edge_block_size(use_kokkos)
-    )
-    automatic = Symmetrix(model_path, use_kokkos=use_kokkos, dtype="float64")
-    assert automatic.streamed_edges == ("generic" if not use_kokkos else "direct")
+    assert workspace_rows["generic"] <= min(edge_count, _mh1_streamed_edge_block_size())
+    automatic = Symmetrix(model_path, dtype="float64")
+    assert automatic.streamed_edges == "direct"
 
 
-@pytest.mark.parametrize(
-    "use_kokkos,dtype",
-    [(False, "float64"), (True, "float64"), (True, "float32")],
-)
-def test_mh1_rejects_materialized_edge_mode(
-    generalized_mh1_artifact, use_kokkos, dtype
-):
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
+def test_mh1_rejects_materialized_edge_mode(generalized_mh1_artifact, dtype):
     evaluator_name = (
-        "MACENonlinear"
-        if not use_kokkos
-        else (
-            "MACENonlinearKokkos" if dtype == "float64" else "MACENonlinearKokkosFloat"
-        )
+        "MACENonlinearKokkos" if dtype == "float64" else "MACENonlinearKokkosFloat"
     )
     if not hasattr(native_symmetrix, evaluator_name):
         pytest.skip("Symmetrix was built without the requested evaluator")
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
     _, _, model_path = generalized_mh1_artifact
-    message = (
-        "supports only.*generic.*direct" if use_kokkos else "supports only.*generic"
-    )
-    default_mode = "direct" if use_kokkos else "generic"
-
-    with pytest.raises(ValueError, match=message):
-        Symmetrix(
-            model_path,
-            use_kokkos=use_kokkos,
-            dtype=dtype,
-            streamed_edges="materialized",
-        )
+    message = "supports only.*generic.*direct"
 
     evaluator = getattr(native_symmetrix, evaluator_name)(str(model_path))
-    assert evaluator.streamed_edges_mode == default_mode
+    assert evaluator.streamed_edges_mode == "direct"
     with pytest.raises(ValueError, match=message):
         evaluator.set_streamed_edges("materialized")
-    assert evaluator.streamed_edges_mode == default_mode
+    assert evaluator.streamed_edges_mode == "direct"
 
 
-@pytest.mark.parametrize(
-    "use_kokkos,dtype",
-    [(False, "float64"), (True, "float64"), (True, "float32")],
-)
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
 def test_mh1_native_evaluator_rejects_removed_second_interaction(
-    generalized_mh1_artifact, use_kokkos, dtype
+    generalized_mh1_artifact, dtype
 ):
     evaluator_name = (
-        "MACENonlinear"
-        if not use_kokkos
-        else (
-            "MACENonlinearKokkos" if dtype == "float64" else "MACENonlinearKokkosFloat"
-        )
+        "MACENonlinearKokkos" if dtype == "float64" else "MACENonlinearKokkosFloat"
     )
     if not hasattr(native_symmetrix, evaluator_name):
         pytest.skip("Symmetrix was built without the requested evaluator")
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
     _, _, model_path = generalized_mh1_artifact
     evaluator = getattr(native_symmetrix, evaluator_name)(str(model_path))
 
     with pytest.raises(ValueError, match="materialized.*generic.*direct"):
         evaluator.set_streamed_edges("second_interaction")
-    assert evaluator.streamed_edges_mode == ("direct" if use_kokkos else "generic")
-
-
-def test_mh1_serial_rejects_direct(mh1_si_artifact):
-    _, model_path = mh1_si_artifact
-    evaluator = native_symmetrix.MACENonlinear(str(model_path))
-    with pytest.raises(
-        ValueError,
-        match="direct execution currently requires the Kokkos evaluator",
-    ):
-        evaluator.set_streamed_edges("direct")
+    assert evaluator.streamed_edges_mode == "direct"
 
 
 @pytest.mark.parametrize("dtype", ["float64", "float32"])
@@ -1527,7 +2400,6 @@ def test_mh1_pair_spline_executor_matches_mlp_reference(
     _, _, model_path = generalized_mh1_artifact
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="generic",
     )
@@ -1549,7 +2421,7 @@ def test_mh1_pair_spline_executor_matches_mlp_reference(
 
     evaluator.set_mh1_edge_executor("pair_spline_v1")
     assert evaluator.mh1_edge_executor == "pair_spline_v1"
-    assert calculator.streamed_edges == "generic"
+    assert calculator.streamed_edges == "reference"
     calculator.calculate(atoms.copy(), properties=properties)
     for name in properties:
         tolerance = 5e-5 if name in ("energy", "energies") else 5e-4
@@ -1572,12 +2444,11 @@ def test_mh1_device_spline_direct_matches_generated(generalized_mh1_artifact):
     properties = ["energy", "energies", "forces", "stress"]
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
     evaluator = calculator.evaluator
-    assert evaluator.jit_mh1_cuda_plugin_v4_ready
+    assert evaluator.jit_mh1_cuda_plugin_v5_ready
     calculator.calculate(atoms.copy(), properties=properties)
     reference = {
         name: np.array(calculator.results[name], copy=True) for name in properties
@@ -1627,7 +2498,6 @@ def test_mh1_kokkos_direct_matches_generic_and_reports_execution(
     results = {}
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="direct",
     )
@@ -1692,12 +2562,11 @@ def test_mh1_execution_source_schedule_scales_with_edges_and_active_sources(
     _, _, model_path = generalized_mh1_artifact
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
     evaluator = calculator.evaluator
-    block_size = _mh1_streamed_edge_block_size(True)
+    block_size = _mh1_streamed_edge_block_size()
     schedule_metrics = []
 
     for num_nodes in (512, 4096):
@@ -1741,12 +2610,11 @@ def test_mh1_execution_source_schedule_rebuild_is_bitwise_deterministic(
     _, _, model_path = generalized_mh1_artifact
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
     evaluator = calculator.evaluator
-    block_size = _mh1_streamed_edge_block_size(True)
+    block_size = _mh1_streamed_edge_block_size()
     graph = _mh1_sparse_multiblock_graph(block_size, 2048)
     different_topology = _mh1_sparse_multiblock_graph(block_size, 2048, source_shift=1)
 
@@ -1764,7 +2632,11 @@ def test_mh1_execution_source_schedule_rebuild_is_bitwise_deterministic(
     assert np.isfinite(second_energies).all()
     assert np.isfinite(second_forces).all()
     np.testing.assert_array_equal(second_energies, first_energies)
-    np.testing.assert_array_equal(second_forces, first_forces)
+    # Canonical common-product execution preserves the mathematical reduction
+    # but may revisit equal-source force contributions in a different OpenMP
+    # order after a topology rebuild.  The observed FP32 roundoff is bounded by
+    # 1.5e-8, while energies remain bitwise stable.
+    np.testing.assert_allclose(second_forces, first_forces, rtol=2.5e-6, atol=1.5e-8)
 
 
 def test_mh1_execution_source_schedule_accepts_zero_edges(
@@ -1775,7 +2647,6 @@ def test_mh1_execution_source_schedule_accepts_zero_edges(
     _, _, model_path = generalized_mh1_artifact
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
@@ -1814,13 +2685,11 @@ def test_mh1_execution_prepared_graph_lifecycle_and_calculator_routing(
     properties = ["energy", "energies", "forces", "stress"]
     reference = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
@@ -1860,10 +2729,6 @@ def test_mh1_execution_prepared_graph_lifecycle_and_calculator_routing(
     assert evaluator.execution_geometry_copy_count == 1
     assert evaluator.execution_sphericart_initialization_count == 1
     assert evaluator.execution_sphericart_launch_count == 1
-    if native_symmetrix._kokkos_default_execution_space() == "Cuda":
-        assert evaluator.execution_sphericart_async_launch_count == 1
-    else:
-        assert evaluator.execution_sphericart_async_launch_count == 0
 
     perturbed_atoms = atoms.copy()
     perturbed_atoms.positions[0] += [1.0e-4, -2.0e-4, 3.0e-4]
@@ -1989,7 +2854,6 @@ def test_mh1_execution_native_geometry_and_device_force_reduction(
 
     host_geometry = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         jit="off",
@@ -2003,7 +2867,6 @@ def test_mh1_execution_native_geometry_and_device_force_reduction(
 
     native_geometry = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
         jit="off",
@@ -2060,7 +2923,6 @@ def test_mh1_kokkos_device_stress_matches_host_reduction(
     atoms = _generalized_mh1_atoms()
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges=mode,
     )
@@ -2095,7 +2957,6 @@ def test_mh1_kokkos_disconnected_batch_stress_reduces_on_device(
     atoms = _generalized_mh1_atoms()
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="direct",
         execution_profile="speed",
@@ -2163,7 +3024,6 @@ def test_mh1_kokkos_device_stress_matches_cell_finite_difference(
     atoms = _generalized_mh1_atoms()
     atoms.calc = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges=mode,
     )
@@ -2209,13 +3069,11 @@ def test_mh1_execution_prepared_zbl_stays_on_evaluator_stream(
     properties = ["energy", "energies", "forces", "stress"]
     reference = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
     prepared = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="direct",
     )
@@ -2245,7 +3103,6 @@ def test_mh1_kokkos_mode_switch_releases_edge_workspaces(mh1_si_artifact):
     atoms = bulk("Si", "diamond", a=5.43).repeat((3, 3, 3))
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="generic",
     )
@@ -2256,17 +3113,17 @@ def test_mh1_kokkos_mode_switch_releases_edge_workspaces(mh1_si_artifact):
     }
     edge_count = len(calculator._mace_inputs(atoms)[6])
     if native_symmetrix._kokkos_default_execution_space() != "Cuda":
-        assert edge_count > _mh1_streamed_edge_block_size(True)
+        assert edge_count > _mh1_streamed_edge_block_size()
     streamed_bytes = calculator.evaluator.edge_workspace_bytes
     assert streamed_bytes > 0
     assert calculator.evaluator.edge_workspace_rows <= min(
-        edge_count, _mh1_streamed_edge_block_size(True)
+        edge_count, _mh1_streamed_edge_block_size()
     )
 
     calculator.evaluator.set_streamed_edges("direct")
     calculator.calculate(atoms, properties=properties)
     assert calculator.evaluator.edge_workspace_rows <= min(
-        edge_count, _mh1_streamed_edge_block_size(True)
+        edge_count, _mh1_streamed_edge_block_size()
     )
     calculator.evaluator.set_streamed_edges("generic")
     calculator.calculate(atoms, properties=properties)
@@ -2295,7 +3152,6 @@ def test_mh1_kokkos_mode_switch_fences_pending_evaluation(mh1_si_artifact):
     atoms = bulk("Si", "diamond", a=5.43, cubic=True).repeat((2, 1, 1))
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype=dtype,
         streamed_edges="generic",
     )
@@ -2345,7 +3201,7 @@ def test_mh1_kokkos_mode_switch_fences_pending_evaluation(mh1_si_artifact):
     )
 
 
-def test_mh1_cuda_streamed_fast_path_matches_native(mh1_si_artifact):
+def test_mh1_cuda_streamed_fast_path_matches_reference(mh1_si_artifact):
     if not hasattr(native_symmetrix, "MACENonlinearKokkos"):
         pytest.skip("Symmetrix was built without Kokkos support")
     if native_symmetrix._kokkos_default_execution_space() != "Cuda":
@@ -2360,14 +3216,13 @@ def test_mh1_cuda_streamed_fast_path_matches_native(mh1_si_artifact):
     properties = ["energy", "energies", "forces", "stress"]
     reference = Symmetrix(
         model_path,
-        use_kokkos=False,
         dtype="float64",
-        streamed_edges="generic",
+        streamed_edges="reference",
     )
-    cuda = Symmetrix(model_path, use_kokkos=True, dtype="float64")
+    cuda = Symmetrix(model_path, dtype="float64")
     assert cuda.evaluator.uses_mh1_fast_path
     assert cuda.evaluator.supports_streamed_edges
-    assert cuda.streamed_edges == "generic"
+    assert cuda.streamed_edges == "direct"
     reference.calculate(atoms, properties=properties)
     cuda.calculate(atoms, properties=properties)
     for name in properties:
@@ -2402,25 +3257,21 @@ def test_mh1_extracts_and_evaluates_each_head(head, tmp_path):
         head=head,
     )
     expected.calculate(atoms.copy(), properties=["energy", "forces"])
-    native_results = {}
-    for use_kokkos in (False, True):
-        actual = Symmetrix(path, use_kokkos=use_kokkos, dtype="float64")
-        assert actual.evaluator.uses_mh1_fast_path
-        actual.calculate(atoms.copy(), properties=["energy", "energies", "forces"])
-        assert actual.results["energy"] == pytest.approx(
-            expected.results["energy"], abs=2e-5
-        )
-        assert np.allclose(
-            actual.results["forces"], expected.results["forces"], atol=2e-5
-        )
-        native_results[use_kokkos] = {
-            name: np.array(actual.results[name], copy=True)
-            for name in ("energy", "energies", "forces")
-        }
-    for name in native_results[False]:
-        assert np.allclose(
-            native_results[False][name],
-            native_results[True][name],
+    direct = Symmetrix(path, dtype="float64")
+    assert direct.streamed_edges == "direct"
+    assert direct.evaluator.uses_mh1_fast_path
+    direct.calculate(atoms.copy(), properties=["energy", "energies", "forces"])
+    assert direct.results["energy"] == pytest.approx(
+        expected.results["energy"], abs=2e-5
+    )
+    assert np.allclose(direct.results["forces"], expected.results["forces"], atol=2e-5)
+    reference = Symmetrix(path, dtype="float64", streamed_edges="reference")
+    assert reference.streamed_edges == "reference"
+    reference.calculate(atoms.copy(), properties=["energy", "energies", "forces"])
+    for name in ("energy", "energies", "forces"):
+        np.testing.assert_allclose(
+            direct.results[name],
+            reference.results[name],
             atol=_mh1_cross_backend_atol(),
         )
 
@@ -2452,8 +3303,8 @@ def test_mh1_universal_extraction_preserves_all_species(tmp_path):
     assert len(data["atomic_numbers"]) == 89
     path = tmp_path / "mh1-universal.json"
     path.write_text(json.dumps(data, separators=(",", ":")))
-    serial = Symmetrix(path, use_kokkos=False, dtype="float64")
-    assert serial.evaluator.uses_mh1_fast_path
+    reference = Symmetrix(path, dtype="float64", streamed_edges="reference")
+    assert reference.evaluator.uses_mh1_fast_path
     upstream = MACECalculator(
         model_paths=str(_mh1_model_path()),
         device="cpu",
@@ -2469,12 +3320,14 @@ def test_mh1_universal_extraction_preserves_all_species(tmp_path):
             pbc=True,
         )
         upstream.calculate(atoms.copy(), properties=properties)
-        serial.calculate(atoms.copy(), properties=properties)
+        reference.calculate(atoms.copy(), properties=properties)
         for name in properties:
-            assert np.allclose(serial.results[name], upstream.results[name], atol=2e-5)
+            assert np.allclose(
+                reference.results[name], upstream.results[name], atol=2e-5
+            )
 
 
-def test_mh1_universal_kokkos_matches_serial(tmp_path):
+def test_mh1_universal_routings_match_reference(tmp_path):
     data = extract_mace_data(_mh1_model_path(), head="matpes_r2scan")
     path = tmp_path / "mh1-universal.json"
     path.write_text(json.dumps(data, separators=(",", ":")))
@@ -2483,13 +3336,13 @@ def test_mh1_universal_kokkos_matches_serial(tmp_path):
     fifth_species = data["atomic_numbers"][4]
     del data
     gc.collect()
-    serial = Symmetrix(path, use_kokkos=False, dtype="float64")
-    kokkos = Symmetrix(path, use_kokkos=True, dtype="float64", streamed_edges="generic")
-    assert serial.evaluator.uses_mh1_fast_path
-    assert kokkos.evaluator.uses_mh1_fast_path
-    assert kokkos.evaluator.mh1_pair_spline_ready
-    assert kokkos.evaluator.mh1_edge_executor == "pair_spline_v1"
-    assert kokkos.evaluator.mh1_pair_spline_type_count == 0
+    reference = Symmetrix(path, dtype="float64", streamed_edges="reference")
+    direct = Symmetrix(path, dtype="float64", streamed_edges="direct")
+    assert reference.evaluator.uses_mh1_fast_path
+    assert direct.evaluator.uses_mh1_fast_path
+    assert reference.evaluator.mh1_pair_spline_ready
+    assert reference.evaluator.mh1_edge_executor == "pair_spline_v1"
+    assert reference.evaluator.mh1_pair_spline_type_count == 0
     properties = ["energy", "energies", "forces", "stress"]
     four_species = Atoms(
         numbers=universal_species,
@@ -2502,20 +3355,15 @@ def test_mh1_universal_kokkos_matches_serial(tmp_path):
         cell=[12.0, 12.0, 12.0],
         pbc=True,
     )
-    serial.calculate(four_species.copy(), properties=properties)
-    kokkos.calculate(four_species.copy(), properties=properties)
-    assert kokkos.evaluator.mh1_pair_spline_type_count == 4
-    for name in properties:
-        np.testing.assert_allclose(
-            kokkos.results[name], serial.results[name], atol=_mh1_cross_backend_atol()
-        )
-    direct = Symmetrix(path, use_kokkos=True, dtype="float64", streamed_edges="direct")
-    assert direct.evaluator.mh1_edge_executor == "pair_spline_v1"
+    reference.calculate(four_species.copy(), properties=properties)
     direct.calculate(four_species.copy(), properties=properties)
+    assert reference.evaluator.mh1_pair_spline_type_count == 4
     assert direct.evaluator.mh1_pair_spline_type_count == 4
     for name in properties:
         np.testing.assert_allclose(
-            direct.results[name], serial.results[name], atol=_mh1_cross_backend_atol()
+            reference.results[name],
+            direct.results[name],
+            atol=_mh1_cross_backend_atol(),
         )
     five_species = Atoms(
         numbers=universal_species + [fifth_species],
@@ -2529,29 +3377,23 @@ def test_mh1_universal_kokkos_matches_serial(tmp_path):
         cell=[12.0, 12.0, 12.0],
         pbc=True,
     )
-    mlp = Symmetrix(path, use_kokkos=True, dtype="float64", streamed_edges="generic")
+    mlp = Symmetrix(path, dtype="float64", streamed_edges="reference")
     mlp.evaluator.set_mh1_edge_executor("mlp_reference")
-    serial.calculate(five_species.copy(), properties=properties)
     mlp.calculate(five_species.copy(), properties=properties)
-    kokkos.calculate(five_species.copy(), properties=properties)
-    assert kokkos.evaluator.mh1_pair_spline_type_count == 5
+    reference.calculate(five_species.copy(), properties=properties)
     direct.calculate(five_species.copy(), properties=properties)
+    assert reference.evaluator.mh1_pair_spline_type_count == 5
     assert direct.evaluator.mh1_pair_spline_type_count == 5
     for name in properties:
         np.testing.assert_allclose(
-            kokkos.results[name], mlp.results[name], atol=_mh1_cross_backend_atol()
+            reference.results[name],
+            mlp.results[name],
+            atol=MH1_SPLINE_REFERENCE_ATOL,
         )
         np.testing.assert_allclose(
-            direct.results[name], mlp.results[name], atol=_mh1_cross_backend_atol()
-        )
-        np.testing.assert_allclose(
-            mlp.results[name], serial.results[name], atol=_mh1_cross_backend_atol()
-        )
-    kokkos.evaluator.set_mh1_edge_executor("pair_spline_v1")
-    kokkos.calculate(five_species.copy(), properties=properties)
-    for name in properties:
-        np.testing.assert_allclose(
-            kokkos.results[name], mlp.results[name], atol=_mh1_cross_backend_atol()
+            direct.results[name],
+            mlp.results[name],
+            atol=MH1_SPLINE_REFERENCE_ATOL,
         )
     del mlp
     gc.collect()
@@ -2562,12 +3404,12 @@ def test_mh1_universal_kokkos_matches_serial(tmp_path):
             cell=[12.0, 12.0, 12.0],
             pbc=True,
         )
-        serial.calculate(atoms.copy(), properties=properties)
-        kokkos.calculate(atoms.copy(), properties=properties)
+        reference.calculate(atoms.copy(), properties=properties)
+        direct.calculate(atoms.copy(), properties=properties)
         for name in properties:
             assert np.allclose(
-                kokkos.results[name],
-                serial.results[name],
+                reference.results[name],
+                direct.results[name],
                 atol=_mh1_cross_backend_atol(),
             )
 
@@ -2604,9 +3446,7 @@ def test_mh1_extraction_forwards_num_spline_points(tmp_path):
     atoms = _generalized_mh1_atoms()
     forces = {}
     for nodes, path in paths.items():
-        calculator = Symmetrix(
-            path, use_kokkos=True, dtype="float64", streamed_edges="generic"
-        )
+        calculator = Symmetrix(path, dtype="float64", streamed_edges="generic")
         assert calculator.evaluator.mh1_pair_spline_nodes == (nodes or 256)
         calculator.calculate(atoms.copy(), properties=["forces"])
         forces[nodes] = np.array(calculator.results["forces"], copy=True)
@@ -2642,14 +3482,13 @@ def test_mh1_raw_checkpoint_builds_generated_host_execution(monkeypatch, tmp_pat
         _mh1_model_path(),
         head="matpes_r2scan",
         dtype="float32",
-        use_kokkos=True,
         streamed_edges="direct",
     )
     calculator.evaluator.set_mh1_edge_executor("mlp_reference")
     assert calculator.jit_status == "built"
     assert calculator.evaluator.has_execution_mh1_contract
-    assert calculator.evaluator.jit_mh1_host_plugin_v4_ready
-    assert calculator.evaluator.execution_mh1_execution_backend == "generated_host_v4"
+    assert calculator.evaluator.jit_mh1_host_plugin_v7_ready
+    assert calculator.evaluator.execution_mh1_execution_backend == "generated_host_v7"
     atoms = Atoms(
         "Si3",
         positions=[[0.0, 0.0, 0.0], [2.2, 0.1, 0.0], [0.2, 2.3, 0.1]],
@@ -2677,69 +3516,37 @@ def test_mh1_json_dispatch_does_not_depend_on_filename_suffix(
     _, model_path = mh1_si_artifact
     suffixless_path = tmp_path / "mh1-model-data"
     suffixless_path.symlink_to(model_path)
-    calculator = Symmetrix(suffixless_path, use_kokkos=False, dtype="float64")
-    assert type(calculator.evaluator).__name__ == "MACENonlinear"
+    calculator = Symmetrix(suffixless_path, dtype="float64", streamed_edges="reference")
+    assert type(calculator.evaluator).__name__ == "MACENonlinearKokkos"
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
-def test_mh1_fast_path_requires_compatible_family_architecture(
-    mh1_si_artifact, tmp_path, use_kokkos
+def test_mh1_fast_path_rejects_scalar_hidden_on_nonfinal_layer(
+    mh1_si_artifact, tmp_path
 ):
-    data, model_path = mh1_si_artifact
+    data, _ = mh1_si_artifact
     changed = json.loads(json.dumps(data))
     changed["interactions"][0]["hidden_irreps"] = "512x0e"
     path = tmp_path / "near-mh1.json"
     path.write_text(json.dumps(changed))
-    if use_kokkos and not native_symmetrix._kokkos_is_initialized():
+    if not native_symmetrix._kokkos_is_initialized():
         native_symmetrix._init_kokkos()
-    evaluator_type = (
-        native_symmetrix.MACENonlinearKokkos
-        if use_kokkos
-        else native_symmetrix.MACENonlinear
-    )
-    evaluator = evaluator_type(str(path))
+    evaluator = native_symmetrix.MACENonlinearKokkos(str(path))
     assert not evaluator.uses_mh1_fast_path
     assert not evaluator.supports_streamed_edges
-    if use_kokkos:
-        assert not evaluator.supports_factorized
+    assert not evaluator.supports_factorized
     assert evaluator.streamed_edges_mode == "materialized"
     assert not evaluator.is_mh1_family
     assert evaluator.mh1_family_rejection_reason
     with pytest.raises(ValueError, match="compatible MACE-MH-1 family"):
         evaluator.set_streamed_edges("generic")
-    if use_kokkos:
-        with pytest.raises(ValueError, match="compatible MACE-MH-1 family"):
-            evaluator.set_streamed_edges("direct")
-    if use_kokkos and hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
+    with pytest.raises(ValueError, match="compatible MACE-MH-1 family"):
+        evaluator.set_streamed_edges("direct")
+    if hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
         with pytest.raises(ValueError, match="Float32.*compatible MACE-MH-1 family"):
             native_symmetrix.MACENonlinearKokkosFloat(str(path))
-    atoms = Atoms(
-        "Si2",
-        positions=[[0.0, 0.0, 0.0], [2.2, 0.1, 0.0]],
-        cell=[10.0, 10.0, 10.0],
-        pbc=True,
-    )
-    fast = Symmetrix(model_path, use_kokkos=use_kokkos, dtype="float64")
-    generic = Symmetrix(path, use_kokkos=use_kokkos, dtype="float64")
-    fast.calculate(atoms.copy(), properties=["energy", "energies", "forces", "stress"])
-    generic.calculate(
-        atoms.copy(), properties=["energy", "energies", "forces", "stress"]
-    )
-    assert fast.evaluator.uses_mh1_fast_path
-    assert not generic.evaluator.uses_mh1_fast_path
-    for property_name in ("energy", "energies", "forces", "stress"):
-        np.testing.assert_allclose(
-            generic.results[property_name],
-            fast.results[property_name],
-            rtol=0.0,
-            atol=2e-12 if not use_kokkos else _mh1_cross_backend_atol(),
-        )
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
-def test_mh1_fast_path_accepts_equivalent_irrep_formatting(
-    mh1_si_artifact, tmp_path, use_kokkos
-):
+def test_mh1_fast_path_accepts_equivalent_irrep_formatting(mh1_si_artifact, tmp_path):
     data, _ = mh1_si_artifact
     changed = json.loads(json.dumps(data))
     changed["interactions"][1]["node_feats_irreps"] = " 512x0e + 512x1o "
@@ -2748,21 +3555,13 @@ def test_mh1_fast_path_accepts_equivalent_irrep_formatting(
     )
     path = tmp_path / "mh1-equivalent-irreps.json"
     path.write_text(json.dumps(changed, separators=(",", ":")))
-    if use_kokkos and not native_symmetrix._kokkos_is_initialized():
+    if not native_symmetrix._kokkos_is_initialized():
         native_symmetrix._init_kokkos()
-    evaluator_type = (
-        native_symmetrix.MACENonlinearKokkos
-        if use_kokkos
-        else native_symmetrix.MACENonlinear
-    )
-    evaluator = evaluator_type(str(path))
+    evaluator = native_symmetrix.MACENonlinearKokkos(str(path))
     assert evaluator.uses_mh1_fast_path
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
-def test_mh1_fast_path_requires_conditionable_edge_mlp(
-    mh1_si_artifact, tmp_path, use_kokkos
-):
+def test_mh1_fast_path_requires_conditionable_edge_mlp(mh1_si_artifact, tmp_path):
     data, _ = mh1_si_artifact
     changed = json.loads(json.dumps(data))
     width = changed["interactions"][0]["conv_tp_weights"]["layers"][0]["weight"][
@@ -2780,28 +3579,22 @@ def test_mh1_fast_path_requires_conditionable_edge_mlp(
     )
     path = tmp_path / "near-mh1-unconditionable.json"
     path.write_text(json.dumps(changed, separators=(",", ":")))
-    if use_kokkos and not native_symmetrix._kokkos_is_initialized():
+    if not native_symmetrix._kokkos_is_initialized():
         native_symmetrix._init_kokkos()
-    evaluator_type = (
-        native_symmetrix.MACENonlinearKokkos
-        if use_kokkos
-        else native_symmetrix.MACENonlinear
-    )
-    evaluator = evaluator_type(str(path))
+    evaluator = native_symmetrix.MACENonlinearKokkos(str(path))
     assert not evaluator.uses_mh1_fast_path
     assert evaluator.is_mh1_family
     assert evaluator.mh1_uses_compiled_products
     assert not evaluator.mh1_uses_pair_conditioning
     assert "Conditioned edge MLP" in evaluator.mh1_fast_path_rejection_reason
-    if use_kokkos and hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
+    if hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
         with pytest.raises(ValueError, match="Float32.*compatible MACE-MH-1 family"):
             native_symmetrix.MACENonlinearKokkosFloat(str(path))
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
 @pytest.mark.parametrize("module_name", ["conv_tp_weights", "density_fn"])
 def test_mh1_fast_path_requires_exact_conditioned_mlp_input_width(
-    mh1_si_artifact, tmp_path, use_kokkos, module_name
+    mh1_si_artifact, tmp_path, module_name
 ):
     data, _ = mh1_si_artifact
     changed = json.loads(json.dumps(data))
@@ -2814,23 +3607,17 @@ def test_mh1_fast_path_requires_exact_conditioned_mlp_input_width(
     first_layer["weight"]["values"] = np.pad(weights, ((0, 0), (0, 1))).ravel().tolist()
     path = tmp_path / f"near-mh1-{module_name}-extra-conditioned-column.json"
     path.write_text(json.dumps(changed, separators=(",", ":")))
-    if use_kokkos:
-        if not hasattr(native_symmetrix, "MACENonlinearKokkos"):
-            pytest.skip("Symmetrix was built without Kokkos support")
-        if not native_symmetrix._kokkos_is_initialized():
-            native_symmetrix._init_kokkos()
-    evaluator_type = (
-        native_symmetrix.MACENonlinearKokkos
-        if use_kokkos
-        else native_symmetrix.MACENonlinear
-    )
-    evaluator = evaluator_type(str(path))
+    if not hasattr(native_symmetrix, "MACENonlinearKokkos"):
+        pytest.skip("Symmetrix was built without Kokkos support")
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    evaluator = native_symmetrix.MACENonlinearKokkos(str(path))
     assert evaluator.is_mh1_family
     assert evaluator.mh1_uses_compiled_products
     assert not evaluator.mh1_uses_pair_conditioning
     assert not evaluator.uses_mh1_fast_path
     assert "Conditioned edge MLP" in evaluator.mh1_fast_path_rejection_reason
-    if use_kokkos and hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
+    if hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
         with pytest.raises(ValueError, match="Float32.*compatible MACE-MH-1 family"):
             native_symmetrix.MACENonlinearKokkosFloat(str(path))
 
@@ -2838,10 +3625,7 @@ def test_mh1_fast_path_requires_exact_conditioned_mlp_input_width(
 def test_mh1_extraction_rejects_unsupported_architecture_features():
     from symmetrix.extract_mace_nonlinear import extract_mace_nonlinear_data
 
-    model = torch.load(
-        _mh1_model_path(), map_location=torch.device("cpu"), weights_only=False
-    ).to(torch.float64)
-    model = remove_pt_head(model, "matpes_r2scan")
+    model = _mh1_reference_model()
 
     model.use_last_readout_only = True
     with pytest.raises(RuntimeError, match="use_last_readout_only"):
@@ -2864,10 +3648,7 @@ def test_mh1_single_head_wigner_tensors_preserve_float64():
     from e3nn import o3
     from symmetrix.extract_mace_nonlinear import extract_mace_nonlinear_data
 
-    model = torch.load(
-        _mh1_model_path(), map_location=torch.device("cpu"), weights_only=False
-    ).to(torch.float64)
-    model = remove_pt_head(model, "matpes_r2scan")
+    model = _mh1_reference_model()
     previous_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch.float32)
@@ -2888,7 +3669,7 @@ def test_mh1_single_head_wigner_tensors_preserve_float64():
         assert np.allclose(actual, expected.numpy().reshape(-1), atol=1e-14)
 
 
-def test_mh1_native_serial_and_kokkos_match_upstream(mh1_si_artifact):
+def test_mh1_native_routings_match_upstream(mh1_si_artifact):
     _, model_path = mh1_si_artifact
     atoms = Atoms(
         "Si2",
@@ -2896,27 +3677,23 @@ def test_mh1_native_serial_and_kokkos_match_upstream(mh1_si_artifact):
         cell=[8.0, 8.0, 8.0],
         pbc=True,
     )
+    properties = ["energy", "energies", "forces", "stress"]
     expected = MACECalculator(
         model_paths=str(_mh1_model_path()),
         device="cpu",
         default_dtype="float64",
         head="matpes_r2scan",
     )
-    expected.calculate(
-        atoms.copy(), properties=["energy", "energies", "forces", "stress"]
-    )
+    expected.calculate(atoms.copy(), properties=properties)
 
-    native_results = {}
-    for use_kokkos, evaluator_name in (
-        (False, "MACENonlinear"),
-        (True, "MACENonlinearKokkos"),
-    ):
-        actual = Symmetrix(model_path, use_kokkos=use_kokkos, dtype="float64")
+    direct = Symmetrix(model_path, dtype="float64")
+    assert direct.streamed_edges == "direct"
+    reference = Symmetrix(model_path, dtype="float64", streamed_edges="reference")
+    assert reference.streamed_edges == "reference"
+    for actual in (direct, reference):
         assert actual.evaluator.uses_mh1_fast_path
-        actual.calculate(
-            atoms.copy(), properties=["energy", "energies", "forces", "stress"]
-        )
-        assert type(actual.evaluator).__name__ == evaluator_name
+        actual.calculate(atoms.copy(), properties=properties)
+        assert type(actual.evaluator).__name__ == "MACENonlinearKokkos"
         assert actual.cutoff == pytest.approx(expected.r_max)
         assert actual.results["energy"] == pytest.approx(
             expected.results["energy"], abs=2e-5
@@ -2930,15 +3707,11 @@ def test_mh1_native_serial_and_kokkos_match_upstream(mh1_si_artifact):
         assert np.allclose(
             actual.results["stress"], expected.results["stress"], atol=2e-5
         )
-        native_results[use_kokkos] = {
-            name: np.array(actual.results[name], copy=True)
-            for name in ("energy", "energies", "forces", "stress")
-        }
 
-    for name in native_results[False]:
-        assert np.allclose(
-            native_results[False][name],
-            native_results[True][name],
+    for name in properties:
+        np.testing.assert_allclose(
+            direct.results[name],
+            reference.results[name],
             atol=_mh1_cross_backend_atol(),
         )
 
@@ -2946,8 +3719,8 @@ def test_mh1_native_serial_and_kokkos_match_upstream(mh1_si_artifact):
 @pytest.mark.parametrize("dtype", ["float64", "float32"])
 def test_mh1_kokkos_repeated_calculations(mh1_si_artifact, dtype):
     _, model_path = mh1_si_artifact
-    serial = Symmetrix(model_path, use_kokkos=False, dtype="float64")
-    kokkos = Symmetrix(model_path, use_kokkos=True, dtype=dtype)
+    reference = Symmetrix(model_path, dtype="float64", streamed_edges="reference")
+    kokkos = Symmetrix(model_path, dtype=dtype)
     tolerance = _mh1_cross_backend_atol() if dtype == "float64" else 2e-5
     atoms = Atoms(
         "Si2",
@@ -2959,16 +3732,16 @@ def test_mh1_kokkos_repeated_calculations(mh1_si_artifact, dtype):
     for displacement in (0.0, 0.04, -0.03):
         moved = atoms.copy()
         moved.positions[1] += [displacement, -0.5 * displacement, 0.25 * displacement]
-        serial.calculate(moved, properties=["energy", "forces", "stress"])
+        reference.calculate(moved, properties=["energy", "forces", "stress"])
         kokkos.calculate(moved, properties=["energy", "forces", "stress"])
         assert kokkos.results["energy"] == pytest.approx(
-            serial.results["energy"], abs=tolerance
+            reference.results["energy"], abs=tolerance
         )
         assert np.allclose(
-            kokkos.results["forces"], serial.results["forces"], atol=tolerance
+            kokkos.results["forces"], reference.results["forces"], atol=tolerance
         )
         assert np.allclose(
-            kokkos.results["stress"], serial.results["stress"], atol=tolerance
+            kokkos.results["stress"], reference.results["stress"], atol=tolerance
         )
         if first_energy is None:
             first_energy = kokkos.results["energy"]
@@ -2979,13 +3752,15 @@ def test_mh1_kokkos_repeated_calculations(mh1_si_artifact, dtype):
 @pytest.mark.parametrize("dtype", ["float64", "float32"])
 def test_mh1_kokkos_reuses_workspaces_across_graph_sizes(mh1_si_artifact, dtype):
     _, model_path = mh1_si_artifact
-    serial = Symmetrix(model_path, use_kokkos=False, dtype="float64")
-    kokkos = Symmetrix(model_path, use_kokkos=True, dtype=dtype)
+    reference = Symmetrix(model_path, dtype="float64", streamed_edges="reference")
+    kokkos = Symmetrix(model_path, dtype=dtype)
     primitive = bulk("Si", "diamond", a=5.43)
     systems = (primitive, primitive.repeat((2, 2, 2)), primitive.repeat((3, 3, 3)))
 
     for atoms in (*systems, *reversed(systems), *systems):
-        serial.calculate(atoms, properties=["energy", "energies", "forces", "stress"])
+        reference.calculate(
+            atoms, properties=["energy", "energies", "forces", "stress"]
+        )
         kokkos.calculate(atoms, properties=["energy", "energies", "forces", "stress"])
         for property_name in ("energy", "energies", "forces", "stress"):
             tolerance = _mh1_cross_backend_atol()
@@ -2993,7 +3768,7 @@ def test_mh1_kokkos_reuses_workspaces_across_graph_sizes(mh1_si_artifact, dtype)
                 tolerance = 2e-4 * len(atoms) if property_name == "energy" else 2e-4
             assert np.allclose(
                 kokkos.results[property_name],
-                serial.results[property_name],
+                reference.results[property_name],
                 atol=tolerance,
             )
 
@@ -3001,8 +3776,8 @@ def test_mh1_kokkos_reuses_workspaces_across_graph_sizes(mh1_si_artifact, dtype)
 @pytest.mark.parametrize("dtype", ["float64", "float32"])
 def test_mh1_kokkos_handles_changes_in_supported_species(mh1_h_si_artifact, dtype):
     _, model_path = mh1_h_si_artifact
-    serial = Symmetrix(model_path, use_kokkos=False, dtype="float64")
-    kokkos = Symmetrix(model_path, use_kokkos=True, dtype=dtype)
+    reference = Symmetrix(model_path, dtype="float64", streamed_edges="reference")
+    kokkos = Symmetrix(model_path, dtype=dtype)
     kokkos_tolerance = _mh1_cross_backend_atol() if dtype == "float64" else 2e-4
     upstream = MACECalculator(
         model_paths=str(_mh1_model_path()),
@@ -3024,32 +3799,36 @@ def test_mh1_kokkos_handles_changes_in_supported_species(mh1_h_si_artifact, dtyp
             pbc=True,
         )
         upstream.calculate(atoms.copy(), properties=["energy", "forces", "stress"])
-        serial.calculate(atoms, properties=["energy", "forces", "stress"])
+        reference.calculate(atoms, properties=["energy", "forces", "stress"])
         kokkos.calculate(atoms, properties=["energy", "forces", "stress"])
-        assert serial.results["energy"] == pytest.approx(
-            upstream.results["energy"], abs=2e-5
+        assert reference.results["energy"] == pytest.approx(
+            upstream.results["energy"], abs=MH1_UPSTREAM_ATOL
         )
         assert np.allclose(
-            serial.results["forces"], upstream.results["forces"], atol=2e-5
+            reference.results["forces"],
+            upstream.results["forces"],
+            atol=MH1_UPSTREAM_ATOL,
         )
         assert np.allclose(
-            serial.results["stress"], upstream.results["stress"], atol=2e-5
+            reference.results["stress"],
+            upstream.results["stress"],
+            atol=MH1_UPSTREAM_ATOL,
         )
         assert kokkos.results["energy"] == pytest.approx(
-            serial.results["energy"], abs=kokkos_tolerance
+            reference.results["energy"], abs=kokkos_tolerance
         )
         assert np.allclose(
-            kokkos.results["forces"], serial.results["forces"], atol=kokkos_tolerance
+            kokkos.results["forces"], reference.results["forces"], atol=kokkos_tolerance
         )
         assert np.allclose(
-            kokkos.results["stress"], serial.results["stress"], atol=kokkos_tolerance
+            kokkos.results["stress"], reference.results["stress"], atol=kokkos_tolerance
         )
 
 
-def test_mh1_serial_matches_upstream_for_isolated_atom(mh1_si_artifact):
+def test_mh1_reference_matches_upstream_for_isolated_atom(mh1_si_artifact):
     _, model_path = mh1_si_artifact
     atoms = Atoms("Si", positions=[[0.0, 0.0, 0.0]], cell=[10.0, 10.0, 10.0])
-    actual = Symmetrix(model_path, use_kokkos=False, dtype="float64")
+    actual = Symmetrix(model_path, dtype="float64", streamed_edges="reference")
     expected = MACECalculator(
         model_paths=str(_mh1_model_path()),
         device="cpu",
@@ -3069,11 +3848,8 @@ def test_mh1_serial_matches_upstream_for_isolated_atom(mh1_si_artifact):
     assert np.allclose(actual.results["forces"], expected.results["forces"], atol=2e-9)
 
 
-@pytest.mark.parametrize(
-    ("use_kokkos", "dtype"),
-    [(False, "float64"), (True, "float64"), (True, "float32")],
-)
-def test_mh1_native_force_matches_finite_difference(mh1_si_artifact, use_kokkos, dtype):
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
+def test_mh1_native_force_matches_finite_difference(mh1_si_artifact, dtype):
     _, model_path = mh1_si_artifact
     atoms = Atoms(
         "Si2",
@@ -3081,7 +3857,7 @@ def test_mh1_native_force_matches_finite_difference(mh1_si_artifact, use_kokkos,
         cell=[10.0, 10.0, 10.0],
         pbc=False,
     )
-    atoms.calc = Symmetrix(model_path, use_kokkos=use_kokkos, dtype=dtype)
+    atoms.calc = Symmetrix(model_path, dtype=dtype)
     force = atoms.get_forces()[1, 0]
     step = 1e-4 if dtype == "float64" else 2e-3
     displaced = atoms.copy()
@@ -3101,10 +3877,7 @@ def test_mh1_affine_mlp_forward_and_reverse_match_autograd(
     mh1_si_artifact, module_name
 ):
     data, _ = mh1_si_artifact
-    model = torch.load(
-        _mh1_model_path(), map_location=torch.device("cpu"), weights_only=False
-    ).to(torch.float64)
-    model = remove_pt_head(model, "matpes_r2scan")
+    model = _mh1_reference_model()
     torch_module = getattr(model.interactions[0], module_name)
     native_module = native_symmetrix.AffineMLP(
         json.dumps(data["interactions"][0][module_name])
@@ -3269,10 +4042,7 @@ def test_mh1_float32_linear_backends_match_on_official_shapes(mh1_si_artifact, l
 @pytest.mark.parametrize("layer", [0, 1])
 def test_mh1_tensor_product_forward_and_reverse_match_autograd(mh1_si_artifact, layer):
     data, _ = mh1_si_artifact
-    model = torch.load(
-        _mh1_model_path(), map_location=torch.device("cpu"), weights_only=False
-    ).to(torch.float64)
-    model = remove_pt_head(model, "matpes_r2scan")
+    model = _mh1_reference_model()
     torch_module = model.interactions[layer].conv_tp
     native_module = native_symmetrix.E3TensorProduct(
         json.dumps(data["interactions"][layer]["conv_tp"])
@@ -3560,8 +4330,8 @@ def test_mh1_cuda_tensor_team_size_tracks_edge_multiplicity(
     )
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
-def test_mh1_uuu_tensor_product_uses_diagonal_weights(use_kokkos):
+@pytest.mark.parametrize("kokkos_module", [False, True])
+def test_mh1_uuu_tensor_product_uses_diagonal_weights(kokkos_module):
     definition = {
         "irreps_in1": "3x0e",
         "irreps_in2": "3x0e",
@@ -3581,7 +4351,7 @@ def test_mh1_uuu_tensor_product_uses_diagonal_weights(use_kokkos):
         "weight": {"shape": [0], "values": []},
         "output_mask": {"shape": [3], "values": [1.0, 1.0, 1.0]},
     }
-    if use_kokkos:
+    if kokkos_module:
         if not hasattr(native_symmetrix, "E3TensorProductKokkos"):
             pytest.skip("Symmetrix was built without Kokkos support")
         if not native_symmetrix._kokkos_is_initialized():
@@ -3598,6 +4368,53 @@ def test_mh1_uuu_tensor_product_uses_diagonal_weights(use_kokkos):
     assert np.allclose(x_adj, seed * weights * y)
     assert np.allclose(y_adj, seed * weights * x)
     assert np.allclose(weight_adj, seed * x * y)
+
+
+@pytest.mark.parametrize("kokkos_module", [False, True])
+def test_mh1_uvw_tensor_product_matches_the_serial_e3_reverse(kokkos_module):
+    definition = {
+        "irreps_in1": "2x0e",
+        "irreps_in2": "3x0e",
+        "irreps_out": "4x0e",
+        "instructions": [
+            {
+                "i_in1": 0,
+                "i_in2": 0,
+                "i_out": 0,
+                "connection_mode": "uvw",
+                "has_weight": True,
+                "path_weight": 0.75,
+                "path_shape": [2, 3, 4],
+                "wigner_3j": {"shape": [1, 1, 1], "values": [1.0]},
+            }
+        ],
+        "weight": {
+            "shape": [24],
+            "values": [0.01 * (index + 1) for index in range(24)],
+        },
+        "output_mask": {"shape": [4], "values": [1.0] * 4},
+    }
+    serial = native_symmetrix.E3TensorProduct(json.dumps(definition))
+    if kokkos_module:
+        if not hasattr(native_symmetrix, "E3TensorProductKokkos"):
+            pytest.skip("Symmetrix was built without Kokkos support")
+        if not native_symmetrix._kokkos_is_initialized():
+            native_symmetrix._init_kokkos()
+        module = native_symmetrix.E3TensorProductKokkos(json.dumps(definition))
+    else:
+        module = serial
+    rng = np.random.default_rng(7721)
+    x = rng.normal(size=2)
+    y = rng.normal(size=3)
+    weights = np.asarray(definition["weight"]["values"])
+    seed = rng.normal(size=4)
+    expected = serial.evaluate(x, y, weights)
+    expected_adjoints = serial.reverse(x, y, weights, seed)
+    actual = module.evaluate(x, y, weights)
+    actual_adjoints = module.reverse(x, y, weights, seed)
+    np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
+    for actual_value, expected_value in zip(actual_adjoints, expected_adjoints):
+        np.testing.assert_allclose(actual_value, expected_value, rtol=0.0, atol=1e-12)
 
 
 def test_mh1_kokkos_tensor_product_validates_binding_dimensions():
@@ -3635,6 +4452,45 @@ def test_mh1_kokkos_tensor_product_validates_binding_dimensions():
         module.reverse([3.0], [5.0], [], [])
 
 
+def test_mh1_kokkos_uvu_internal_weights_keep_the_generic_plan():
+    """A uvu contract with internal weights must not be reported as MH-1.
+
+    The compact MH-1 schedule consumes weights per edge; admitting a contract
+    that carries its own weight tensor to that plan changes the reported
+    backend and the execution predicates that other consumers key off, even
+    though ``evaluate`` keeps routing to the internal-weight branch.  The
+    admission rule is therefore "official layout and no internal weights".
+    """
+    if not hasattr(native_symmetrix, "E3TensorProductKokkos"):
+        pytest.skip("Symmetrix was built without Kokkos support")
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    definition = {
+        "irreps_in1": "1x0e",
+        "irreps_in2": "1x0e",
+        "irreps_out": "1x0e",
+        "instructions": [
+            {
+                "i_in1": 0,
+                "i_in2": 0,
+                "i_out": 0,
+                "connection_mode": "uvu",
+                "has_weight": True,
+                "path_weight": 1.0,
+                "path_shape": [1, 1],
+                "wigner_3j": {"shape": [1, 1, 1], "values": [1.0]},
+            }
+        ],
+        "weight": {"shape": [1], "values": [2.0]},
+        "output_mask": {"shape": [1], "values": [1.0]},
+    }
+    module = native_symmetrix.E3TensorProductKokkos(json.dumps(definition))
+    assert module.has_internal_weights
+    assert module.uses_mh1_fast_path is False
+    assert module.execution_backend == "generic_kokkos"
+    assert module.evaluate([3.0], [5.0], []) == pytest.approx([30.0])
+
+
 def test_mh1_affine_mlp_rejects_inconsistent_layer_dimensions():
     definition = {
         "layers": [
@@ -3656,8 +4512,8 @@ def test_mh1_affine_mlp_rejects_inconsistent_layer_dimensions():
         native_symmetrix.AffineMLP(json.dumps(definition))
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
-def test_mh1_product_basis_rejects_malformed_tensor_layout(use_kokkos):
+@pytest.mark.parametrize("kokkos_module", [False, True])
+def test_mh1_product_basis_rejects_malformed_tensor_layout(kokkos_module):
     linear = {
         "irreps_in": "1x0e",
         "irreps_out": "1x0e",
@@ -3692,7 +4548,7 @@ def test_mh1_product_basis_rejects_malformed_tensor_layout(use_kokkos):
             ],
         },
     }
-    if use_kokkos:
+    if kokkos_module:
         if not hasattr(native_symmetrix, "E3ProductBasisKokkos"):
             pytest.skip("Symmetrix was built without Kokkos support")
         if not native_symmetrix._kokkos_is_initialized():
@@ -3766,17 +4622,13 @@ def test_mh1_generic_product_batch_supports_varying_elements_without_skip():
     assert np.allclose(skip_adjoints, 0.0)
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
-def test_mh1_native_rejects_inconsistent_graph_metadata(mh1_si_artifact, use_kokkos):
+def test_mh1_native_rejects_inconsistent_graph_metadata(mh1_si_artifact):
     _, model_path = mh1_si_artifact
-    if use_kokkos:
-        if not hasattr(native_symmetrix, "MACENonlinearKokkos"):
-            pytest.skip("Symmetrix was built without Kokkos support")
-        if not native_symmetrix._kokkos_is_initialized():
-            native_symmetrix._init_kokkos()
-        evaluator = native_symmetrix.MACENonlinearKokkos(str(model_path))
-    else:
-        evaluator = native_symmetrix.MACENonlinear(str(model_path))
+    if not hasattr(native_symmetrix, "MACENonlinearKokkos"):
+        pytest.skip("Symmetrix was built without Kokkos support")
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    evaluator = native_symmetrix.MACENonlinearKokkos(str(model_path))
     with pytest.raises(ValueError, match="neighbor counts do not match"):
         evaluator.compute_node_energies_forces(1, [0], [1], [], [], [], [])
 
@@ -3786,10 +4638,7 @@ def test_mh1_product_basis_forward_and_reverse_match_autograd(
     mh1_si_artifact, product_index
 ):
     data, _ = mh1_si_artifact
-    model = torch.load(
-        _mh1_model_path(), map_location=torch.device("cpu"), weights_only=False
-    ).to(torch.float64)
-    model = remove_pt_head(model, "matpes_r2scan")
+    model = _mh1_reference_model()
     torch_module = model.products[product_index]
     native_module = native_symmetrix.E3ProductBasis(
         json.dumps(data["products"][product_index])
@@ -4202,19 +5051,15 @@ def test_mh1_conditioned_affine_mlp_batch_matches_scalar_calls(
         assert np.allclose(kokkos_adjoints, expected_adjoints, atol=2e-12)
 
 
-@pytest.mark.parametrize("use_kokkos", [False, True])
 def test_mh1_native_rejects_neighbor_source_type_mismatch(
-    mh1_h_si_artifact, use_kokkos
+    mh1_h_si_artifact,
 ):
     _, model_path = mh1_h_si_artifact
-    if use_kokkos:
-        if not hasattr(native_symmetrix, "MACENonlinearKokkos"):
-            pytest.skip("Symmetrix was built without Kokkos support")
-        if not native_symmetrix._kokkos_is_initialized():
-            native_symmetrix._init_kokkos()
-        evaluator = native_symmetrix.MACENonlinearKokkos(str(model_path))
-    else:
-        evaluator = native_symmetrix.MACENonlinear(str(model_path))
+    if not hasattr(native_symmetrix, "MACENonlinearKokkos"):
+        pytest.skip("Symmetrix was built without Kokkos support")
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
+    evaluator = native_symmetrix.MACENonlinearKokkos(str(model_path))
     with pytest.raises(ValueError, match="invalid edge index, type"):
         evaluator.compute_node_energies_forces(
             2,
@@ -4227,12 +5072,6 @@ def test_mh1_native_rejects_neighbor_source_type_mismatch(
         )
 
 
-def test_mh1_native_serial_float32_is_rejected(mh1_si_artifact):
-    _, model_path = mh1_si_artifact
-    with pytest.raises(ValueError, match="Native serial.*require dtype 'float64'"):
-        Symmetrix(model_path, use_kokkos=False, dtype="float32")
-
-
 def test_mh1_kokkos_float32_supported_modes_match_float64(mh1_si_artifact):
     if not hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
         pytest.skip("Symmetrix was built without Float32 Kokkos nonlinear support")
@@ -4242,7 +5081,6 @@ def test_mh1_kokkos_float32_supported_modes_match_float64(mh1_si_artifact):
 
     reference = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float64",
         streamed_edges="generic",
     )
@@ -4256,7 +5094,6 @@ def test_mh1_kokkos_float32_supported_modes_match_float64(mh1_si_artifact):
     for mode in ("generic", "direct"):
         calculator = Symmetrix(
             model_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges=mode,
         )
@@ -4292,7 +5129,7 @@ def test_mh1_kokkos_float32_supported_modes_match_float64(mh1_si_artifact):
     assert float_workspace_bytes["generic"] <= reference_workspace_bytes * 0.51
     assert float_workspace_bytes["direct"] <= float_workspace_bytes["generic"]
 
-    automatic = Symmetrix(model_path, use_kokkos=True, dtype="float32")
+    automatic = Symmetrix(model_path, dtype="float32")
     assert automatic.streamed_edges == "direct"
 
 
@@ -4405,7 +5242,6 @@ def test_mh1_cuda_packed_linear_matches_scalar(mh1_si_artifact):
     for backend in ("scalar", "packed_gemm"):
         calculator = Symmetrix(
             model_path,
-            use_kokkos=True,
             dtype="float32",
             streamed_edges="generic",
         )
@@ -4433,7 +5269,6 @@ def test_mh1_cuda_fused_reverse_matches_control(mh1_si_artifact):
     properties = ["energy", "energies", "forces", "stress"]
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="generic",
     )
@@ -4481,7 +5316,6 @@ def test_mh1_host_cached_gate_probabilities_match_control(mh1_si_artifact):
     properties = ["energy", "energies", "forces", "stress"]
     calculator = Symmetrix(
         model_path,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges="all_interactions",
     )
@@ -4504,5 +5338,7 @@ def test_mh1_host_cached_gate_probabilities_match_control(mh1_si_artifact):
 
 def test_legacy_evaluator_rejects_nonlinear_schema(mh1_si_artifact):
     _, model_path = mh1_si_artifact
+    if not native_symmetrix._kokkos_is_initialized():
+        native_symmetrix._init_kokkos()
     with pytest.raises((RuntimeError, ValueError), match="MACE_Nonlinear"):
-        native_symmetrix.MACE(str(model_path))
+        native_symmetrix.MACEKokkos(str(model_path))

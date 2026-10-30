@@ -52,31 +52,10 @@ efficiency.
 
 ## Demonstrated speed
 
-A matched FP32 RTX 5090 qualification compared complete warmed ASE
-energy/forces/stress calls for the standard MACE-OMAT-0 medium checkpoint:
-
-| Atoms | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
-|---:|---:|---:|---:|---:|
-| 864 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
-| 4,000 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
-
-The MACE-Torch baseline used cuEquivariance with the exact 6.0 A graph.
-Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving
-an effective cutoff of 6.5 A; the graph policies are therefore not identical.
-
-Across the matched FP32 LAMMPS benchmarks reported in the paper, Symmetrix-XL
-reduces complete step time by 3.1-5.0x relative to ML-IAP + cuEquivariance on
-the tested A100 and RTX 5090 workloads. A representative RTX 5090 result uses
-5,000-atom perturbed cubic SrTiO3 with MACE-OMAT-0 medium:
-
-| Implementation | Time (us/atom/step) | Speedup vs. ML-IAP |
-|---|---:|---:|
-| MACE-Torch + cuEquivariance through LAMMPS ML-IAP | 12.813 | 1.00x |
-| Symmetrix-XL LAMMPS pair style | 2.559 | 5.01x |
-
-Each value is the median of three 20-step runs after warmup. Both deployments
-used a 6.0 A model cutoff and a 0.5 A neighbor-list skin; see the paper for the
-full benchmark protocol and graph-policy details.
+The Symmetrix-XL paper reports the matched performance study, including the
+model, graph policy, hardware, warmup, and measurement protocol. Release
+documentation does not reproduce timings from comparison packages; consult the
+paper when evaluating performance claims.
 
 ## Installation
 
@@ -218,10 +197,56 @@ MACEField checkpoints must be converted before use. Passing an original
 MACEField checkpoint directly to the calculator is rejected rather than
 silently delegating evaluation to PyTorch.
 
+### NequIP OAM (experimental)
+
+NequIP support uses the OAM v2 versioned JSON contract. Install the optional
+exporter stack in a fresh environment and export an upstream OAM package or
+checkpoint:
+
+```bash
+uv pip install "symmetrix-xl[nequip]"   # torch, nequip, and e3nn
+symmetrix_extract_nequip \
+    --model NequIP-OAM-S-0.1.nequip.zip \
+    --output oam-s-nequip.json
+```
+
+Runtime evaluation accepts the OAM v2 JSON contract with
+`symmetrix_nequip_format_version=2` and `architecture="oam"`. The contract
+retains a universal H through Pu element mapping, model cutoff, ordered layers,
+and precision-independent parameters. Runtime evaluation uses the exported
+JSON, ASE, and the native Symmetrix extension; PyTorch, NequIP, and e3nn remain
+exporter/reference dependencies. OAM-S, OAM-M, OAM-L, and OAM-XL are
+experimentally supported.
+Retained OAM-v2 qualification covers energy, forces, and stress for host
+S-FP32, M-FP32/FP64, L-FP32, and XL-FP32 and CUDA `sm120` S/M/L/XL FP32/FP64.
+The independent upstream comparison is narrower and does not establish live
+upstream FP64 parity. HIP and multi-GPU execution are unsupported; other CUDA
+targets are artifact-available but runtime-unqualified. The earlier `sm80`
+package/generated-path record predates ABI v4 and requires a merged-source
+rerun.
+
+Unsupported modules fail during export with a qualified diagnostic. Original
+`.nequip`/`.nequip.zip` packages, PyTorch checkpoints, and AOTInductor `.pt2`
+artifacts are upstream reference inputs and are not loaded implicitly by the
+native calculator. See the [model guide](../docs/user/models.md#nequip-and-oam)
+for current OAM support and artifact boundaries.
+
+The CPU and CUDA release-wheel build plan includes FP32 and FP64 generated
+artifacts for the known OAM-S/M/L/XL architectures; repaired-wheel inclusion
+remains a release gate. `NequIPCalculator` selects one only when the
+model's explicit ordered layer, irrep/channel, angular-order, tensor-product,
+and radial-table layout matches exactly; model paths and learned-weight hashes
+are not selection keys. A custom architecture is generated during preparation
+and stored in the configured runtime JIT cache when the matching compiler is
+available. As for MACE, the installed catalog reduces time to first energy but
+is not a correctness fallback.
+
 See the
 [model guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/models.md)
 for supported model families, multi-head models, precision, and conversion
-options.
+options. NequIP-OAM users should also follow the
+[publication guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/reference/publications.md#nequip-oam)
+for the NequIP and OAM papers to cite.
 
 ## ASE calculator
 
@@ -251,6 +276,25 @@ Model evaluation defaults to FP32. Request FP64 explicitly when needed:
 ```python
 atoms.calc = Symmetrix("srtio3-mace.json", dtype="float64")
 ```
+
+Native DFT-D2 and two-body DFT-D3 corrections can be added without PyTorch or
+`torch-dftd`:
+
+```python
+from symmetrix import D3Correction, Symmetrix
+
+atoms.calc = Symmetrix(
+    "srtio3-mace.json",
+    corrections=[D3Correction(functional="pbe", damping="bj")],
+)
+```
+
+The correction runs through the loaded Kokkos CPU, CUDA, or HIP backend and
+owns a neighbor graph independent of the model graph. See the
+[dispersion guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/dispersion_corrections.md)
+for D2, damping choices, cutoffs and skin, diagnostics, and limitations. The
+deprecated `symmetrix-xl[dispersion]` extra remains an empty compatibility
+extra; ordinary `symmetrix-xl` already contains the native implementation.
 
 Direct execution is the default for supported compact models. Two-interaction
 models compile or reuse a precision- and backend-specific artifact and fail

@@ -732,16 +732,17 @@ def make_calculator(
     jit = "off" if backend == "kokkos_all" else "required"
     calculator = Symmetrix(
         compact_model,
-        use_kokkos=True,
         dtype="float32",
         streamed_edges=streamed_edges,
         jit=jit,
     )
     if getattr(calculator.evaluator, "scalar_size_bytes", None) != 4:
         raise RuntimeError("Kokkos calculator is not float32")
-    if calculator.streamed_edges != streamed_edges:
+    expected_routing = "direct" if streamed_edges == "factorized" else "reference"
+    if calculator.streamed_edges != expected_routing:
         raise RuntimeError(
-            f"requested streamed_edges={streamed_edges}, got {calculator.streamed_edges}"
+            f"requested streamed_edges={streamed_edges} resolved the "
+            f"{calculator.streamed_edges} routing, expected {expected_routing}"
         )
     calculator.evaluator._set_m1_recompute_tile_channels(m1_recompute_tile_channels)
     calculator.evaluator._set_m1_polynomial_policy(m1_polynomial_policy)
@@ -771,6 +772,7 @@ def runtime_identity(backend: str, calculator) -> dict[str, Any]:
                 "execution_space": native_symmetrix._kokkos_default_execution_space(),
                 "native_extension": str(extension),
                 "native_extension_sha256": sha256_file(extension),
+                "streamed_edges_requested": calculator.streamed_edges_requested,
                 "streamed_edges": calculator.streamed_edges,
                 "model_cutoff_A": MODEL_CUTOFF_A,
                 "neighbor_skin_A": calculator.neighbor_skin,

@@ -45,23 +45,92 @@ def _git_output(directory: Path, *arguments: str) -> bytes | None:
     return result.stdout
 
 
-def _hash_submodule_identity(digest: Any, repo_root: Path, prefix: str = "") -> None:
-    """Hash submodule revisions and local edits without walking clean trees."""
+_SUBMODULE_PATH_KEY = r"^submodule\..*\.path$"
+
+
+def _gitmodules_submodule_paths(gitmodules: Path) -> list[str]:
+    """Flatten ``.gitmodules`` through Git, which owns that file's syntax."""
+
+    output = _git_output(
+        gitmodules.parent,
+        "config",
+        "-f",
+        str(gitmodules),
+        "--get-regexp",
+        _SUBMODULE_PATH_KEY,
+    )
+    if output is None:
+        return []
+    values: list[str] = []
+    for line in output.decode("utf-8", errors="replace").splitlines():
+        _, separator, value = line.partition(" ")
+        if separator:
+            values.append(value.strip().strip('"'))
+    return values
+
+
+def _sectioned_submodule_paths(gitmodules: Path) -> list[str]:
+    """Read the same paths without Git, tracking ``[submodule ...]`` sections."""
+
+    values: list[str] = []
+    in_submodule_section = False
+    for line in gitmodules.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped[0] in "#;":
+            continue
+        if stripped.startswith("["):
+            header = stripped.split("]", 1)[0][1:]
+            in_submodule_section = header.strip().lower().startswith("submodule")
+            continue
+        if not in_submodule_section:
+            continue
+        key, separator, value = stripped.partition("=")
+        if separator and key.strip().lower() == "path":
+            values.append(value.strip().strip('"'))
+    return values
+
+
+def _submodule_paths(repo_root: Path) -> list[Path]:
+    """Return the submodule paths declared by ``.gitmodules``, deduplicated.
+
+    ``.gitmodules`` is INI-like: inside a ``[submodule "..."]`` section the key
+    is a bare ``path``, not the flattened ``submodule.<name>.path`` that
+    ``git config --list`` would print.  Git's own flattening is authoritative;
+    the section-aware reader covers environments without Git.  Repeated sections
+    for one path are collapsed so a duplicated entry cannot change the digest.
+    """
 
     gitmodules = repo_root / ".gitmodules"
     if not gitmodules.is_file():
-        return
-    paths: list[Path] = []
-    for line in gitmodules.read_text(encoding="utf-8", errors="replace").splitlines():
-        key, separator, value = line.partition("=")
-        if separator and key.strip().endswith(".path"):
-            candidate = Path(value.strip())
-            if not candidate.is_absolute() and ".." not in candidate.parts:
-                paths.append(candidate)
-    for relative_path in sorted(set(paths), key=lambda item: item.as_posix()):
+        return []
+    declared = _gitmodules_submodule_paths(gitmodules)
+    if not declared:
+        declared = _sectioned_submodule_paths(gitmodules)
+    paths: set[Path] = set()
+    for value in declared:
+        candidate = Path(value)
+        if not value or candidate.is_absolute() or ".." in candidate.parts:
+            continue
+        paths.add(candidate)
+    return sorted(paths, key=lambda item: item.as_posix())
+
+
+def _hash_submodule_identity(digest: Any, repo_root: Path, prefix: str = "") -> None:
+    """Hash submodule revisions and local edits without walking clean trees."""
+
+    for relative_path in _submodule_paths(repo_root):
         path = repo_root / relative_path
         name = "/".join(item for item in (prefix, relative_path.as_posix()) if item)
         label = f"submodule:{name}".encode()
+        recorded = _git_output(
+            repo_root, "ls-files", "-s", "--", relative_path.as_posix()
+        )
+        if recorded is None:
+            _hash_entry(digest, label + b":gitlink-unavailable", b"")
+        else:
+            # The recorded gitlink is what a fresh checkout would materialize,
+            # and it can move while the submodule working tree stays put.
+            _hash_entry(digest, label + b":gitlink", recorded.strip())
         head = _git_output(path, "rev-parse", "HEAD")
         if head is None:
             for candidate in sorted(path.rglob("*")):
@@ -182,7 +251,6 @@ def symmetrix_source_provenance(
                 str(repo_root),
                 "status",
                 "--porcelain",
-                "--ignore-submodules=all",
             )
         )
         if status.returncode == 0:

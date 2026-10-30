@@ -92,6 +92,11 @@ public:
     bool has_A0() const;
     bool has_A1() const;
     bool has_R1() const;
+    bool uses_distance_transform() const { return use_agnesi; }
+
+    // Shared nodal derivative system used by compact radial tables.
+    static std::vector<double> spline_derivatives(
+        const std::vector<double>& values, double h);
 
 private:
     double grid_min;

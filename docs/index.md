@@ -10,6 +10,7 @@ are intentionally kept separate.
 :caption: User Guide
 
 user/index
+mace_les
 ```
 
 ```{toctree}

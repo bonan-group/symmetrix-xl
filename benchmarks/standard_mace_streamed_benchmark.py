@@ -357,6 +357,9 @@ def _mh0_state_report(evaluator):
         "readout_workspace_bytes": int(
             getattr(evaluator, "readout_workspace_bytes", 0)
         ),
+        "a1_blas_flatten_workspace_bytes": int(
+            getattr(evaluator, "a1_blas_flatten_workspace_bytes", 0)
+        ),
         "readout_policy": getattr(evaluator, "readout_policy", "retained"),
     }
 
@@ -476,10 +479,6 @@ def _make_calculator(
     dtype,
     mode,
     factorized_source_strategy=None,
-    factorized_direct_forward_executor=None,
-    factorized_direct_reverse_executor=None,
-    factorized_reverse_cache_policy=None,
-    factorized_planner_budget_bytes=None,
     standard_r0_executor=None,
     standard_m0_executor=None,
     factorized_parameter_gradients=False,
@@ -495,7 +494,6 @@ def _make_calculator(
 ):
     calculator = Symmetrix(
         model,
-        use_kokkos=backend == "kokkos",
         dtype=dtype,
         streamed_edges=mode,
         m1_polynomial_policy=m1_polynomial_policy,
@@ -505,30 +503,13 @@ def _make_calculator(
     )
     if mode in PREPARED_MODES and factorized_source_strategy is not None:
         calculator.evaluator._set_factorized_source_strategy(factorized_source_strategy)
-    if mode == "direct" and factorized_direct_forward_executor is not None:
-        calculator.evaluator._set_factorized_direct_forward_executor(
-            factorized_direct_forward_executor
-        )
-    if mode == "direct" and factorized_direct_reverse_executor is not None:
-        calculator.evaluator._set_factorized_direct_reverse_executor(
-            factorized_direct_reverse_executor
-        )
-    if mode == "receiver_factorized" and factorized_reverse_cache_policy is not None:
-        calculator.evaluator._set_factorized_reverse_cache_policy(
-            factorized_reverse_cache_policy
-        )
-    if mode == "receiver_factorized" and factorized_planner_budget_bytes is not None:
-        calculator.evaluator._set_factorized_planner_budget_bytes(
-            factorized_planner_budget_bytes
-        )
     if mode in PREPARED_MODES and standard_r0_executor is not None:
         calculator.evaluator._set_standard_r0_executor(standard_r0_executor)
-    if (
-        mode in ("non-compiled", "direct", "receiver_factorized")
-        and standard_m0_executor is not None
+    if mode in ("generic", "non-compiled", "direct") and (
+        standard_m0_executor is not None
     ):
         calculator.evaluator._set_standard_m0_executor(standard_m0_executor)
-    if mode == "receiver_factorized" and factorized_parameter_gradients:
+    if mode in PREPARED_MODES and factorized_parameter_gradients:
         calculator.evaluator.set_factorized_parameter_gradients(True)
     if backend == "kokkos":
         optional_policies = (
@@ -561,10 +542,6 @@ def _evaluate(
     warmups,
     repeats,
     factorized_source_strategy,
-    factorized_direct_forward_executor,
-    factorized_direct_reverse_executor,
-    factorized_reverse_cache_policy,
-    factorized_planner_budget_bytes,
     standard_r0_executor,
     standard_m0_executor,
     factorized_parameter_gradients,
@@ -590,10 +567,6 @@ def _evaluate(
             dtype,
             mode,
             factorized_source_strategy,
-            factorized_direct_forward_executor,
-            factorized_direct_reverse_executor,
-            factorized_reverse_cache_policy,
-            factorized_planner_budget_bytes,
             standard_r0_executor,
             standard_m0_executor,
             factorized_parameter_gradients,
@@ -666,8 +639,6 @@ def _evaluate(
         "factorized_jit_launch_count",
         "factorized_jit_forward_launch_count",
         "factorized_jit_reverse_launch_count",
-        "receiver_factorized_forward_launch_count",
-        "receiver_factorized_reverse_launch_count",
         "factorized_custom_blas_launch_count",
         "factorized_blas_stream_bind_count",
         "standard_r0_module_launch_count",
@@ -928,48 +899,6 @@ def _evaluate(
                     False,
                 )
             ),
-            "receiver_factorized_rtc": {
-                "ready": bool(
-                    getattr(
-                        calculator.evaluator,
-                        "receiver_factorized_host_plugin_ready",
-                        False,
-                    )
-                ),
-                "artifact_id": getattr(
-                    calculator.evaluator,
-                    "receiver_factorized_host_plugin_artifact_id",
-                    None,
-                ),
-                "workspace_bytes": int(
-                    getattr(
-                        calculator.evaluator,
-                        "receiver_factorized_workspace_bytes",
-                        0,
-                    )
-                ),
-                "projection_bytes": int(
-                    getattr(
-                        calculator.evaluator,
-                        "receiver_factorized_projection_bytes",
-                        0,
-                    )
-                ),
-                "forward_launches": int(
-                    getattr(
-                        calculator.evaluator,
-                        "receiver_factorized_forward_launch_count",
-                        0,
-                    )
-                ),
-                "reverse_launches": int(
-                    getattr(
-                        calculator.evaluator,
-                        "receiver_factorized_reverse_launch_count",
-                        0,
-                    )
-                ),
-            },
             "r1_jit_forward": {
                 "jit_ready": bool(
                     getattr(calculator.evaluator, "factorized_jit_ready", False)
@@ -982,11 +911,6 @@ def _evaluate(
                 "contract_fingerprint": getattr(
                     calculator.evaluator,
                     "factorized_jit_contract_fingerprint",
-                    None,
-                ),
-                "requested_executor": getattr(
-                    calculator.evaluator,
-                    "factorized_direct_forward_executor",
                     None,
                 ),
                 "selected_executor": getattr(
@@ -1014,11 +938,6 @@ def _evaluate(
                 "contract_fingerprint": getattr(
                     calculator.evaluator,
                     "factorized_jit_contract_fingerprint",
-                    None,
-                ),
-                "requested_executor": getattr(
-                    calculator.evaluator,
-                    "factorized_direct_reverse_executor",
                     None,
                 ),
                 "selected_executor": getattr(
@@ -1364,7 +1283,15 @@ def _evaluate(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model", type=pathlib.Path)
-    parser.add_argument("--backend", choices=("serial", "kokkos"), default="kokkos")
+    parser.add_argument(
+        "--backend",
+        choices=("serial", "kokkos"),
+        default="kokkos",
+        help=(
+            "legacy stack selector; the retired 'serial' spelling measures the "
+            "artifact-free reference routing"
+        ),
+    )
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float64")
     parser.add_argument("--modes", default="materialized,direct")
     parser.add_argument("--sizes", default="2,3,4")
@@ -1382,34 +1309,7 @@ def main():
     parser.add_argument(
         "--factorized-r1-source-strategy",
         dest="factorized_source_strategy",
-        choices=(
-            "serial_reference",
-            "team_cached",
-            "tiled_coupling",
-            "jit_plugin",
-        ),
-    )
-    parser.add_argument(
-        "--factorized-r1-direct-forward-executor",
-        dest="factorized_direct_forward_executor",
-        choices=("automatic", "runtime", "jit_all"),
-    )
-    parser.add_argument(
-        "--factorized-r1-direct-reverse-executor",
-        dest="factorized_direct_reverse_executor",
-        choices=("automatic", "runtime", "jit"),
-    )
-    parser.add_argument(
-        "--factorized-r1-reverse-cache-policy",
-        dest="factorized_reverse_cache_policy",
-        choices=("automatic", "recompute", "retain"),
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--factorized-r1-planner-budget-bytes",
-        dest="factorized_planner_budget_bytes",
-        type=int,
-        help=argparse.SUPPRESS,
+        choices=("serial_reference", "jit_plugin"),
     )
     parser.add_argument(
         "--standard-r0-executor",
@@ -1503,28 +1403,6 @@ def main():
         modes
     ):
         parser.error("--factorized-r1-source-strategy requires a prepared mode")
-    if args.factorized_direct_forward_executor is not None and "direct" not in modes:
-        parser.error(
-            "--factorized-r1-direct-forward-executor requires direct in --modes"
-        )
-    if args.factorized_direct_reverse_executor is not None and "direct" not in modes:
-        parser.error(
-            "--factorized-r1-direct-reverse-executor requires direct in --modes"
-        )
-    if (
-        args.factorized_reverse_cache_policy is not None
-        and "receiver_factorized" not in modes
-    ):
-        parser.error(
-            "--factorized-r1-reverse-cache-policy requires receiver_factorized"
-        )
-    if args.factorized_planner_budget_bytes is not None:
-        if "receiver_factorized" not in modes:
-            parser.error(
-                "--factorized-r1-planner-budget-bytes requires receiver_factorized"
-            )
-        if args.factorized_planner_budget_bytes < 1:
-            parser.error("--factorized-r1-planner-budget-bytes must be positive")
     if args.standard_r0_executor is not None and "direct" not in modes:
         parser.error("--standard-r0-executor requires direct")
     if (
@@ -1533,8 +1411,8 @@ def main():
         and "direct" not in modes
     ):
         parser.error("--standard-m0-executor requires a streamed mode")
-    if args.factorized_parameter_gradients and "receiver_factorized" not in modes:
-        parser.error("--factorized-parameter-gradients requires receiver_factorized")
+    if args.factorized_parameter_gradients and "direct" not in modes:
+        parser.error("--factorized-parameter-gradients requires direct in --modes")
     if args.factorized_parameter_gradients and args.backend != "kokkos":
         parser.error("--factorized-parameter-gradients requires the kokkos backend")
     if args.m1_polynomial_policy == "recompute":
@@ -1616,6 +1494,13 @@ def main():
         if len(modes) != 1 or len(sizes) != 1 or args.repeats != 1:
             parser.error("--nvtx requires exactly one mode, one size, and --repeats=1")
 
+    # ``--backend`` selected the removed serial evaluator.  Its artifact-free
+    # single-thread host path is now the family's ``reference`` routing, so the
+    # legacy spelling measures that one routing instead of one row per
+    # requested mode; every other routing is Kokkos-only.
+    if args.backend != "kokkos":
+        modes = ["reference"]
+
     model = args.model.resolve()
     with model.open(encoding="utf-8") as stream:
         model_cutoff = float(json.load(stream)["r_cut"])
@@ -1654,14 +1539,6 @@ def main():
             "synchronized_evaluations": True,
             "fresh_process_required": True,
             "factorized_source_strategy": args.factorized_source_strategy,
-            "factorized_direct_forward_executor": (
-                args.factorized_direct_forward_executor
-            ),
-            "factorized_direct_reverse_executor": (
-                args.factorized_direct_reverse_executor
-            ),
-            "factorized_reverse_cache_policy": args.factorized_reverse_cache_policy,
-            "factorized_planner_budget_bytes": args.factorized_planner_budget_bytes,
             "standard_r0_executor": args.standard_r0_executor,
             "standard_m0_executor": args.standard_m0_executor,
             "factorized_parameter_gradients": args.factorized_parameter_gradients,
@@ -1697,10 +1574,6 @@ def main():
             args.dtype,
             modes[0],
             args.factorized_source_strategy,
-            args.factorized_direct_forward_executor,
-            args.factorized_direct_reverse_executor,
-            args.factorized_reverse_cache_policy,
-            args.factorized_planner_budget_bytes,
             args.standard_r0_executor,
             args.standard_m0_executor,
             args.factorized_parameter_gradients,
@@ -1726,10 +1599,6 @@ def main():
                 args.warmups,
                 args.repeats,
                 args.factorized_source_strategy,
-                args.factorized_direct_forward_executor,
-                args.factorized_direct_reverse_executor,
-                args.factorized_reverse_cache_policy,
-                args.factorized_planner_budget_bytes,
                 args.standard_r0_executor,
                 args.standard_m0_executor,
                 args.factorized_parameter_gradients,

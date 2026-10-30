@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -145,31 +147,26 @@ void copy_int_prefix(
 template <typename Precision>
 std::string MACEKokkos<Precision>::streamed_edges_mode() const
 {
-    return mace_streamed_edges_mode_name(streamed_edges);
+    return execution_mode_name(streamed_edges);
 }
 
 template <typename Precision>
 void MACEKokkos<Precision>::set_execution_plan_request(
     std::string algorithm, std::string profile, std::string debug_plan)
 {
-    const auto requested = parse_mace_streamed_edges_mode(algorithm);
+    const auto requested = parse_execution_mode(algorithm);
     set_streamed_edges(std::move(algorithm));
     execution_plan_.requested_algorithm = requested;
     execution_plan_.requested_profile =
         symmetrix::execution::parse_execution_profile(profile);
-    if (!debug_plan.empty()
-        && debug_plan != "mh0-direct-speed"
-        && debug_plan != "mh0-direct-capacity-retained"
-        && debug_plan != "mh0-direct-capacity-y-only"
-        && debug_plan != "mh0-single-layer-tiled-v1"
-        && debug_plan != "mh0-dual-layer-tiled-v1")
+    if (!debug_plan.empty() && !plan_candidate_space().declares(debug_plan))
         throw std::invalid_argument(
             "_debug_execution_plan must be one of 'mh0-direct-speed', "
             "'mh0-direct-capacity-retained', or "
             "'mh0-direct-capacity-y-only', or "
             "'mh0-single-layer-tiled-v1', or "
             "'mh0-dual-layer-tiled-v1'.");
-    if (!debug_plan.empty() && !mace_uses_direct_execution(requested))
+    if (!debug_plan.empty() && !uses_direct_execution(requested))
         throw std::invalid_argument(
             "_debug_execution_plan requires streamed_edges='direct'.");
     if (debug_plan == "mh0-direct-speed"
@@ -203,9 +200,9 @@ void MACEKokkos<Precision>::resolve_execution_plan()
     if (execution_plan_.requested_algorithm != streamed_edges)
         throw std::logic_error(
             "execution-plan algorithm differs from the active streamed-edge mode.");
-    if (!mace_uses_direct_execution(streamed_edges)) {
+    if (!uses_direct_execution(streamed_edges)) {
         execution_plan_.state = "active";
-        execution_plan_.selected_id = streamed_edges == MACEStreamedEdgesMode::generic
+        execution_plan_.selected_id = streamed_edges == ExecutionMode::generic
             ? "generic" : "legacy-materialized";
         execution_plan_.selection_reason = "explicit compatibility algorithm";
         return;
@@ -234,33 +231,84 @@ MACEKokkos<Precision>::execution_plan_report() const
     return execution_plan_;
 }
 
+// --- Family adapter lifecycle ----------------------------------------------
+// The neutral lifecycle names delegate to the MH-0 entry points that own the
+// behaviour; nothing here re-implements a preparation or a reduction.
+
+template <typename Precision>
+std::uint64_t MACEKokkos<Precision>::prepare_graph(
+    const int num_nodes, const std::span<const int> node_types,
+    const std::span<const int> num_neigh,
+    const std::span<const int> neigh_indices,
+    const std::span<const int> neigh_types)
+{
+    return prepare_factorized_graph(
+        num_nodes, node_types, num_neigh, neigh_indices, neigh_types);
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::prepare_geometry(
+    const std::uint64_t graph_generation,
+    const std::span<const double> reference_positions,
+    const std::span<const double> reference_xyz,
+    const std::span<const double> cell,
+    const std::span<const double> inverse_cell,
+    const std::span<const int> pbc)
+{
+    prepare_factorized_geometry(graph_generation, reference_positions,
+        reference_xyz, cell, inverse_cell, pbc);
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::compute_prepared(
+    const std::uint64_t graph_generation, const std::span<const double> xyz,
+    const std::span<const double> distances)
+{
+    compute_prepared_factorized(graph_generation, xyz, distances);
+}
+
+template <typename Precision>
+std::uint64_t MACEKokkos<Precision>::graph_generation() const
+{
+    return factorized_prepared_graph_generation;
+}
+
+template <typename Precision>
+std::uint64_t MACEKokkos<Precision>::geometry_generation() const
+{
+    return factorized_prepared_geometry_graph_generation;
+}
+
 template <typename Precision>
 void MACEKokkos<Precision>::set_streamed_edges(std::string mode)
 {
-    const auto requested = parse_mace_streamed_edges_mode(mode);
-    if (requested != MACEStreamedEdgesMode::materialized && !supports_streamed_edges())
+    const auto requested = parse_execution_mode(mode);
+    validate_model_execution_mode(requested);
+    if (requested != ExecutionMode::materialized && !supports_streamed_edges())
         throw std::invalid_argument(
             "Streamed edges require a format-v2 compact MACE or MACEField model.");
-    if (mace_uses_prepared_execution(requested) && !supports_factorized())
+    if (uses_prepared_execution(requested) && !supports_factorized())
         throw std::invalid_argument(
             "direct execution requires a factorable format-v2 "
             "compact MACE model.");
+    if (requested != streamed_edges)
+        on_model_execution_mode_change(streamed_edges, requested);
     Kokkos::fence();
     invalidate_all_interactions_prepared_graph();
     streamed_edges = requested;
-    if (mace_uses_direct_execution(streamed_edges)
+    if (uses_direct_execution(streamed_edges)
         && (jit_host_plugin_ready() || jit_device_plugin_ready()))
         factorized_source_strategy = FactorizedSourceStrategy::jit_plugin;
     if (use_m0_module())
         release_m0_polynomial_workspace();
     standard_r0_module_active = false;
     standard_r0_density_scale_fused = false;
-    if (streamed_edges == MACEStreamedEdgesMode::generic
-        || mace_uses_prepared_execution(streamed_edges)) {
+    if (streamed_edges == ExecutionMode::generic
+        || uses_prepared_execution(streamed_edges)) {
         R1 = decltype(R1)();
         R1_deriv = decltype(R1_deriv)();
     }
-    if (mace_uses_prepared_execution(streamed_edges)) {
+    if (uses_prepared_execution(streamed_edges)) {
         active_types.clear();
         factorized_ready = false;
         factorized_schedule_dirty = true;
@@ -270,12 +318,12 @@ void MACEKokkos<Precision>::set_streamed_edges(std::string mode)
         dPhi1r = decltype(dPhi1r)();
         dPhi1 = decltype(dPhi1)();
     }
-    if (streamed_edges == MACEStreamedEdgesMode::generic
-        || mace_uses_prepared_execution(streamed_edges)) {
+    if (streamed_edges == ExecutionMode::generic
+        || uses_prepared_execution(streamed_edges)) {
         R0 = decltype(R0)();
         R0_deriv = decltype(R0_deriv)();
     }
-    if (mace_uses_prepared_execution(streamed_edges)) {
+    if (uses_prepared_execution(streamed_edges)) {
         A0_spline_values = decltype(A0_spline_values)();
         A0_spline_derivs = decltype(A0_spline_derivs)();
     }
@@ -302,7 +350,7 @@ void MACEKokkos<Precision>::prepare_streamed_edge_schedule(
     all_interactions_schedule_build_count += 1;
 
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
-    if (streamed_edges != MACEStreamedEdgesMode::generic
+    if (streamed_edges != ExecutionMode::generic
         && !supports_fused_streamed_reverse()
         && num_edges > streamed_edge_owned_limit) {
         streamed_edge_receivers = Kokkos::View<int*>();
@@ -389,18 +437,17 @@ void MACEKokkos<Precision>::invalidate_factorized_operator_benchmark()
 template <typename Precision>
 void MACEKokkos<Precision>::begin_factorized_production_evaluation()
 {
+    if (alchemical_weights_active())
+        validate_alchemical_execution();
     begin_metal_evaluation();
-    if (mace_uses_direct_execution(streamed_edges)) {
-        if (!single_layer_readout
-            && !jit_host_plugin_ready() && !jit_device_plugin_ready())
-            throw std::runtime_error(
-                "streamed_edges='direct' requires a loaded RTC artifact; "
-                "direct execution does not fall back to another algorithm.");
-        if (factorized_observer_enabled || execution_parameter_gradients_enabled)
-            throw std::invalid_argument(
-                "streamed_edges='direct' does not support Execution observers "
-                "or parameter gradients; these features are unavailable.");
-    }
+    if (uses_direct_execution(streamed_edges)
+        && !single_layer_readout
+        && !factorized_observer_enabled
+        && !execution_parameter_gradients_enabled
+        && !jit_host_plugin_ready() && !jit_device_plugin_ready())
+        throw std::runtime_error(
+            "streamed_edges='direct' requires a loaded RTC artifact; "
+            "direct execution does not fall back to another algorithm.");
     invalidate_factorized_operator_benchmark();
     factorized_completed_evaluation_epoch = 0;
     factorized_completed_evaluation_graph_generation = 0;
@@ -440,7 +487,7 @@ std::uint64_t MACEKokkos<Precision>::prepare_all_interactions_graph(
     const std::span<const int> neigh_indices,
     const std::span<const int> neigh_types)
 {
-    if (streamed_edges != MACEStreamedEdgesMode::generic)
+    if (streamed_edges != ExecutionMode::generic)
         throw std::invalid_argument(
             "Prepared streamed graphs require streamed_edges='generic'.");
     if (num_nodes < 0
@@ -667,7 +714,7 @@ void MACEKokkos<Precision>::compute_prepared_all_interactions_positions(
     const std::uint64_t graph_generation,
     const std::span<const double> positions)
 {
-    if (streamed_edges != MACEStreamedEdgesMode::generic)
+    if (streamed_edges != ExecutionMode::generic)
         throw std::invalid_argument(
             "Prepared streamed positions require streamed_edges='generic'.");
     if (graph_generation == 0
@@ -854,6 +901,11 @@ void MACEKokkos<Precision>::compute_prepared_all_interactions_positions(
 template <typename Precision>
 void MACEKokkos<Precision>::invalidate_factorized_prepared_graph()
 {
+    if (alchemical_weights_active()) {
+        factorized_execution_space.fence("Release alchemical graph coefficients");
+        alchemical_node_weights = {};
+        alchemical_edge_weights = {};
+    }
     factorized_prepared_graph_generation = 0;
     factorized_prepared_geometry_graph_generation = 0;
     factorized_prepared_geometry_fractional = false;
@@ -960,9 +1012,14 @@ std::uint64_t MACEKokkos<Precision>::prepare_factorized_graph(
     if (factorized_distributed_phase != FactorizedDistributedPhase::idle)
         throw std::logic_error(
             "A prepared factorized graph cannot change during a distributed evaluation.");
-    if (!mace_uses_prepared_execution(streamed_edges))
+    if (!uses_prepared_execution(streamed_edges))
         throw std::invalid_argument(
             "Prepared Execution R1 graphs require streamed_edges='factorized'.");
+    if (!single_layer_readout
+        && !factorized_observer_enabled
+        && !execution_parameter_gradients_enabled
+        && !jit_host_plugin_ready() && !jit_device_plugin_ready())
+        throw std::runtime_error(direct_artifact_requirement_message());
     if (num_receivers < 0 || num_feature_nodes < num_receivers
         || receiver_feature_indices.size()
             != static_cast<std::size_t>(num_receivers)
@@ -1118,6 +1175,115 @@ std::uint64_t MACEKokkos<Precision>::prepare_factorized_graph(
 }
 
 template <typename Precision>
+bool MACEKokkos<Precision>::alchemical_weights_active() const
+{
+    return alchemical_node_weights.extent(0) != 0
+        || alchemical_edge_weights.extent(0) != 0;
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::validate_alchemical_execution() const
+{
+    if (metal_r0_module_ready() || metal_r1_module_ready()
+        || metal_m0_module_ready() || metal_m1_module_ready())
+        throw std::invalid_argument(
+            "Alchemical coefficients do not support Metal execution.");
+    if (!uses_direct_execution(streamed_edges))
+        throw std::invalid_argument(
+            "Alchemical coefficients require prepared direct execution.");
+    if (!uses_compact_radial || !compact_radial_model
+        || num_interactions != 2 || single_layer_readout || has_field_coupling)
+        throw std::invalid_argument(
+            "Alchemical coefficients require a standard compact two-interaction MACE model.");
+    if (available_heads.size() > 1)
+        throw std::invalid_argument(
+            "Alchemical coefficients do not support multi-head models.");
+    if (single_layer_tiled_plan_active || dual_layer_tiled_plan_active)
+        throw std::invalid_argument(
+            "Alchemical coefficients do not support tiled fixed-workspace execution.");
+    if (!r0_supports_low_memory())
+        throw std::invalid_argument(
+            "Alchemical coefficients require a state-free builtin v2 or generated R0 "
+            "operator; generic and v1 R0 execution are unsupported.");
+    if (execution_parameter_gradients_enabled || factorized_observer_enabled)
+        throw std::invalid_argument(
+            "Alchemical coefficients do not support parameter gradients or execution observers.");
+    if (!use_factorized_direct_inference())
+        throw std::invalid_argument(
+            "Alchemical coefficients require a loaded direct RTC artifact without fallback.");
+    if (factorized_prepared_graph_generation == 0 || factorized_schedule_dirty)
+        throw std::invalid_argument(
+            "Alchemical coefficients require a current prepared graph.");
+    if (execution_prepared_num_feature_nodes
+            != static_cast<int>(execution_prepared_node_types.extent(0)))
+        throw std::invalid_argument(
+            "Alchemical coefficients do not support distributed prepared graphs.");
+    for (std::size_t node=0;
+         node<execution_prepared_receiver_feature_indices_host.size(); ++node)
+        if (execution_prepared_receiver_feature_indices_host[node]
+                != static_cast<int>(node))
+            throw std::invalid_argument(
+                "Alchemical coefficients require identity receiver feature indices.");
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::set_alchemical_weights(
+    const std::uint64_t graph_generation,
+    const std::span<const double> node_weights,
+    const std::span<const double> edge_weights)
+{
+    validate_model_capability(MACEModelCapability::alchemical);
+    if (graph_generation == 0
+        || graph_generation != factorized_prepared_graph_generation
+        || factorized_schedule_dirty)
+        throw std::invalid_argument(
+            "Alchemical coefficient graph token is stale; prepare the graph again.");
+    if (factorized_distributed_phase != FactorizedDistributedPhase::idle)
+        throw std::logic_error(
+            "Alchemical coefficients cannot change during a distributed evaluation.");
+    validate_alchemical_execution();
+    if (node_weights.size() != execution_prepared_node_types.extent(0)
+        || edge_weights.size() != execution_prepared_neigh_indices.extent(0))
+        throw std::invalid_argument(
+            "Alchemical coefficient extents must match the prepared nodes and edges.");
+    const auto valid_coefficient = [] (const double value) {
+        // std::isfinite can be folded to true under the core's -ffast-math.
+        static_assert(std::numeric_limits<double>::is_iec559);
+        constexpr std::uint64_t exponent = 0x7ff0000000000000ULL;
+        return (std::bit_cast<std::uint64_t>(value) & exponent) != exponent
+            && value >= 0.0;
+    };
+    if (!std::all_of(node_weights.begin(), node_weights.end(), valid_coefficient)
+        || !std::all_of(edge_weights.begin(), edge_weights.end(), valid_coefficient))
+        throw std::invalid_argument(
+            "Alchemical coefficients must be finite and nonnegative.");
+
+    // Stage both arrays before replacing either published view. Synchronous
+    // copies also protect host input lifetimes and retire preceding evaluations.
+    Kokkos::View<double*> candidate_nodes(
+        Kokkos::view_alloc("Alchemical node coefficients", Kokkos::WithoutInitializing),
+        node_weights.size());
+    Kokkos::View<double*> candidate_edges;
+    if (!edge_weights.empty())
+        candidate_edges = Kokkos::View<double*>(
+            Kokkos::view_alloc("Alchemical edge coefficients", Kokkos::WithoutInitializing),
+            edge_weights.size());
+    Kokkos::deep_copy(candidate_nodes,
+        Kokkos::View<const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            node_weights.data(), node_weights.size()));
+    if (!edge_weights.empty())
+        Kokkos::deep_copy(candidate_edges,
+            Kokkos::View<const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+                edge_weights.data(), edge_weights.size()));
+    Kokkos::fence("Publish alchemical graph coefficients");
+    alchemical_node_weights = std::move(candidate_nodes);
+    alchemical_edge_weights = std::move(candidate_edges);
+    invalidate_factorized_operator_benchmark();
+    factorized_completed_evaluation_epoch = 0;
+    factorized_completed_evaluation_graph_generation = 0;
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::prepare_single_layer_tiled_workspace(
     const int num_receivers)
 {
@@ -1144,7 +1310,7 @@ void MACEKokkos<Precision>::prepare_single_layer_tiled_workspace(
     single_layer_workspace_active_edge_capacity = edge_capacity;
 
     const std::size_t precision_per_receiver =
-        (static_cast<std::size_t>(num_lm)
+        (2*static_cast<std::size_t>(num_lm)
          +2*static_cast<std::size_t>(num_LM)+1)
         *static_cast<std::size_t>(num_channels);
     single_layer_workspace_receiver_bytes = checked_workspace_sum(
@@ -1226,6 +1392,7 @@ void MACEKokkos<Precision>::prepare_single_layer_tiled_workspace(
     standard_r0_density_state = {};
     mh0_a0_scale_adjoint = {};
     single_layer_workspace_a0 = {};
+    single_layer_workspace_a0_adjoint = {};
     single_layer_workspace_equivariant_a = {};
     single_layer_workspace_equivariant_b = {};
     single_layer_workspace_m1 = {};
@@ -1250,6 +1417,15 @@ void MACEKokkos<Precision>::prepare_single_layer_tiled_workspace(
             capacity, num_lm, num_channels);
     offset += checked_workspace_product(
         "single-layer A0 slot",
+        {static_cast<std::size_t>(capacity), static_cast<std::size_t>(num_lm),
+         static_cast<std::size_t>(num_channels), sizeof(Precision)});
+    single_layer_workspace_a0_adjoint = make_tracked_workspace_alias<
+        decltype(single_layer_workspace_a0_adjoint)>(
+            single_layer_workspace_arena,
+            reinterpret_cast<Precision*>(raw+offset),
+            capacity, num_lm, num_channels);
+    offset += checked_workspace_product(
+        "single-layer A0 adjoint slot",
         {static_cast<std::size_t>(capacity), static_cast<std::size_t>(num_lm),
          static_cast<std::size_t>(num_channels), sizeof(Precision)});
     single_layer_workspace_equivariant_a = make_tracked_workspace_alias<
@@ -1323,6 +1499,8 @@ void MACEKokkos<Precision>::bind_single_layer_tiled_workspace_batch(
         std::size_t(0), static_cast<std::size_t>(active_receivers));
     A0 = Kokkos::subview(
         single_layer_workspace_a0, rows, Kokkos::ALL, Kokkos::ALL);
+    A0_adj = Kokkos::subview(
+        single_layer_workspace_a0_adjoint, rows, Kokkos::ALL, Kokkos::ALL);
     M0 = Kokkos::subview(
         single_layer_workspace_equivariant_a,
         rows, Kokkos::ALL, Kokkos::ALL);
@@ -1336,7 +1514,6 @@ void MACEKokkos<Precision>::bind_single_layer_tiled_workspace_batch(
     streamed_first_neigh = Kokkos::subview(
         single_layer_workspace_first_neigh, rows);
 
-    A0_adj = {};
     M0_adj = {};
     H1_adj = {};
     M1_adj = {};
@@ -1395,7 +1572,7 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
         "dual-layer precision slots",
         {checked_workspace_sum(
              "dual-layer precision slots",
-             {a_slot_elements, std::size_t(2)*equivariant_elements,
+             {std::size_t(4)*a_slot_elements, std::size_t(2)*equivariant_elements,
               phi_elements, m1_elements}),
          sizeof(Precision)});
     const std::size_t double_offset = checked_workspace_align_up(
@@ -1463,9 +1640,11 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
 
     if (!arena_fits) {
         dual_layer_workspace_a0 = {};
+        dual_layer_workspace_a0_adjoint = {};
         dual_layer_workspace_equivariant_a = {};
         dual_layer_workspace_equivariant_b = {};
         dual_layer_workspace_a1 = {};
+        dual_layer_workspace_a1_adjoint = {};
         dual_layer_workspace_phi1 = {};
         dual_layer_workspace_m1 = {};
         dual_layer_workspace_h2 = {};
@@ -1487,9 +1666,23 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
             decltype(dual_layer_workspace_a0)>(
                 dual_layer_workspace_arena, a_slot,
                 capacity, num_lm, num_channels);
+        offset += a_slot_elements*sizeof(Precision);
+        dual_layer_workspace_a0_adjoint = make_tracked_workspace_alias<
+            decltype(dual_layer_workspace_a0_adjoint)>(
+                dual_layer_workspace_arena,
+                reinterpret_cast<Precision*>(raw+offset),
+                capacity, num_lm, num_channels);
+        offset += a_slot_elements*sizeof(Precision);
         dual_layer_workspace_a1 = make_tracked_workspace_alias<
             decltype(dual_layer_workspace_a1)>(
-                dual_layer_workspace_arena, a_slot,
+                dual_layer_workspace_arena,
+                reinterpret_cast<Precision*>(raw+offset),
+                capacity, num_lm, num_channels);
+        offset += a_slot_elements*sizeof(Precision);
+        dual_layer_workspace_a1_adjoint = make_tracked_workspace_alias<
+            decltype(dual_layer_workspace_a1_adjoint)>(
+                dual_layer_workspace_arena,
+                reinterpret_cast<Precision*>(raw+offset),
                 capacity, num_lm, num_channels);
         offset += a_slot_elements*sizeof(Precision);
         dual_layer_workspace_equivariant_a = make_tracked_workspace_alias<
@@ -1577,6 +1770,9 @@ void MACEKokkos<Precision>::bind_dual_layer_phase1_workspace(
         std::size_t(0), static_cast<std::size_t>(receiver_count));
     A0 = Kokkos::subview(
         dual_layer_workspace_a0, local_rows, Kokkos::ALL, Kokkos::ALL);
+    A0_adj = Kokkos::subview(
+        dual_layer_workspace_a0_adjoint,
+        local_rows, Kokkos::ALL, Kokkos::ALL);
     M0 = Kokkos::subview(
         dual_layer_workspace_equivariant_a,
         local_rows, Kokkos::ALL, Kokkos::ALL);
@@ -1588,7 +1784,6 @@ void MACEKokkos<Precision>::bind_dual_layer_phase1_workspace(
         dual_layer_workspace_density_a0, local_rows);
     streamed_first_neigh = Kokkos::subview(
         dual_layer_workspace_first_neigh, local_rows);
-    A0_adj = {};
     M0_adj = {};
 }
 
@@ -1604,6 +1799,9 @@ void MACEKokkos<Precision>::bind_dual_layer_phase2_workspace(
         std::size_t(0), static_cast<std::size_t>(receiver_count));
     A1 = Kokkos::subview(
         dual_layer_workspace_a1, local_rows, Kokkos::ALL, Kokkos::ALL);
+    A1_adj = Kokkos::subview(
+        dual_layer_workspace_a1_adjoint,
+        local_rows, Kokkos::ALL, Kokkos::ALL);
     Phi1 = Kokkos::subview(
         dual_layer_workspace_phi1, local_rows, Kokkos::ALL, Kokkos::ALL);
     M1 = Kokkos::subview(
@@ -1619,7 +1817,6 @@ void MACEKokkos<Precision>::bind_dual_layer_phase2_workspace(
     M0 = {};
     streamed_first_neigh = Kokkos::subview(
         dual_layer_workspace_first_neigh, local_rows);
-    A1_adj = {};
     A1_inverse_scale = {};
     a1_scale_factors_ready = false;
     dPhi1 = {};
@@ -1939,7 +2136,7 @@ MACEKokkos<Precision>::prepare_periodic_factorized_graph(
     if (factorized_distributed_phase != FactorizedDistributedPhase::idle)
         throw std::logic_error(
             "A prepared factorized graph cannot change during a distributed evaluation.");
-    if (!mace_uses_direct_execution(streamed_edges))
+    if (!uses_direct_execution(streamed_edges))
         throw std::invalid_argument(
             "Native periodic graph construction requires streamed_edges='direct'.");
     if (positions.size()%3 != 0
@@ -2785,7 +2982,7 @@ void MACEKokkos<Precision>::compute_prepared_factorized(
     // Match the legacy prepared entry point: even a rejected evaluation
     // invalidates any operator benchmark tied to the preceding coordinates.
     begin_factorized_production_evaluation();
-    if (!mace_uses_prepared_execution(streamed_edges))
+    if (!uses_prepared_execution(streamed_edges))
         throw std::invalid_argument(
             "An execution graph token requires streamed_edges='direct'.");
     if (graph_generation == 0
@@ -2914,7 +3111,7 @@ void MACEKokkos<Precision>::update_prepared_factorized_positions_geometry(
     const std::span<const double> positions)
 {
     begin_factorized_production_evaluation();
-    if (!mace_uses_prepared_execution(streamed_edges))
+    if (!uses_prepared_execution(streamed_edges))
         throw std::invalid_argument(
             "Prepared Execution R1 positions require streamed_edges='factorized'.");
     if (graph_generation == 0
@@ -3188,7 +3385,7 @@ void MACEKokkos<Precision>::compute_prepared_factorized_field(
     if (!has_field_coupling)
         throw std::invalid_argument(
             "Prepared Execution field evaluation requires field coupling.");
-    if (!mace_uses_prepared_execution(streamed_edges))
+    if (!uses_prepared_execution(streamed_edges))
         throw std::invalid_argument(
             "An execution graph token requires streamed_edges='direct' or "
             "'direct'.");
@@ -3655,7 +3852,7 @@ bool MACEKokkos<Precision>::prepare_factorized_schedule_host(
         num_receivers, num_feature_nodes, num_edges, schedule_num_neigh);
     const bool direct_inference = factorized_direct_profile_requested()
         || (single_layer_readout
-            && mace_uses_direct_execution(streamed_edges));
+            && uses_direct_execution(streamed_edges));
     constexpr bool host_execution = std::is_same_v<
         typename Kokkos::DefaultExecutionSpace::memory_space,
         Kokkos::HostSpace>;
@@ -3956,7 +4153,7 @@ void MACEKokkos<Precision>::prepare_active_types(std::vector<int> node_types)
         if (type < 0 || type >= atomic_numbers_host.size())
             throw std::out_of_range("MACEKokkos active type index is out of range.");
     if (node_types == active_types
-        && (!mace_uses_prepared_execution(streamed_edges) || factorized_ready))
+        && (!uses_prepared_execution(streamed_edges) || factorized_ready))
         return;
 
     Kokkos::fence();
@@ -3965,13 +4162,13 @@ void MACEKokkos<Precision>::prepare_active_types(std::vector<int> node_types)
     auto pair_tables = std::vector<CompactRadialPairTables>();
     pair_tables.reserve(pair_count);
     auto factorized_pair_tables = std::vector<CompactRadialFactorizedPairTables>();
-    if (mace_uses_prepared_execution(streamed_edges) && !single_layer_readout)
+    if (uses_prepared_execution(streamed_edges) && !single_layer_readout)
         factorized_pair_tables.reserve(pair_count);
     for (int active_i=0; active_i<active_count; ++active_i)
         for (int active_j=active_i; active_j<active_count; ++active_j) {
             pair_tables.push_back(compact_radial_model->materialize_pair(
                 node_types[active_i], node_types[active_j]));
-            if (mace_uses_prepared_execution(streamed_edges)
+            if (uses_prepared_execution(streamed_edges)
                 && !single_layer_readout)
                 factorized_pair_tables.push_back(
                     compact_radial_model->materialize_factorized_pair(
@@ -4108,10 +4305,10 @@ void MACEKokkos<Precision>::prepare_active_types(std::vector<int> node_types)
         A0_splines = std::move(new_A0_splines);
     if (A1_scaled)
         A1_splines = std::move(new_A1_splines);
-    if (mace_uses_prepared_execution(streamed_edges)
+    if (uses_prepared_execution(streamed_edges)
         && !single_layer_readout)
         prepare_factorized_model(factorized_pair_tables, h, x0);
-    else if (mace_uses_prepared_execution(streamed_edges))
+    else if (uses_prepared_execution(streamed_edges))
         factorized_ready = true;
     type_to_active = new_type_to_active;
     num_active_types = active_count;

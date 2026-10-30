@@ -12,6 +12,6 @@
   "source_commit": "@SYMMETRIX_BUILD_SOURCE_COMMIT@",
   "source_content_sha256": "@SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256@",
   "native_source_content_sha256": "@SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256@",
-  "source_dirty": @SYMMETRIX_BUILD_SOURCE_DIRTY@,
+  "source_dirty": @SYMMETRIX_BUILD_SOURCE_DIRTY_JSON@,
   "toolkit": ""
 }

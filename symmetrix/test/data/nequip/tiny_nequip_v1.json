@@ -1,0 +1,148 @@
+{
+  "model_type": "NequIP",
+  "symmetrix_nequip_format_version": 1,
+  "model_metadata": {
+    "source_package": "nequip",
+    "source_version": "0.15.0",
+    "exporter_version": "symmetrix-nequip-exporter/1",
+    "exporter_fingerprint": "sha256:fixture-exporter"
+  },
+  "atomic_numbers": [1, 94],
+  "model_atomic_numbers": [1, 94],
+  "atomic_number_to_model_type": {"1": 0, "94": 1},
+  "r_cut": 4.5,
+  "initial_embedding": {
+    "irreps_out": "1x0e+1x1o",
+    "weight": {"shape": [2, 4], "values": [0.1, 0.2, 0.0, 0.0, 0.3, 0.4, 0.0, 0.0]}
+  },
+  "num_layers": 2,
+  "layers": [
+    {
+      "name": "interaction_0",
+      "node_irreps_in": "1x0e+1x1o",
+      "edge_irreps": "1x0e+1x1o",
+      "node_irreps_out": "1x0e+1x1o",
+      "node_irreps_pre_gate": "1x0e+1x0e+1x1o",
+      "radial_basis": {
+        "type": "bessel",
+        "num_basis": 2,
+        "cutoff": {"type": "polynomial", "p": 6},
+        "mlp": {
+          "layers": [
+            {
+              "weight": {"shape": [3, 2], "values": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]},
+              "bias": {"shape": [3], "values": [0.0, 0.0, 0.0]}
+            },
+            {
+              "weight": {"shape": [1, 3], "values": [0.1, 0.2, 0.3]},
+              "bias": {"shape": [1], "values": [0.0]}
+            }
+          ]
+        }
+      },
+      "edge_tensor_product": {
+        "irreps_in1": "1x0e+1x1o",
+        "irreps_in2": "1x0e+1x1o",
+        "irreps_out": "1x0e+1x0e+1x1o",
+        "instructions": [
+          {
+            "i_in1": 0,
+            "i_in2": 0,
+            "i_out": 0,
+            "connection_mode": "uvu",
+            "has_weight": true,
+            "path_weight": 1.0,
+            "path_shape": [1, 1],
+            "wigner_3j": {"shape": [1, 1, 1], "values": [1.0]}
+          }
+        ],
+        "weight": {"shape": [1], "values": [0.5]},
+        "output_mask": {"shape": [5], "values": [1.0, 1.0, 1.0, 1.0, 1.0]}
+      },
+      "message_linear": {
+        "irreps_in": "1x0e+1x0e+1x1o",
+        "irreps_out": "1x0e+1x0e+1x1o",
+        "instructions": [{"i_in": 2, "i_out": 2, "path_shape": [1, 1], "path_weight": 1.0}],
+        "weight": {"shape": [1], "values": [0.5]},
+        "bias": {"shape": [5], "values": [0.0, 0.0, 0.0, 0.0, 0.0]},
+        "output_mask": {"shape": [5], "values": [1.0, 1.0, 1.0, 1.0, 1.0]}
+      },
+      "self_connection": {
+        "irreps_in": "1x0e+1x1o",
+        "irreps_out": "1x0e+1x0e+1x1o",
+        "instructions": [{"i_in": 1, "i_out": 2, "path_shape": [1, 1], "path_weight": 1.0}],
+        "weight": {"shape": [1], "values": [0.5]},
+        "bias": {"shape": [5], "values": [0.0, 0.0, 0.0, 0.0, 0.0]},
+        "output_mask": {"shape": [5], "values": [1.0, 1.0, 1.0, 1.0, 1.0]}
+      },
+      "gate": {"type": "scalar_gate", "scalar_irreps": "1x0e", "gate_irreps": "1x0e", "gated_irreps": "1x1o"},
+      "update_nonlinearity": {"type": "silu"}
+    },
+    {
+      "name": "interaction_1",
+      "node_irreps_in": "1x0e+1x1o",
+      "edge_irreps": "1x0e+1x1o",
+      "node_irreps_out": "1x0e+1x1o",
+      "node_irreps_pre_gate": "1x0e+1x0e+1x1o",
+      "radial_basis": {
+        "type": "bessel",
+        "num_basis": 2,
+        "cutoff": {"type": "polynomial", "p": 6},
+        "mlp": {
+          "layers": [
+            {
+              "weight": {"shape": [1, 2], "values": [0.1, 0.2]},
+              "bias": {"shape": [1], "values": [0.0]}
+            }
+          ]
+        }
+      },
+      "edge_tensor_product": {
+        "irreps_in1": "1x0e+1x1o",
+        "irreps_in2": "1x0e+1x1o",
+        "irreps_out": "1x0e+1x0e+1x1o",
+        "instructions": [
+          {
+            "i_in1": 0,
+            "i_in2": 0,
+            "i_out": 0,
+            "connection_mode": "uvu",
+            "has_weight": true,
+            "path_weight": 1.0,
+            "path_shape": [1, 1],
+            "wigner_3j": {"shape": [1, 1, 1], "values": [1.0]}
+          }
+        ],
+        "weight": {"shape": [1], "values": [0.5]},
+        "output_mask": {"shape": [5], "values": [1.0, 1.0, 1.0, 1.0, 1.0]}
+      },
+      "message_linear": {
+        "irreps_in": "1x0e+1x0e+1x1o",
+        "irreps_out": "1x0e+1x0e+1x1o",
+        "instructions": [{"i_in": 2, "i_out": 2, "path_shape": [1, 1], "path_weight": 1.0}],
+        "weight": {"shape": [1], "values": [0.5]},
+        "bias": {"shape": [5], "values": [0.0, 0.0, 0.0, 0.0, 0.0]},
+        "output_mask": {"shape": [5], "values": [1.0, 1.0, 1.0, 1.0, 1.0]}
+      },
+      "self_connection": {
+        "irreps_in": "1x0e+1x1o",
+        "irreps_out": "1x0e+1x0e+1x1o",
+        "instructions": [{"i_in": 1, "i_out": 2, "path_shape": [1, 1], "path_weight": 1.0}],
+        "weight": {"shape": [1], "values": [0.5]},
+        "bias": {"shape": [5], "values": [0.0, 0.0, 0.0, 0.0, 0.0]},
+        "output_mask": {"shape": [5], "values": [1.0, 1.0, 1.0, 1.0, 1.0]}
+      },
+      "gate": {"type": "scalar_gate", "scalar_irreps": "1x0e", "gate_irreps": "1x0e", "gated_irreps": "1x1o"},
+      "update_nonlinearity": {"type": "silu"}
+    }
+  ],
+  "readout": {
+    "irreps_in": "1x0e+1x1o",
+    "instructions": [],
+    "weight": {"shape": [1, 4], "values": [0.25, 0.25, 0.0, 0.0]},
+    "bias": {"shape": [1], "values": [0.0]},
+    "output_mask": {"shape": [1], "values": [1.0]}
+  },
+  "per_type_shift": {"shape": [2], "values": [-0.1, -0.2]},
+  "per_type_scale": {"shape": [2], "values": [1.0, 1.0]}
+}

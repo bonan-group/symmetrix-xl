@@ -121,8 +121,7 @@ void MACEKokkos<Precision>::validate_factorized_operator_benchmark(
         throw std::invalid_argument(
             "Execution R1 operator benchmark evaluation state is stale; "
             "prepare it again after a successful prepared evaluation.");
-    if (!use_factorized_direct_jit_forward()
-        || !use_factorized_direct_jit_reverse())
+    if (!use_factorized_direct_inference())
         throw std::logic_error(
             "Execution R1 operator benchmark requires the admitted generated "
             "fixed-weight forward and coordinate reverse executors.");
@@ -137,7 +136,7 @@ std::uint64_t MACEKokkos<Precision>::prepare_factorized_operator_benchmark(
     if constexpr (!std::is_same_v<Precision,float>)
         throw std::logic_error(
             "Execution R1 operator benchmark requires float32 model execution.");
-    if (!mace_uses_direct_execution(streamed_edges))
+    if (!uses_direct_execution(streamed_edges))
         throw std::logic_error(
             "Execution R1 operator benchmark requires streamed_edges='direct'.");
     if (graph_generation == 0
@@ -150,8 +149,7 @@ std::uint64_t MACEKokkos<Precision>::prepare_factorized_operator_benchmark(
         throw std::logic_error(
             "Execution R1 operator benchmark requires a successfully completed "
             "prepared evaluation for the current graph.");
-    if (!use_factorized_direct_jit_forward()
-        || !use_factorized_direct_jit_reverse())
+    if (!use_factorized_direct_inference())
         throw std::logic_error(
             "Execution R1 operator benchmark requires the admitted generated "
             "fixed-weight forward and coordinate reverse executors.");

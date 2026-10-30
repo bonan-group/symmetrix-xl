@@ -23,15 +23,17 @@ jobs:
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 4
       KOKKOS_NUM_THREADS: 1
+      SYMMETRIX_JIT_CACHE: ${{ runner.temp }}/symmetrix-cuda-jit
+      SYMMETRIX_JIT_POLICY: required
       TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: "1"
     steps:
       - name: Clone repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v8.3.2
         with:
           python-version: "3.12"
 
@@ -46,21 +48,65 @@ jobs:
 
       - name: Build CUDA extension
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install mace-torch numpy pytest
-          python -m pip install --verbose ./symmetrix \
-            --config-settings=cmake.define.CMAKE_BUILD_TYPE=Release \
-            --config-settings=cmake.define.Kokkos_ENABLE_SERIAL=ON \
-            --config-settings=cmake.define.Kokkos_ENABLE_CUDA=ON \
-            --config-settings=cmake.define.Kokkos_ARCH_NATIVE=ON \
-            --config-settings=cmake.define.Kokkos_ENABLE_AGGRESSIVE_VECTORIZATION=ON \
-            --config-settings=cmake.define.SYMMETRIX_KOKKOS=ON \
-            --config-settings=cmake.define.SYMMETRIX_SPHERICART_CUDA=ON
+          uv venv --clear --python 3.12
+          source .venv/bin/activate
+          uv pip install scikit-build-core pybind11 ninja pytest mace-torch
+          mkdir -p "$SYMMETRIX_JIT_CACHE"
+          chmod 700 "$SYMMETRIX_JIT_CACHE"
+          python tools/symmetrix_build.py install \
+            --backend cpu \
+            --cpu-target native \
+            --build-root "$RUNNER_TEMP/symmetrix-cpu-build" \
+            --generator 'Unix Makefiles'
+          python tools/symmetrix_build.py install \
+            --backend cuda \
+            --cuda-root "$CUDA_ROOT" \
+            --build-root "$RUNNER_TEMP/symmetrix-cuda-build" \
+            --generator 'Unix Makefiles'
+
+      - name: Verify installed backend provenance
+        run: |
+          source .venv/bin/activate
+          symmetrix backend show --probe
+          symmetrix doctor --json
+          symmetrix version --probe --json | tee "$RUNNER_TEMP/version-probe.json"
+          python - "$RUNNER_TEMP/version-probe.json" <<'PY'
+          import json
+          import sys
+          import tomllib
+
+          record = json.load(open(sys.argv[1]))
+          assert record["probe_status"] == "ok", record
+          with open("symmetrix/pyproject.toml", "rb") as handle:
+              expected_version = tomllib.load(handle)["project"]["version"]
+          assert record["version"] == expected_version, record
+          assert record["distribution_version"] == expected_version, record
+          backend = record["probe"]["backend"]
+          build = record["probe"]["build_info"]
+          assert backend["source_commit"] == build["source_commit"]
+          assert len(backend["source_commit"]) == 40
+          assert set(backend["source_commit"]) <= set("0123456789abcdef")
+          assert backend["source_dirty"] is False
+          assert build["source_dirty"] is False
+          for value in (
+              backend["source_content_sha256"],
+              backend["native_source_content_sha256"],
+              build["source_content_sha256"],
+              build["native_source_content_sha256"],
+          ):
+              assert len(value) == 64 and set(value) <= set("0123456789abcdef")
+          assert backend["source_content_sha256"] == build["source_content_sha256"]
+          assert (
+              backend["native_source_content_sha256"]
+              == build["native_source_content_sha256"]
+          )
+          PY
 
       - name: Compile ordinary R1 with required NVRTC
         env:
           SYMMETRIX_REQUIRED_TEST_MANIFEST: cuda_compiler_required_tests.json
         run: |
+          source .venv/bin/activate
           cd symmetrix/test
           pytest -q \
             'test_jit_compiler_qualification.py::test_cuda_forced_compiler_produces_expected_artifact[nvrtc]'
@@ -70,22 +116,36 @@ jobs:
         env:
           SYMMETRIX_JIT_NVCC: ${{ env.CUDA_ROOT }}/bin/nvcc
         run: |
+          source .venv/bin/activate
           cd symmetrix/test
           pytest -q \
             'test_jit_compiler_qualification.py::test_cuda_forced_compiler_produces_expected_artifact[nvcc]'
 
-      - name: Require NVRTC ordinary R1 and MH1 module launches
+      - name: Require NVRTC ordinary, MH-1, OAM, and dispersion launches
         env:
           SYMMETRIX_JIT_CUDA_JIT_BACKEND: nvrtc
           SYMMETRIX_REQUIRED_TEST_MANIFEST: cuda_runtime_required_tests.json
         run: |
+          source .venv/bin/activate
           cd symmetrix/test
           pytest -q \
-            'test_cuda_runtime.py::test_cuda_r1_nvrtc_module_matches_generic' \
-            'test_mh1.py::test_mh1_generated_cuda_handles_nondivisible_second_subgroup_iteration'
+            'test_cuda_runtime.py::test_cuda_r1_generated_module_matches_generic' \
+            'test_mh1.py::test_mh1_generated_cuda_handles_nondivisible_second_subgroup_iteration' \
+            'test_oam_cuda_r1.py::test_generated_execution_matches_oracle_and_reuses_displaced_graph[float32-nvrtc]' \
+            'test_oam_cuda_r1.py::test_generated_execution_matches_oracle_and_reuses_displaced_graph[float64-nvrtc]' \
+            'test_oam_cuda_r1.py::test_degree_four_harmonics_match_the_reference_routing[nvrtc]' \
+            'test_nequip_calculator.py::test_oam_direct_request_reports_the_plan_and_every_node_tier[speed]' \
+            'test_nequip_calculator.py::test_oam_direct_request_reports_the_plan_and_every_node_tier[capacity]' \
+            'test_nequip_oam_stress.py::test_periodic_stress_matches_strain_after_cached_energy_and_forces[float32-False]' \
+            'test_nequip_oam_stress.py::test_periodic_stress_matches_strain_after_cached_energy_and_forces[float64-False]' \
+            'test_dispersion_device.py::test_cuda_dispersion_device_graph_reuse[d2]' \
+            'test_dispersion_device.py::test_cuda_dispersion_device_graph_reuse[d3]' \
+            'test_dispersion_device.py::test_cuda_dispersion_precision_parity[d2]' \
+            'test_dispersion_device.py::test_cuda_dispersion_precision_parity[d3]'
 
       - name: Download and verify MACE-MH-1 checkpoint
         run: |
+          source .venv/bin/activate
           mkdir -p "$HOME/.cache/symmetrix/test-models"
           curl --fail --location --retry 3 \
             https://github.com/ACEsuit/mace-foundations/releases/download/mace_mh_1/mace-mh-1.model \
@@ -99,6 +159,7 @@ jobs:
           SYMMETRIX_MH1_MODEL: ${{ runner.temp }}/mace-mh-1.model
           SYMMETRIX_JIT_CUDA_JIT_BACKEND: nvrtc
         run: |
+          source .venv/bin/activate
           cp "$HOME/.cache/symmetrix/test-models/mace-mh-1.model" "$SYMMETRIX_MH1_MODEL"
           cd symmetrix/test
           pytest -q test_mh1.py \
@@ -118,6 +179,7 @@ jobs:
           SYMMETRIX_MH1_MODEL: ${{ runner.temp }}/mace-mh-1.model
           SYMMETRIX_JIT_CUDA_JIT_BACKEND: nvrtc
         run: |
+          source .venv/bin/activate
           cp "$HOME/.cache/symmetrix/test-models/mace-mh-1.model" "$SYMMETRIX_MH1_MODEL"
           cd symmetrix/test
           pytest -q test_mh1.py

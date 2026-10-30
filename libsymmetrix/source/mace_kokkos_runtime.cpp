@@ -38,6 +38,7 @@
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
 #include "device_backend.hpp"
+#include "mace_device_backend.hpp"
 #ifdef SYMMETRIX_ENABLE_METAL
 #include "metal_m0_module.hpp"
 #include "metal_r0_module.hpp"
@@ -46,11 +47,12 @@
 #include "metal_r1_module.hpp"
 #endif
 #include "kernel_launch_profile.hpp"
-#include "standard_m0.hpp"
-#include "standard_m1.hpp"
-#include "standard_r0.hpp"
+#include "mace_standard_m0.hpp"
+#include "mace_standard_m1.hpp"
+#include "mace_standard_r0.hpp"
 #include "jit_generation_version.hpp"
 #include "factorized_blas.hpp"
+#include "sha256.hpp"
 
 using Kokkos::ALL;
 using Kokkos::LayoutRight;
@@ -76,6 +78,128 @@ using ExecutionDeviceBackend = DeviceBackendTraits<Kokkos::HIP>;
 #endif
 
 namespace {
+
+std::string generated_r0_artifact_id(
+    const std::string_view contract_fingerprint,
+    const std::string_view structure_fingerprint,
+    const std::string_view precision,
+    const std::string_view backend,
+    const std::string_view target,
+    const int channels,
+    const int l_max,
+    const std::string_view edge_weight_mode,
+    const std::string_view schedule,
+    const int schedule_revision)
+{
+    const nlohmann::json identity = {
+        {"backend", backend},
+        {"channels", channels},
+        {"compatibility_version", symmetrix::execution::r0_compatibility_version},
+        {"contract_fingerprint", contract_fingerprint},
+        {"edge_weight_mode", edge_weight_mode},
+        {"floating_point_policy",
+#if defined(SYMMETRIX_FAST_MATH_ENABLED)
+            backend == "cuda" ? "cuda-fast-math" : "strict"},
+#else
+            "strict"},
+#endif
+        {"generation_revision",
+            symmetrix::execution::required_jit_generation_version},
+        {"harmonic_count", (l_max+1)*(l_max+1)},
+        {"l_max", l_max},
+        {"operator", "R0"},
+        {"precision", precision},
+        {"schedule", schedule},
+        {"schedule_revision", schedule_revision},
+        {"schema", "symmetrix.generated-operator-identity/1"},
+        {"structure_fingerprint", structure_fingerprint},
+        {"target", target},
+    };
+    sha256::Digest digest;
+    digest.update(identity.dump());
+    const auto fingerprint = digest.finish();
+    const auto precision_suffix = precision == "float32" ? "f32" : "f64";
+    return "generated-r0-gen"
+        +std::to_string(symmetrix::execution::required_jit_generation_version)
+        +"-"+std::string(backend)+"-"+precision_suffix+"-"
+        +fingerprint.substr(std::string_view("sha256:").size());
+}
+
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+struct R0DeviceScheduleExpectation {
+    int persistent_blocks_per_compute_unit;
+    int forward_extent_multiplier;
+    int forward_owners_per_block;
+    int coordinate_reverse_owners_per_block;
+    int density_threads_per_block;
+    int forward_threads_per_block;
+    int reverse_prepare_threads_per_block;
+    int coordinate_reverse_threads_per_block;
+    int density_persistent;
+    int forward_persistent;
+    int reverse_prepare_persistent;
+    int coordinate_reverse_persistent;
+};
+
+template<class Precision>
+R0DeviceScheduleExpectation expected_r0_device_schedule(
+    const std::string_view target,
+    const std::string_view schedule,
+    const int channels,
+    const int l_max)
+{
+    constexpr int threads_per_block = 256;
+    const int edge_vector_length = schedule == "receiver-edge32" ? 32 : 16;
+#ifdef KOKKOS_ENABLE_CUDA
+    static_cast<void>(target);
+    constexpr int cuda_static_shared_limit = 48*1024;
+    const int forward_scratch_bytes_per_team =
+        channels*(2*l_max+1)*sizeof(Precision);
+    const bool wide_fallback =
+        forward_scratch_bytes_per_team > cuda_static_shared_limit;
+    return {
+        std::is_same_v<Precision,float> ? 3 : 4,
+        wide_fallback ? channels : l_max+1,
+        wide_fallback ? threads_per_block : 1,
+        threads_per_block/edge_vector_length,
+        threads_per_block,
+        wide_fallback ? threads_per_block : 32,
+        threads_per_block,
+        threads_per_block,
+        0,
+        0,
+        0,
+        1,
+    };
+#else
+    const bool all_angular = std::is_same_v<Precision,float>;
+    const bool gfx1151 = target.substr(0, target.find(':')) == "gfx1151";
+    constexpr int hip_static_shared_limit = 64*1024;
+    const int forward_scratch_bytes_per_team =
+        channels*(2*l_max+1)*sizeof(Precision);
+    const bool wide_fallback =
+        forward_scratch_bytes_per_team > hip_static_shared_limit;
+    const int forward_owners = std::max(
+        1, std::min(
+            threads_per_block/32,
+            hip_static_shared_limit/forward_scratch_bytes_per_team));
+    return {
+        all_angular && gfx1151 ? 8 : 4,
+        all_angular || wide_fallback ? channels : l_max+1,
+        all_angular || wide_fallback ? threads_per_block : forward_owners,
+        threads_per_block/edge_vector_length,
+        threads_per_block,
+        threads_per_block,
+        threads_per_block,
+        threads_per_block,
+        1,
+        1,
+        1,
+        1,
+    };
+#endif
+}
+#endif
 
 std::size_t checked_extent_product(
     const std::string_view name,
@@ -159,6 +283,14 @@ void capture_packed_execution_tile(
                             (eta*components+component)*channels+channel;
                         destination[index] = host(local_receiver,q,column);
                     }
+}
+
+// The reported reason a declared fixed-workspace plan is not yet qualified:
+// the plan space never admits one without an explicit caller opt-in.
+std::string fixed_workspace_opt_in_reason()
+{
+    return "fixed-workspace execution requires explicit opt-in via "
+        "allow_fixed_workspace";
 }
 
 template <typename Precision, typename StateView>
@@ -276,17 +408,39 @@ void MACEKokkos<Precision>::validate_graph_cardinality(
 
 template <typename Precision>
 MACEKokkos<Precision>::MACEKokkos(
-    std::string filename, std::string requested_head)
+    const SelectedMACEModel& selected,
+    const MACEModelKind expected_kind)
 {
+    const bool expected_model = selected.kind == expected_kind
+        || (expected_kind == MACEModelKind::mace
+            && selected.kind == MACEModelKind::mace_field);
+    if (!expected_model) {
+        if (selected.kind == MACEModelKind::mace_les)
+            throw std::invalid_argument(
+                "MACELES documents require the dedicated evaluator; use "
+                "MACELESKokkos.");
+        throw std::invalid_argument(
+            "MACE and MACEField documents require the base evaluator; use "
+            "MACEKokkos.");
+    }
+
     factorized_blas_context = std::make_unique<FactorizedBlasContext>();
-    load_from_json(filename, requested_head);
+    load_mace_backbone(selected);
     set_m1_polynomial_policy("automatic");
     // Match the Python calculator: compact models use direct execution by
-    // default.  Direct still fails closed until its required RTC artifact is
+    // default. Direct still fails closed until its required RTC artifact is
     // loaded; callers can explicitly request non-compiled/materialized modes.
     if (supports_streamed_edges())
-        streamed_edges = MACEStreamedEdgesMode::direct;
+        streamed_edges = ExecutionMode::direct;
 }
+
+template <typename Precision>
+MACEKokkos<Precision>::MACEKokkos(
+    std::string filename, std::string requested_head)
+  : MACEKokkos(
+        read_selected_mace_model(filename, requested_head),
+        MACEModelKind::mace)
+{}
 
 template <typename Precision>
 void MACEKokkos<Precision>::ensure_spherical_harmonics_state()
@@ -613,6 +767,176 @@ bool MACEKokkos<Precision>::supports_factorized() const
 }
 
 template <typename Precision>
+bool MACEKokkos<Precision>::admits_batched_a1_blas() const
+{
+#if defined(KOKKOS_ENABLE_CUDA) && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)
+    if constexpr (std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
+        // Prepared execution keeps the second interaction on the device.  The
+        // route needs the full node-major layout, so a prepared channel-tiled
+        // Phi1 (a debug plan) is left to the fallback; the unprepared state is
+        // admitted because the binding report is queried before the first
+        // graph is sized, and the dispatch re-checks the layout it finds.  The
+        // extents must be *exact*: the node strides the batched call uses are
+        // num_lme*num_channels and num_lm*num_channels, which only describe the
+        // allocation when those extents match.
+        const bool full_layout =
+            (Phi1.extent_int(1) == 0 || Phi1.extent_int(1) == num_lme)
+            && (Phi1.extent_int(2) == 0 || Phi1.extent_int(2) == num_channels);
+        const bool a1_layout =
+            A1.extent_int(1) == 0 || A1.extent_int(1) == num_lm;
+        return factorized_blas_context != nullptr
+            && uses_prepared_execution(streamed_edges)
+            && num_channels > 0 && num_lme > 0 && num_lm > 0
+            && full_layout && a1_layout;
+    }
+#endif
+    return false;
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::admits_flattened_a1_blas(
+    const int num_nodes) const
+{
+#if defined(KOKKOS_ENABLE_CUDA)
+    if constexpr (std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
+        // A variant of the batched route, not a separate binding: it reuses the
+        // same dispatcher and the same shared-weight descriptor, and only the
+        // operand layout differs.  It is restricted to the prepared routing
+        // because the packing kernel and the GEMM share one stream, and field-
+        // coupled models keep the generic path, as the M1 device route does.
+        // The node threshold keeps the small graphs the batched call already
+        // serves well off the pack/unpack cost.
+        return admits_batched_a1_blas()
+            && uses_prepared_execution(streamed_edges)
+            && !has_field_coupling
+            && num_nodes >= a1_blas_flatten_min_nodes;
+    }
+#endif
+    return false;
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::ensure_a1_blas_flatten_capacity(
+    const std::size_t input_elements,
+    const std::size_t output_elements)
+{
+    if (A1_blas_flatten_input.extent(0) >= input_elements
+        && A1_blas_flatten_output.extent(0) >= output_elements)
+        return;
+    factorized_execution_space.fence("Replace A1 flattened BLAS staging");
+    if (A1_blas_flatten_input.extent(0) < input_elements)
+        A1_blas_flatten_input = decltype(A1_blas_flatten_input)(
+            Kokkos::view_alloc(
+                "A1 flattened BLAS input", Kokkos::WithoutInitializing),
+            input_elements);
+    if (A1_blas_flatten_output.extent(0) < output_elements)
+        A1_blas_flatten_output = decltype(A1_blas_flatten_output)(
+            Kokkos::view_alloc(
+                "A1 flattened BLAS output", Kokkos::WithoutInitializing),
+            output_elements);
+}
+
+template <typename Precision>
+std::size_t MACEKokkos<Precision>::a1_blas_flatten_workspace_bytes() const
+{
+    return sizeof(Precision)*(
+        A1_blas_flatten_input.size()+A1_blas_flatten_output.size());
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::admits_m1_device_terms() const
+{
+#if defined(KOKKOS_ENABLE_CUDA)
+    if constexpr (std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
+        if (!m1_terms_ready || M1_term_count <= 0)
+            return false;
+        // Field-coupled models keep the generic implementation: the flattened
+        // terms are the same polynomial, but no device/host parity case for a
+        // field-coupled MH-0 model exists in the suite, so the route is not
+        // admitted for them until one does.
+        if (has_field_coupling)
+            return false;
+        if (m1_polynomial_policy != M1PolynomialPolicy::recompute)
+            return false;
+        if (!uses_prepared_execution(streamed_edges))
+            return false;
+        const int channels = num_channels;
+        const int harmonics = single_layer_readout ? num_LM : num_lm;
+        const auto polynomial_input = single_layer_readout ? H1 : A1;
+        // The unprepared state is admitted because the binding report is
+        // queried before the first graph is sized, and the dispatch re-checks
+        // the layouts it finds.  The kernel reads one input leaf per term and
+        // writes one output element, so the channel extents must be exact.
+        const bool input_layout =
+            (polynomial_input.extent_int(1) == 0
+                || polynomial_input.extent_int(1) >= harmonics)
+            && (polynomial_input.extent_int(2) == 0
+                || polynomial_input.extent_int(2) == channels);
+        const bool output_layout =
+            M1.extent_int(1) == 0 || M1.extent_int(1) == channels;
+        const bool term_layout =
+            M1_term_leaves.extent_int(0) >= M1_term_count
+            && M1_term_leaves.extent_int(1) >= 3
+            && M1_term_nodes.extent_int(0) >= M1_term_count
+            && M1_poly_coeff.extent_int(1) > 0
+            && M1_poly_coeff.extent_int(2) == channels;
+        return channels > 0 && harmonics > 0
+            && input_layout && output_layout && term_layout;
+    }
+#endif
+    return false;
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::admits_device_h2_stages() const
+{
+#if defined(KOKKOS_ENABLE_CUDA)
+    if constexpr (std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
+        const int channels = num_channels;
+        if (channels <= 0)
+            return false;
+        // Field-coupled models keep the generic implementation: the fused
+        // stages narrow the second-interaction arithmetic to the compute
+        // precision, and no device/host parity case for a field-coupled MH-0
+        // model exists in the suite, so the route is not admitted for them
+        // until one does.
+        if (has_field_coupling)
+            return false;
+        // The fused stages serve prepared execution only: the reference routing
+        // must keep running the generic kernels, so a parity comparison against
+        // it stays a comparison against a different implementation.
+        if (!uses_prepared_execution(streamed_edges))
+            return false;
+        // The unprepared state is admitted because the binding report is
+        // queried before the first graph is sized, and the dispatch re-checks
+        // the layouts it finds.  Both kernels read one input slice per node and
+        // write one output element per (node, channel), so those extents must
+        // be exact; the weight blocks are indexed by channels*channels.
+        const auto exact = [] (const auto& view, const int dim,
+                               const int expected) {
+            return view.extent_int(dim) == 0
+                || view.extent_int(dim) == expected;
+        };
+        const auto at_least = [] (const auto& view, const int dim,
+                                  const int needed) {
+            return view.extent_int(dim) == 0
+                || view.extent_int(dim) >= needed;
+        };
+        const int weight_entries = channels*channels;
+        return exact(H1, 2, channels) && exact(H1_adj, 2, channels)
+            && exact(M1, 1, channels) && exact(M1_adj, 1, channels)
+            && exact(H2, 1, channels) && exact(H2_adj, 1, channels)
+            && at_least(H1, 1, 1)
+            && at_least(H2_weights_for_H1, 1, weight_entries)
+            && at_least(H2_weights_for_M1, 0, weight_entries)
+            && at_least(H2_weights_for_H1_reverse, 1, weight_entries)
+            && at_least(H2_weights_for_M1_reverse, 0, weight_entries);
+    }
+#endif
+    return false;
+}
+
+template <typename Precision>
 bool MACEKokkos<Precision>::device_cuda_available() const
 {
 #ifdef KOKKOS_ENABLE_CUDA
@@ -710,6 +1034,18 @@ int MACEKokkos<Precision>::execution_cuda_driver_version() const
     }
 #endif
     return 0;
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::validate_model_artifact_load(
+    const std::string_view loader) const
+{
+    try {
+        validate_model_capability(MACEModelCapability::metal_artifact);
+    } catch (const MACEModelCapabilityError& error) {
+        throw std::invalid_argument(
+            std::string(error.what())+" '"+std::string(loader)+"'.");
+    }
 }
 
 template <typename Precision>
@@ -997,9 +1333,11 @@ void MACEKokkos<Precision>::load_m0_device_module(
             || m0_module_term_count <= 0)
             throw std::invalid_argument(
                 "Execution M0 device module weights are unavailable.");
-        if (schedule != "chunk32" && schedule != "table")
+        if (schedule != "chunk32" && schedule != "table"
+            && schedule != "tiled128x4-v1")
             throw std::invalid_argument(
-                "Execution M0 device schedule must be 'chunk32' or 'table'.");
+                "Execution M0 device schedule must be 'chunk32', 'table', or "
+                "'tiled128x4-v1'.");
         if (persistent_blocks_per_compute_unit <= 0
             || persistent_blocks_per_compute_unit > 32)
             throw std::invalid_argument(
@@ -1031,19 +1369,21 @@ void MACEKokkos<Precision>::load_m0_device_module(
             +(normalized.features.empty() ? std::string() : ":"+normalized.features);
         max_threads = device.maxThreadsPerBlock;
 #endif
+        const int schedule_revision = schedule == "chunk32" ? 2
+            : schedule == "tiled128x4-v1" ? 3 : 1;
         const std::string artifact_id = "jit-m0-gen"
             +std::to_string(symmetrix::execution::required_jit_generation_version)
             +"-"+std::string(precision_suffix)+"-"
             +standard_m0_model_structure_fingerprint.substr(
                 fingerprint_prefix.size(), 16)+"-c"+std::to_string(num_channels)
-            +"-"+schedule+"-"+target;
+            +"-"+schedule+"-r"+std::to_string(schedule_revision)+"-"+target;
         constexpr std::uint32_t capabilities =
             SYMMETRIX_JIT_OPERATOR_M0_FORWARD_V1
             |SYMMETRIX_JIT_OPERATOR_M0_REVERSE_V1
-            |SYMMETRIX_JIT_OPERATOR_M0_ALIAS_SAFE_V1
             |SYMMETRIX_JIT_OPERATOR_M0_SCALE_ADJOINT_V1
             |SYMMETRIX_JIT_OPERATOR_M0_RESPONSE_REVERSE_V1;
-        const symmetrix::execution::OperatorModuleExpectation expectation{
+        const bool tiled_schedule = schedule == "tiled128x4-v1";
+        symmetrix::execution::OperatorModuleExpectation expectation{
             SYMMETRIX_JIT_OPERATOR_KIND_M0_V1,
             artifact_id,
             standard_m0_model_structure_fingerprint,
@@ -1058,7 +1398,15 @@ void MACEKokkos<Precision>::load_m0_device_module(
             m0_correlation,
             m0_module_term_count,
             max_threads,
+            tiled_schedule ? 128 : 256,
         };
+        expectation.schedule_revision=schedule_revision;
+        expectation.channel_tile=tiled_schedule ? 128 : 1;
+        expectation.forward_node_tile=1;
+        expectation.forward_component_tile=tiled_schedule ? 1 : num_LM;
+        expectation.reverse_node_tile=tiled_schedule ? 4 : 1;
+        expectation.reverse_component_tile=tiled_schedule ? 1 : num_lm;
+        expectation.logical_tiles_per_block=tiled_schedule ? 1 : 256;
         auto loaded = symmetrix::execution::OperatorModule::load(
             std::move(path), expectation);
         factorized_execution_space.fence("Replace Execution M0 device module");
@@ -1113,7 +1461,7 @@ std::string MACEKokkos<Precision>::m0_device_module_schedule_name() const
 template <typename Precision>
 void MACEKokkos<Precision>::load_m0_host_plugin(std::string path)
 {
-    if constexpr (!symmetrix::standard_r0::host_execution_space<
+    if constexpr (!symmetrix::execution::host_execution_space<
             Kokkos::DefaultExecutionSpace>) {
         throw std::invalid_argument(
             "Execution M0 host plugins require a host Kokkos execution space.");
@@ -1139,7 +1487,7 @@ void MACEKokkos<Precision>::load_m0_host_plugin(std::string path)
             +"-"+std::string(suffix)+"-"
             +standard_m0_model_structure_fingerprint.substr(
                 fingerprint_prefix.size(), 16)
-            +"-c"+std::to_string(num_channels)+"-chunk32";
+            +"-c"+std::to_string(num_channels)+"-chunk32-r2";
         const symmetrix::execution::M0HostPluginExpectation expectation{
             artifact_id,
             standard_m0_model_structure_fingerprint,
@@ -1164,7 +1512,7 @@ void MACEKokkos<Precision>::load_m0_host_plugin(std::string path)
 template <typename Precision>
 bool MACEKokkos<Precision>::m0_host_plugin_ready() const
 {
-    return symmetrix::standard_r0::host_execution_space<
+    return symmetrix::execution::host_execution_space<
             Kokkos::DefaultExecutionSpace>
         && m0_host_plugin != nullptr && static_cast<bool>(*m0_host_plugin);
 }
@@ -1183,29 +1531,37 @@ std::string MACEKokkos<Precision>::m0_host_plugin_artifact_id() const
 }
 
 template <typename Precision>
-void MACEKokkos<Precision>::load_r0_device_module(
-    std::string path, const int persistent_blocks_per_compute_unit)
+void MACEKokkos<Precision>::load_m1_device_module(
+    std::string path, std::string schedule,
+    const int persistent_blocks_per_compute_unit)
 {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     if constexpr (!device_execution_space<Kokkos::DefaultExecutionSpace>) {
         throw std::invalid_argument(
-            "Execution R0 device modules require a device Kokkos execution space.");
+            "Execution M1 device modules require a device Kokkos execution space.");
     } else {
-        if (!uses_compact_radial || !standard_r0_has_model_contract
-            || !r0_model_payload_verified)
+        if (!uses_compact_radial || !m1_has_model_contract
+            || !m1_model_payload_verified
+            || generated_m1_module_weights.data() == nullptr)
             throw std::invalid_argument(
-                "Execution R0 device modules require a verified scalar-source R0 contract.");
+                "Execution M1 device modules require a verified compact-v2 M1 contract.");
+        if (m1_correlation <= 0 || m1_correlation > 4)
+            throw std::invalid_argument(
+                "Execution M1 device modules support correlation up to four.");
+        if (schedule != "chunk32" && schedule != "table"
+            && schedule != "tiled128x4-v1")
+            throw std::invalid_argument(
+                "Execution M1 device schedule must be 'chunk32', 'table', or "
+                "'tiled128x4-v1'.");
         if (persistent_blocks_per_compute_unit <= 0
             || persistent_blocks_per_compute_unit > 32)
             throw std::invalid_argument(
-                "Execution R0 persistent blocks per compute unit must be in [1, 32].");
+                "Execution M1 persistent blocks per compute unit must be in [1, 32].");
         constexpr std::string_view fingerprint_prefix = "sha256:";
-        if (!std::string_view(standard_r0_model_structure_fingerprint)
-                .starts_with(fingerprint_prefix)
-            || standard_r0_model_structure_fingerprint.size()
-                < fingerprint_prefix.size()+16)
+        if (!std::string_view(m1_model_structure_fingerprint)
+                .starts_with(fingerprint_prefix))
             throw std::invalid_argument(
-                "Execution R0 structure fingerprint is malformed.");
+                "Execution M1 structure fingerprint is malformed.");
         constexpr std::string_view precision_suffix =
             std::is_same_v<Precision,float> ? "f32" : "f64";
         std::string target;
@@ -1225,11 +1581,217 @@ void MACEKokkos<Precision>::load_r0_device_module(
             +(normalized.features.empty() ? std::string() : ":"+normalized.features);
         max_threads = device.maxThreadsPerBlock;
 #endif
-        const std::string artifact_id = "jit-r0-gen"
+        const int schedule_revision = schedule == "chunk32" ? 3
+            : schedule == "tiled128x4-v1" ? 4 : 2;
+        const std::string artifact_id = "jit-m1-gen"
             +std::to_string(symmetrix::execution::required_jit_generation_version)
             +"-"+std::string(precision_suffix)+"-"
-            +standard_r0_model_structure_fingerprint.substr(
-                fingerprint_prefix.size(), 16)+"-edge-batch1-"+target;
+            +m1_model_structure_fingerprint.substr(
+                fingerprint_prefix.size(), 16)+"-c"+std::to_string(num_channels)
+            +"-"+schedule+"-r"+std::to_string(schedule_revision)+"-"+target;
+        constexpr std::uint32_t capabilities =
+            SYMMETRIX_JIT_OPERATOR_M1_FORWARD_V1
+            |SYMMETRIX_JIT_OPERATOR_M1_REVERSE_V1
+            |SYMMETRIX_JIT_OPERATOR_M1_SCALE_ADJOINT_V1;
+        const bool tiled_schedule = schedule == "tiled128x4-v1";
+        symmetrix::execution::OperatorModuleExpectation expectation{
+            SYMMETRIX_JIT_OPERATOR_KIND_M1_V1,
+            artifact_id,
+            m1_model_structure_fingerprint,
+            target,
+            std::is_same_v<Precision,float>
+                ? SYMMETRIX_JIT_OPERATOR_SCALAR_FLOAT32_V1
+                : SYMMETRIX_JIT_OPERATOR_SCALAR_FLOAT64_V1,
+            sizeof(Precision), capabilities,
+            single_layer_readout ? num_LM : num_lm, 1,
+            m1_correlation, m1_module_term_count, max_threads,
+            tiled_schedule ? 128 : 256,
+        };
+        expectation.schedule_revision=schedule_revision;
+        expectation.channel_tile=tiled_schedule ? 128 : 1;
+        expectation.forward_node_tile=1;
+        expectation.forward_component_tile=1;
+        expectation.reverse_node_tile=tiled_schedule ? 4 : 1;
+        expectation.reverse_component_tile=tiled_schedule
+            ? 1 : (single_layer_readout ? num_LM : num_lm);
+        expectation.logical_tiles_per_block=tiled_schedule ? 1 : 256;
+        auto loaded = symmetrix::execution::OperatorModule::load(
+            std::move(path), expectation);
+        factorized_execution_space.fence("Replace Execution M1 device module");
+        m1_device_module =
+            std::make_unique<symmetrix::execution::OperatorModule>(
+                std::move(loaded));
+        m1_device_module_schedule = std::move(schedule);
+        m1_device_persistent_blocks_per_compute_unit =
+            persistent_blocks_per_compute_unit;
+        selected_m1_implementation = M1Implementation::device_module;
+    }
+#else
+    (void)path;
+    (void)schedule;
+    (void)persistent_blocks_per_compute_unit;
+    throw std::invalid_argument(
+        "Execution M1 device modules require a CUDA- or HIP-enabled build.");
+#endif
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::m1_device_module_ready() const
+{
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+    return m1_device_module != nullptr && static_cast<bool>(*m1_device_module);
+#else
+    return false;
+#endif
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::m1_device_module_path() const
+{
+    return m1_device_module_ready() ? m1_device_module->path() : std::string();
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::m1_device_module_artifact_id() const
+{
+    return m1_device_module_ready()
+        ? std::string(m1_device_module->artifact_id()) : std::string();
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::load_m1_host_plugin(std::string path)
+{
+    if constexpr (!symmetrix::execution::host_execution_space<
+            Kokkos::DefaultExecutionSpace>) {
+        throw std::invalid_argument(
+            "Execution M1 host plugins require a host Kokkos execution space.");
+    } else {
+        if (!uses_compact_radial || !m1_has_model_contract
+            || !m1_model_payload_verified
+            || generated_m1_module_weights.data() == nullptr)
+            throw std::invalid_argument(
+                "Execution M1 host plugins require a verified compact-v2 M1 contract.");
+        constexpr std::string_view fingerprint_prefix = "sha256:";
+        if (!std::string_view(m1_model_structure_fingerprint)
+                .starts_with(fingerprint_prefix))
+            throw std::invalid_argument(
+                "Execution M1 structure fingerprint is malformed.");
+        constexpr std::string_view suffix =
+            std::is_same_v<Precision,float> ? "f32" : "f64";
+        const std::string artifact_id = "jit-m1-host-gen"
+            +std::to_string(symmetrix::execution::required_jit_generation_version)
+            +"-"+std::string(suffix)+"-"
+            +m1_model_structure_fingerprint.substr(
+                fingerprint_prefix.size(), 16)
+            +"-c"+std::to_string(num_channels)+"-chunk32-r2";
+        const symmetrix::execution::M1HostPluginExpectation expectation{
+            artifact_id, m1_model_structure_fingerprint,
+            std::is_same_v<Precision,float>
+                ? SYMMETRIX_JIT_M1_HOST_SCALAR_FLOAT32_V1
+                : SYMMETRIX_JIT_M1_HOST_SCALAR_FLOAT64_V1,
+            sizeof(Precision), num_channels,
+            single_layer_readout ? num_LM : num_lm, 1,
+            m1_correlation, m1_module_term_count,
+        };
+        auto loaded = symmetrix::execution::M0HostPlugin::load_m1(
+            std::move(path), expectation);
+        factorized_execution_space.fence("Replace Execution M1 host plugin");
+        m1_host_plugin =
+            std::make_unique<symmetrix::execution::M0HostPlugin>(
+                std::move(loaded));
+        selected_m1_implementation = M1Implementation::host_plugin;
+    }
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::m1_host_plugin_ready() const
+{
+    return symmetrix::execution::host_execution_space<
+            Kokkos::DefaultExecutionSpace>
+        && m1_host_plugin != nullptr && static_cast<bool>(*m1_host_plugin);
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::m1_host_plugin_path() const
+{
+    return m1_host_plugin_ready() ? m1_host_plugin->path() : std::string();
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::m1_host_plugin_artifact_id() const
+{
+    return m1_host_plugin_ready()
+        ? std::string(m1_host_plugin->descriptor().artifact_id) : std::string();
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::load_r0_device_module(
+    std::string path, const int persistent_blocks_per_compute_unit,
+    const bool apply_edge_weights, std::string schedule)
+{
+#if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
+    if constexpr (!device_execution_space<Kokkos::DefaultExecutionSpace>) {
+        throw std::invalid_argument(
+            "Execution R0 device modules require a device Kokkos execution space.");
+    } else {
+        constexpr int r0_device_schedule_revision = 6;
+        if (!uses_compact_radial || !standard_r0_has_model_contract
+            || !r0_model_payload_verified)
+            throw std::invalid_argument(
+                "Execution R0 device modules require a verified scalar-source R0 contract.");
+        if (persistent_blocks_per_compute_unit <= 0
+            || persistent_blocks_per_compute_unit > 32)
+            throw std::invalid_argument(
+                "Execution R0 persistent blocks per compute unit must be in [1, 32].");
+        if (schedule != "receiver-edge16" && schedule != "receiver-edge32")
+            throw std::invalid_argument(
+                "Execution R0 device schedule must be receiver-edge16 or "
+                "receiver-edge32.");
+        constexpr std::string_view fingerprint_prefix = "sha256:";
+        if (!std::string_view(standard_r0_model_structure_fingerprint)
+                .starts_with(fingerprint_prefix)
+            || standard_r0_model_structure_fingerprint.size()
+                < fingerprint_prefix.size()+16)
+            throw std::invalid_argument(
+                "Execution R0 structure fingerprint is malformed.");
+        std::string target;
+        int max_threads = 0;
+#ifdef KOKKOS_ENABLE_CUDA
+        symmetrix::execution::CudaDeviceGuard device_guard(
+            factorized_execution_space.cuda_device());
+        const auto& device = factorized_execution_space.cuda_device_prop();
+        target = "sm_"+std::to_string(10*device.major+device.minor);
+        max_threads = device.maxThreadsPerBlock;
+#else
+        symmetrix::execution::HipDeviceGuard device_guard(
+            factorized_execution_space.hip_device());
+        const auto& device = factorized_execution_space.hip_device_prop();
+        const auto normalized = normalize_hip_agent_target(device.gcnArchName);
+        target = normalized.base_isa
+            +(normalized.features.empty() ? std::string() : ":"+normalized.features);
+        max_threads = device.maxThreadsPerBlock;
+#endif
+        const auto schedule_expectation = expected_r0_device_schedule<Precision>(
+            target, schedule, num_channels, l_max);
+        const int expected_r0_persistent_blocks_per_compute_unit =
+            schedule_expectation.persistent_blocks_per_compute_unit;
+        if (persistent_blocks_per_compute_unit
+                != expected_r0_persistent_blocks_per_compute_unit)
+            throw std::invalid_argument(
+                "Execution R0 persistent-block profile does not match the "
+                "generated backend schedule.");
+        const std::string artifact_id = generated_r0_artifact_id(
+            standard_r0_model_contract_fingerprint,
+            standard_r0_model_structure_fingerprint,
+            std::is_same_v<Precision,float> ? "float32" : "float64",
+#ifdef KOKKOS_ENABLE_CUDA
+            "cuda",
+#else
+            "hip",
+#endif
+            target, num_channels, l_max,
+            apply_edge_weights ? "weighted" : "unity", schedule,
+            r0_device_schedule_revision);
         constexpr std::uint32_t capabilities =
             SYMMETRIX_JIT_OPERATOR_R0_DENSITY_PREPARE_V1
             |SYMMETRIX_JIT_OPERATOR_R0_FORWARD_V1
@@ -1253,6 +1815,44 @@ void MACEKokkos<Precision>::load_r0_device_module(
             1,
             num_lm,
             max_threads,
+            256,
+            r0_device_schedule_revision,
+            expected_r0_persistent_blocks_per_compute_unit,
+            num_channels,
+            l_max,
+            1,
+            8,
+            schedule_expectation.density_threads_per_block,
+            schedule_expectation.density_persistent,
+            schedule_expectation.forward_extent_multiplier,
+            schedule_expectation.forward_owners_per_block,
+            schedule_expectation.forward_threads_per_block,
+            schedule_expectation.forward_persistent,
+            1,
+            1,
+            schedule_expectation.reverse_prepare_threads_per_block,
+            schedule_expectation.reverse_prepare_persistent,
+            1,
+            schedule_expectation.coordinate_reverse_owners_per_block,
+            schedule_expectation.coordinate_reverse_threads_per_block,
+            schedule_expectation.coordinate_reverse_persistent,
+            {
+                artifact_id,
+                standard_r0_model_structure_fingerprint,
+                target,
+                schedule,
+                std::is_same_v<Precision,float>
+                    ? SYMMETRIX_JIT_OPERATOR_SCALAR_FLOAT32_V1
+                    : SYMMETRIX_JIT_OPERATOR_SCALAR_FLOAT64_V1,
+                sizeof(Precision),
+                symmetrix::execution::r0_required_capabilities,
+                num_channels,
+                l_max,
+                num_lm,
+                apply_edge_weights ? 1 : 0,
+                r0_device_schedule_revision,
+                symmetrix::execution::r0_compatibility_version,
+            },
         };
         auto loaded = symmetrix::execution::OperatorModule::load(
             std::move(path), expectation);
@@ -1262,11 +1862,15 @@ void MACEKokkos<Precision>::load_r0_device_module(
                 std::move(loaded));
         r0_device_persistent_blocks_per_compute_unit =
             persistent_blocks_per_compute_unit;
+        r0_device_module_schedule = std::move(schedule);
+        selected_r0_artifact_origin.clear();
         selected_r0_implementation = R0Implementation::device_module;
     }
 #else
     (void)path;
     (void)persistent_blocks_per_compute_unit;
+    (void)apply_edge_weights;
+    (void)schedule;
     throw std::invalid_argument(
         "Execution R0 device modules require a CUDA- or HIP-enabled build.");
 #endif
@@ -1293,6 +1897,79 @@ std::string MACEKokkos<Precision>::r0_device_module_artifact_id() const
 {
     return r0_device_module_ready()
         ? std::string(r0_device_module->artifact_id()) : std::string();
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::load_r0_host_plugin(
+    std::string path, const bool apply_edge_weights, std::string target)
+{
+    if constexpr (!symmetrix::execution::host_execution_space<
+            Kokkos::DefaultExecutionSpace>) {
+        throw std::invalid_argument(
+            "Execution R0 host plugins require a host Kokkos execution space.");
+    } else {
+        if (!uses_compact_radial || !standard_r0_has_model_contract
+            || !r0_model_payload_verified)
+            throw std::invalid_argument(
+                "Execution R0 host plugins require a verified scalar-source R0 contract.");
+        if (target.empty())
+            throw std::invalid_argument(
+                "Execution R0 host plugin target must not be empty.");
+        constexpr std::string_view fingerprint_prefix = "sha256:";
+        if (!std::string_view(standard_r0_model_structure_fingerprint)
+                .starts_with(fingerprint_prefix)
+            || standard_r0_model_structure_fingerprint.size()
+                < fingerprint_prefix.size()+16)
+            throw std::invalid_argument(
+                "Execution R0 structure fingerprint is malformed.");
+        const std::string artifact_id = generated_r0_artifact_id(
+            standard_r0_model_contract_fingerprint,
+            standard_r0_model_structure_fingerprint,
+            std::is_same_v<Precision,float> ? "float32" : "float64",
+            "host", target, num_channels, l_max,
+            apply_edge_weights ? "weighted" : "unity", "host-owner", 4);
+        const symmetrix::execution::R0HostPluginExpectation expectation{
+            artifact_id,
+            standard_r0_model_structure_fingerprint,
+            target,
+            "host-owner",
+            std::is_same_v<Precision,float>
+                ? SYMMETRIX_JIT_R0_HOST_SCALAR_FLOAT32_V1
+                : SYMMETRIX_JIT_R0_HOST_SCALAR_FLOAT64_V1,
+            sizeof(Precision), symmetrix::execution::r0_required_capabilities,
+            num_channels, l_max, num_lm, apply_edge_weights ? 1 : 0, 4,
+            symmetrix::execution::r0_compatibility_version,
+        };
+        auto loaded = symmetrix::execution::R0HostPlugin::load(
+            std::move(path), expectation);
+        factorized_execution_space.fence("Replace Execution R0 host plugin");
+        r0_host_plugin =
+            std::make_unique<symmetrix::execution::R0HostPlugin>(
+                std::move(loaded));
+        selected_r0_artifact_origin.clear();
+        selected_r0_implementation = R0Implementation::host_plugin;
+    }
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::r0_host_plugin_ready() const
+{
+    return symmetrix::execution::host_execution_space<
+            Kokkos::DefaultExecutionSpace>
+        && r0_host_plugin != nullptr && static_cast<bool>(*r0_host_plugin);
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::r0_host_plugin_path() const
+{
+    return r0_host_plugin_ready() ? r0_host_plugin->path() : std::string();
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::r0_host_plugin_artifact_id() const
+{
+    return r0_host_plugin_ready()
+        ? std::string(r0_host_plugin->descriptor().artifact_id) : std::string();
 }
 
 template <typename Precision>
@@ -1369,7 +2046,11 @@ void MACEKokkos<Precision>::load_metal_r1_module(
     const int source_harmonics,
     const int output_components)
 {
+    validate_model_artifact_load("_load_metal_r1_module");
 #ifdef SYMMETRIX_ENABLE_METAL
+    if (alchemical_weights_active())
+        throw std::invalid_argument(
+            "Metal execution does not support alchemical coefficients.");
     if constexpr (!std::is_same_v<Precision, float>) {
         throw std::invalid_argument(
             "Metal R1 execution supports FP32 evaluators only.");
@@ -1449,13 +2130,17 @@ void MACEKokkos<Precision>::clear_metal_r1_module()
 template <typename Precision>
 bool MACEKokkos<Precision>::metal_r1_module_ready() const
 {
-    return static_cast<bool>(metal_r1_module);
+    return metal_module_ready_for_testing || static_cast<bool>(metal_r1_module);
 }
 
 template <typename Precision>
 void MACEKokkos<Precision>::load_metal_r0_module()
 {
+    validate_model_artifact_load("_load_metal_r0_module");
 #ifdef SYMMETRIX_ENABLE_METAL
+    if (alchemical_weights_active())
+        throw std::invalid_argument(
+            "Metal execution does not support alchemical coefficients.");
     if constexpr (!std::is_same_v<Precision, float>)
         throw std::invalid_argument(
             "Metal R0 execution supports FP32 evaluators only.");
@@ -1474,7 +2159,7 @@ void MACEKokkos<Precision>::load_metal_r0_module()
 template <typename Precision>
 bool MACEKokkos<Precision>::metal_r0_module_ready() const
 {
-    return static_cast<bool>(metal_r0_module);
+    return metal_module_ready_for_testing || static_cast<bool>(metal_r0_module);
 }
 
 template <typename Precision>
@@ -1485,7 +2170,11 @@ void MACEKokkos<Precision>::load_metal_m0_module(
     const int output_components,
     const int term_count)
 {
+    validate_model_artifact_load("_load_metal_m0_module");
 #ifdef SYMMETRIX_ENABLE_METAL
+    if (alchemical_weights_active())
+        throw std::invalid_argument(
+            "Metal execution does not support alchemical coefficients.");
     if constexpr (!std::is_same_v<Precision, float>) {
         throw std::invalid_argument(
             "Metal M0 execution supports FP32 evaluators only.");
@@ -1514,7 +2203,7 @@ void MACEKokkos<Precision>::load_metal_m0_module(
 template <typename Precision>
 bool MACEKokkos<Precision>::metal_m0_module_ready() const
 {
-    return static_cast<bool>(metal_m0_module);
+    return metal_module_ready_for_testing || static_cast<bool>(metal_m0_module);
 }
 
 template <typename Precision>
@@ -1525,7 +2214,11 @@ void MACEKokkos<Precision>::load_metal_m1_module(
     const int output_components,
     const int term_count)
 {
+    validate_model_artifact_load("_load_metal_m1_module");
 #ifdef SYMMETRIX_ENABLE_METAL
+    if (alchemical_weights_active())
+        throw std::invalid_argument(
+            "Metal execution does not support alchemical coefficients.");
     if constexpr (!std::is_same_v<Precision, float>) {
         throw std::invalid_argument(
             "Metal M1 execution supports FP32 evaluators only.");
@@ -1555,7 +2248,13 @@ void MACEKokkos<Precision>::load_metal_m1_module(
 template <typename Precision>
 bool MACEKokkos<Precision>::metal_m1_module_ready() const
 {
-    return static_cast<bool>(metal_m1_module);
+    return metal_module_ready_for_testing || static_cast<bool>(metal_m1_module);
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::set_metal_module_ready_for_testing()
+{
+    metal_module_ready_for_testing = true;
 }
 
 template <typename Precision>
@@ -1683,7 +2382,7 @@ std::string MACEKokkos<Precision>::jit_host_plugin_artifact_id() const
 template <typename Precision>
 bool MACEKokkos<Precision>::use_factorized_async_inference() const
 {
-    return mace_uses_prepared_execution(streamed_edges)
+    return uses_prepared_execution(streamed_edges)
         && !factorized_observer_enabled
         && !execution_parameter_gradients_enabled;
 }
@@ -1691,8 +2390,8 @@ bool MACEKokkos<Precision>::use_factorized_async_inference() const
 template <typename Precision>
 bool MACEKokkos<Precision>::use_gpu_field_h1_reverse() const
 {
-    return (streamed_edges == MACEStreamedEdgesMode::generic
-            || mace_uses_prepared_execution(streamed_edges))
+    return (streamed_edges == ExecutionMode::generic
+            || uses_prepared_execution(streamed_edges))
         && !factorized_observer_enabled
         && !execution_parameter_gradients_enabled;
 }
@@ -1708,7 +2407,7 @@ void MACEKokkos<Precision>::complete_device_stage(const char* label)
     if (use_factorized_async_inference() && !force_execution_stage_fences)
         return;
     Kokkos::fence(label);
-    if (mace_uses_prepared_execution(streamed_edges))
+    if (uses_prepared_execution(streamed_edges))
         factorized_stage_fence_count += 1;
 }
 
@@ -1717,57 +2416,43 @@ void MACEKokkos<Precision>::set_factorized_source_strategy(std::string strategy)
 {
     if (strategy == "serial_reference")
         factorized_source_strategy = FactorizedSourceStrategy::serial_reference;
-    else if (strategy == "team_cached")
-        factorized_source_strategy = FactorizedSourceStrategy::team_cached;
-    else if (strategy == "tiled_coupling")
-        factorized_source_strategy = FactorizedSourceStrategy::tiled_coupling;
     else if (strategy == "jit_plugin")
         factorized_source_strategy = FactorizedSourceStrategy::jit_plugin;
     else
         throw std::invalid_argument(
-            "Execution R1 source strategy must be 'serial_reference', 'team_cached', "
-            "'tiled_coupling', or 'jit_plugin'.");
-    if (factorized_source_strategy != FactorizedSourceStrategy::tiled_coupling)
-        release_factorized_coupling_workspace();
+            "Execution R1 source strategy must be 'serial_reference' or "
+            "'jit_plugin'.");
+    release_factorized_coupling_workspace();
     plan_factorized_reverse_cache();
     if (use_factorized_direct_inference())
         release_factorized_stateful_workspace();
 }
 
 template <typename Precision>
-void MACEKokkos<Precision>::set_factorized_direct_forward_executor(
-    std::string executor)
+void MACEKokkos<Precision>::set_direct_artifact_diagnostic(
+    std::string code, std::string description)
 {
-    if (executor == "automatic")
-        factorized_direct_forward_executor =
-            FactorizedDirectForwardExecutor::automatic;
-    else if (executor == "runtime")
-        factorized_direct_forward_executor =
-            FactorizedDirectForwardExecutor::runtime;
-    else if (executor == "jit_all")
-        factorized_direct_forward_executor =
-            FactorizedDirectForwardExecutor::jit_all;
-    else
-        throw std::invalid_argument(
-            "Execution R1 direct forward executor must be 'automatic', 'runtime', "
-            "or 'jit_all'.");
+    direct_artifact_diagnostic_code = std::move(code);
+    direct_artifact_diagnostic_description = std::move(description);
 }
 
 template <typename Precision>
-void MACEKokkos<Precision>::set_factorized_direct_reverse_executor(
-    std::string executor)
+std::string MACEKokkos<Precision>::direct_artifact_requirement_message() const
 {
-    if (executor == "automatic")
-        factorized_direct_reverse_executor =
-            FactorizedDirectReverseExecutor::automatic;
-    else if (executor == "runtime")
-        factorized_direct_reverse_executor = FactorizedDirectReverseExecutor::runtime;
-    else if (executor == "jit")
-        factorized_direct_reverse_executor = FactorizedDirectReverseExecutor::jit;
-    else
-        throw std::invalid_argument(
-            "Execution R1 direct reverse executor must be 'automatic', 'runtime', "
-            "or 'jit'.");
+    std::string message =
+        "streamed_edges='direct' requires a qualified R1 execution artifact "
+        "before graph preparation; direct execution does not fall back to "
+        "another algorithm.";
+    message += direct_artifact_diagnostic_code.empty()
+        ? "\nDirect R1 artifact diagnostic: no qualified R1 artifact is loaded."
+        : "\nDirect R1 artifact diagnostic ("+direct_artifact_diagnostic_code
+            +"): "+direct_artifact_diagnostic_description;
+    message +=
+        "\nDirect R1 artifact causes: (a) the R1 artifact cache is empty while a "
+        "working compiler is available; (b) no compiler is available for this "
+        "backend; (c) the requested prebuilt R1 artifact is missing; (d) a "
+        "cached R1 artifact was rejected as stale.";
+    return message;
 }
 
 template <typename Precision>
@@ -1803,8 +2488,8 @@ void MACEKokkos<Precision>::set_standard_m0_executor(std::string executor)
         throw std::invalid_argument(
             "Execution M0 executor must be 'automatic', 'runtime', or 'standard'.");
 
-    const bool supported_mode = streamed_edges == MACEStreamedEdgesMode::generic
-        || mace_uses_prepared_execution(streamed_edges);
+    const bool supported_mode = streamed_edges == ExecutionMode::generic
+        || uses_prepared_execution(streamed_edges);
     if (requested == StandardM0Executor::standard) {
         if (!supported_mode)
             throw std::invalid_argument(
@@ -1947,7 +2632,7 @@ template <typename Precision>
 bool MACEKokkos<Precision>::use_mh0_adjoint_reuse() const
 {
     return mh0_state_policy == MH0StatePolicy::reuse_adjoints
-        && mace_admits_low_memory(streamed_edges)
+        && admits_low_memory(streamed_edges)
         && m1_polynomial_policy == M1PolynomialPolicy::recompute
         && (single_layer_readout
             || factorized_source_strategy == FactorizedSourceStrategy::jit_plugin)
@@ -1960,7 +2645,7 @@ bool MACEKokkos<Precision>::use_mh0_adjoint_reuse() const
 template <typename Precision>
 bool MACEKokkos<Precision>::use_h1_m0_adjoint_ping_pong() const
 {
-    if constexpr (!symmetrix::standard_r0::host_execution_space<
+    if constexpr (!symmetrix::execution::host_execution_space<
             Kokkos::DefaultExecutionSpace>) {
         if (!single_layer_tiled_plan_active || dual_layer_tiled_plan_active)
             return false;
@@ -1980,10 +2665,28 @@ void MACEKokkos<Precision>::prepare_mh0_state_policy_views()
             adjoint = std::decay_t<decltype(adjoint)>();
     };
     prepare(M1_adj, M1);
-    prepare(A1_adj, A1);
     prepare(M0_adj, M0);
-    prepare(A0_adj, A0);
     prepare(H2_adj, H2);
+    const auto prepare_input_adjoint = [reuse] (
+            auto& adjoint, const auto& forward, const bool generated) {
+        const bool aliases = adjoint.data() != nullptr
+            && adjoint.data() == forward.data();
+        // Generated product reverse reads the primal input while writing its
+        // adjoint, so retain an existing disjoint allocation across repeated
+        // evaluations.  A policy/implementation transition from the built-in
+        // destructive alias must still detach before the generated launch.
+        if ((!reuse && aliases) || (reuse && generated && aliases)
+            || (reuse && !generated && !aliases))
+            adjoint = std::decay_t<decltype(adjoint)>();
+    };
+    prepare_input_adjoint(
+        A1_adj, A1,
+        selected_m1_implementation == M1Implementation::device_module
+            || selected_m1_implementation == M1Implementation::host_plugin);
+    prepare_input_adjoint(
+        A0_adj, A0,
+        selected_m0_implementation == M0Implementation::device_module
+            || selected_m0_implementation == M0Implementation::host_plugin);
     const bool h1_adjoint_aliases_m0 = H1_adj.data() != nullptr
         && H1_adj.data() == M0.data();
     const bool m0_adjoint_aliases_h1 = M0_adj.data() != nullptr
@@ -2016,7 +2719,7 @@ void MACEKokkos<Precision>::set_mh0_state_policy(std::string policy)
             "MH-0 state policy must be 'full-retention-v1' or "
             "'reuse-adjoints-v1'.");
     if (policy == "reuse-adjoints-v1") {
-        if (!mace_admits_low_memory(streamed_edges))
+        if (!admits_low_memory(streamed_edges))
             throw std::invalid_argument(
                 "MH-0 adjoint reuse requires direct execution.");
         if (m1_polynomial_policy != M1PolynomialPolicy::recompute)
@@ -2063,7 +2766,7 @@ std::string MACEKokkos<Precision>::mh0_state_policy_fallback_reason_name() const
     if (mh0_state_policy != MH0StatePolicy::reuse_adjoints
         || use_mh0_adjoint_reuse())
         return {};
-    if (!mace_uses_prepared_execution(streamed_edges))
+    if (!uses_prepared_execution(streamed_edges))
         return "prepared execution is not active";
     if (m1_polynomial_policy != M1PolynomialPolicy::recompute)
         return "M1 polynomial recomputation is not active";
@@ -2233,9 +2936,13 @@ void MACEKokkos<Precision>::ensure_mh0_m0_adjoint_capacity()
         return;
     }
     if (use_mh0_adjoint_reuse()) {
+        // M0 is the reverse output adjoint, not the primal input.  Reusing it
+        // is valid for built-in and generated modules alike.
         M0_adj = M0;
         return;
     }
+    if (M0_adj.data() != nullptr && M0_adj.data() == M0.data())
+        M0_adj = decltype(M0_adj)();
     if (M0_adj.extent(0) >= M0.extent(0)
         && M0_adj.extent(1) == M0.extent(1)
         && M0_adj.extent(2) == M0.extent(2))
@@ -2402,7 +3109,7 @@ bool MACEKokkos<Precision>::use_channel_tiled_phi1() const
 #if defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_CUDA)
     return phi1_policy == Phi1Policy::channel_tiled_64
         && !has_field_coupling
-        && mace_admits_low_memory(streamed_edges)
+        && admits_low_memory(streamed_edges)
         && factorized_source_strategy == FactorizedSourceStrategy::jit_plugin
         && jit_device_plugin_ready()
         && jit_device_plugin->supports_tiled_r1()
@@ -2420,7 +3127,7 @@ bool MACEKokkos<Precision>::use_receiver_local_phi1() const
     return phi1_policy == Phi1Policy::receiver_local
         && std::is_same_v<Precision,float>
         && !has_field_coupling
-        && mace_admits_low_memory(streamed_edges)
+        && admits_low_memory(streamed_edges)
         && factorized_source_strategy == FactorizedSourceStrategy::jit_plugin
         && jit_device_plugin_ready()
         && jit_device_plugin->supports_projected_r1()
@@ -2453,7 +3160,7 @@ void MACEKokkos<Precision>::set_phi1_policy(std::string policy)
         if (has_field_coupling)
             throw std::invalid_argument(
                 "experimental Phi1 policies currently support ordinary MACE only.");
-        if (!mace_admits_low_memory(streamed_edges)
+        if (!admits_low_memory(streamed_edges)
             || factorized_source_strategy != FactorizedSourceStrategy::jit_plugin)
             throw std::invalid_argument(
                 "experimental Phi1 policies require direct generated execution.");
@@ -2529,7 +3236,7 @@ std::string
 MACEKokkos<Precision>::y_only_direct_harmonics_admission_reason() const
 {
     const bool host_execution =
-        symmetrix::standard_r0::host_execution_space<
+        symmetrix::execution::host_execution_space<
             Kokkos::DefaultExecutionSpace>;
     const bool host_generated_r1 = host_execution
         && factorized_source_strategy == FactorizedSourceStrategy::jit_plugin
@@ -2547,7 +3254,7 @@ MACEKokkos<Precision>::y_only_direct_harmonics_admission_reason() const
     } else if (edge_geometry_policy != EdgeGeometryPolicy::cartesian_f64) {
         return "float64 execution requires Cartesian float64 geometry";
     }
-    if (!mace_admits_low_memory(streamed_edges))
+    if (!admits_low_memory(streamed_edges))
         return "direct execution is not active";
     if (!single_layer_readout
         && (factorized_source_strategy != FactorizedSourceStrategy::jit_plugin
@@ -2601,7 +3308,7 @@ void MACEKokkos<Precision>::set_harmonic_storage_policy(std::string policy)
                     "float64 y-only-direct-v1 requires Cartesian float64 "
                     "geometry.");
         }
-        if (!mace_admits_low_memory(streamed_edges)
+        if (!admits_low_memory(streamed_edges)
             || (!single_layer_readout
                 && (factorized_source_strategy
                         != FactorizedSourceStrategy::jit_plugin
@@ -2952,7 +3659,8 @@ std::size_t MACEKokkos<Precision>::estimate_single_layer_tiled_graph_bytes(
     const std::size_t workspace_precision_scalars = checked_extent_sum(
         "single-layer tiled precision workspace",
         {checked_extent_product(
-             "single-layer tiled A0 workspace", {harmonics, channels}),
+             "single-layer tiled A0 value and adjoint workspace",
+             {std::size_t(2), harmonics, channels}),
          checked_extent_product(
              "single-layer tiled equivariant workspace",
              {std::size_t(2), outputs, channels}),
@@ -3000,7 +3708,7 @@ std::string MACEKokkos<Precision>::single_layer_tiled_admission_reason() const
 #else
     if (!single_layer_readout)
         return "mh0-single-layer-tiled-v1 requires single_layer_readout=true";
-    if (!mace_uses_prepared_execution(streamed_edges))
+    if (!uses_prepared_execution(streamed_edges))
         return "mh0-single-layer-tiled-v1 requires direct prepared execution";
     if (has_field_coupling)
         return "mh0-single-layer-tiled-v1 does not support field coupling";
@@ -3028,7 +3736,7 @@ std::string MACEKokkos<Precision>::dual_layer_tiled_admission_reason() const
 #else
     if (single_layer_readout || num_interactions != 2)
         return "mh0-dual-layer-tiled-v1 requires an ordinary two-layer MACE model";
-    if (!mace_uses_prepared_execution(streamed_edges))
+    if (!uses_prepared_execution(streamed_edges))
         return "mh0-dual-layer-tiled-v1 requires direct prepared execution";
     if (has_field_coupling)
         return "mh0-dual-layer-tiled-v1 does not support field coupling";
@@ -3108,7 +3816,8 @@ std::size_t MACEKokkos<Precision>::estimate_dual_layer_tiled_graph_bytes(
     const std::size_t workspace_precision = checked_extent_sum(
         "dual-layer tiled precision workspace",
         {checked_extent_product(
-             "dual-layer tiled A slot", {workspace, harmonics, channels}),
+             "dual-layer tiled A0/A1 value and adjoint slots",
+             {std::size_t(4), workspace, harmonics, channels}),
          checked_extent_product(
              "dual-layer tiled equivariant slot", {workspace, outputs, channels}),
          checked_extent_product(
@@ -3179,7 +3888,7 @@ template <typename Precision>
 typename MACEKokkos<Precision>::LowMemoryPolicy
 MACEKokkos<Precision>::preferred_speed_policy(const std::size_t num_edges) const
 {
-    if (!mace_admits_low_memory(streamed_edges)
+    if (!admits_low_memory(streamed_edges)
         || (!single_layer_readout
             && (factorized_source_strategy != FactorizedSourceStrategy::jit_plugin
                 || !(jit_host_plugin_ready() || jit_device_plugin_ready())))
@@ -3192,7 +3901,7 @@ MACEKokkos<Precision>::preferred_speed_policy(const std::size_t num_edges) const
 
     constexpr std::size_t y_only_throughput_threshold_edges = 40960;
     constexpr bool host_execution =
-        symmetrix::standard_r0::host_execution_space<
+        symmetrix::execution::host_execution_space<
             Kokkos::DefaultExecutionSpace>;
 #if defined(KOKKOS_ENABLE_CUDA)
     constexpr bool cuda_fp32_execution = std::is_same_v<Precision, float>;
@@ -3278,7 +3987,7 @@ void MACEKokkos<Precision>::apply_low_memory_policy(
         }
         if (!readout_policy_pinned)
             set_readout_policy("recompute");
-        if (symmetrix::standard_r0::host_execution_space<
+        if (symmetrix::execution::host_execution_space<
                 Kokkos::DefaultExecutionSpace>)
             set_standard_r0_executor("v2_receiver");
         if (!harmonic_storage_policy_pinned)
@@ -3838,12 +4547,66 @@ void MACEKokkos<Precision>::select_low_memory_policy_for_graph(
 }
 
 template <typename Precision>
+symmetrix::execution::PlanCandidateSpace
+MACEKokkos<Precision>::plan_candidate_space() const
+{
+    using symmetrix::execution::PlanCandidateEvaluation;
+    using symmetrix::execution::PlanCandidateSpace;
+    // A fixed-workspace plan is qualified only when the caller opts in
+    // explicitly; the caller's own admission reason explains the rest.
+    const auto tiled_evaluation = [this] (
+        const bool permitted, const std::string& reason,
+        const std::size_t estimate) {
+        return PlanCandidateEvaluation{
+            permitted && reason.empty(),
+            estimate,
+            !permitted
+                ? fixed_workspace_opt_in_reason()
+                : reason.empty() ? std::string("qualified") : reason};
+    };
+    PlanCandidateSpace space;
+    space.declare("mh0-direct-speed", [this] {
+        const bool memory_budget_available = low_memory_device_total != 0;
+        return PlanCandidateEvaluation{
+            true,
+            low_memory_speed_estimate,
+            !memory_budget_available
+                ? "memory query unavailable"
+                : low_memory_speed_estimate <= low_memory_available
+                ? "estimated fit" : "exceeds advisory memory budget"};
+    });
+    space.declare("mh0-direct-capacity-y-only", [this] {
+        const auto reason = y_only_direct_harmonics_admission_reason();
+        return PlanCandidateEvaluation{
+            reason.empty(),
+            low_memory_capacity_y_only_estimate,
+            reason.empty() ? std::string("qualified") : reason};
+    });
+    space.declare("mh0-direct-capacity-retained", [this] {
+        return PlanCandidateEvaluation{
+            true, low_memory_capacity_retained_estimate, "qualified"};
+    });
+    space.declare("mh0-single-layer-tiled-v1", [this, tiled_evaluation] {
+        return tiled_evaluation(
+            allow_fixed_workspace_
+                || execution_plan_debug_id_ == "mh0-single-layer-tiled-v1",
+            single_layer_tiled_admission_reason(), single_layer_tiled_estimate);
+    });
+    space.declare("mh0-dual-layer-tiled-v1", [this, tiled_evaluation] {
+        return tiled_evaluation(
+            allow_fixed_workspace_
+                || execution_plan_debug_id_ == "mh0-dual-layer-tiled-v1",
+            dual_layer_tiled_admission_reason(), dual_layer_tiled_estimate);
+    });
+    return space;
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::refresh_execution_plan_report()
 {
-    if (!mace_uses_direct_execution(streamed_edges))
+    if (!uses_direct_execution(streamed_edges))
         return;
 
-    const auto y_only_reason = y_only_direct_harmonics_admission_reason();
     const bool memory_budget_available = low_memory_device_total != 0;
     const auto single_layer_tiled_reason =
         single_layer_tiled_admission_reason();
@@ -3858,9 +4621,6 @@ void MACEKokkos<Precision>::refresh_execution_plan_report()
         ? single_layer_tiled_reason : dual_layer_tiled_reason;
     const std::size_t applicable_tiled_estimate = single_layer_readout
         ? single_layer_tiled_estimate : dual_layer_tiled_estimate;
-    const std::string fixed_workspace_opt_in_reason =
-        "fixed-workspace execution requires explicit opt-in via "
-        "allow_fixed_workspace";
     execution_plan_.available_bytes = low_memory_available;
     execution_plan_.reserve_bytes = low_memory_reserve;
     execution_plan_.state = "active";
@@ -3887,32 +4647,490 @@ void MACEKokkos<Precision>::refresh_execution_plan_report()
             ? "mh0-direct-capacity-y-only"
             : "mh0-direct-capacity-retained";
     execution_plan_.selection_reason = low_memory_selection_reason;
-    execution_plan_.candidates = {
-        {"mh0-direct-speed", true, low_memory_speed_estimate,
-            !memory_budget_available
-                ? "memory query unavailable"
-                : low_memory_speed_estimate <= low_memory_available
-                ? "estimated fit" : "exceeds advisory memory budget"},
-        {"mh0-direct-capacity-y-only", y_only_reason.empty(),
-            low_memory_capacity_y_only_estimate,
-            y_only_reason.empty() ? "qualified" : y_only_reason},
-        {"mh0-direct-capacity-retained", true,
-            low_memory_capacity_retained_estimate, "qualified"},
-        {"mh0-single-layer-tiled-v1",
-            single_layer_tiled_permitted && single_layer_tiled_reason.empty(),
-            single_layer_tiled_estimate,
-            !single_layer_tiled_permitted
-                ? fixed_workspace_opt_in_reason
-                : single_layer_tiled_reason.empty()
-                    ? "qualified" : single_layer_tiled_reason},
-        {"mh0-dual-layer-tiled-v1",
-            dual_layer_tiled_permitted && dual_layer_tiled_reason.empty(),
-            dual_layer_tiled_estimate,
-            !dual_layer_tiled_permitted
-                ? fixed_workspace_opt_in_reason
-                : dual_layer_tiled_reason.empty()
-                    ? "qualified" : dual_layer_tiled_reason},
+    execution_plan_.candidates = plan_candidate_space().evaluate();
+    execution_plan_.bindings = family_binding_report().bindings;
+    execution_plan_.binding_report_version = 1;
+}
+
+// --- Family adapter interface ----------------------------------------------
+// Each member delegates to the MH-0 entry point that already owns the
+// behaviour, so the neutral lifecycle adds no second execution path.  The
+// program is compiled from the model state this evaluator already parsed and
+// the registry's predicates read this evaluator's own readiness flags, so the
+// binding report states what this instance can actually run.
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::family_execution_target() const
+{
+    return symmetrix::execution::host_execution_space<Kokkos::DefaultExecutionSpace>
+        ? "host"
+        : ::DeviceBackendTraits<
+            Kokkos::DefaultExecutionSpace>::backend_name;
+}
+
+template <typename Precision>
+symmetrix::execution::FamilyCapabilities
+MACEKokkos<Precision>::family_capabilities() const
+{
+    using symmetrix::execution::FamilyCapabilities;
+    const bool host_build =
+        symmetrix::execution::host_execution_space<Kokkos::DefaultExecutionSpace>;
+    FamilyCapabilities capabilities;
+    capabilities.target = family_execution_target();
+    capabilities.precision =
+        std::is_same_v<Precision, float> ? "float32" : "float64";
+    // The reference routing is single-thread execution of the generic
+    // implementation on the default host execution space, so it exists exactly
+    // on a host build and only for a model the family admits to either generic
+    // mode.  The portable tier is the generic Kokkos prepared path, which every
+    // direct model admits without an artifact; the generated tier is the
+    // JIT/RTC artifact or a frozen built-in module.
+    capabilities.reference_ready = host_build
+        && (supports_streamed_edges() || supports_factorized());
+    capabilities.portable_ready = supports_factorized();
+    capabilities.generated_ready = jit_host_plugin_ready()
+        || jit_device_plugin_ready() || r0_device_module_ready()
+        || m0_device_module_ready() || m0_host_plugin_ready();
+    capabilities.stress = true;
+    capabilities.field = has_field_coupling;
+    capabilities.parameter_gradients = supports_factorized();
+    // A host artifact is always loadable; a device artifact needs a device
+    // execution space, and a CUDA-capable host build can still stage one.
+    capabilities.loads_host_artifact = true;
+    capabilities.loads_device_artifact = !host_build || device_cuda_available();
+    return capabilities;
+}
+
+template <typename Precision>
+symmetrix::execution::Program MACEKokkos<Precision>::compile_program() const
+{
+    using symmetrix::execution::BufferContract;
+    using symmetrix::execution::LayoutContract;
+    using symmetrix::execution::OperatorKind;
+    using symmetrix::execution::OperatorNode;
+    using symmetrix::execution::Program;
+    const int channels = num_channels;
+    const int l_max = L_max;
+    const int interactions = num_interactions;
+    const std::size_t node_width = static_cast<std::size_t>(channels)
+        * static_cast<std::size_t>((l_max + 1) * (l_max + 1));
+    const auto node_buffer = [node_width] (const char* name) {
+        BufferContract buffer;
+        buffer.name = name;
+        buffer.dtype = "float64";
+        buffer.shape = {0, node_width};
+        // The irreps string is empty: this family expresses its node layout by
+        // the (extent, order) pair, which is itself contract data.
+        buffer.layout = LayoutContract{"lane_major", "", 1};
+        return buffer;
     };
+    const auto edge_buffer = [node_width] (const char* name) {
+        BufferContract buffer;
+        buffer.name = name;
+        buffer.dtype = "float64";
+        buffer.shape = {0, node_width};
+        buffer.layout = LayoutContract{"edge_major", "", 1};
+        return buffer;
+    };
+    Program program;
+    program.family = "MH-0 compact model";
+    program.precision =
+        std::is_same_v<Precision, float> ? "float32" : "float64";
+    program.version = 1;
+    const auto declare = [&program] (
+        const OperatorKind kind, const std::string& id,
+        const std::string& capability_key) {
+        OperatorNode node;
+        node.kind = kind;
+        node.id = id;
+        node.capability_key = capability_key;
+        program.operators.push_back(std::move(node));
+        return &program.operators.back();
+    };
+    {
+        OperatorNode node;
+        node.kind = OperatorKind::geometry;
+        node.id = "mh0.geometry";
+        node.capability_key = "geometry";
+        BufferContract coordinates;
+        coordinates.name = "reference_positions";
+        coordinates.dtype = "float64";
+        coordinates.shape = {0, 3};
+        coordinates.layout = LayoutContract{"node_major", "", 1};
+        node.inputs.push_back(std::move(coordinates));
+        BufferContract geometry;
+        geometry.name = "edge_geometry";
+        geometry.dtype = "float64";
+        geometry.shape = {0, 4};
+        geometry.layout = LayoutContract{"edge_major", "", 1};
+        node.outputs.push_back(std::move(geometry));
+        node.parameters.emplace_back("r_cut", r_cut);
+        program.operators.push_back(std::move(node));
+    }
+    for (int interaction = 0; interaction < interactions; ++interaction) {
+        const std::string prefix =
+            "mh0.interaction" + std::to_string(interaction);
+        auto* radial = declare(OperatorKind::radial, prefix + ".r0", "r0");
+        radial->parameters.emplace_back("interaction", interaction);
+        radial->parameters.emplace_back("channels", channels);
+        auto* harmonics = declare(OperatorKind::spherical_harmonic,
+            prefix + ".harmonics", "harmonics");
+        harmonics->parameters.emplace_back("l_max", l_max);
+        auto* product = declare(OperatorKind::tensor_product,
+            prefix + ".m0", "m0");
+        product->parameters.emplace_back("interaction", interaction);
+        product->parameters.emplace_back("channels", channels);
+        auto* first_linear = declare(OperatorKind::linear,
+            prefix + ".h1", "h1");
+        first_linear->parameters.emplace_back("channels", channels);
+        auto* phi1 = declare(OperatorKind::tensor_product,
+            prefix + ".phi1", "phi1");
+        phi1->parameters.emplace_back("interaction", interaction);
+        auto* second = declare(OperatorKind::linear, prefix + ".a1", "a1");
+        second->parameters.emplace_back("channels", channels);
+        auto* m1 = declare(OperatorKind::tensor_product, prefix + ".m1", "m1");
+        m1->parameters.emplace_back("interaction", interaction);
+        auto* third = declare(OperatorKind::linear, prefix + ".h2", "h2");
+        third->parameters.emplace_back("channels", channels);
+    }
+    {
+        OperatorNode node;
+        node.kind = OperatorKind::readout;
+        node.id = "mh0.readout";
+        node.capability_key = "readout";
+        node.inputs.push_back(node_buffer("node_features"));
+        node.parameters.emplace_back("channels", channels);
+        node.parameters.emplace_back("single_layer_readout",
+            single_layer_readout ? 1.0 : 0.0);
+        program.operators.push_back(std::move(node));
+    }
+    if (has_zbl) {
+        OperatorNode node;
+        node.kind = OperatorKind::pair_energy;
+        node.id = "mh0.pair_energy";
+        node.capability_key = "pair_energy";
+        node.inputs.push_back(edge_buffer("edge_distances"));
+        node.parameters.emplace_back("r_cut", r_cut);
+        program.operators.push_back(std::move(node));
+    }
+    // The two lifecycle reductions are operators of the pipeline too, and each
+    // has a portable implementation, so binding them keeps the report complete
+    // over the prepared lifecycle.
+    for (const char* key : {"reduce_forces", "reduce_stress"}) {
+        OperatorNode node;
+        node.kind = OperatorKind::reduction;
+        node.id = std::string("mh0.") + key;
+        node.capability_key = key;
+        node.inputs.push_back(node_buffer("node_adjoint"));
+        program.operators.push_back(std::move(node));
+    }
+    program.fingerprint = symmetrix::execution::program_fingerprint(program);
+    return program;
+}
+
+template <typename Precision>
+symmetrix::execution::ImplementationRegistry
+MACEKokkos<Precision>::family_implementation_registry() const
+{
+    using symmetrix::execution::FamilyCapabilities;
+    using symmetrix::execution::ImplementationDescriptor;
+    using symmetrix::execution::ImplementationRegistry;
+    using symmetrix::execution::ImplementationTier;
+    using symmetrix::execution::OperatorKind;
+    using symmetrix::execution::PrecisionPolicy;
+    // The portable tier is the generic Kokkos implementation the direct path
+    // runs without an artifact; the frozen tier is a legacy built-in module
+    // that is only admitted for the single-layer contracts that ship it and is
+    // never created anew; the generated tier is the MH-0 JIT/RTC artifact.
+    // Every predicate reads this evaluator's own readiness flags, so a binding
+    // states what this instance can run.
+    const std::string target = family_execution_target();
+    const std::string precision_name =
+        std::is_same_v<Precision, float> ? "float32" : "float64";
+    const PrecisionPolicy policy{precision_name, "float64"};
+    const bool generated_r1 =
+        jit_host_plugin_ready() || jit_device_plugin_ready();
+    const bool generated_r0 = r0_device_module_ready() || r0_host_plugin_ready();
+    const bool generated_m0 = m0_device_module_ready() || m0_host_plugin_ready();
+    const bool generated_m1 = m1_device_module_ready() || m1_host_plugin_ready();
+    ImplementationRegistry registry;
+    const auto declare = [&registry, target, policy] (
+        const std::string& id, const OperatorKind kind,
+        const std::string& capability_key, const ImplementationTier tier,
+        std::function<bool()> qualified) {
+        ImplementationDescriptor descriptor;
+        descriptor.id = id;
+        descriptor.kind = kind;
+        descriptor.capability_key = capability_key;
+        descriptor.tier = tier;
+        descriptor.target = target;
+        descriptor.precision = policy;
+        descriptor.capabilities.target = target;
+        descriptor.capabilities.precision = policy.compute;
+        descriptor.qualified =
+            [available = std::move(qualified)] (const auto&) {
+                return available();
+            };
+        registry.declare(std::move(descriptor));
+    };
+    declare("generic_geometry", OperatorKind::geometry, "geometry",
+        ImplementationTier::portable, [] { return true; });
+    declare("generic_r0", OperatorKind::radial, "r0",
+        ImplementationTier::portable,
+        [this] { return supports_factorized(); });
+    declare("builtin_r0", OperatorKind::radial, "r0",
+        ImplementationTier::frozen,
+        [this] { return standard_r0_module_ready; });
+    declare("generated_r0", OperatorKind::radial, "r0",
+        ImplementationTier::generated,
+        [this, generated_r0] { return generated_r0; });
+    declare("generic_harmonics", OperatorKind::spherical_harmonic, "harmonics",
+        ImplementationTier::portable, [] { return true; });
+    declare("generic_m0", OperatorKind::tensor_product, "m0",
+        ImplementationTier::portable,
+        [this] { return supports_factorized(); });
+    declare("builtin_m0", OperatorKind::tensor_product, "m0",
+        ImplementationTier::frozen,
+        [this] { return standard_m0_module_ready; });
+    declare("generated_m0", OperatorKind::tensor_product, "m0",
+        ImplementationTier::generated,
+        [this, generated_m0] { return generated_m0; });
+#if defined(KOKKOS_ENABLE_CUDA) && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)
+    // The strided-batched BLAS implementation of the A1 contraction, declared
+    // only where it can run: a CUDA target with the cuBLAS TPL.  Host and HIP
+    // targets keep the generic Kokkos implementation declared below, so their
+    // execution is unchanged and no HIP strided-batched route is claimed.
+    declare("blas_batched_a1", OperatorKind::linear, "a1",
+        ImplementationTier::portable,
+        [this] { return admits_batched_a1_blas(); });
+#endif
+#if defined(KOKKOS_ENABLE_CUDA)
+    // The fused H2 stages, declared only where they can run: a CUDA target.
+    // Declared before the generic H2 implementation so it wins the
+    // portable-tier tie-break.  Host and HIP targets keep the generic Kokkos
+    // implementation declared below, so their execution is unchanged and no HIP
+    // route is claimed.
+    declare("device_h2_stages", OperatorKind::linear, "h2",
+        ImplementationTier::portable,
+        [this] { return admits_device_h2_stages(); });
+#endif
+    for (const char* key : {"h1", "a1", "h2"}) {
+        declare(std::string("generic_") + key, OperatorKind::linear, key,
+            ImplementationTier::portable,
+            [this] { return supports_factorized(); });
+    }
+#if defined(KOKKOS_ENABLE_CUDA)
+    // The per-output-element implementation of the M1 polynomial forward,
+    // declared only where it can run: a CUDA target.  It is declared before the
+    // generic M1 implementation, so it wins the portable-tier tie-break.  Host
+    // and HIP targets keep the generic Kokkos implementation declared below, so
+    // their execution is unchanged and no HIP route is claimed.
+    declare("device_m1_terms", OperatorKind::tensor_product, "m1",
+        ImplementationTier::portable,
+        [this] { return admits_m1_device_terms(); });
+#endif
+    declare("generic_phi1", OperatorKind::tensor_product, "phi1",
+        ImplementationTier::portable,
+        [this] { return supports_factorized(); });
+    declare("generated_phi1", OperatorKind::tensor_product, "phi1",
+        ImplementationTier::generated,
+        [this, generated_r1] { return generated_r1; });
+    declare("generic_m1", OperatorKind::tensor_product, "m1",
+        ImplementationTier::portable,
+        [this] { return supports_factorized(); });
+    declare("builtin_m1", OperatorKind::tensor_product, "m1",
+        ImplementationTier::frozen,
+        [this] { return standard_m1_module_ready; });
+    declare("generated_m1", OperatorKind::tensor_product, "m1",
+        ImplementationTier::generated,
+        [generated_m1] { return generated_m1; });
+    declare("generic_readout", OperatorKind::readout, "readout",
+        ImplementationTier::portable,
+        [this] { return supports_factorized(); });
+    declare("generated_readout", OperatorKind::readout, "readout",
+        ImplementationTier::generated,
+        [this, generated_r1] { return generated_r1; });
+    declare("generic_pair_energy", OperatorKind::pair_energy, "pair_energy",
+        ImplementationTier::portable, [] { return true; });
+    declare("generic_reduce_forces", OperatorKind::reduction, "reduce_forces",
+        ImplementationTier::portable, [] { return true; });
+    declare("generic_reduce_stress", OperatorKind::reduction, "reduce_stress",
+        ImplementationTier::portable, [] { return true; });
+    // The readiness flags above say what each node can run; the dispatcher
+    // additionally requires the module to be in use and the direct JIT profile
+    // to be selected.  The resolver is the family's statement of what it
+    // actually dispatches, so a binding names the executed implementation.
+    registry.set_selected_implementation_resolver(
+        [this] (const symmetrix::execution::ImplementationContext& context,
+                const symmetrix::execution::ImplementationBinding& planned) {
+            return dispatched_implementation_id(context.capability_key, planned);
+        });
+    return registry;
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::dispatched_implementation_id(
+    const std::string& capability_key,
+    const symmetrix::execution::ImplementationBinding& planned) const
+{
+    using symmetrix::execution::ImplementationTier;
+    // A module-backed node runs its module only while the path that owns the
+    // module is in use: the loader selects the module, the dispatch gate below
+    // decides whether it serves this evaluation, and the generic Kokkos
+    // implementation serves the node when it does not.
+    if (capability_key == "r0") {
+        if (!use_generated_r0_dispatch())
+            return "generic_r0";
+        if (selected_r0_implementation == R0Implementation::builtin)
+            return "builtin_r0";
+        if (selected_r0_implementation == R0Implementation::device_module
+            || selected_r0_implementation == R0Implementation::host_plugin)
+            return "generated_r0";
+        return "generic_r0";
+    }
+    if (capability_key == "m0") {
+        if (!use_m0_module())
+            return "generic_m0";
+        if (selected_m0_implementation == M0Implementation::builtin)
+            return "builtin_m0";
+        if (selected_m0_implementation == M0Implementation::generic)
+            return "generic_m0";
+        return "generated_m0";
+    }
+    if (capability_key == "m1") {
+        if (selected_m1_implementation == M1Implementation::device_module
+            || selected_m1_implementation == M1Implementation::host_plugin)
+            return "generated_m1";
+        if (selected_m1_implementation == M1Implementation::builtin)
+            return "builtin_m1";
+        if (admits_m1_device_terms())
+            return "device_m1_terms";
+        return "generic_m1";
+    }
+    // The generated R1 nodes run only through the direct JIT profile; without
+    // it the portable tier serves them, including the CUDA-scoped variants the
+    // portable tier tie-breaks to ahead of the generic implementation.
+    if (planned.tier == ImplementationTier::generated
+        && !use_factorized_direct_inference()) {
+        if (capability_key == "a1" && admits_batched_a1_blas())
+            return "blas_batched_a1";
+        if (capability_key == "h2" && admits_device_h2_stages())
+            return "device_h2_stages";
+        if (capability_key == "m1" && admits_m1_device_terms())
+            return "device_m1_terms";
+        return "generic_" + capability_key;
+    }
+    return planned.implementation_id;
+}
+
+template <typename Precision>
+symmetrix::execution::ArtifactReadiness
+MACEKokkos<Precision>::family_artifact_readiness() const
+{
+    using symmetrix::execution::ArtifactReadiness;
+    const bool host_ready = jit_host_plugin_ready();
+    const bool device_ready = jit_device_plugin_ready();
+    ArtifactReadiness readiness;
+    readiness.ready = host_ready || device_ready;
+    readiness.target = family_execution_target();
+    readiness.artifact_id = device_ready
+        ? jit_device_plugin_artifact_id() : jit_host_plugin_artifact_id();
+    readiness.generation_fingerprint = factorized_jit_contract_fingerprint();
+    readiness.semantic_fingerprint = factorized_model_semantic_fingerprint;
+    readiness.structure_fingerprint = factorized_model_structure_fingerprint;
+    readiness.reason = readiness.ready
+        ? "generated MH-0 artifact admitted"
+        : "no generated MH-0 artifact is admitted";
+    return readiness;
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::family_artifact_ready() const
+{
+    return jit_host_plugin_ready() || jit_device_plugin_ready();
+}
+
+template <typename Precision>
+symmetrix::execution::ArtifactReadiness
+MACEKokkos<Precision>::artifact_readiness_for(const std::string& target) const
+{
+    auto readiness = family_artifact_readiness();
+    readiness.target = target;
+    if (target == "host") {
+        const bool host_ready = jit_host_plugin_ready();
+        readiness.ready = host_ready;
+        readiness.artifact_id = host_ready
+            ? jit_host_plugin_artifact_id() : std::string();
+        readiness.reason = host_ready
+            ? "generated host artifact admitted"
+            : "no generated host artifact is admitted";
+        return readiness;
+    }
+    // A device target reports the artifact that target binds rather than a host
+    // one that happens to be ready alongside it.
+    const bool device_ready = jit_device_plugin_ready();
+    readiness.ready = device_ready;
+    readiness.artifact_id = device_ready
+        ? jit_device_plugin_artifact_id() : std::string();
+    readiness.reason = device_ready
+        ? "generated device artifact admitted"
+        : "no generated device artifact is admitted on target '" + target + "'";
+    return readiness;
+}
+
+template <typename Precision>
+symmetrix::execution::ArtifactReadiness
+MACEKokkos<Precision>::load_family_artifact(
+    const symmetrix::execution::ArtifactRequest& request)
+{
+    const std::string target = request.target.empty()
+        ? family_execution_target() : request.target;
+    // An empty path is the interface's readiness query and must not reach a
+    // loader: the artifact loaders resolve an identity manifest beside the
+    // plugin, so an empty path would read the working directory instead.
+    if (!request.path.empty()) {
+        if (target == "host")
+            load_jit_host_plugin(request.path);
+        else
+            load_jit_device_plugin(request.path);
+    }
+    return artifact_readiness_for(target);
+}
+
+template <typename Precision>
+symmetrix::execution::FamilyDiagnostics
+MACEKokkos<Precision>::family_diagnostics() const
+{
+    using symmetrix::execution::FamilyDiagnostics;
+    FamilyDiagnostics diagnostics;
+    diagnostics.fallback_count = factorized_fallback_evaluation_count;
+    diagnostics.diagnostic = factorized_execution_strategy_name();
+    if (!direct_artifact_diagnostic_description.empty()) {
+        diagnostics.diagnostic += "; " + direct_artifact_diagnostic_code + ": "
+            + direct_artifact_diagnostic_description;
+    }
+#if defined(KOKKOS_ENABLE_HIP)
+    // The strided-batched A1 implementation is declared only on a CUDA target
+    // with the cuBLAS TPL, so on HIP this target keeps the generic Kokkos
+    // kernels and the route is unqualified here rather than silently claimed by
+    // the report.  A host target has no device BLAS route to qualify at all, so
+    // its diagnostic stays as it was.
+    diagnostics.diagnostic +=
+        "; the strided-batched A1 route, the per-output-element M1 route and"
+        " the fused H2 stages are unqualified on this target (CUDA only)";
+#endif
+    return diagnostics;
+}
+
+template <typename Precision>
+symmetrix::execution::ImplementationBindingReport
+MACEKokkos<Precision>::family_binding_report() const
+{
+    const auto capabilities = family_capabilities();
+    return symmetrix::execution::plan_program(compile_program(),
+        family_implementation_registry(), capabilities.target,
+        capabilities.precision, family_artifact_ready(),
+        family_artifact_readiness().artifact_id);
 }
 
 template <typename Precision>
@@ -3953,7 +5171,7 @@ void MACEKokkos<Precision>::set_edge_geometry_policy(std::string policy)
         if constexpr (!std::is_same_v<Precision,float>)
             throw std::invalid_argument(
                 "unit-f32-radius-f64-v1 requires float32 inference.");
-        if (!mace_admits_low_memory(streamed_edges))
+        if (!admits_low_memory(streamed_edges))
             throw std::invalid_argument(
                 "unit-f32-radius-f64-v1 requires direct execution.");
         if (!single_layer_readout
@@ -3991,6 +5209,8 @@ void MACEKokkos<Precision>::set_edge_geometry_policy(std::string policy)
 template <typename Precision>
 void MACEKokkos<Precision>::set_allow_fixed_workspace(const bool enabled)
 {
+    if (enabled)
+        validate_model_capability(MACEModelCapability::fixed_workspace);
     if (enabled == allow_fixed_workspace_)
         return;
     factorized_execution_space.fence("Change fixed-workspace opt-in");
@@ -4021,7 +5241,7 @@ void MACEKokkos<Precision>::set_low_memory(const bool enabled)
         return;
     }
 
-    if (!mace_admits_low_memory(streamed_edges))
+    if (!admits_low_memory(streamed_edges))
         throw std::invalid_argument(
             "Low-memory execution requires direct execution.");
     if (!single_layer_readout
@@ -4909,10 +6129,6 @@ std::string MACEKokkos<Precision>::factorized_source_strategy_name() const
     switch (factorized_source_strategy) {
     case FactorizedSourceStrategy::serial_reference:
         return "serial_reference";
-    case FactorizedSourceStrategy::team_cached:
-        return "team_cached";
-    case FactorizedSourceStrategy::tiled_coupling:
-        return "tiled_coupling";
     case FactorizedSourceStrategy::jit_plugin:
         return "jit_plugin";
     }
@@ -4924,57 +6140,25 @@ std::string MACEKokkos<Precision>::factorized_execution_strategy_name() const
 {
     if (factorized_source_strategy == FactorizedSourceStrategy::jit_plugin) {
         if (use_factorized_direct_inference())
-            return use_factorized_direct_jit_reverse()
-                ? "direct_jit_reverse" : "direct_runtime";
-        if (factorized_tiled_ready)
-            return "tiled_coupling";
-        return "team_cached";
+            return "direct_jit_reverse";
+        return factorized_tiled_ready
+            ? "compiled_tiled" : "compiled_chunked";
     }
     return factorized_source_strategy_name();
-}
-
-template <typename Precision>
-std::string MACEKokkos<Precision>::factorized_direct_forward_executor_name() const
-{
-    switch (factorized_direct_forward_executor) {
-    case FactorizedDirectForwardExecutor::automatic:
-        return "automatic";
-    case FactorizedDirectForwardExecutor::runtime:
-        return "runtime";
-    case FactorizedDirectForwardExecutor::jit_all:
-        return "jit_all";
-    }
-    throw std::logic_error("Invalid Execution R1 direct forward executor.");
 }
 
 template <typename Precision>
 std::string MACEKokkos<Precision>::factorized_selected_direct_forward_executor_name()
     const
 {
-    if (!use_factorized_direct_jit_forward())
-        return "runtime";
-    return "jit_all";
-}
-
-template <typename Precision>
-std::string MACEKokkos<Precision>::factorized_direct_reverse_executor_name() const
-{
-    switch (factorized_direct_reverse_executor) {
-    case FactorizedDirectReverseExecutor::automatic:
-        return "automatic";
-    case FactorizedDirectReverseExecutor::runtime:
-        return "runtime";
-    case FactorizedDirectReverseExecutor::jit:
-        return "jit";
-    }
-    throw std::logic_error("Invalid Execution R1 direct reverse executor.");
+    return use_factorized_direct_inference() ? "jit_all" : "runtime";
 }
 
 template <typename Precision>
 std::string MACEKokkos<Precision>::factorized_selected_direct_reverse_executor_name()
     const
 {
-    return use_factorized_direct_jit_reverse() ? "jit" : "runtime";
+    return use_factorized_direct_inference() ? "jit" : "runtime";
 }
 
 template <typename Precision>
@@ -5047,18 +6231,37 @@ bool MACEKokkos<Precision>::use_standard_m0_module() const
 template <typename Precision>
 bool MACEKokkos<Precision>::use_r0_module() const
 {
-    return (streamed_edges == MACEStreamedEdgesMode::generic
-            || mace_uses_prepared_execution(streamed_edges))
+    return (streamed_edges == ExecutionMode::generic
+            || uses_prepared_execution(streamed_edges))
         && selected_r0_implementation != R0Implementation::generic
         && !factorized_observer_enabled
         && !execution_parameter_gradients_enabled;
 }
 
 template <typename Precision>
+bool MACEKokkos<Precision>::use_r0_comparison_dispatch() const
+{
+    const bool module_scope = streamed_edges == ExecutionMode::generic
+        || (uses_prepared_execution(streamed_edges)
+            && (single_layer_readout
+                || factorized_source_strategy
+                    == FactorizedSourceStrategy::jit_plugin));
+    return module_scope && use_r0_module()
+        && standard_r0_executor != StandardR0Executor::v1;
+}
+
+template <typename Precision>
+bool MACEKokkos<Precision>::use_generated_r0_dispatch() const
+{
+    return use_r0_comparison_dispatch() && !single_layer_tiled_plan_active
+        && !dual_layer_tiled_plan_active;
+}
+
+template <typename Precision>
 bool MACEKokkos<Precision>::use_m0_module() const
 {
-    return (streamed_edges == MACEStreamedEdgesMode::generic
-            || mace_uses_prepared_execution(streamed_edges))
+    return (streamed_edges == ExecutionMode::generic
+            || uses_prepared_execution(streamed_edges))
         && selected_m0_implementation != M0Implementation::generic
         && standard_m0_executor != StandardM0Executor::runtime
         && !factorized_observer_enabled
@@ -5068,11 +6271,12 @@ bool MACEKokkos<Precision>::use_m0_module() const
 template <typename Precision>
 bool MACEKokkos<Precision>::r0_supports_low_memory() const
 {
-    if (!use_r0_module())
+    if (!use_r0_comparison_dispatch())
         return false;
     if (selected_r0_implementation == R0Implementation::builtin)
-        return standard_r0_module_ready
-            && standard_r0_executor != StandardR0Executor::v1;
+        return standard_r0_module_ready;
+    if (selected_r0_implementation == R0Implementation::host_plugin)
+        return r0_host_plugin_ready();
     return selected_r0_implementation == R0Implementation::device_module
         && r0_device_module_ready();
 }
@@ -5093,6 +6297,12 @@ bool MACEKokkos<Precision>::m0_supports_low_memory() const
 template <typename Precision>
 std::string MACEKokkos<Precision>::r0_implementation_name() const
 {
+    return use_generated_r0_dispatch() ? "generated" : "generic";
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::r0_loader_implementation_name() const
+{
     switch (selected_r0_implementation) {
     case R0Implementation::generic:
         return "generic";
@@ -5100,8 +6310,79 @@ std::string MACEKokkos<Precision>::r0_implementation_name() const
         return "builtin";
     case R0Implementation::device_module:
         return "device_module";
+    case R0Implementation::host_plugin:
+        return "host_plugin";
     }
     throw std::logic_error("Invalid R0 implementation.");
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::r0_backend_name() const
+{
+#if defined(KOKKOS_ENABLE_CUDA)
+    return "cuda";
+#elif defined(KOKKOS_ENABLE_HIP)
+    return "hip";
+#else
+    return "host";
+#endif
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::r0_artifact_origin_name() const
+{
+    return use_generated_r0_dispatch()
+        ? selected_r0_artifact_origin : std::string{};
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::r0_schedule_name() const
+{
+    if (!use_generated_r0_dispatch())
+        return "generic";
+    switch (selected_r0_implementation) {
+    case R0Implementation::generic:
+        return "generic";
+    case R0Implementation::builtin:
+        return "frozen";
+    case R0Implementation::device_module:
+        return r0_device_module_schedule;
+    case R0Implementation::host_plugin:
+        return "host-owner";
+    }
+    throw std::logic_error("Invalid R0 implementation.");
+}
+
+template <typename Precision>
+std::string MACEKokkos<Precision>::r0_profile_name() const
+{
+    if (!use_generated_r0_dispatch())
+        return "generic";
+    switch (selected_r0_implementation) {
+    case R0Implementation::generic:
+        return "generic";
+    case R0Implementation::builtin:
+        return "fixed-weight-coordinate";
+    case R0Implementation::device_module:
+        return "persistent-"
+            +std::to_string(r0_device_persistent_blocks_per_compute_unit);
+    case R0Implementation::host_plugin:
+        return "owner-batched";
+    }
+    throw std::logic_error("Invalid R0 implementation.");
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::set_r0_artifact_origin(std::string origin)
+{
+    if (selected_r0_implementation != R0Implementation::device_module
+        && selected_r0_implementation != R0Implementation::host_plugin)
+        throw std::logic_error(
+            "R0 artifact origin requires a loaded generated artifact.");
+    if (origin != "prebuilt" && origin != "cache" && origin != "runtime")
+        throw std::invalid_argument(
+            "R0 artifact origin must be prebuilt, cache, or runtime.");
+    selected_r0_artifact_origin = std::move(origin);
 }
 
 template <typename Precision>
@@ -5123,10 +6404,14 @@ std::string MACEKokkos<Precision>::m0_implementation_name() const
 template <typename Precision>
 std::string MACEKokkos<Precision>::r0_selected_module_id() const
 {
+    if (!use_generated_r0_dispatch())
+        return {};
     if (selected_r0_implementation == R0Implementation::builtin)
         return standard_r0_module_id();
     if (selected_r0_implementation == R0Implementation::device_module)
         return r0_device_module_artifact_id();
+    if (selected_r0_implementation == R0Implementation::host_plugin)
+        return r0_host_plugin_artifact_id();
     return {};
 }
 
@@ -5145,7 +6430,7 @@ std::string MACEKokkos<Precision>::m0_selected_module_id() const
 template <typename Precision>
 bool MACEKokkos<Precision>::factorized_direct_profile_requested() const
 {
-    return mace_uses_direct_execution(streamed_edges)
+    return uses_direct_execution(streamed_edges)
         && factorized_source_strategy == FactorizedSourceStrategy::jit_plugin
         && (jit_host_plugin_ready() || jit_device_plugin_ready())
         && !factorized_observer_enabled
@@ -5156,24 +6441,6 @@ template <typename Precision>
 bool MACEKokkos<Precision>::use_factorized_direct_inference() const
 {
     return factorized_direct_profile_requested();
-}
-
-template <typename Precision>
-bool MACEKokkos<Precision>::use_factorized_direct_jit_forward() const
-{
-    return use_factorized_direct_inference()
-        && (jit_host_plugin_ready() || jit_device_plugin_ready())
-        && factorized_direct_forward_executor
-            != FactorizedDirectForwardExecutor::runtime;
-}
-
-template <typename Precision>
-bool MACEKokkos<Precision>::use_factorized_direct_jit_reverse() const
-{
-    return use_factorized_direct_inference()
-        && (jit_host_plugin_ready() || jit_device_plugin_ready())
-        && factorized_direct_reverse_executor
-            != FactorizedDirectReverseExecutor::runtime;
 }
 
 template <typename Precision>
@@ -5357,13 +6624,6 @@ template <typename Precision>
 std::size_t MACEKokkos<Precision>::factorized_reverse_coupling_workspace_bytes() const
 {
     return factorized_coupling_workspace_bytes;
-}
-
-template <typename Precision>
-std::size_t MACEKokkos<Precision>::a1_blas_flatten_workspace_bytes() const
-{
-    return (A1_blas_flatten_input.span()+A1_blas_flatten_output.span())
-        * sizeof(Precision);
 }
 
 template <typename Precision>
@@ -5834,7 +7094,7 @@ void MACEKokkos<Precision>::set_factorized_observer(
 {
     if (enabled && max_bytes == 0)
         throw std::invalid_argument("Execution R1 observer byte limit must be positive.");
-    if (enabled && !mace_uses_direct_execution(streamed_edges))
+    if (enabled && !uses_direct_execution(streamed_edges))
         throw std::invalid_argument(
             "Execution R1 observation requires "
             "streamed_edges='direct'.");
@@ -5915,7 +7175,7 @@ void MACEKokkos<Precision>::set_execution_parameter_gradients(
         apply_low_memory_policy(LowMemoryPolicy::speed);
         low_memory_policy = LowMemoryPolicy::speed;
     }
-    if (!mace_uses_direct_execution(streamed_edges))
+    if (!uses_direct_execution(streamed_edges))
         throw std::invalid_argument(
             "Execution parameter gradients require "
             "streamed_edges='direct'.");
@@ -6047,7 +7307,7 @@ void MACEKokkos<Precision>::begin_execution_parameter_gradients()
 {
     if (!execution_parameter_gradients_enabled)
         return;
-    if (!mace_uses_direct_execution(streamed_edges))
+    if (!uses_direct_execution(streamed_edges))
         throw std::invalid_argument(
             "Execution parameter gradients require "
             "streamed_edges='direct'.");
@@ -6401,3 +7661,11 @@ void MACEKokkos<Precision>::finish_standard_r0_reverse_observation()
 
 template class MACEKokkos<float>;
 template class MACEKokkos<double>;
+
+// The family-adapter conformance gate: this translation unit instantiates the
+// evaluator, so a missing or mistyped interface member fails the library build
+// here rather than at a consumer.
+static_assert(symmetrix::execution::FamilyEvaluator<MACEKokkos<float>>);
+static_assert(symmetrix::execution::FamilyEvaluator<MACEKokkos<double>>);
+static_assert(symmetrix::execution::TieredFamilyEvaluator<MACEKokkos<float>>);
+static_assert(symmetrix::execution::TieredFamilyEvaluator<MACEKokkos<double>>);

@@ -20,6 +20,8 @@ jobs:
 
   symmetrix:
     runs-on: ubuntu-latest
+    env:
+      TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: "1"
     steps:
     - name: Clone repo
       uses: actions/checkout@v6
@@ -261,8 +263,12 @@ jobs:
         wget https://github.com/ACEsuit/mace-off/raw/refs/heads/main/mace_off23/MACE-OFF23_small.model
         symmetrix_extract_mace --model MACE-OFF23_small.model
         python3 -c "from symmetrix import Symmetrix; calc = Symmetrix('MACE-OFF23_small-universal.json')"
-        # compare legacy pair splines from chemical symbols with compact output
-        symmetrix_extract_mace --model MACE-OFF23_small.model --chemical-symbols H O --radial-format pair-splines -o extract_test.json
+        # Compare a chemical-symbol subset export with the universal compact
+        # export.  The original pair-spline comparison is retired: the original
+        # Symmetrix pair-spline format (named v1 here) is no longer loadable
+        # through a calculator, and the LAMMPS job covers its retained
+        # materialized path end to end.
+        symmetrix_extract_mace --model MACE-OFF23_small.model --chemical-symbols H O -o extract_test.json
         python3 - <<'PY'
         import numpy as np
         from ase import Atoms
@@ -273,23 +279,26 @@ jobs:
             ("float64", 1e-10, 1e-9),
             ("float32", 1e-4, 1e-4),
         ):
-            compact_atoms = atoms.copy()
-            legacy_atoms = atoms.copy()
-            compact_atoms.calc = Symmetrix(
-                "MACE-OFF23_small-universal.json", use_kokkos=True, dtype=dtype,
-            )
-            legacy_atoms.calc = Symmetrix(
-                "extract_test.json", use_kokkos=True, dtype=dtype,
-            )
-            assert np.allclose(
-                compact_atoms.get_potential_energy(),
-                legacy_atoms.get_potential_energy(),
-                atol=energy_tolerance,
-            )
-            assert np.allclose(
-                compact_atoms.get_forces(),
-                legacy_atoms.get_forces(),
-                atol=force_tolerance,
-            )
+            for routing in ("direct", "reference"):
+                universal_atoms = atoms.copy()
+                subset_atoms = atoms.copy()
+                universal_atoms.calc = Symmetrix(
+                    "MACE-OFF23_small-universal.json",
+                    dtype=dtype,
+                    streamed_edges=routing,
+                )
+                subset_atoms.calc = Symmetrix(
+                    "extract_test.json", dtype=dtype, streamed_edges=routing,
+                )
+                assert np.allclose(
+                    universal_atoms.get_potential_energy(),
+                    subset_atoms.get_potential_energy(),
+                    atol=energy_tolerance,
+                )
+                assert np.allclose(
+                    universal_atoms.get_forces(),
+                    subset_atoms.get_forces(),
+                    atol=force_tolerance,
+                )
         PY
         deactivate

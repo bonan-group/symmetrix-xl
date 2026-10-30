@@ -1,0 +1,18 @@
+#pragma once
+
+namespace symmetrix::build {
+inline constexpr const char* prebuilt_operator_mode = "off";
+inline constexpr const char* prebuilt_operator_backend = "";
+inline constexpr const char* prebuilt_operator_target = "";
+inline constexpr const char* prebuilt_operator_catalog_relative_path = "";
+inline constexpr const char* prebuilt_operator_catalog_sha256 = "";
+inline constexpr const char* prebuilt_operator_source_content_sha256 =
+    "@SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256@";
+inline constexpr const char* prebuilt_operator_native_source_content_sha256 =
+    "@SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256@";
+inline constexpr const char* prebuilt_operator_compiler_id = "";
+inline constexpr const char* prebuilt_operator_compiler_version = "";
+inline constexpr unsigned long long prebuilt_operator_artifact_count = 0ULL;
+inline constexpr unsigned long long prebuilt_operator_installed_bytes = 0ULL;
+inline constexpr double prebuilt_operator_build_duration_seconds = 0.0;
+}

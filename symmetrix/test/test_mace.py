@@ -1,5 +1,6 @@
 import ase
 from ase.neighborlist import neighbor_list
+import json
 import numpy as np
 import pytest
 
@@ -28,31 +29,33 @@ model = "mace-off-small"
 # model = "mace-mpa-medium"
 # model = "mace-omat-0-medium"
 
-kokkos = False
-if kokkos:
-    MACE = symmetrix.MACEKokkos
-    if not symmetrix._kokkos_is_initialized():
-        symmetrix._init_kokkos()
-else:
-    MACE = symmetrix.MACE
+# The serial MACE evaluator is retired, so MACEKokkos is the only MACE evaluator
+# left.  The cached models below are the original Symmetrix pair-spline format
+# (named v1 here): the native loader still admits them through the materialized
+# edge representation and warns that it did, while set_streamed_edges refuses
+# such a model, so the loader's own routing is the only one it can run in.  The
+# Python calculator frontend refuses the format outright, which is why this
+# exploration constructs the native evaluator directly.
+if not symmetrix._kokkos_is_initialized():
+    symmetrix._init_kokkos()
 
 # load model
 if model == "mace-off-small":
-    evaluator = MACE(str(JSON_MODELS["MACE-OFF23_small-1-8.json"]))
+    evaluator = symmetrix.MACEKokkos(str(JSON_MODELS["MACE-OFF23_small-1-8.json"]))
 elif model == "mace-off-medium":
-    evaluator = MACE("MACE-OFF23_medium-1-8.json")
+    evaluator = symmetrix.MACEKokkos("MACE-OFF23_medium-1-8.json")
 elif model == "mace-off-large":
-    evaluator = MACE("MACE-OFF23_large-1-8.json")
+    evaluator = symmetrix.MACEKokkos("MACE-OFF23_large-1-8.json")
 elif model == "mace-mp-small":
-    evaluator = MACE("mace-small-density-agnesi-stress-1-8.json")
+    evaluator = symmetrix.MACEKokkos("mace-small-density-agnesi-stress-1-8.json")
 elif model == "mace-mp-medium":
-    evaluator = MACE("mace-medium-density-agnesi-stress-1-8.json")
+    evaluator = symmetrix.MACEKokkos("mace-medium-density-agnesi-stress-1-8.json")
 elif model == "mace-mp-large":
-    evaluator = MACE("mace-large-density-agnesi-stress.json")
+    evaluator = symmetrix.MACEKokkos("mace-large-density-agnesi-stress.json")
 elif model == "mace-mpa-medium":
-    evaluator = MACE("mace-mpa-0-medium-1-8.json")
+    evaluator = symmetrix.MACEKokkos("mace-mpa-0-medium-1-8.json")
 elif model == "mace-omat-0-medium":
-    evaluator = MACE("mace-omat-0-medium-1-8.json")
+    evaluator = symmetrix.MACEKokkos("mace-omat-0-medium-1-8.json")
 
 # prepare for tests
 atoms = ase.Atoms("OHH", positions=[[0.0, -2.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
@@ -69,6 +72,20 @@ neigh_types = [mace_atomic_numbers.index(ase_atomic_numbers[j]) for j in j_list]
 evaluator.compute_node_energies_forces(
     num_nodes, node_types, num_neigh, j_list, neigh_types, xyz.flatten(), r
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _release_evaluator():
+    """Drop the module-level evaluator before the session finalizes Kokkos.
+
+    ``MACEKokkos`` counts as a live Symmetrix evaluator and the session fixture
+    refuses to finalize Kokkos while one is alive; this exploration keeps its
+    evaluator in a module global, so the reference is dropped explicitly.
+    """
+
+    yield
+    global evaluator
+    evaluator = None
 
 
 def numerical_gradient(f, x):
@@ -751,7 +768,8 @@ def test_compute_node_energies_forces():
 
 
 def test_zbl(generated_standard_mace_zbl_model):
-    evaluator = MACE(str(generated_standard_mace_zbl_model))
+    evaluator = symmetrix.MACEKokkos(str(generated_standard_mace_zbl_model))
+    evaluator.set_streamed_edges("generic")
     atoms = ase.Atoms(
         "OHH", positions=[[0.0, -0.5, 0.0], [0.5, 0.0, 0.0], [0.0, 0.5, 0.0]]
     )
@@ -822,3 +840,27 @@ def test_zbl(generated_standard_mace_zbl_model):
                 f_num[3 * ij + w] = -(ep - em) / (2 * h)
             ij += 1
     assert np.allclose(f, f_num, rtol=1e-4, atol=1e-6)
+
+
+def test_kokkos_loader_admits_only_the_declared_interaction_count(
+    tmp_path, generated_standard_mace_zbl_model
+):
+    """The interaction count is contract data: the model declares it and the
+    single-layer readout metadata admits one or two interactions."""
+
+    data = json.loads(generated_standard_mace_zbl_model.read_text())
+    # The generated model declares no interaction count, so the loader admits the
+    # two-interaction default its readout flag configures.
+    assert "num_interactions" not in data
+    data["num_interactions"] = 1
+    data["single_layer_readout"] = False
+    mismatched = tmp_path / "mismatched-interactions.json"
+    mismatched.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+    if not symmetrix._kokkos_is_initialized():
+        symmetrix._init_kokkos()
+    with pytest.raises(
+        ValueError,
+        match="interaction count 1 does not match the 2 interactions admitted "
+        "by the single-layer readout contract",
+    ):
+        symmetrix.MACEKokkos(str(mismatched))

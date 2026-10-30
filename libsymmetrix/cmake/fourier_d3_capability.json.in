@@ -1,0 +1,11 @@
+{
+  "policy": "@SYMMETRIX_PARTICLE_MESH@",
+  "available": @SYMMETRIX_FOURIER_D3_AVAILABLE_JSON@,
+  "provider": "@SYMMETRIX_FOURIER_D3_PROVIDER@",
+  "provider_variant": "@SYMMETRIX_FOURIER_D3_PROVIDER_VARIANT@",
+  "kokkosfft_version": "@SYMMETRIX_FOURIER_D3_KOKKOSFFT_VERSION@",
+  "kokkosfft_source": "@SYMMETRIX_KOKKOSFFT_SOURCE_DIR@",
+  "reason": "@SYMMETRIX_FOURIER_D3_REASON@",
+  "provider_libraries": [@SYMMETRIX_FOURIER_D3_PROVIDER_LIBRARIES_JSON@],
+  "provider_include_dirs": [@SYMMETRIX_FOURIER_D3_PROVIDER_INCLUDE_DIRS_JSON@]
+}

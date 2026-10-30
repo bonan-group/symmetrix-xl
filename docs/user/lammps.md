@@ -52,6 +52,55 @@ Kokkos, architecture, `SYMMETRIX_*`, and `PKG_*` definitions remain managed by
 the frontend; select packages with `--lammps-package` instead of passing
 `PKG_NAME=ON` directly.
 
+## MACE Polar
+
+`pair_style symmetrix/mace/polar/kk` calls the same family-owned native
+whole-model evaluator as the ASE adapter. It does not call Python and does not
+invoke the public ordinary MACE evaluator. The FP32 spelling is
+`symmetrix/mace/polar/float32/kk`; LAMMPS may append `/kk` when launched with
+`-sf kk`.
+
+The qualified deployment is deliberately narrow: exactly one MPI rank must own
+the complete system. Domain decomposition, ghost-owned model atoms,
+`pair_style hybrid`, per-atom energy, and per-atom virial are rejected before
+model evaluation. The distributed Polar LAMMPS path remains a future delivery.
+The pair style returns energy, forces, and the global virial; it does not expose
+the model dipole as a LAMMPS output. The atom-type map must cover every LAMMPS
+type, the model must be `MACE_Polar`, and the global atom count must fit the
+native flattened-index capacity.
+
+For example, a qualified FP32 CPU invocation is:
+
+```text
+pair_style symmetrix/mace/polar/float32/kk \
+           total_charge 0.0 total_spin 0.0 fermi_level 0.0 \
+           electric_field 0.0 0.0 0.0 \
+           polar_electrostatics auto \
+           jit_host_artifact /absolute/path/polar-backbone.so
+pair_coeff * * /absolute/path/MACE-POLAR-1-M.json H O
+```
+
+The optional settings are `total_charge`, `total_spin`, `fermi_level`,
+`electric_field EX EY EZ`, `polar_electrostatics`, and `head`. Select at most one prepared
+artifact with either `jit_host_artifact` or
+`jit_device_artifact`. With no artifact, the consumer uses the portable
+`pair_spline_v1` backbone. A matching artifact selects the generated/direct
+backbone. Supplying both artifact settings, or repeating one, is an error. The
+artifact must match the JSON, precision, backend, and JIT ABI.
+
+Backbone artifact selection is independent of the electrostatic solver. The
+JSON remains solver-neutral: `polar_electrostatics auto` chooses real space
+only when all three PBC flags are false and direct reciprocal space when any
+axis is periodic. Explicit `realspace`, `periodic`, and `direct_reciprocal`
+requests are available for validation. Forced `pme` is available only for fully
+three-dimensional periodic input on qualified CUDA builds with an FFT provider;
+LAMMPS consumers and other backends continue to use direct reciprocal space.
+
+This native Polar electrostatics is independent of LAMMPS `kspace_style`.
+Enabling the `KSPACE` package or selecting LAMMPS PPPM does not provide the
+family-owned Polar PME solver and must not be overlaid as if it were that model
+component.
+
 Package installation does not select the corrections at runtime. For example,
 the following illustrates a learned potential overlaid with explicit Coulomb
 and D3 terms:

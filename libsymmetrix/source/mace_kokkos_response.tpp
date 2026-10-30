@@ -174,7 +174,7 @@ void MACEKokkos<Precision>::compute_electric_field_response(
 
     const auto response_mode = streamed_edges;
     const bool response_radial_inline =
-        response_mode != MACEStreamedEdgesMode::materialized
+        response_mode != ExecutionMode::materialized
         && !response_debug_materialized_radial()
         && num_active_types > 0
         && radial_1.function_count()
@@ -185,21 +185,21 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         macefield_response_radial_inline_evaluation_count += 1;
     } else {
         if (include_force_derivative
-            && (response_mode == MACEStreamedEdgesMode::generic
-                || mace_uses_prepared_execution(response_mode)))
+            && (response_mode == ExecutionMode::generic
+                || uses_prepared_execution(response_mode)))
             compute_R0(num_nodes, node_types, num_neigh, neigh_types, r);
-        if (response_mode != MACEStreamedEdgesMode::materialized)
+        if (response_mode != ExecutionMode::materialized)
             compute_R1(
                 num_nodes, node_types, num_neigh, neigh_types, r,
                 include_force_derivative);
         else if (!include_force_derivative)
             R1_deriv = decltype(R1_deriv)();
-        if (response_mode != MACEStreamedEdgesMode::materialized)
+        if (response_mode != ExecutionMode::materialized)
             macefield_response_radial_materialized_evaluation_count += 1;
     }
 
     Kokkos::View<const int*> response_edge_receivers;
-    if (mace_uses_prepared_execution(response_mode)) {
+    if (uses_prepared_execution(response_mode)) {
         if (factorized_schedule_dirty
             || execution_schedule_num_nodes != num_nodes
             || execution_edge_receivers.extent(0) != response_edges
@@ -215,7 +215,7 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         macefield_response_receiver_ownership = "factorized_edge";
         macefield_response_source_ownership = "edge_atomic";
         macefield_response_factorized_topology_count += 1;
-    } else if (response_mode != MACEStreamedEdgesMode::materialized) {
+    } else if (response_mode != ExecutionMode::materialized) {
         response_edge_receivers = streamed_edge_receivers;
         macefield_response_receiver_ownership =
             response_edge_receivers.extent(0) == response_edges
@@ -319,7 +319,7 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         // Build a per-row CG lookup so the response reverse evaluates the CG
         // reduction of dPhi1 inline instead of materializing dPhi1r tangents.
         // Phi1_clebsch_gordan/Phi1_l1/Phi1_l2/Phi1_lelm1lm2/num_channels are
-        // written only by load_from_json, so the lookup is model-immutable and
+        // written only by load_mace_backbone, so the lookup is model-immutable and
         // is built once per evaluator.
         const int cg_count = static_cast<int>(Phi1_clebsch_gordan.size());
         auto host_rows = Kokkos::create_mirror_view_and_copy(
@@ -1265,7 +1265,7 @@ void MACEKokkos<Precision>::compute_electric_field_response(
 
 #ifdef KOKKOS_ENABLE_CUDA
         const auto edge_receivers = response_edge_receivers;
-        if (response_mode != MACEStreamedEdgesMode::materialized
+        if (response_mode != ExecutionMode::materialized
             && supports_fused_streamed_reverse()
             && edge_receivers.extent(0) == response_edges) {
             macefield_response_phi1_fused_launch_count += 1;
@@ -1853,7 +1853,7 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         const auto response_type_to_active = type_to_active;
         const int response_active_type_count = num_active_types;
         const bool A0_scale_recompute =
-            response_mode != MACEStreamedEdgesMode::materialized;
+            response_mode != ExecutionMode::materialized;
         if (A0_scaled) {
             Kokkos::parallel_for(
                 "MACEField analytic A0 scaled reverse tangent",
@@ -1955,7 +1955,7 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         const auto radial0 = R0;
         const auto radial0_deriv = R0_deriv;
 #ifdef KOKKOS_ENABLE_CUDA
-        if (response_mode != MACEStreamedEdgesMode::materialized
+        if (response_mode != ExecutionMode::materialized
             && response_edge_receivers.extent(0) == response_edges) {
             macefield_response_a0_fused_launch_count += 1;
             constexpr int edges_per_team = 8;
@@ -2276,13 +2276,13 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         Kokkos::fence();
     }
 
-    if (response_mode == MACEStreamedEdgesMode::generic
-        || mace_uses_prepared_execution(response_mode)) {
+    if (response_mode == ExecutionMode::generic
+        || uses_prepared_execution(response_mode)) {
         R1 = decltype(R1)();
         R1_deriv = decltype(R1_deriv)();
     }
-    if (response_mode == MACEStreamedEdgesMode::generic
-        || mace_uses_prepared_execution(response_mode)) {
+    if (response_mode == ExecutionMode::generic
+        || uses_prepared_execution(response_mode)) {
         R0 = decltype(R0)();
         R0_deriv = decltype(R0_deriv)();
     }
@@ -2311,12 +2311,8 @@ void MACEKokkos<Precision>::reconstruct_mh0_field_response_state(
     const bool direct = use_factorized_direct_inference();
     if (direct) {
         release_factorized_stateful_workspace();
-        if (use_factorized_direct_jit_forward())
-            compute_Phi1_streamed_jit(
-                num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
-        else
-            compute_Phi1_streamed(
-                num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
+        compute_Phi1_streamed_jit(
+            num_nodes, node_types, num_neigh, neigh_indices, neigh_types, r);
         if (response_debug_stage_fences())
             Kokkos::fence("response reconstruction: Phi1_streamed");
         compute_A1(num_nodes, !use_factorized_async_inference());
@@ -2366,7 +2362,7 @@ void MACEKokkos<Precision>::compute_current_electric_field_hessian(
     Kokkos::View<const double*> electric_field,
     const std::uint64_t graph_generation)
 {
-    if (mace_uses_prepared_execution(streamed_edges)
+    if (uses_prepared_execution(streamed_edges)
         && (graph_generation == 0
             || graph_generation != factorized_prepared_graph_generation
             || factorized_completed_evaluation_epoch == 0
@@ -2408,7 +2404,7 @@ void MACEKokkos<Precision>::compute_current_electric_field_force_derivative(
     Kokkos::View<const double*> electric_field,
     const std::uint64_t graph_generation)
 {
-    if (mace_uses_prepared_execution(streamed_edges)
+    if (uses_prepared_execution(streamed_edges)
         && (graph_generation == 0
             || graph_generation != factorized_prepared_graph_generation
             || factorized_completed_evaluation_epoch == 0
@@ -2434,7 +2430,7 @@ void MACEKokkos<Precision>::compute_current_electric_field_bec_bins(
     Kokkos::View<const double*> electric_field,
     const std::uint64_t graph_generation)
 {
-    if (mace_uses_prepared_execution(streamed_edges)
+    if (uses_prepared_execution(streamed_edges)
         && (graph_generation == 0
             || graph_generation != factorized_prepared_graph_generation
             || factorized_completed_evaluation_epoch == 0
@@ -2455,7 +2451,7 @@ void MACEKokkos<Precision>::compute_prepared_factorized_field_response(
     const bool include_force_derivative,
     const bool scatter_bec_bins)
 {
-    if (!mace_uses_prepared_execution(streamed_edges)
+    if (!uses_prepared_execution(streamed_edges)
         || graph_generation == 0
         || graph_generation != factorized_prepared_graph_generation
         || factorized_completed_evaluation_epoch == 0

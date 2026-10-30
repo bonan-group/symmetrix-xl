@@ -383,15 +383,18 @@ def _run_lammps_case(
             f"{fixed_workspace_option}{debug_option}{artifact_option}"
         )
     elif pair_backend == "cpu":
-        if precision != "float64":
-            raise ValueError("The CPU LAMMPS pair style supports only float64")
-        if pair_comm != "default":
-            raise ValueError(
-                "Kokkos pair communication options require pair_backend='kokkos'"
-            )
-        pair_style = "symmetrix/mace"
-        atom_style = "atomic"
-        package_command = ""
+        # The serial pair style is retired, so the CPU path is the Kokkos host
+        # execution space.  Without an artifact the pair style's `auto` default
+        # resolves to the compiler-free reference implementation.
+        pair_style = (
+            "symmetrix/mace/float32/kk/host"
+            if precision == "float32"
+            else "symmetrix/mace/kk/host"
+        )
+        atom_style = "atomic/kk"
+        package_command = (
+            f"package         kokkos neigh half newton on{pair_comm_option}"
+        )
         pair_options = ""
     else:
         raise ValueError(f"Unsupported pair backend: {pair_backend}")
@@ -456,13 +459,12 @@ print           "MIGRATED mode={mode} pe=$(pe:%.16g) pxx=$(pxx:%.16g) pyy=$(pyy:
             "OMP_PROC_BIND": "false",
         }
     )
-    kokkos_arguments = []
+    kokkos_arguments = ["-k", "on", "t", "1"]
     if pair_backend == "kokkos":
-        kokkos_arguments = ["-k", "on", "t", "1"]
         kokkos_gpus = os.environ.get("SYMMETRIX_LAMMPS_KOKKOS_GPUS")
         if kokkos_gpus:
             kokkos_arguments.extend(("g", kokkos_gpus))
-        kokkos_arguments.extend(("-sf", "kk"))
+    kokkos_arguments.extend(("-sf", "kk"))
     subprocess.run(
         [
             mpiexec,
@@ -530,11 +532,14 @@ def _run_timing_case(tmp_path, executable, model, pair_backend, ranks, domain_mo
             kokkos_arguments.extend(("g", kokkos_gpus))
         kokkos_arguments.extend(("-sf", "kk"))
     elif pair_backend == "cpu":
-        atom_style = "atomic"
-        package_command = ""
-        pair_style = "symmetrix/mace"
+        # The serial pair style is retired, so the CPU path is the Kokkos host
+        # execution space.  Without an artifact the pair style's `auto` default
+        # resolves to the compiler-free reference implementation.
+        atom_style = "atomic/kk"
+        package_command = "package kokkos neigh half newton on"
+        pair_style = "symmetrix/mace/kk/host"
         pair_options = ""
-        kokkos_arguments = []
+        kokkos_arguments = ["-k", "on", "t", "1", "-sf", "kk"]
     else:
         raise ValueError(f"Unsupported pair backend: {pair_backend}")
 
@@ -780,7 +785,7 @@ def _run_kokkos_hybrid_index_case(tmp_path, executable, model, precision, domain
     initial_dump = tmp_path / f"{label}.dump"
     log_path = tmp_path / f"{label}.log"
     pair_style = (
-        "symmetrix/mace/float32" if precision == "float32" else "symmetrix/mace"
+        "symmetrix/mace/float32/kk" if precision == "float32" else "symmetrix/mace/kk"
     )
     data_path.write_text(
         """Hybrid per-atom energy indexing fixture
@@ -1008,8 +1013,8 @@ def test_timing_collective_is_deferred_to_compute_query():
     compute_source = (source_root / "compute_symmetrix_timing.cpp").read_text()
     assert compute_source.count("MPI_Allgather(") == 1
     assert "if (last_reduced_step == update->ntimestep) return;" in compute_source
-    for name in ("pair_symmetrix_mace.cpp", "pair_symmetrix_mace_kokkos.cpp"):
-        assert "MPI_Allgather(" not in (source_root / name).read_text()
+    pair_source = (source_root / "pair_symmetrix_mace_kokkos.cpp").read_text()
+    assert "MPI_Allgather(" not in pair_source
 
 
 def test_timing_compute_reference_counts_pair_timing_opt_in():
@@ -1018,9 +1023,8 @@ def test_timing_compute_reference_counts_pair_timing_opt_in():
     assert "*timing_enabled += 1.0;" in compute_source
     assert "*timing_enabled -= 1.0;" in compute_source
     assert "if (force && timing_enabled)" in compute_source
-    for name in ("pair_symmetrix_mace.cpp", "pair_symmetrix_mace_kokkos.cpp"):
-        pair_source = (source_root / name).read_text()
-        assert pair_source.count("execution_timing_enabled = 0.0;") == 1
+    pair_source = (source_root / "pair_symmetrix_mace_kokkos.cpp").read_text()
+    assert pair_source.count("execution_timing_enabled = 0.0;") == 1
 
 
 def test_symmetrix_timing_survives_partial_uncompute_and_pair_replacement(tmp_path):
@@ -1037,11 +1041,12 @@ def test_symmetrix_timing_survives_partial_uncompute_and_pair_replacement(tmp_pa
     input_path.write_text(
         f"""
 units           metal
-atom_style      atomic
+atom_style      atomic/kk
 atom_modify     map yes sort 1 0.0
 boundary        p p p
+package         kokkos neigh half newton on
 read_data       {data_path}
-pair_style      symmetrix/mace no_domain_decomposition
+pair_style      symmetrix/mace/kk no_domain_decomposition
 pair_coeff      * * {model} Al N
 compute         timing_a all symmetrix/timing
 compute         timing_b all symmetrix/timing
@@ -1051,7 +1056,7 @@ thermo_modify   colname auto line one
 run             1 post no
 uncompute       timing_a
 run             1 pre no post no
-pair_style      symmetrix/mace no_domain_decomposition
+pair_style      symmetrix/mace/kk no_domain_decomposition
 pair_coeff      * * {model} Al N
 run             1 post no
 """
@@ -1071,6 +1076,12 @@ run             1 post no
             "none",
             "-log",
             log_path,
+            "-k",
+            "on",
+            "t",
+            "1",
+            "-sf",
+            "kk",
             "-in",
             input_path,
         ],

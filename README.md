@@ -51,6 +51,14 @@ install a tested architecture-matched extension, and make environments easier
 to reproduce. Build from source when no suitable wheel exists or when developing
 the native implementation.
 
+Official CPU and CUDA wheels also carry generated artifacts for the known MACE
+contracts and OAM architectures. OAM lookup compares the exported model's
+ordered layer count, channel/irrep widths, angular orders, tensor-product
+instructions and masks, and radial-table dimensions with the catalog entry.
+It does not select by model path or learned-weight hash. A custom architecture
+that has no exact catalog match is generated at runtime when the matching
+compiler is available.
+
 ### Demonstrated scale
 
 The paper's FP32 single-GPU LAMMPS capacity benchmark uses the MACE-OMAT-0
@@ -71,33 +79,10 @@ to 703.04 million atoms at 93.81% efficiency.
 
 ### Demonstrated speed
 
-A matched FP32 RTX 5090 qualification compared complete warmed ASE
-energy/forces/stress calls for the standard MACE-OMAT-0 medium checkpoint:
-
-| Atoms | MACE-Torch + cuEquivariance (us/atom) | Symmetrix-XL direct (us/atom) | Speedup | Sampled VRAM: MACE-Torch / Symmetrix-XL (MiB) |
-|---:|---:|---:|---:|---:|
-| 864 | 44.487 | 4.241 | 10.49x | 2,136 / 924 |
-| 4,000 | 31.011 | 3.248 | 9.55x | 7,136 / 1,386 |
-
-The MACE-Torch baseline used cuEquivariance with the exact 6.0 A graph.
-Symmetrix-XL used the same model cutoff plus a 0.5 A neighbor-list skin, giving
-an effective cutoff of 6.5 A; the graph policies are therefore not identical.
-
-Across the matched FP32 LAMMPS benchmarks reported in the paper, Symmetrix-XL
-reduces complete step time by 3.1-5.0x relative to ML-IAP + cuEquivariance on
-the tested A100 and RTX 5090 workloads. One representative RTX 5090 result uses
-5,000-atom perturbed cubic SrTiO3 with MACE-OMAT-0 medium:
-
-| Implementation | Time (us/atom/step) | Speedup vs. ML-IAP |
-|---|---:|---:|
-| MACE-Torch + cuEquivariance through LAMMPS ML-IAP | 12.813 | 1.00x |
-| Symmetrix-XL LAMMPS pair style | 2.559 | 5.01x |
-
-Each value is the median of three 20-step runs after warmup. Both deployments
-used a 6.0 A model cutoff and a 0.5 A neighbor-list skin (6.5 A effective
-neighbor cutoff), with zero neighbor-list rebuilds during the measured block.
-The paper also reports complete ASE energy/forces/stress calls; see the paper
-for the full benchmark protocol and graph-policy details.
+The Symmetrix-XL paper reports the matched performance study, including the
+model, graph policy, hardware, warmup, and measurement protocol. Release
+documentation does not reproduce timings from comparison packages; consult the
+paper when evaluating performance claims.
 
 -----
 
@@ -231,6 +216,35 @@ selectors are intended only for deliberately restricted format-v2 deployments
 or exports in the original Symmetrix pair-spline format (named v1 here);
 format-v3 models reject subsets.
 
+### NequIP-OAM (experimental)
+
+Version 0.2.0 includes experimental native evaluation of exported NequIP-OAM
+S/M/L/XL models through the OAM v2 JSON contract. It is not a general NequIP
+graph compiler. Exporting an upstream package requires the optional reference
+stack; evaluating the resulting JSON does not import PyTorch, NequIP, or e3nn:
+
+```bash
+python -m pip install "symmetrix-xl[nequip]"
+symmetrix_extract_nequip \
+    --model NequIP-OAM-S-0.1.nequip.zip \
+    --output oam-s-nequip.json
+```
+
+```python
+from symmetrix import NequIPCalculator
+
+atoms.calc = NequIPCalculator("oam-s-nequip.json", dtype="float32")
+```
+
+Current host ABI-v7 and CUDA ABI-v3 `direct` artifacts use the
+full-message-only generated path. Source generation supports FP32 and FP64,
+but the fresh runtime release matrix and repaired-wheel gates remain pending.
+HIP and multi-GPU execution are unsupported.
+See the [model guide](docs/user/models.md#nequip-and-oam) for the
+exact property and artifact boundaries, and the
+[publication guide](docs/reference/publications.md#nequip-oam) for the NequIP
+and OAM papers to cite.
+
 CUDA and HIP backends are installed separately for a matching GPU architecture;
 see the [installation guide](docs/user/installation.md) and [Symmetrix-XL
 package README](symmetrix/README.md) for backend-specific builds.
@@ -263,6 +277,14 @@ If you use Symmetrix-XL, please cite:
 
 * L. Fu, Z. Feng, Y. Li, H. Du, X. He, J. Wu, K. Bao, Y. Zhang, Z. Deng, Z. Lu, and B. Zhu, "Train for Accuracy, Execute at Scale: Architecture-Preserving Inference for Equivariant Atomistic Foundation Models," arXiv:2610.01036 (2026). [[arXiv]](https://arxiv.org/abs/2610.01036)
 
+Also cite the method implemented by the model or correction and the publication
+for the checkpoint used. The [publication and software citation
+guide](docs/reference/publications.md) covers MACE, MACE-MH-1, MACELES,
+MACE-POLAR-1, MACEField, NequIP-OAM, DFT-D2/D3 damping variants, FourierD3,
+and the open-source numerical reference implementations used during
+development. Follow the model package or model card when it requests further
+model-specific citations.
+
 ```bibtex
 @article{fu2026symmetrixxl,
   title   = {Train for Accuracy, Execute at Scale: Architecture-Preserving Inference for Equivariant Atomistic Foundation Models},
@@ -294,6 +316,11 @@ to maintain consistency with LAMMPS.
 
 Symmetrix-XL is based on [Symmetrix](https://github.com/wcwitt/symmetrix),
 developed by William C. Witt.
+
+The FourierD3 reciprocal-space DFT-D3 work builds on the method introduced by
+V. Valeeva, C. H. Ho, M. Geiger, F. Pellegrini, G. Csányi, E. Kucukbenli, and
+C. Ortner, "A fast summation method for the DFT-D3 dispersion correction,"
+arXiv:2607.15103 (2026). [[arXiv]](https://arxiv.org/abs/2607.15103)
 
 The original Symmetrix project also has the following acknowledgement statement:
 

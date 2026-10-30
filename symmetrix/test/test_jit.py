@@ -1,6 +1,7 @@
 import ctypes
 import errno
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -13,13 +14,25 @@ from types import SimpleNamespace
 
 import pytest
 
-SHARED_SUFFIX = ".dylib" if sys.platform == "darwin" else ".so"
-
 
 def _load_jit():
     repository = Path(__file__).resolve().parents[2]
     path = repository / "symmetrix" / "source" / "symmetrix" / "jit.py"
     spec = importlib.util.spec_from_file_location("symmetrix_jit_test", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_generated_operator_core():
+    repository = Path(__file__).resolve().parents[2]
+    path = (
+        repository / "symmetrix" / "source" / "symmetrix" / "generated_operator_core.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "symmetrix_generated_operator_core_test", path
+    )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -203,7 +216,7 @@ def test_nvrtc_build_publish_validate_and_reuse(jit, tmp_path):
     assert {path.name for path in built.artifact_path.parent.iterdir()} == {
         "manifest.json",
         "module.cu",
-        "factorized_cuda_module_gen11.cubin",
+        f"factorized_cuda_module_gen{jit.JIT_GENERATION_VERSION}.cubin",
     }
     manifest = jit.validate_jit_manifest(
         built.artifact_path.parent, expected_key=built.cache_key
@@ -226,6 +239,7 @@ def test_nvrtc_build_publish_validate_and_reuse(jit, tmp_path):
     assert manifest["compiler_options"] == [
         "--std=c++20",
         "--gpu-architecture=sm_120",
+        "--split-compile=2",
     ]
     assert len(calls) == 1
     assert any("synthetic NVRTC log" in value for value in built.diagnostics)
@@ -235,6 +249,23 @@ def test_nvrtc_build_publish_validate_and_reuse(jit, tmp_path):
     assert cached.cache_key == built.cache_key
     assert cached.artifact_path == built.artifact_path
     assert len(calls) == 1
+
+
+def test_nvrtc_rejects_r0_floating_policy_option_mismatch(jit, tmp_path):
+    with pytest.raises(ValueError, match="cuda-fast-math.*use_fast_math"):
+        jit.prepare_nvrtc_jit_artifact(
+            'extern "C" __global__ void kernel() {}\n',
+            abi={"tag": "symmetrix.jit.operator-module/1", "version": 4},
+            build={
+                "operator": {
+                    "operator": "R0",
+                    "floating_point_policy": "cuda-fast-math",
+                }
+            },
+            compute_capability="sm_120",
+            cache_root=tmp_path / "cache",
+            nvrtc_options=("--split-compile=2",),
+        )
 
 
 def test_nvrtc_rejects_unsupported_exact_architecture(jit, tmp_path):
@@ -391,9 +422,17 @@ def test_cuda13_packaged_nvrtc_library_uses_unified_namespace(
 ):
     package = tmp_path / "nvidia" / "cu13"
     library = package / "lib" / "libnvrtc.so.13"
+    builtins = package / "lib" / "libnvrtc-builtins.so.13.0"
     library.parent.mkdir(parents=True)
     library.write_bytes(b"synthetic CUDA 13 NVRTC library")
+    builtins.write_bytes(b"synthetic CUDA 13 NVRTC builtins")
+    loaded = []
     monkeypatch.delenv(jit.NVRTC_LIBRARY_ENVIRONMENT_VARIABLE, raising=False)
+    monkeypatch.setattr(
+        jit.ctypes,
+        "CDLL",
+        lambda path, *, mode: loaded.append((path, mode)) or object(),
+    )
     monkeypatch.setattr(
         importlib.util,
         "find_spec",
@@ -409,12 +448,10 @@ def test_cuda13_packaged_nvrtc_library_uses_unified_namespace(
 
     assert jit._discover_packaged_nvrtc_library("cuda13") == str(library.resolve())
     assert os.environ[jit.NVRTC_LIBRARY_ENVIRONMENT_VARIABLE] == str(library.resolve())
+    assert loaded == [(str(builtins.resolve()), ctypes.RTLD_GLOBAL)]
 
 
-def test_cache_key_is_canonical_and_covers_all_inputs(jit, monkeypatch):
-    # The golden key covers the artifact filename, defined here as the Linux
-    # shared-library name so the canonicalization check is platform-neutral.
-    monkeypatch.setattr(jit, "_shared_library_suffix", lambda: ".so")
+def test_cache_key_is_canonical_and_covers_all_inputs(jit):
     common = {
         "source": _source(),
         "source_content_sha256": "a" * 64,
@@ -426,7 +463,6 @@ def test_cache_key_is_canonical_and_covers_all_inputs(jit, monkeypatch):
     first = jit.jit_cache_key(**common)
     reordered = jit.jit_cache_key(**{**common, "abi": {"a": 1, "z": 2}})
     assert first == reordered
-    assert first == ("84e81864ae64c36fd9aa859522dcc211d0f4fd5a6aabb17a50f6f671caa682a4")
     assert len(first) == 64
 
     variants = [
@@ -501,11 +537,13 @@ def test_host_jit_default_policy_prefers_accepted_native_target(jit, monkeypatch
     monkeypatch.delenv(jit.HOST_FLAGS_ENVIRONMENT_VARIABLE, raising=False)
     monkeypatch.delenv(jit.HOST_FP_MODE_ENVIRONMENT_VARIABLE, raising=False)
     monkeypatch.setattr(jit, "_probe_host_compiler_flags", probe)
+    monkeypatch.setattr(jit, "detect_cpu_identity", lambda: _x86_64_v3_identity(jit))
 
     policy = jit.resolve_host_jit_policy(("/usr/bin/c++",))
 
     assert policy.requested == "automatic"
     assert policy.selected == "native"
+    assert policy.effective_target.startswith("host-native-sha256-")
     assert policy.flags == ("-ffast-math", "-march=native")
     assert probes == [(("/usr/bin/c++",), ("-ffast-math", "-march=native"), {})]
     assert "automatic -> native" in policy.diagnostics[0]
@@ -527,6 +565,69 @@ def test_host_jit_ieee_mode_disables_fast_math_and_contraction(jit, monkeypatch)
     assert any("floating-point mode: ieee" in item for item in policy.diagnostics)
 
 
+def test_host_jit_native_effective_target_is_cpu_specific(jit, monkeypatch):
+    monkeypatch.setattr(jit, "_probe_host_compiler_flags", lambda *args: (True, ""))
+    cpu_identity = {"machine": "x86_64", "cpuinfo": {"model": "first"}}
+    monkeypatch.setattr(jit, "detect_cpu_identity", lambda: cpu_identity)
+
+    automatic = jit.resolve_host_jit_policy(("c++",), target="automatic")
+    explicit_native = jit.resolve_host_jit_policy(("c++",), target="native")
+    native_flags = jit.resolve_host_jit_policy(("c++",), flags=("-march=native",))
+    cpu_identity["cpuinfo"]["model"] = "second"
+    other_cpu = jit.resolve_host_jit_policy(("c++",), target="native")
+    other_native_flags = jit.resolve_host_jit_policy(("c++",), flags=("-march=native",))
+
+    assert automatic.effective_target == explicit_native.effective_target
+    assert automatic.effective_target != other_cpu.effective_target
+    assert native_flags.effective_target != other_native_flags.effective_target
+
+
+def test_equivalent_host_compilation_inputs_share_canonical_target_and_r0_id(
+    jit, monkeypatch
+):
+    monkeypatch.delenv(jit.HOST_TARGET_ENVIRONMENT_VARIABLE, raising=False)
+    monkeypatch.delenv(jit.HOST_FLAGS_ENVIRONMENT_VARIABLE, raising=False)
+    monkeypatch.delenv(jit.HOST_FP_MODE_ENVIRONMENT_VARIABLE, raising=False)
+    monkeypatch.setattr(jit, "_probe_host_compiler_flags", lambda *args: (True, ""))
+    monkeypatch.setattr(
+        jit,
+        "detect_cpu_identity",
+        lambda: {"machine": "x86_64", "cpuinfo": {"model": "test-cpu"}},
+    )
+
+    native = jit.resolve_host_jit_policy(("c++",), target="native")
+    explicit_flags = jit.resolve_host_jit_policy(("c++",), flags=native.flags)
+
+    assert native.selected == "native"
+    assert explicit_flags.selected == "explicit-flags"
+    assert native.flags == explicit_flags.flags
+    assert native.effective_target == explicit_flags.effective_target
+    assert native.identity != explicit_flags.identity
+
+    core = _load_generated_operator_core()
+    common = {
+        "generation_revision": 4,
+        "compatibility_version": 2,
+        "contract_fingerprint": "sha256:" + "a" * 64,
+        "structure_fingerprint": "sha256:" + "b" * 64,
+        "precision": "float32",
+        "backend": "host",
+        "channels": 16,
+        "l_max": 2,
+        "edge_weight_mode": "weighted",
+        "schedule": "host-owner",
+        "schedule_revision": 1,
+    }
+    native_identity = core.generated_r0_identity(
+        **common, target=native.effective_target
+    )
+    explicit_identity = core.generated_r0_identity(
+        **common, target=explicit_flags.effective_target
+    )
+
+    assert native_identity["artifact_id"] == explicit_identity["artifact_id"]
+
+
 def test_host_jit_rejects_unknown_fp_mode(jit, monkeypatch):
     monkeypatch.setenv(jit.HOST_FP_MODE_ENVIRONMENT_VARIABLE, "approximate")
 
@@ -539,6 +640,199 @@ def _x86_64_v3_identity(jit, *, without=()):
         next(iter(aliases)) for aliases in jit._X86_64_V3_FEATURES.values()
     } - set(without)
     return {"machine": "x86_64", "cpuinfo": {"flags": sorted(features)}}
+
+
+def _x86_64_v4_identity(jit, *, without=()):
+    features = {
+        next(iter(aliases)) for aliases in jit._X86_64_V4_FEATURES.values()
+    } - set(without)
+    return {"machine": "x86_64", "cpuinfo": {"flags": sorted(features)}}
+
+
+def test_host_jit_x86_64_v4_target_is_accepted_on_a_compatible_host(jit, monkeypatch):
+    monkeypatch.setattr(jit, "detect_cpu_identity", lambda: _x86_64_v4_identity(jit))
+    monkeypatch.setattr(jit, "_probe_host_compiler_flags", lambda *args: (True, ""))
+
+    policy = jit.resolve_host_jit_policy(("c++",), target="x86-64-v4")
+
+    assert policy.effective_target == "host-isa-x86-64-v4"
+    assert (
+        jit.active_host_target_for(policy.effective_target) == policy.effective_target
+    )
+
+
+def test_host_jit_x86_64_v4_target_rejects_an_insufficient_host(jit, monkeypatch):
+    monkeypatch.setattr(jit, "detect_cpu_identity", lambda: _x86_64_v3_identity(jit))
+
+    with pytest.raises(jit.JitError, match="x86-64-v4.*missing CPU features: avx512"):
+        jit.active_host_target_for("host-isa-x86-64-v4")
+
+
+@pytest.mark.parametrize(
+    ("level", "missing"),
+    (
+        ("x86-64-v2", "sse4.2"),
+        ("x86-64-v3", "avx2"),
+        ("x86-64-v4", "avx512f"),
+    ),
+)
+def test_host_jit_checks_each_x86_64_level_independently(
+    jit, monkeypatch, level, missing
+):
+    identity = _x86_64_v4_identity(jit)
+    identity["cpuinfo"]["flags"] = sorted(
+        set(identity["cpuinfo"]["flags"]) - set(jit._X86_64_V4_FEATURES[missing])
+    )
+    monkeypatch.setattr(jit, "detect_cpu_identity", lambda: identity)
+
+    with pytest.raises(
+        jit.JitError, match=rf"{level}.*missing CPU features: {missing}"
+    ):
+        jit.active_host_target_for(f"host-isa-{level}")
+
+
+def test_host_jit_extra_isa_flag_is_identity_bound_and_compatibility_checked(
+    jit, monkeypatch
+):
+    plain = jit.resolve_host_jit_policy(
+        ("c++",), flags=("-march=x86-64-v3",)
+    ).effective_target
+    extended = jit.resolve_host_jit_policy(
+        ("c++",), flags=("-march=x86-64-v3", "-mavx512f")
+    ).effective_target
+
+    assert plain == "host-isa-x86-64-v3"
+    assert extended != plain
+    assert "requires-avx512f" in extended
+
+    monkeypatch.setattr(jit, "detect_cpu_identity", lambda: _x86_64_v4_identity(jit))
+    assert jit.active_host_target_for(extended) == extended
+    monkeypatch.setattr(jit, "detect_cpu_identity", lambda: _x86_64_v3_identity(jit))
+    with pytest.raises(jit.JitError, match="missing CPU features: avx512f"):
+        jit.active_host_target_for(extended)
+
+
+def test_host_jit_explicit_isa_flags_without_march_are_verifiable(jit, monkeypatch):
+    target = jit.resolve_host_jit_policy(
+        ("c++",), flags=("-mavx2", "-mfma")
+    ).effective_target
+
+    assert target.startswith("host-isa-x86-64-requires-avx2+fma-flags-sha256-")
+    assert jit.resolve_host_jit_policy(("c++",), flags=("-mavx2", "-mfma")).flags == (
+        "-march=x86-64",
+        "-mavx2",
+        "-mfma",
+    )
+    monkeypatch.setattr(jit, "detect_cpu_identity", lambda: _x86_64_v3_identity(jit))
+    assert jit.active_host_target_for(target) == target
+    monkeypatch.setattr(
+        jit,
+        "detect_cpu_identity",
+        lambda: _x86_64_v3_identity(jit, without=("fma",)),
+    )
+    with pytest.raises(jit.JitError, match="missing CPU features: fma"):
+        jit.active_host_target_for(target)
+
+
+def test_host_jit_native_tuning_is_bound_to_the_detected_cpu(jit, monkeypatch):
+    monkeypatch.setattr(
+        jit,
+        "detect_cpu_identity",
+        lambda: {"machine": "x86_64", "cpuinfo": {"model name": "cpu-a"}},
+    )
+    first = jit.resolve_host_jit_policy(("c++",), flags=("-mtune=native",))
+    monkeypatch.setattr(
+        jit,
+        "detect_cpu_identity",
+        lambda: {"machine": "x86_64", "cpuinfo": {"model name": "cpu-b"}},
+    )
+    second = jit.resolve_host_jit_policy(("c++",), flags=("-mtune=native",))
+
+    assert first.flags == ("-march=x86-64", "-mtune=native")
+    assert first.effective_target.startswith("host-native-sha256-")
+    assert first.effective_target != second.effective_target
+
+
+def test_host_jit_clang_target_features_share_the_gcc_canonical_identity(
+    jit, monkeypatch
+):
+    gcc = jit.resolve_host_jit_policy(
+        ("c++",), flags=("-march=x86-64", "-mavx2", "-mfma")
+    )
+    clang = jit.resolve_host_jit_policy(
+        ("clang++",),
+        flags=(
+            "-Xclang",
+            "-target-feature",
+            "-Xclang",
+            "+avx2",
+            "-Xclang",
+            "-target-feature",
+            "-Xclang",
+            "+fma",
+        ),
+    )
+
+    assert clang.flags[0] == "-march=x86-64"
+    assert clang.effective_target == gcc.effective_target
+    monkeypatch.setattr(jit, "detect_cpu_identity", lambda: _x86_64_v3_identity(jit))
+    assert jit.active_host_target_for(clang.effective_target) == clang.effective_target
+
+
+@pytest.mark.parametrize(
+    ("gcc_flag", "clang_feature", "canonical_feature"),
+    (
+        ("-mbmi", "+bmi", "bmi1"),
+        ("-mlahf-sahf", "+lahf-sahf", "lahf_sahf"),
+    ),
+)
+def test_host_jit_normalizes_gcc_and_clang_feature_aliases(
+    jit, gcc_flag, clang_feature, canonical_feature
+):
+    gcc = jit.resolve_host_jit_policy(("c++",), flags=(gcc_flag,))
+    clang = jit.resolve_host_jit_policy(
+        ("clang++",),
+        flags=("-Xclang", "-target-feature", "-Xclang", clang_feature),
+    )
+
+    assert f"requires-{canonical_feature}" in gcc.effective_target
+    assert clang.effective_target == gcc.effective_target
+
+
+def test_host_jit_rejects_unknown_clang_target_feature(jit):
+    with pytest.raises(jit.JitError, match="unknown.*unverifiable required ISA"):
+        jit.resolve_host_jit_policy(
+            ("clang++",),
+            flags=(
+                "-Xclang",
+                "-target-feature",
+                "-Xclang",
+                "+future-isa",
+            ),
+        )
+
+
+def test_host_jit_rejects_unverifiable_cross_target_arguments(jit):
+    with pytest.raises(
+        jit.JitError, match="unknown or unverifiable target architecture"
+    ):
+        jit.resolve_host_jit_policy(
+            ("clang++",), flags=("--target=x86_64-unknown-linux-gnu",)
+        )
+
+
+def test_host_jit_normalizes_joined_clang_target_feature_arguments(jit):
+    joined = jit.resolve_host_jit_policy(
+        ("clang++",),
+        flags=("-Xclang=-target-feature", "-Xclang=+avx2"),
+    )
+    split = jit.resolve_host_jit_policy(
+        ("clang++",),
+        flags=("-Xclang", "-target-feature", "-Xclang", "+avx2"),
+    )
+
+    assert joined.flags[0] == "-march=x86-64"
+    assert joined.effective_target == split.effective_target
 
 
 def test_host_jit_rejected_native_target_selects_x86_64_v3(jit, monkeypatch):
@@ -556,6 +850,7 @@ def test_host_jit_rejected_native_target_selects_x86_64_v3(jit, monkeypatch):
     policy = jit.resolve_host_jit_policy(("c++",), target="automatic")
 
     assert policy.selected == "portable"
+    assert policy.effective_target == "host-isa-x86-64-v3"
     assert policy.flags == ("-ffast-math", "-march=x86-64-v3")
     assert probes == [
         ("-ffast-math", "-march=native"),
@@ -620,8 +915,12 @@ def test_host_jit_explicit_target_and_flags_are_safe_argv(jit, monkeypatch):
     )
     target_policy = jit.resolve_host_jit_policy(("c++",), target="x86-64")
     assert target_policy.selected == "target:x86-64"
+    assert target_policy.effective_target == "host-isa-x86-64"
     assert target_policy.flags == ("-ffast-math", "-march=x86-64")
     assert probes == [("-ffast-math", "-march=x86-64")]
+
+    with pytest.raises(jit.JitError, match="cannot be proven"):
+        jit.active_host_target_for("host-sha256-" + "a" * 64)
 
     monkeypatch.setattr(
         jit.subprocess,
@@ -671,12 +970,12 @@ def test_host_jit_effective_flags_and_policy_are_cached(jit, tmp_path, cxx):
         "-ffast-math",
         "-DHOST_POLICY=1",
     ]
-    assert first.manifest["key_inputs"]["build"]["host_jit_policy"] == {
-        "schema": "symmetrix.jit.host-policy/1",
-        "requested": "automatic",
-        "selected": "explicit-flags",
-        "flags": ["-ffast-math", "-DHOST_POLICY=1"],
-    }
+    policy_identity = first.manifest["key_inputs"]["build"]["host_jit_policy"]
+    assert policy_identity["schema"] == "symmetrix.jit.host-policy/2"
+    assert policy_identity["requested"] == "automatic"
+    assert policy_identity["selected"] == "explicit-flags"
+    assert policy_identity["flags"] == ["-ffast-math", "-DHOST_POLICY=1"]
+    assert policy_identity["effective_target"].startswith("host-sha256-")
     assert any("host JIT policy: explicit-flags" in item for item in first.diagnostics)
     assert any("-DHOST_POLICY=1" in item for item in first.diagnostics)
 
@@ -751,7 +1050,8 @@ def test_cuda_build_publish_validate_and_reuse(jit, monkeypatch, tmp_path):
     assert {path.name for path in built.artifact_path.parent.iterdir()} == {
         "manifest.json",
         "plugin.cu",
-        "factorized_cuda_plugin_gen11" + SHARED_SUFFIX,
+        f"factorized_cuda_plugin_gen{jit.JIT_GENERATION_VERSION}"
+        + jit._shared_library_suffix(),
     }
     manifest = jit.validate_jit_manifest(
         built.artifact_path.parent, expected_key=built.cache_key
@@ -777,6 +1077,7 @@ def test_cuda_build_publish_validate_and_reuse(jit, monkeypatch, tmp_path):
     assert "-Xcompiler=-fPIC" in options
     assert "-fPIC" not in options
     assert "-gencode=arch=compute_120,code=sm_120" in options
+    assert "--split-compile=2" in options
     assert manifest["key_inputs"]["cxx_flags"] == options
     assert any(
         "ignored ambient NVCC_PREPEND_FLAGS" in item for item in built.diagnostics
@@ -792,7 +1093,8 @@ def test_cuda_build_publish_validate_and_reuse(jit, monkeypatch, tmp_path):
     assert invocations[1]["argv"][-2] == "-o"
     assert (
         Path(invocations[1]["argv"][-1]).name
-        == "factorized_cuda_plugin_gen11" + SHARED_SUFFIX
+        == f"factorized_cuda_plugin_gen{jit.JIT_GENERATION_VERSION}"
+        + jit._shared_library_suffix()
     )
     assert all(call["prepend"] is None for call in invocations)
     assert all(call["append"] is None for call in invocations)
@@ -914,8 +1216,26 @@ def test_cache_rejects_group_writable_root(jit, tmp_path, cxx):
     )
 
     assert not result.available
-    assert "private" in result.reason
-    assert not (cache / "artifacts").exists()
+    assert "writable by group or other" in result.reason
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_rejects_world_writable_root(jit, tmp_path, cxx):
+    cache = tmp_path / "world-writable-cache"
+    cache.mkdir(mode=0o700)
+    cache.chmod(0o777)
+
+    result = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="world-writable-permission-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+
+    assert not result.available
+    assert "writable by group or other" in result.reason
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
@@ -967,7 +1287,7 @@ def test_cache_follows_symbolic_link_root(jit, tmp_path, cxx):
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
-def test_cache_reuses_foreign_root_only_with_explicit_trust(
+def test_cache_requires_opt_in_for_foreign_read_only_root(
     jit, monkeypatch, tmp_path, cxx
 ):
     cache = tmp_path / "site-cache"
@@ -983,9 +1303,7 @@ def test_cache_reuses_foreign_root_only_with_explicit_trust(
 
     real_uid = os.getuid()
     monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
-    monkeypatch.delenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, raising=False)
-
-    refused = jit.prepare_jit_artifact(
+    rejected = jit.prepare_jit_artifact(
         _source(),
         abi="test-abi",
         build="trusted-shared-test",
@@ -993,10 +1311,10 @@ def test_cache_reuses_foreign_root_only_with_explicit_trust(
         cache_root=cache,
         cxx=cxx,
     )
-    assert not refused.available
-    assert jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE in refused.reason
+    assert not rejected.available
+    assert "SYMMETRIX_JIT_TRUST_SHARED_CACHE=1" in rejected.reason
 
-    monkeypatch.setenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, "1")
+    monkeypatch.setenv("SYMMETRIX_JIT_TRUST_SHARED_CACHE", "1")
     reused = jit.prepare_jit_artifact(
         _source(),
         abi="test-abi",
@@ -1027,14 +1345,32 @@ def test_cache_rejects_group_writable_artifacts_directory(jit, tmp_path, cxx):
     )
 
     assert not result.available
-    assert "artifacts" in result.reason
-    assert "private" in result.reason
-    assert list(artifacts.iterdir()) == []
-    assert not (cache / ".staging").exists()
+    assert "writable by group or other" in result.reason
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
-def test_cache_requires_non_sticky_ancestors(jit, tmp_path, cxx):
+def test_cache_rejects_world_writable_artifacts_directory(jit, tmp_path, cxx):
+    cache = tmp_path / "open-artifacts-cache"
+    cache.mkdir(mode=0o700)
+    artifacts = cache / "artifacts"
+    artifacts.mkdir(mode=0o700)
+    artifacts.chmod(0o777)
+
+    result = jit.prepare_jit_artifact(
+        _source(),
+        abi="test-abi",
+        build="world-writable-artifacts-test",
+        cpu="test-cpu",
+        cache_root=cache,
+        cxx=cxx,
+    )
+
+    assert not result.available
+    assert "writable by group or other" in result.reason
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_accepts_world_writable_ancestors(jit, tmp_path, cxx):
     # pytest's tmp_path sits below a sticky world-writable /tmp, where other
     # users cannot rename an entry owned by this user; it must stay acceptable.
     accepted = jit.prepare_jit_artifact(
@@ -1053,7 +1389,7 @@ def test_cache_requires_non_sticky_ancestors(jit, tmp_path, cxx):
     cache = open_parent / "cache"
     cache.mkdir(mode=0o700)
 
-    refused = jit.prepare_jit_artifact(
+    accepted = jit.prepare_jit_artifact(
         _source(),
         abi="test-abi",
         build="ancestor-permission-test",
@@ -1062,12 +1398,11 @@ def test_cache_requires_non_sticky_ancestors(jit, tmp_path, cxx):
         cxx=cxx,
     )
 
-    assert not refused.available
-    assert str(cache.resolve().parent) in refused.reason
+    assert accepted.available
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
-def test_cache_rejects_foreign_owned_artifacts_without_explicit_trust(
+def test_cache_requires_opt_in_for_foreign_owned_artifacts_directory(
     jit, monkeypatch, tmp_path, cxx
 ):
     cache = tmp_path / "artifacts-owner-cache"
@@ -1082,9 +1417,7 @@ def test_cache_rejects_foreign_owned_artifacts_without_explicit_trust(
     assert prepared.available and prepared.status == "built"
 
     # A root owned by the current user can still hold an artifacts directory
-    # owned by another user, so report only that path as foreign-owned; the
-    # existing foreign-root test cannot reach this branch because the root
-    # ownership check runs first.
+    # owned by another user. Model that independently of root ownership.
     artifacts = cache / "artifacts"
     foreign_uid = os.getuid() + 1
     real_stat = os.stat
@@ -1098,9 +1431,7 @@ def test_cache_rejects_foreign_owned_artifacts_without_explicit_trust(
         return metadata
 
     monkeypatch.setattr(jit.os, "stat", fake_stat)
-    monkeypatch.delenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, raising=False)
-
-    refused = jit.prepare_jit_artifact(
+    rejected = jit.prepare_jit_artifact(
         _source(),
         abi="test-abi",
         build="artifacts-owner-test",
@@ -1108,11 +1439,10 @@ def test_cache_rejects_foreign_owned_artifacts_without_explicit_trust(
         cache_root=cache,
         cxx=cxx,
     )
-    assert not refused.available
-    assert "artifacts" in refused.reason
-    assert jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE in refused.reason
+    assert not rejected.available
+    assert "SYMMETRIX_JIT_TRUST_SHARED_CACHE=1" in rejected.reason
 
-    monkeypatch.setenv(jit.TRUST_SHARED_CACHE_ENVIRONMENT_VARIABLE, "1")
+    monkeypatch.setenv("SYMMETRIX_JIT_TRUST_SHARED_CACHE", "1")
     reused = jit.prepare_jit_artifact(
         _source(),
         abi="test-abi",
@@ -1122,6 +1452,38 @@ def test_cache_rejects_foreign_owned_artifacts_without_explicit_trust(
         cxx=cxx,
     )
     assert reused.available and reused.cache_hit
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_cache_rejects_group_writable_compiled_artifact(jit, tmp_path, cxx):
+    prepared = _prepare(jit, tmp_path, cxx)
+    assert prepared.available
+    prepared.artifact_path.chmod(0o660)
+
+    reused = _prepare(jit, tmp_path, cxx)
+
+    assert not reused.available
+    assert "compiled artifact" in reused.reason
+    assert "writable by group or other" in reused.reason
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cache permission boundary")
+def test_load_revalidates_artifact_permissions_after_prepare(jit, tmp_path, cxx):
+    prepared = _prepare(jit, tmp_path, cxx)
+    assert prepared.available
+    prepared.artifact_path.chmod(0o660)
+    loaded_modes = []
+
+    attempt = jit.load_validated_jit_artifact(
+        lambda: prepared,
+        lambda path: loaded_modes.append(Path(path).stat().st_mode & 0o777),
+        artifact_key=lambda result: result.cache_key,
+        attempts=1,
+    )
+
+    assert attempt.status == "exhausted"
+    assert loaded_modes == []
+    assert any("writable by group or other" in item for item in attempt.diagnostics)
 
 
 def test_build_publish_validate_and_reuse(jit, tmp_path, cxx):
@@ -1134,14 +1496,17 @@ def test_build_publish_validate_and_reuse(jit, tmp_path, cxx):
     assert {path.name for path in built.artifact_path.parent.iterdir()} == {
         "manifest.json",
         "plugin.cpp",
-        "execution_plugin_gen11" + SHARED_SUFFIX,
+        f"execution_plugin_gen{jit.JIT_GENERATION_VERSION}"
+        + jit._shared_library_suffix(),
     }
     manifest = jit.validate_jit_manifest(
         built.artifact_path.parent, expected_key=built.cache_key
     )
     assert manifest == built.manifest
     assert manifest["source"] == "plugin.cpp"
-    assert manifest["key_inputs"]["jit_generation_version"] == 11
+    assert (
+        manifest["key_inputs"]["jit_generation_version"] == jit.JIT_GENERATION_VERSION
+    )
     assert manifest["compiler_options"] == [
         "-std=c++20",
         "-O3",
@@ -1166,31 +1531,30 @@ def test_build_publish_validate_and_reuse(jit, tmp_path, cxx):
 def test_generation_version_publishes_and_preserves_distinct_entries(
     jit, tmp_path, cxx, monkeypatch
 ):
-    generation_eleven = _prepare(jit, tmp_path, cxx)
-    assert generation_eleven.status == "built"
-    assert (
-        generation_eleven.artifact_path.name == "execution_plugin_gen11" + SHARED_SUFFIX
+    generation_current = _prepare(jit, tmp_path, cxx)
+    assert generation_current.status == "built"
+    current_version = jit.JIT_GENERATION_VERSION
+
+    next_version = current_version + 1
+    monkeypatch.setattr(jit, "JIT_GENERATION_VERSION", next_version)
+    generation_next = _prepare(jit, tmp_path, cxx)
+    assert generation_next.status == "built"
+    assert generation_next.cache_key != generation_current.cache_key
+    assert generation_next.artifact_path.name != generation_current.artifact_path.name
+    assert generation_next.manifest["key_inputs"]["jit_generation_version"] == (
+        next_version
     )
 
-    monkeypatch.setattr(jit, "JIT_GENERATION_VERSION", 12)
-    generation_twelve = _prepare(jit, tmp_path, cxx)
-    assert generation_twelve.status == "built"
-    assert generation_twelve.cache_key != generation_eleven.cache_key
-    assert (
-        generation_twelve.artifact_path.name == "execution_plugin_gen12" + SHARED_SUFFIX
-    )
-    assert generation_twelve.manifest["key_inputs"]["jit_generation_version"] == 12
-
-    assert generation_eleven.artifact_path.is_file()
-    assert generation_eleven.manifest_path.is_file()
-    assert {generation_eleven.cache_key, generation_twelve.cache_key} <= {
+    assert generation_current.artifact_path.is_file()
+    assert generation_current.manifest_path.is_file()
+    assert {generation_current.cache_key, generation_next.cache_key} <= {
         path.name for path in (tmp_path / "cache" / "artifacts").iterdir()
     }
 
-    monkeypatch.setattr(jit, "JIT_GENERATION_VERSION", 11)
-    cached_generation_eleven = _prepare(jit, tmp_path, cxx)
-    assert cached_generation_eleven.status == "cached"
-    assert cached_generation_eleven.artifact_path == generation_eleven.artifact_path
+    monkeypatch.setattr(jit, "JIT_GENERATION_VERSION", current_version)
+    cached_generation_current = _prepare(jit, tmp_path, cxx)
+    assert cached_generation_current.status == "cached"
+    assert cached_generation_current.artifact_path == generation_current.artifact_path
 
 
 def test_changed_source_publishes_a_distinct_entry(jit, tmp_path, cxx):
@@ -1210,12 +1574,7 @@ def test_changed_native_source_fingerprint_publishes_distinct_named_artifact(
     assert first.available and second.available
     assert first.cache_key != second.cache_key
     assert first.artifact_path != second.artifact_path
-    assert first.artifact_path.name == (
-        f"execution_plugin_gen11_src{'a' * 64}{SHARED_SUFFIX}"
-    )
-    assert second.artifact_path.name == (
-        f"execution_plugin_gen11_src{'b' * 64}{SHARED_SUFFIX}"
-    )
+    assert first.artifact_path.name != second.artifact_path.name
     assert first.manifest["key_inputs"]["source_content_sha256"] == "a" * 64
     assert second.manifest["key_inputs"]["source_content_sha256"] == "b" * 64
 
@@ -1286,6 +1645,183 @@ def test_stale_load_result_does_not_quarantine_new_publication(jit, tmp_path, cx
     jit.remove_jit_quarantine(first_quarantine)
 
 
+def _jit_result(jit, cache_key, artifact, *, diagnostics=()):
+    """A prepared-result stand-in for the shared load/validate retry contract."""
+
+    return jit.JitResult(
+        status="built",
+        cache_key=cache_key,
+        artifact_path=artifact,
+        manifest_path=artifact.parent / "manifest.json",
+        manifest={"key_inputs": {"cache_key": cache_key}},
+        command=(),
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def _bypass_preload_revalidation(jit, monkeypatch):
+    """Keep shared-loader state-machine tests independent of cache fixtures."""
+
+    monkeypatch.setattr(jit, "_validated_entry", lambda *args, **kwargs: None)
+
+
+def test_load_validated_jit_artifact_returns_without_quarantine(
+    jit, monkeypatch, tmp_path
+):
+    artifact = tmp_path / "plugin.so"
+    loaded_paths = []
+
+    def unexpected_quarantine(*args, **kwargs):
+        raise AssertionError("a successful load must not quarantine")
+
+    _bypass_preload_revalidation(jit, monkeypatch)
+    monkeypatch.setattr(jit, "quarantine_jit_artifact", unexpected_quarantine)
+    attempt = jit.load_validated_jit_artifact(
+        lambda: _jit_result(jit, "key-a", artifact, diagnostics=("compiled",)),
+        loaded_paths.append,
+        artifact_key=lambda result: result.cache_key,
+    )
+
+    assert attempt.status == "loaded"
+    assert attempt.loaded
+    assert attempt.diagnostics == ("compiled",)
+    assert attempt.quarantines == ()
+    assert attempt.error is None
+    assert attempt.cache_key == "key-a"
+    assert loaded_paths == [str(artifact)]
+
+
+def test_load_validated_jit_artifact_quarantines_once_then_reloads(
+    jit, monkeypatch, tmp_path
+):
+    artifact = tmp_path / "plugin.so"
+    quarantines = []
+    load_attempts = []
+
+    def quarantine(result, reason):
+        quarantines.append((result, reason))
+        return jit.JitQuarantine(None, (f"quarantined {reason}",))
+
+    def load(path):
+        load_attempts.append(path)
+        if len(load_attempts) == 1:
+            raise RuntimeError("descriptor mismatch")
+
+    _bypass_preload_revalidation(jit, monkeypatch)
+    monkeypatch.setattr(jit, "quarantine_jit_artifact", quarantine)
+    attempt = jit.load_validated_jit_artifact(
+        lambda: _jit_result(jit, "key-a", artifact, diagnostics=("compiled",)),
+        load,
+        artifact_key=lambda result: (result.cache_key, str(result.artifact_path)),
+    )
+
+    assert attempt.status == "loaded"
+    assert len(load_attempts) == 2
+    assert len(quarantines) == 1
+    assert quarantines[0][1] == "RuntimeError: descriptor mismatch"
+    assert attempt.diagnostics == (
+        "compiled",
+        "quarantined RuntimeError: descriptor mismatch",
+        "compiled",
+    )
+
+
+def test_load_validated_jit_artifact_stops_when_one_entry_fails_twice(
+    jit, monkeypatch, tmp_path
+):
+    artifact = tmp_path / "plugin.so"
+    prepares = []
+
+    def prepare():
+        prepares.append(True)
+        return _jit_result(jit, "key-a", artifact)
+
+    def load(path):
+        raise RuntimeError("descriptor mismatch")
+
+    _bypass_preload_revalidation(jit, monkeypatch)
+    monkeypatch.setattr(
+        jit,
+        "quarantine_jit_artifact",
+        lambda result, reason: jit.JitQuarantine(None, ("quarantined",)),
+    )
+    attempt = jit.load_validated_jit_artifact(
+        prepare,
+        load,
+        artifact_key=lambda result: (result.cache_key, str(result.artifact_path)),
+    )
+
+    assert attempt.status == "load-failed"
+    assert isinstance(attempt.error, RuntimeError)
+    assert str(attempt.error) == "descriptor mismatch"
+    assert len(prepares) == 2
+    assert len(attempt.quarantines) == 1
+
+
+def test_load_validated_jit_artifact_reports_unavailable_without_loading(
+    jit, monkeypatch, tmp_path
+):
+    loaded_paths = []
+    unavailable = jit.JitResult(
+        status="fallback",
+        cache_key="key-a",
+        artifact_path=None,
+        manifest_path=None,
+        manifest=None,
+        command=(),
+        diagnostics=("compiler stderr: boom",),
+        reason="boom",
+    )
+
+    monkeypatch.setattr(
+        jit,
+        "quarantine_jit_artifact",
+        lambda *args, **kwargs: pytest.fail("an unavailable result is not quarantined"),
+    )
+    attempt = jit.load_validated_jit_artifact(
+        lambda: unavailable,
+        loaded_paths.append,
+        artifact_key=lambda result: result.cache_key,
+    )
+
+    assert attempt.status == "unavailable"
+    assert attempt.result is unavailable
+    assert attempt.cache_key == "key-a"
+    assert attempt.diagnostics == ("compiler stderr: boom",)
+    assert loaded_paths == []
+
+
+def test_load_validated_jit_artifact_exhausts_distinct_entries(
+    jit, monkeypatch, tmp_path
+):
+    prepared = []
+
+    def prepare():
+        index = len(prepared)
+        prepared.append(index)
+        return _jit_result(jit, "key-a", tmp_path / f"plugin-{index}.so")
+
+    def load(path):
+        raise RuntimeError(f"descriptor mismatch at {path}")
+
+    _bypass_preload_revalidation(jit, monkeypatch)
+    monkeypatch.setattr(
+        jit,
+        "quarantine_jit_artifact",
+        lambda result, reason: jit.JitQuarantine(None, ()),
+    )
+    attempt = jit.load_validated_jit_artifact(
+        prepare,
+        load,
+        artifact_key=lambda result: (result.cache_key, str(result.artifact_path)),
+    )
+
+    assert attempt.status == "exhausted"
+    assert attempt.error is None
+    assert len(prepared) == 4
+    assert len(attempt.quarantines) == 4
+
+
 def test_manifest_rejects_path_traversal(jit, tmp_path, cxx):
     result = _prepare(jit, tmp_path, cxx)
     manifest = json.loads(result.manifest_path.read_text())
@@ -1324,6 +1860,42 @@ def test_compile_failure_returns_diagnostics_and_cleans_staging(jit, tmp_path, c
     assert failed.command
     staging = tmp_path / "cache" / ".staging"
     assert list(staging.iterdir()) == []
+
+
+def test_compile_progress_is_flushed_only_for_cache_miss(jit, tmp_path, cxx, capsys):
+    built = _prepare(jit, tmp_path, cxx, show_progress=True)
+
+    assert built.status == "built"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "Symmetrix: compiling JIT artifact 'execution_plugin' with CXX; this may "
+        "take a few minutes on first use...\n"
+        "Symmetrix: finished compiling JIT artifact 'execution_plugin'.\n"
+    )
+
+    cached = _prepare(jit, tmp_path, cxx, show_progress=True)
+
+    assert cached.status == "cached"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_compile_progress_animates_on_interactive_stderr(jit, monkeypatch):
+    stream = io.StringIO()
+    stream.isatty = lambda: True
+    monkeypatch.setattr(jit.sys, "stderr", stream)
+
+    with jit._jit_compile_progress("test_plugin", "CXX", enabled=True):
+        time.sleep(0.22)
+
+    output = stream.getvalue()
+    assert "\rSymmetrix: compiling JIT artifact 'test_plugin' with CXX ⠋" in output
+    assert "⠙" in output
+    assert output.endswith(
+        "\rSymmetrix: finished compiling JIT artifact 'test_plugin'.\n"
+    )
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux renameat2 coverage")

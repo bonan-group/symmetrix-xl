@@ -1,11 +1,14 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include "mace_streamed_edges.hpp"
+#include "execution_mode.hpp"
+#include "implementation_registry.hpp"
 
 namespace symmetrix::execution {
 
@@ -32,12 +35,13 @@ inline const char* execution_profile_name(const ExecutionProfile profile)
 struct ExecutionPlanCandidate {
     std::string id;
     bool qualified = false;
-    std::size_t estimated_bytes = 0;
+    std::optional<std::size_t> estimated_bytes;
     std::string reason;
+    bool fixed_workspace = false;
 };
 
 struct ExecutionPlanReport {
-    MACEStreamedEdgesMode requested_algorithm = MACEStreamedEdgesMode::direct;
+    ExecutionMode requested_algorithm = ExecutionMode::direct;
     ExecutionProfile requested_profile = ExecutionProfile::capacity;
     std::string selection_source = "request";
     std::string state = "pending";
@@ -47,6 +51,16 @@ struct ExecutionPlanReport {
     std::size_t reserve_bytes = 0;
     bool boundary_attempt = false;
     std::vector<ExecutionPlanCandidate> candidates;
+
+    // Per-operator implementation binding, additive and versioned.  The
+    // whole-plan selection above says which plan runs; this says which tier of
+    // each operator it runs, so a consumer can see a portable node next to a
+    // generated one, and each binding's `selected_implementation_id` names the
+    // implementation the execution path dispatches for that node.  Version 0
+    // means the report predates tier binding: the field is reported, and the
+    // binding list is empty rather than meaning "no implementation qualified".
+    std::uint32_t binding_report_version = 0;
+    std::vector<ImplementationBinding> bindings;
 };
 
 } // namespace symmetrix::execution
