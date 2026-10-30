@@ -1199,7 +1199,7 @@ void MACEKokkos<Precision>::load_from_json(
     const bool m0_composite = h1_affine_v4();
     auto H2_weights_for_H1_vec = file[
         m0_composite ? symmetrix::h1_affine::skip_key(h1_affine_mode) : "H2_weights_for_H1"]
-        .get<std::vector<std::vector<double>>>();
+        .template get<std::vector<std::vector<double>>>();
     H2_weights_for_H1 = {};
     H2_weights_for_H1_reverse = {};
     H2_weights_for_M0 = {};
@@ -1275,7 +1275,7 @@ void MACEKokkos<Precision>::load_from_json(
         readout_1_weights_for_M0 = toKokkosView(
             "readout_1_weights_for_M0",
             file[symmetrix::h1_affine::readout_key(h1_affine_mode)]
-                .get<std::vector<double>>());
+                .template get<std::vector<double>>());
     else
         readout_1_weights = toKokkosView("readout_1_weights", file["readout_1_weights"].get<std::vector<double>>());
     auto readout_2_weights_1 = file["readout_2_weights_1"].get<std::vector<double>>();

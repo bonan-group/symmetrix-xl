@@ -96,7 +96,9 @@ def legacy_cancellation(data: dict) -> dict:
     readout = ratio(np.max(np.abs(A) @ np.abs(r)), np.max(np.abs(A @ r)))
     skip = 1.0
     for S_z in S:
-        skip = max(skip, ratio(np.max(np.abs(A) @ np.abs(S_z)), np.max(np.abs(A @ S_z))))
+        skip = max(
+            skip, ratio(np.max(np.abs(A) @ np.abs(S_z)), np.max(np.abs(A @ S_z)))
+        )
     return {"readout": readout, "skip": skip}
 
 
@@ -189,7 +191,9 @@ def scalar_linear_up_map(data: dict) -> np.ndarray:
     return _scalar_block(data, "H1_linear_up_weights")
 
 
-def _readout_and_skip(data: dict, readout_key: str, skip_key: str) -> tuple[np.ndarray, np.ndarray]:
+def _readout_and_skip(
+    data: dict, readout_key: str, skip_key: str
+) -> tuple[np.ndarray, np.ndarray]:
     K, _, num_elements = _dims(data)
     for key in (readout_key, skip_key):
         if key not in data:
@@ -229,7 +233,9 @@ def _check_head_payloads(data: dict, readout_key: str) -> None:
             raise H1AffineError(f"prediction head {name!r} is missing {readout_key}")
         stale = [key for key in LEGACY_KEYS if key in payload]
         if stale:
-            raise H1AffineError(f"prediction head {name!r} carries old-basis keys {stale}")
+            raise H1AffineError(
+                f"prediction head {name!r} carries old-basis keys {stale}"
+            )
         _finite_array(payload[readout_key], f"{name}.{readout_key}", K)
 
 
@@ -246,11 +252,14 @@ def h1_affine_mode_of(data: dict) -> str:
         )
     version = int(data.get("symmetrix_format_version", 1))
     if version in (1, 2):
-        declared = [key for key in ("h1_affine_mode", "h1_affine_version") if key in data]
+        declared = [
+            key for key in ("h1_affine_mode", "h1_affine_version") if key in data
+        ]
         declared += [key for keys in BASIS_KEYS.values() for key in keys if key in data]
         if declared:
             raise H1AffineError(
-                f"format version {version} must not declare h1_affine fields {declared}")
+                f"format version {version} must not declare h1_affine fields {declared}"
+            )
         return H1_AFFINE_MODE_LEGACY
     if version != FORMAT_VERSION:
         raise H1AffineError(f"unsupported symmetrix_format_version {version} for MACE")
@@ -267,13 +276,17 @@ def h1_affine_mode_of(data: dict) -> str:
         )
     present_old = [key for key in LEGACY_KEYS if key in data]
     if present_old:
-        raise H1AffineError(f"format-4 payload must not contain legacy keys {present_old}")
+        raise H1AffineError(
+            f"format-4 payload must not contain legacy keys {present_old}"
+        )
     other = next(m for m in H1_AFFINE_MODES if m != mode)
     present_other = [key for key in BASIS_KEYS[other] if key in data]
     if present_other:
         raise H1AffineError(f"a {mode!r} payload must not contain {present_other}")
     if data.get("model_type", "MACE") not in ("MACE", "MACEField"):
-        raise H1AffineError(f"model_type {data.get('model_type')!r} is not standard MACE")
+        raise H1AffineError(
+            f"model_type {data.get('model_type')!r} is not standard MACE"
+        )
     if data.get("radial_representation") not in ("compact", "pair-splines"):
         raise H1AffineError(
             "format version 4 requires radial_representation 'compact' or "
@@ -286,8 +299,12 @@ def h1_affine_mode_of(data: dict) -> str:
             "field-coupled features; such models use 'pre_linear_up'"
         )
     if mode == H1_AFFINE_MODE_PRE_LINEAR_UP:
-        if int(data.get("num_interactions", 2)) != 2 or data.get("single_layer_readout"):
-            raise H1AffineError("the pre_linear_up basis applies to two-interaction models only")
+        if int(data.get("num_interactions", 2)) != 2 or data.get(
+            "single_layer_readout"
+        ):
+            raise H1AffineError(
+                "the pre_linear_up basis applies to two-interaction models only"
+            )
         if "H1_product_weights" not in data:
             raise H1AffineError("the pre_linear_up basis requires H1_product_weights")
     missing = [key for key in BASIS_KEYS[mode] if key not in data]
@@ -308,9 +325,15 @@ def validate_payload(data: dict) -> dict:
         cancellation = legacy_cancellation(data)
         warning = legacy_format_message(version, cancellation)
         cancellation = {key: _bounded(value) for key, value in cancellation.items()}
-        return {"mode": mode, "format_version": version, "K": K, "L_max": L_max,
-                "num_elements": num_elements, "cancellation": cancellation,
-                "warning": warning}
+        return {
+            "mode": mode,
+            "format_version": version,
+            "K": K,
+            "L_max": L_max,
+            "num_elements": num_elements,
+            "cancellation": cancellation,
+            "warning": warning,
+        }
     readout, skip = affine_maps(data, mode)
     return {
         "mode": mode,
@@ -332,8 +355,16 @@ def conditioning(A: np.ndarray, name: str = "C") -> dict:
     }
 
 
-def identity_check(A: np.ndarray, r: np.ndarray, S: np.ndarray, q: np.ndarray,
-                   T: np.ndarray, *, num_probe_rows: int = 64, seed: int = 20261017) -> dict:
+def identity_check(
+    A: np.ndarray,
+    r: np.ndarray,
+    S: np.ndarray,
+    q: np.ndarray,
+    T: np.ndarray,
+    *,
+    num_probe_rows: int = 64,
+    seed: int = 20261017,
+) -> dict:
     """fp64 identities (m A) r == m q and (m A) S_z == m T_z for every element z.
 
     A is the map in front of the old basis (C for m0_composite, U0 for
@@ -352,11 +383,17 @@ def identity_check(A: np.ndarray, r: np.ndarray, S: np.ndarray, q: np.ndarray,
     out = {
         "probe_rows": num_probe_rows,
         "seed": seed,
-        "q_vs_Cr_max_rel": float(np.max(np.abs(q - A @ r)) / max(np.max(np.abs(q)), 1e-300)),
-        "q_vs_Cr_max_rel_terms": float(np.max(np.abs(q - A @ r) / np.maximum(q_terms, 1e-300))),
+        "q_vs_Cr_max_rel": float(
+            np.max(np.abs(q - A @ r)) / max(np.max(np.abs(q)), 1e-300)
+        ),
+        "q_vs_Cr_max_rel_terms": float(
+            np.max(np.abs(q - A @ r) / np.maximum(q_terms, 1e-300))
+        ),
         "E1_max_abs_diff": float(np.max(np.abs(e_old - e_new))),
         "E1_scale": float(np.max(np.abs(e_new))),
-        "E1_max_rel_terms": float(np.max(np.abs(e_old - e_new) / np.maximum(e_terms, 1e-300))),
+        "E1_max_rel_terms": float(
+            np.max(np.abs(e_old - e_new) / np.maximum(e_terms, 1e-300))
+        ),
         "per_element": [],
     }
     for z in range(S.shape[0]):
@@ -364,22 +401,28 @@ def identity_check(A: np.ndarray, r: np.ndarray, S: np.ndarray, q: np.ndarray,
         h2_new = m @ T[z]
         h2_terms = np.abs(H1) @ np.abs(S[z])
         t_terms = np.abs(A) @ np.abs(S[z])
-        out["per_element"].append({
-            "z_index": z,
-            "T_vs_CS_max_rel": float(
-                np.max(np.abs(T[z] - A @ S[z])) / max(np.max(np.abs(T[z])), 1e-300)),
-            "T_vs_CS_max_rel_terms": float(
-                np.max(np.abs(T[z] - A @ S[z]) / np.maximum(t_terms, 1e-300))),
-            "H2_max_abs_diff": float(np.max(np.abs(h2_old - h2_new))),
-            "H2_scale": float(np.max(np.abs(h2_new))),
-            "H2_max_rel_terms": float(
-                np.max(np.abs(h2_old - h2_new) / np.maximum(h2_terms, 1e-300))),
-        })
+        out["per_element"].append(
+            {
+                "z_index": z,
+                "T_vs_CS_max_rel": float(
+                    np.max(np.abs(T[z] - A @ S[z])) / max(np.max(np.abs(T[z])), 1e-300)
+                ),
+                "T_vs_CS_max_rel_terms": float(
+                    np.max(np.abs(T[z] - A @ S[z]) / np.maximum(t_terms, 1e-300))
+                ),
+                "H2_max_abs_diff": float(np.max(np.abs(h2_old - h2_new))),
+                "H2_scale": float(np.max(np.abs(h2_new))),
+                "H2_max_rel_terms": float(
+                    np.max(np.abs(h2_old - h2_new) / np.maximum(h2_terms, 1e-300))
+                ),
+            }
+        )
     return out
 
 
-def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: int,
-                             source_path: str | None = None) -> tuple[dict, dict]:
+def recompose_legacy_payload(
+    data: dict, *, source_sha256: str, source_bytes: int, source_path: str | None = None
+) -> tuple[dict, dict]:
     """Convert a format-1/2 standard MACE / MACEField payload to format 4.
 
     Covers every old kind: compact (v2) and pair-splines (v1) radial data,
@@ -404,7 +447,8 @@ def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: in
         key in data for keys in BASIS_KEYS.values() for key in keys
     ):
         raise H1AffineError(
-            f"format version {version} must not declare h1_affine fields")
+            f"format version {version} must not declare h1_affine fields"
+        )
     radial = "compact" if version == 2 else "pair-splines"
     if version == 2 and data.get("radial_representation") != "compact":
         raise H1AffineError("format version 2 requires radial_representation 'compact'")
@@ -412,7 +456,9 @@ def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: in
     if mode == H1_AFFINE_MODE_PRE_LINEAR_UP:
         A = scalar_linear_up_map(data)
         if "H1_product_weights" not in data:
-            raise H1AffineError("residual-first / MACEField payload lacks H1_product_weights")
+            raise H1AffineError(
+                "residual-first / MACEField payload lacks H1_product_weights"
+            )
     else:
         A = scalar_h1_map(data)
     r, S = legacy_maps(data)
@@ -424,13 +470,16 @@ def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: in
     checks["mode"] = mode
     diag = conditioning(scalar_h1_map(data))
     diag["legacy_cancellation"] = {
-        key: _bounded(value) for key, value in legacy_cancellation(data).items()}
-    diag.update({
-        "legacy_readout_1_l2": float(np.linalg.norm(r)),
-        "legacy_skip_fro": float(np.linalg.norm(S)),
-        "readout_1_l2": float(np.linalg.norm(q)),
-        "skip_fro": float(np.linalg.norm(T)),
-    })
+        key: _bounded(value) for key, value in legacy_cancellation(data).items()
+    }
+    diag.update(
+        {
+            "legacy_readout_1_l2": float(np.linalg.norm(r)),
+            "legacy_skip_fro": float(np.linalg.norm(S)),
+            "readout_1_l2": float(np.linalg.norm(q)),
+            "skip_fro": float(np.linalg.norm(T)),
+        }
+    )
     if mode == H1_AFFINE_MODE_PRE_LINEAR_UP:
         diag.update(conditioning(A, "U0"))
     readout_key, skip_key = BASIS_KEYS[mode]
@@ -453,7 +502,9 @@ def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: in
             payload = dict(payload)
             if "readout_1_weights" not in payload:
                 raise H1AffineError(f"prediction head {name!r} lacks readout_1_weights")
-            head_r = _finite_array(payload.pop("readout_1_weights"), f"{name}.readout_1_weights", K)
+            head_r = _finite_array(
+                payload.pop("readout_1_weights"), f"{name}.readout_1_weights", K
+            )
             payload[readout_key] = (A @ head_r).tolist()
             parameters[name] = payload
         out["prediction_heads"] = dict(section, parameters=parameters)
@@ -473,8 +524,9 @@ def recompose_legacy_payload(data: dict, *, source_sha256: str, source_bytes: in
     return out, checks
 
 
-def native_composite_maps(P0: np.ndarray, r0_scaled: np.ndarray,
-                          S0: list[np.ndarray]) -> tuple[np.ndarray, list[np.ndarray]]:
+def native_composite_maps(
+    P0: np.ndarray, r0_scaled: np.ndarray, S0: list[np.ndarray]
+) -> tuple[np.ndarray, list[np.ndarray]]:
     """Fresh export from native weights: q = P0 r0*scale, T_z = P0 S0_z (no inverse)."""
     q = P0 @ r0_scaled
     T = [P0 @ S0_z for S0_z in S0]

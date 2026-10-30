@@ -179,7 +179,8 @@ def test_dual_layer_distributed_tiled_lifecycle_uses_feature_mapping():
         "void MACEKokkos<Precision>::accumulate_single_layer_tiled_outputs(\n",
     )
     assert "identity_receiver_features = receiver_features.extent(0) == 0" in tiled
-    assert tiled.count("receiver_features(global_receiver)") == 4
+    # Four state/adjoint scatter/gather stages plus the four format-4 M0 ones.
+    assert tiled.count("receiver_features(global_receiver)") == 8
     assert "compute_dual_layer_tiled_phase1(num_receivers);" in evaluate
     assert "compute_dual_layer_tiled_phase2(num_receivers);" in evaluate
     assert "compute_dual_layer_tiled_phase3(num_receivers);" in evaluate

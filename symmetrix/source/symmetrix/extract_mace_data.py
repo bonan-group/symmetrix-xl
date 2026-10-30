@@ -1175,8 +1175,12 @@ def _extract_single_head_data(
         H1_weights[l, :, :] = weights_0[l, :, :] @ weights_1[l, :, :]
     output["H1_weights"] = H1_weights.flatten().tolist()
     # Native scalar product map P0 (M0 -> pre-linear_up H1) and linear_up U0.
-    h1_product_scalar_weights = np.array(weights_0[0, :, :], dtype=np.float64, copy=True)
-    h1_linear_up_scalar_weights = np.array(weights_1[0, :, :], dtype=np.float64, copy=True)
+    h1_product_scalar_weights = np.array(
+        weights_0[0, :, :], dtype=np.float64, copy=True
+    )
+    h1_linear_up_scalar_weights = np.array(
+        weights_1[0, :, :], dtype=np.float64, copy=True
+    )
     if is_macefield or first_interaction_residual:
         output["H1_product_weights"] = weights_0.flatten().tolist()
         output["H1_linear_up_weights"] = weights_1.flatten().tolist()
@@ -1629,7 +1633,8 @@ def _extract_single_head_data(
             "sigma_max_U0": float(singular_U0[0]),
             "cond_U0": (
                 float(singular_U0[0] / singular_U0[-1])
-                if singular_U0[-1] > 0 else None  # None: singular U0
+                if singular_U0[-1] > 0
+                else None  # None: singular U0
             ),
             "sigma_min_P0": float(singular_P0[-1]),
             "sigma_max_P0": float(singular_P0[0]),

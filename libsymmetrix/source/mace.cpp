@@ -2921,7 +2921,7 @@ void MACECPU<Precision>::load_from_json(
     if (h1_affine_v4()) {
         H2_weights_for_M0 = checked_precision_data<Precision>(
             file[symmetrix::h1_affine::skip_key(h1_affine_mode)]
-                .get<std::vector<std::vector<double>>>());
+                .template get<std::vector<std::vector<double>>>());
     } else {
         H2_weights_for_H1 = checked_precision_data<Precision>(
             file["H2_weights_for_H1"].get<std::vector<std::vector<double>>>());
@@ -2933,7 +2933,7 @@ void MACECPU<Precision>::load_from_json(
     if (h1_affine_v4()) {
         readout_1_weights_for_M0 = checked_precision_data<Precision>(
             file[symmetrix::h1_affine::readout_key(h1_affine_mode)]
-                .get<std::vector<double>>());
+                .template get<std::vector<double>>());
     } else {
         readout_1_weights = checked_precision_data<Precision>(
             file["readout_1_weights"].get<std::vector<double>>());
