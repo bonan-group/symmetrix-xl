@@ -63,6 +63,9 @@ NATIVE_UNPREFIXED = frozenset(
         "cblas.hpp",
         "compact_radial.cpp",
         "compact_radial.hpp",
+        # Shared FFT-provider loading, not a model-family implementation.
+        "cufft_runtime.cpp",
+        "cufft_runtime.hpp",
         "fourier_d3_coordination.cpp",
         "fourier_d3_coordination.hpp",
         "fourier_d3_evaluator.cpp",
@@ -189,6 +192,7 @@ PYTHON_UNPREFIXED = frozenset(
         "backend_loader.py",
         "calculator.py",
         "corrections.py",
+        "cufft_library.py",
         "cuda_codegen_common.py",
         "ensemble.py",
         "extract_mace_data.py",

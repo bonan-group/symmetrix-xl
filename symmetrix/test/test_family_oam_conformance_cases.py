@@ -192,6 +192,19 @@ class OAMAdapter(Adapter):
     def compiler_free_marker(self) -> tuple[str, ...]:
         return ("implementation=portable_oam_kokkos_generic",)
 
+    def expected_buffer_dtype(self) -> str:
+        return self.precision
+
+    def assert_generated_binding(self, binding) -> None:
+        expected = (
+            "generated-r1"
+            if execution_space() == "Cuda"
+            else "receiver_owned_full_message_oam_host_v7"
+        )
+        assert binding["implementation_id"] == expected, binding
+        assert binding["portable_covered"] is False, binding
+        assert binding["artifact_required"] is True, binding
+
     def accepted_generation(self, evaluator) -> int:
         return int(evaluator.graph_generation)
 
@@ -225,9 +238,7 @@ OAM_KEYS = frozenset(
 OAM_MINIMAL_KEYS = OAM_KEYS | {"self_connection"}
 OAM_LAYOUTS = frozenset(("edge_major", "lane_major"))
 OAM_REDUCTIONS = frozenset(("reduce_forces", "reduce_stress"))
-OAM_GENERATED = frozenset(
-    ("radial", "edge_tensor_product", "pre_linear", "post_linear", "readout")
-)
+OAM_GENERATED = frozenset(("edge_tensor_product",))
 
 # Each entry is one admitted contract instance.  ``parameters`` states the
 # instance's shape, layout, precision, and derivative requirements so a failure

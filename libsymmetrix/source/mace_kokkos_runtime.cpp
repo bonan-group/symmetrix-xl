@@ -5068,7 +5068,8 @@ MACEKokkos<Precision>::artifact_readiness_for(const std::string& target) const
     }
     // A device target reports the artifact that target binds rather than a host
     // one that happens to be ready alongside it.
-    const bool device_ready = jit_device_plugin_ready();
+    const bool device_ready = target == family_execution_target()
+        && jit_device_plugin_ready();
     readiness.ready = device_ready;
     readiness.artifact_id = device_ready
         ? jit_device_plugin_artifact_id() : std::string();

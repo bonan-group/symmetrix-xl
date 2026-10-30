@@ -427,6 +427,30 @@ def test_the_program_scales_its_backbone_with_the_interaction_count(
 
 
 @pytest.mark.parametrize("dtype", ("float64", "float32"))
+def test_quadrupole_features_admit_raw_program_but_refuse_composition(tmp_path, dtype):
+    """L's schema/program admission must not request an unsupported conversion."""
+
+    data = extract_mace_polar_data(
+        _build_polar_shaped_model(num_interactions=3, hidden_irreps="4x0e+4x1o+4x2e")
+    )
+    path = _write_model(tmp_path / "polar-quadrupole.json", data)
+    evaluator_class = family_registry.resolve_evaluator_class(
+        FAMILY_ENTRY, dtype=dtype, native=_native_module()
+    )
+    evaluator = evaluator_class(str(path))
+    assert evaluator.has_polar_long_range_contract
+    nodes = _program_nodes(evaluator.family_program)
+    assert {
+        node_id.split(".")[1]
+        for node_id in nodes
+        if node_id.startswith("mh1.interaction")
+    } == {"interaction0", "interaction1", "interaction2"}
+    assert set(nodes) & LONG_RANGE_NODES == LONG_RANGE_NODES
+    with pytest.raises(RuntimeError, match="l<=2"):
+        Symmetrix(str(path), dtype=dtype, streamed_edges="reference")
+
+
+@pytest.mark.parametrize("dtype", ("float64", "float32"))
 @pytest.mark.parametrize("skin_shell", (False, True))
 def test_scalar_single_layer_reference_retains_features_without_generated_artifacts(
     tmp_path, dtype, skin_shell
@@ -802,7 +826,7 @@ def test_direct_loads_generated_backbone_and_default_resolves_to_reference(
     assert direct._native_streamed_edges == "direct"
     assert direct.jit_status in ("built", "cached")
     assert direct.evaluator.uses_mh1_fast_path
-    if _native_module()._kokkos_default_execution_space() == "Cuda":
+    if _native_module()._kokkos_default_execution_space() in ("Cuda", "HIP"):
         assert direct.evaluator.jit_mh1_cuda_plugin_v5_ready
     else:
         assert direct.evaluator.jit_mh1_host_plugin_v7_ready

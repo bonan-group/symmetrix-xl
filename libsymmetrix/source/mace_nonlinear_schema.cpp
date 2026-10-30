@@ -410,6 +410,42 @@ void validate_mace_nonlinear_schema(const nlohmann::json& data)
     validate_mace_backbone_schema(data, MaceBackboneSchema::mh1);
 }
 
+bool mace_backbone_materialized_retention_required(const MaceBackboneSchema schema)
+{
+    return schema == MaceBackboneSchema::polar;
+}
+
+bool mace_backbone_materialized_retention_deferred(
+    const nlohmann::json& data, const MaceBackboneSchema schema)
+{
+    if(!mace_backbone_materialized_retention_required(schema))
+        return false;
+    const Irreps nodes(data.at("interactions").at(0)
+        .at("node_feats_irreps").get<std::string>());
+    if(nodes.blocks.size()!=1||nodes.blocks.front().l!=0
+        ||nodes.blocks.front().parity!=1)
+        return false;
+    const int channels=nodes.blocks.front().multiplicity;
+    bool higher_angular=false;
+    for(const auto& product:data.at("products")) {
+        const Irreps output(product.at("symmetric_contractions")
+            .at("irreps_out").get<std::string>());
+        if(output.blocks.empty())
+            return false;
+        // Defer only a canonical unsupported basis. Malformed parity, block
+        // order, or multiplicity must still reach retained-layout validation.
+        for(std::size_t index=0;index<output.blocks.size();++index) {
+            const auto& block=output.blocks[index];
+            if(block.multiplicity!=channels||block.l<0
+                ||static_cast<std::size_t>(block.l)!=index
+                ||block.parity!=(index%2==0?1:-1))
+                return false;
+        }
+        higher_angular=higher_angular||output.blocks.size()>2;
+    }
+    return higher_angular;
+}
+
 void validate_mace_retained_product_connectivity(const nlohmann::json& product)
 {
     const Irreps output(product.at("symmetric_contractions")

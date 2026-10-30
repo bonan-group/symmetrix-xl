@@ -751,6 +751,15 @@ def generated_host_r0_artifact(
     kokkos_class, dtype, weighted, atol = request.param
     model_path = standard_full_json_path if weighted else macefield_full_json_path
     model_data = json.loads(model_path.read_text())
+    if weighted:
+        # Alchemical execution admits a single prediction head. The flat
+        # payload already holds the exported default's exact parameters.
+        heads = model_data.pop("prediction_heads")
+        assert model_data["head"] == heads["default"]
+        for name, values in heads["parameters"][heads["default"]].items():
+            assert model_data[name] == values
+        model_path = tmp_path_factory.mktemp("r0-weighted-single-head") / "model.json"
+        model_path.write_text(json.dumps(model_data))
     source, metadata = render_jit_r0_host_plugin(
         model_data["execution_contracts"]["R0"],
         precision=dtype,
@@ -805,6 +814,9 @@ def test_generated_host_r0_matches_builtin_execution(
     for evaluator in (control, generated):
         evaluator.set_streamed_edges("direct")
         evaluator._set_factorized_source_strategy("jit_plugin")
+        evaluator._set_edge_geometry_policy(
+            "unit-f32-radius-f64-v1" if dtype == "float32" else "cartesian-f64-v1"
+        )
         evaluator._set_harmonic_storage_policy("y-only-direct-v1")
         evaluator._set_standard_m0_executor("standard")
         evaluator._set_m1_polynomial_policy("recompute")

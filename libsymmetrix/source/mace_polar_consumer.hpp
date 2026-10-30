@@ -227,7 +227,7 @@ public:
                 "MACE Polar artifact target does not match the active backend: "
                 +selected_target+" != "+active_target);
         const bool device=selected_target!="host";
-        const auto launch_plan=install_artifact_contract_identity(path,device);
+        const auto launch_plan=install_artifact_contract_identity(path,selected_target);
         if(device) {
             evaluator_.load_jit_mh1_cuda_plugin_v5(path,launch_plan.dump());
             return evaluator_.jit_mh1_cuda_plugin_v5_ready();
@@ -685,8 +685,9 @@ private:
     }
 
     nlohmann::json install_artifact_contract_identity(
-        const std::string& artifact_path,const bool device)
+        const std::string& artifact_path,const std::string& target)
     {
+        const bool device=target!="host";
         const auto manifest_path=
             std::filesystem::path(artifact_path).parent_path()/"manifest.json";
         std::ifstream stream(manifest_path);
@@ -715,7 +716,10 @@ private:
                 !="symmetrix.execution.mh1.node-metadata/1")
                 throw std::invalid_argument(
                     "MACE Polar artifact node contract tag is unsupported.");
-            if(device&&(contract.at("abi")!="symmetrix.jit.mh1.cuda-plugin/5"
+            const char* device_abi=target=="hip"
+                ?"symmetrix.jit.mh1.hip-module/5"
+                :"symmetrix.jit.mh1.cuda-plugin/5";
+            if(device&&(contract.at("abi")!=device_abi
                 ||contract.at("abi_version")!=5))
                 throw std::invalid_argument(
                     "MACE Polar artifact device node contract is unsupported.");

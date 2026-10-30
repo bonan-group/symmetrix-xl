@@ -4063,7 +4063,9 @@ int MaceBackboneKokkosT<Precision>::layer_feature_components(
         [&](const auto& layout) { return layout.width==width; });
     if(found==layer_retained_feature_layouts.end())
         throw std::runtime_error(
-            "MH-1 layer node features do not match a retained layout.");
+            "MH-1 layer node features do not match a retained layout; "
+            "model-convention conversion supports l<=1 only "
+            "(l<=2 and higher bases are unsupported).");
     return (found->scalar_multiplicity>0?1:0)+found->vector_components;
 }
 
@@ -5097,9 +5099,13 @@ MaceBackboneKokkosT<Precision>::MaceBackboneKokkosT(
     :node_embedding(data.at("node_embedding"))
 {
     validate_mace_backbone_schema(data,schema);
-    if(schema==MaceBackboneSchema::polar)
+    const bool reference_retention=
+        mace_backbone_materialized_retention_required(schema);
+    if(reference_retention)
         for(const auto& product:data.at("products"))
             validate_mace_retained_product_connectivity(product);
+    const bool reference_layouts=reference_retention
+        &&!mace_backbone_materialized_retention_deferred(data,schema);
     mh1_pair_spline_nodes_=data.at("radial_embedding").value(
         "num_spline_points",256);
     selected_head=data.value("selected_head",std::string());available_heads=data.value("available_heads",std::vector<std::string>());
@@ -5164,17 +5170,16 @@ MaceBackboneKokkosT<Precision>::MaceBackboneKokkosT(
     stage_description=symmetrix::mace_nonlinear::StageDescription::canonical(
         interactions.size());
     mh1_family=analyze_mh1_family_architecture(data,schema);
-    // Polar reference execution also retains product outputs and transposes
-    // chain seeds for topologies outside the generated MH-1 support matrix
-    // (notably the scalar-only, one-interaction S checkpoint). The layout
-    // builder still validates every block and output width independently.
-    if(mh1_family.compatible||schema==MaceBackboneSchema::polar) {
+    // Retained reference consumers may admit topologies outside the generated
+    // node support matrix. The schema defers canonical higher-angular bases
+    // to composition admission; malformed layouts still reach validation.
+    if(mh1_family.compatible||reference_layouts) {
         layer_retained_feature_layouts.reserve(mh1_family.layer_count());
         for(std::size_t layer=0;layer<mh1_family.layer_count();++layer)
             layer_retained_feature_layouts.push_back(
                 make_layer_retained_feature_layout(layer));
     }
-    materialized_reference_ready_=schema==MaceBackboneSchema::polar
+    materialized_reference_ready_=reference_layouts
         &&layer_retained_feature_layouts.size()==interactions.size();
     // The Python routing layer validates the contract against the complete
     // model before setting this identity. Do not trust embedded hashes here:
@@ -5789,8 +5794,8 @@ MaceBackboneKokkosT<Precision>::load_family_artifact(
     if(target!="host") {
         // A device target reports the device artifact rather than a host one
         // that happens to be ready alongside it.
-        readiness.ready=
-            jit_mh1_cuda_plugin_v5_ready();
+        readiness.ready=target==family_capabilities().target
+            &&jit_mh1_cuda_plugin_v5_ready();
         readiness.artifact_id=readiness.ready
             ?jit_mh1_cuda_plugin_artifact_id():std::string();
         readiness.reason=readiness.ready

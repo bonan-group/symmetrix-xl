@@ -553,11 +553,14 @@ def test_native_float32_matches_native_float64(streamed_model_paths):
     atoms = _small_structure()
 
     def evaluate(model_path, dtype, electric_field=None):
+        field_options = (
+            {} if electric_field is None else {"electric_field": electric_field}
+        )
         calculator = Symmetrix(
             model_path,
             dtype=dtype,
             streamed_edges="all_interactions",
-            electric_field=electric_field,
+            **field_options,
         )
         assert isinstance(
             calculator.evaluator,
@@ -681,6 +684,31 @@ def test_legacy_pair_spline_models_are_refused(
             legacy_standard_model_path,
             dtype=dtype,
         )
+
+
+def test_multihead_pair_spline_export_preserves_prediction_heads(
+    macefield_model_path, streamed_model_paths
+):
+    _, field_path = streamed_model_paths
+    compact = json.loads(field_path.read_text())
+    assert len(compact["prediction_heads"]["names"]) > 1
+    legacy = extract_mace_data(
+        macefield_model_path,
+        species=[7, 13],
+        head="mp-dielectric",
+        num_spline_points=16,
+        radial_format="pair-splines",
+    )
+    assert legacy["prediction_heads"] == compact["prediction_heads"]
+    assert legacy["head"] == legacy["prediction_heads"]["default"] == "mp-dielectric"
+    for name, values in legacy["prediction_heads"]["parameters"][
+        legacy["head"]
+    ].items():
+        assert legacy[name] == values
+    assert legacy.get("symmetrix_format_version", 1) == 1
+    assert legacy.get("radial_representation") != "compact"
+    assert "compact_radial" not in legacy
+    assert "execution_contracts" not in legacy
 
 
 def test_kokkos_streamed_path_offsets_match_model_layout(streamed_model_paths):
@@ -1592,7 +1620,12 @@ def test_factorized_source_strategies_match_serial_reference(
     assert evaluator.factorized_arena_workspace_bytes == 0
     assert evaluator.factorized_radial_workspace_bytes == 0
     assert evaluator.factorized_jit_ready
-    assert evaluator.factorized_jit_artifact_id.startswith("jit-r1-gen12-")
+    from symmetrix.jit import JIT_GENERATION_VERSION
+
+    assert evaluator.factorized_jit_artifact_id.startswith(
+        f"jit-r1-gen{JIT_GENERATION_VERSION}-"
+    )
+    assert evaluator.factorized_jit_artifact_id == calculator.jit_artifact_id
     assert evaluator.factorized_jit_contract_fingerprint.startswith("sha256:")
     assert evaluator.factorized_forward_coupling_workspace_bytes == 0
     assert evaluator.factorized_reverse_coupling_workspace_bytes == 0
@@ -4588,21 +4621,31 @@ def test_factorized_contract_gate_and_legacy_compatibility(
         )
 
     atoms = _small_structure()
-    r0_mismatched_calculator = Symmetrix(
-        r0_mismatched_path,
+    with pytest.raises(
+        RuntimeError,
+        match="Execution R0 generation fingerprint does not match its contract",
+    ):
+        Symmetrix(
+            r0_mismatched_path,
+            dtype="float32",
+            streamed_edges="direct",
+        )
+
+    r0_valid_calculator = Symmetrix(
+        standard_path,
         dtype="float32",
         streamed_edges="direct",
     )
-    r0_mismatched_calculator.evaluator._set_factorized_source_strategy("jit_plugin")
-    atoms.calc = r0_mismatched_calculator
+    r0_valid_calculator.evaluator._set_factorized_source_strategy("jit_plugin")
+    atoms.calc = r0_valid_calculator
     assert np.isfinite(atoms.get_potential_energy())
-    assert r0_mismatched_calculator.evaluator.standard_r0_has_model_contract
+    assert r0_valid_calculator.evaluator.standard_r0_has_model_contract
     if _execution_fixed_weight_backend_supported():
-        assert r0_mismatched_calculator.evaluator.standard_r0_module_ready
-        assert r0_mismatched_calculator.evaluator.standard_r0_module_launch_count == 4
-        assert r0_mismatched_calculator.evaluator.factorized_jit_ready
+        assert r0_valid_calculator.evaluator.standard_r0_module_ready
+        assert r0_valid_calculator.evaluator.standard_r0_module_launch_count == 4
+        assert r0_valid_calculator.evaluator.factorized_jit_ready
     else:
-        assert r0_mismatched_calculator.evaluator.standard_r0_module_launch_count == 0
+        assert r0_valid_calculator.evaluator.standard_r0_module_launch_count == 0
 
 
 @pytest.mark.parametrize(
@@ -4879,7 +4922,14 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
     )
     evaluator = calculator.evaluator
     evaluator._set_factorized_source_strategy("jit_plugin")
-    evaluator._set_standard_r0_executor("v2_edge16")
+    # Host graph policy selects the receiver-owned R0 schedule; devices use
+    # edge16. Pin and check the exact backend schedule throughout token reuse.
+    expected_r0_executor = (
+        "v2_receiver"
+        if _kokkos_execution_space() in ("OpenMP", "Serial")
+        else "v2_edge16"
+    )
+    evaluator._set_standard_r0_executor(expected_r0_executor)
     inputs = calculator._mace_inputs(atoms)
 
     token = evaluator._prepare_factorized_graph(*inputs[:5])
@@ -4947,7 +4997,7 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
     if _execution_fixed_weight_backend_supported():
         assert evaluator.standard_r0_module_ready
         assert evaluator.standard_r0_module_id == "standard-r0-module-module-v2"
-        assert evaluator.standard_r0_selected_executor == "v2_edge16"
+        assert evaluator.standard_r0_selected_executor == expected_r0_executor
         assert evaluator.factorized_jit_ready
         assert evaluator.factorized_jit_contract_fingerprint.startswith("sha256:")
         assert evaluator.factorized_selected_direct_forward_executor == ("jit_all")
@@ -4977,18 +5027,25 @@ def test_factorized_prepared_graph_token_lifecycle(streamed_model_paths):
         assert evaluator.execution_phi1r_capacity_bytes == 0
         assert evaluator.execution_dphi1r_active_bytes == 0
         assert evaluator.execution_dphi1r_capacity_bytes == 0
-        # The A1 kind binds the strided-batched BLAS route, which shares the
-        # BLAS context: these counters are that route's, and the R1 stage adds
-        # no legacy factorized custom-BLAS launch or stream bind on top of them.
-        # The absolute pin is two evaluations, both directions, one call per
-        # hidden degree.
+        # These counters belong to the CUDA A1 strided-batched BLAS route.
+        # Host/HIP execution does not enter that CUDA-specific branch.
+        # Preserve its two-evaluation pin: both directions, per hidden degree.
         hidden_degrees = json.loads(standard_path.read_text())["l_max"] + 1
-        assert evaluator.batched_a1_blas_launch_count == 2 * hidden_degrees * 2
-        # The model carries a generated M1 contract, so both directions run the
-        # architecture-specialized module and the portable CUDA route is
-        # shadowed.
-        assert evaluator.generated_m1_module_forward_launch_count == 2
-        assert evaluator.generated_m1_module_reverse_launch_count == 2
+        assert evaluator.batched_a1_blas_launch_count == (
+            2 * hidden_degrees * 2 if _kokkos_execution_space() == "Cuda" else 0
+        )
+        if _kokkos_execution_space() in ("OpenMP", "Serial"):
+            # This host profile binds the prebuilt standard M1 module. Check
+            # its actual work, rather than requiring an unrequested JIT owner.
+            assert evaluator.standard_m1_module_ready
+            assert not evaluator.m1_host_plugin_ready
+            assert evaluator.standard_m1_module_forward_launch_count == 2
+            assert evaluator.standard_m1_module_reverse_launch_count == 2
+            assert evaluator.generated_m1_module_forward_launch_count == 0
+            assert evaluator.generated_m1_module_reverse_launch_count == 0
+        else:
+            assert evaluator.generated_m1_module_forward_launch_count == 2
+            assert evaluator.generated_m1_module_reverse_launch_count == 2
         assert evaluator.m1_device_terms_launch_count == 0
         # The H2 forward and reverse each bind a CUDA-scoped fused kernel: two
         # launches per evaluation on the device, none on the host.

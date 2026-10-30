@@ -3006,7 +3006,8 @@ NequIPOAMKokkos<Precision>::artifact_readiness_for(
               "implementation remains available in reference mode";
         return readiness;
     }
-    const bool device = cuda_r1_plugin_ && static_cast<bool>(*cuda_r1_plugin_);
+    const bool device = target == execution_target() && target == "cuda"
+        && cuda_r1_plugin_ && static_cast<bool>(*cuda_r1_plugin_);
     readiness.ready = device;
     readiness.artifact_id = device ? cuda_r1_artifact_id_ : std::string();
     // The generated CUDA identity publishes no separate generation

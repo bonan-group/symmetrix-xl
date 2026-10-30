@@ -108,11 +108,12 @@ def register_family(declaration: FamilyConformance) -> FamilyConformance:
 def crystal(name: str) -> Atoms:
     """The periodic structure registered under ``name``, sized so the skin is real."""
 
+    structures = __getattr__("STRUCTURES")
     try:
-        factory = STRUCTURES[name]
+        factory = structures[name]
     except KeyError:
         raise ValueError(
-            f"unknown structure {name!r}; declared: {sorted(STRUCTURES)}"
+            f"unknown structure {name!r}; declared: {sorted(structures)}"
         ) from None
     return factory()
 
@@ -120,6 +121,7 @@ def crystal(name: str) -> Atoms:
 def build_models(root: Path) -> dict:
     """Every registered family's session models, built once per session."""
 
+    __getattr__("ADAPTER_SPECS")
     models: dict = {}
     for family in _FAMILIES:
         models.update(family.build_models(root))
@@ -179,10 +181,6 @@ def _validate() -> None:
                 )
 
 
-_discover_family_modules()
-_validate()
-
-
 def _merged_instances() -> dict[str, dict]:
     merged: dict[str, dict] = {}
     for family in _FAMILIES:
@@ -190,37 +188,59 @@ def _merged_instances() -> dict[str, dict]:
     return merged
 
 
-#: Every admitted contract instance, keyed as the shared suite reports it.
-ADAPTER_SPECS: dict[str, dict] = _merged_instances()
-
-INSTANCES = tuple(ADAPTER_SPECS)
-
-#: Every instance's admitted prepared-graph tiers, one case per (instance, tier).
-LIFECYCLE_CASES = tuple(
-    (key, tier)
-    for key, spec in ADAPTER_SPECS.items()
-    for tier in spec["lifecycle_tiers"]
+_VIEWS = {}
+_VIEW_NAMES = frozenset(
+    (
+        "ADAPTER_SPECS",
+        "INSTANCES",
+        "LIFECYCLE_CASES",
+        "STRUCTURES",
+        "FIELD_RESPONSE_INSTANCES",
+        "HOST_COMPILER_GATED_INSTANCES",
+        "READINESS_CASES",
+        "ROUTING_CASES",
+    )
 )
 
-#: The periodic structure declared per structure key, as fresh structures.
-STRUCTURES: dict[str, Callable[[], Atoms]] = {
-    key: factory for family in _FAMILIES for key, factory in family.structures.items()
-}
 
-#: The instances whose prepared lifecycle serves a field response derivative.
-FIELD_RESPONSE_INSTANCES = tuple(
-    key for family in _FAMILIES for key in family.field_response_instances
-)
-
-#: The instances whose generated tier is a host artifact gated on a C++ compiler.
-HOST_COMPILER_GATED_INSTANCES = tuple(
-    key for family in _FAMILIES for key in family.host_compiler_gated_instances
-)
-
-#: The evaluator factories the shared readiness case is asserted on.
-READINESS_CASES = tuple(case for family in _FAMILIES for case in family.readiness_cases)
-
-#: The routing-parity cases, in registration order, one per declared family.
-ROUTING_CASES = tuple(
-    family.routing_parity for family in _FAMILIES if family.routing_parity is not None
-)
+def __getattr__(name):
+    if name not in _VIEW_NAMES:
+        raise AttributeError(name)
+    if not _VIEWS:
+        # A family imports the registration API before it registers itself.
+        # Discovering eagerly during that import freezes incomplete views.
+        # Shared consumers request views only after family imports finish.
+        _discover_family_modules()
+        _validate()
+        adapters = _merged_instances()
+        _VIEWS.update(
+            ADAPTER_SPECS=adapters,
+            INSTANCES=tuple(adapters),
+            LIFECYCLE_CASES=tuple(
+                (key, tier)
+                for key, spec in adapters.items()
+                for tier in spec["lifecycle_tiers"]
+            ),
+            STRUCTURES={
+                key: factory
+                for family in _FAMILIES
+                for key, factory in family.structures.items()
+            },
+            FIELD_RESPONSE_INSTANCES=tuple(
+                key for family in _FAMILIES for key in family.field_response_instances
+            ),
+            HOST_COMPILER_GATED_INSTANCES=tuple(
+                key
+                for family in _FAMILIES
+                for key in family.host_compiler_gated_instances
+            ),
+            READINESS_CASES=tuple(
+                case for family in _FAMILIES for case in family.readiness_cases
+            ),
+            ROUTING_CASES=tuple(
+                family.routing_parity
+                for family in _FAMILIES
+                if family.routing_parity is not None
+            ),
+        )
+    return _VIEWS[name]

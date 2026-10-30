@@ -28,6 +28,14 @@ void validate_mace_backbone_schema(
 //: rules, unchanged from the single-family form.
 void validate_mace_nonlinear_schema(const nlohmann::json& data);
 
+// Family schema policy, independent of the generated node support matrix.
+bool mace_backbone_materialized_retention_required(MaceBackboneSchema schema);
+
+// Canonical higher-angular programs remain schema-admitted, but their
+// retained model-convention conversion is deferred to composition admission.
+bool mace_backbone_materialized_retention_deferred(
+    const nlohmann::json& data, MaceBackboneSchema schema);
+
 // Retention follows the product linear; equal widths alone do not establish
 // that its basis matches the contraction and the declared feature consumers.
 void validate_mace_retained_product_connectivity(const nlohmann::json& product);

@@ -867,7 +867,7 @@ def test_polar_generated_backbone_matches_portable_retention_and_seed(
         for layer in range(2)
     )
     assert evaluator.factorized_fallback_evaluation_count == 0
-    if native._kokkos_default_execution_space() == "Cuda":
+    if native._kokkos_default_execution_space() in ("Cuda", "HIP"):
         assert evaluator.jit_mh1_cuda_plugin_v5_ready
     else:
         assert evaluator.jit_mh1_host_plugin_v7_ready

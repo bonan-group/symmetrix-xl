@@ -142,7 +142,10 @@ def test_native_consumer_rejects_missing_or_malformed_device_launch_plan(
     polar_consumer_model, tmp_path, wrapped, plan
 ):
     import symmetrix.symmetrix as native_module
-    from symmetrix.mace_nonlinear_jit_codegen import jit_mh1_cuda_plugin_v5_metadata
+    from symmetrix.mace_nonlinear_jit_codegen import (
+        execution_mh1_hip_module_v4_metadata,
+        jit_mh1_cuda_plugin_v5_metadata,
+    )
     from symmetrix.mace_polar_execution_contract import (
         make_execution_polar_mh1_v4_contract,
     )
@@ -151,11 +154,15 @@ def test_native_consumer_rejects_missing_or_malformed_device_launch_plan(
     if target == "host":
         pytest.skip("device manifest admission requires the CUDA or HIP backend")
     model = json.loads(polar_consumer_model.read_text())
-    request = {
-        "contract": jit_mh1_cuda_plugin_v5_metadata(
-            make_execution_polar_mh1_v4_contract(model), 120
+    contract = make_execution_polar_mh1_v4_contract(model)
+    metadata = (
+        execution_mh1_hip_module_v4_metadata(
+            contract, native_module._execution_device_execution_environment()
         )
-    }
+        if target == "hip"
+        else jit_mh1_cuda_plugin_v5_metadata(contract, 120)
+    )
+    request = {"contract": metadata}
     if plan is not None:
         request["launch_plan"] = plan
     build = {"request": request} if wrapped else request
@@ -188,6 +195,39 @@ def test_native_consumer_rejects_missing_or_malformed_device_contract(
     consumer = _consumer(native_module, polar_consumer_model, "float64")
     with pytest.raises(ValueError, match="node contract"):
         consumer.load_artifact(str(tmp_path / "missing.cubin"), target)
+    assert consumer.diagnostics["transaction_count"] == 0
+
+
+def test_native_consumer_rejects_opposite_device_contract_abi(
+    polar_consumer_model, tmp_path
+):
+    import symmetrix.symmetrix as native_module
+
+    target = _artifact_target()
+    if target == "host":
+        pytest.skip("device ABI admission requires the CUDA or HIP backend")
+    opposite_abi = (
+        "symmetrix.jit.mh1.cuda-plugin/5"
+        if target == "hip"
+        else "symmetrix.jit.mh1.hip-module/5"
+    )
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "key_inputs": {
+                    "build": {
+                        "request": {
+                            "contract": {"abi": opposite_abi, "abi_version": 5},
+                            "launch_plan": {},
+                        }
+                    }
+                }
+            }
+        )
+    )
+    consumer = _consumer(native_module, polar_consumer_model, "float64")
+    with pytest.raises(ValueError, match="device node contract is unsupported"):
+        consumer.load_artifact(str(tmp_path / "missing.bin"), target)
     assert consumer.diagnostics["transaction_count"] == 0
 
 

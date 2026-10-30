@@ -95,16 +95,11 @@ class MH0Adapter(Adapter):
             return evaluator
         if shutil.which("c++") is None:
             raise Unqualified("the MH-0 host R1 artifact", CXX_RUNNER)
-        from symmetrix.mace_jit_host_artifact import prepare_jit_host_artifact
-
-        artifact = prepare_jit_host_artifact(
-            self.model_path(),
-            precision=self.precision,
-            cache_root=self._models["jit_cache"],
-        )
-        evaluator.set_streamed_edges("direct")
-        evaluator._load_jit_host_plugin(str(artifact.artifact_path))
-        return evaluator
+        # Prepare the active backend's complete direct composition, including
+        # canonical operator modules, rather than only its host R1 callback.
+        return Symmetrix(
+            str(self.model_path()), dtype=self.precision, streamed_edges="direct"
+        ).evaluator
 
     def bindings_on(self, evaluator) -> dict[str, str]:
         if evaluator.streamed_edges_mode == "generic":
@@ -189,8 +184,15 @@ class MH0Adapter(Adapter):
         diagnostic = _diagnostic(evaluator)
         return {
             "artifact_id": evaluator.family_artifact_readiness["artifact_id"],
-            "host_plugin_ready": bool(evaluator.jit_host_plugin_ready),
+            "active_plugin_ready": bool(
+                evaluator.jit_host_plugin_ready
+                if native_symmetrix._kokkos_default_execution_space() == "OpenMP"
+                or native_symmetrix._kokkos_default_execution_space() == "Serial"
+                else evaluator.jit_device_plugin_ready
+            ),
             "direct_generated_strategy": "direct_jit" in diagnostic,
+            "generated_m1_forward_launches": evaluator.generated_m1_module_forward_launch_count,
+            "generated_m1_reverse_launches": evaluator.generated_m1_module_reverse_launch_count,
         }
 
     def compiler_free_marker(self) -> tuple[str, ...]:
@@ -256,7 +258,7 @@ class MaceFieldAdapter(MH0Adapter):
         )
         return {
             "energies": self.node_energies(evaluator),
-            "directed_forces": self.node_forces(evaluator),
+            "directed_forces": self.node_forces(evaluator, graph),
             "field_adjoint": self.field_adjoint(evaluator),
         }
 
@@ -277,7 +279,7 @@ class MaceFieldAdapter(MH0Adapter):
         return {
             "graph": graph,
             "energies": self.node_energies(evaluator),
-            "directed_forces": self.node_forces(evaluator),
+            "directed_forces": self.node_forces(evaluator, graph),
             "field_adjoint": self.field_adjoint(evaluator),
         }
 
@@ -339,7 +341,7 @@ MH0_KEYS = frozenset(
 )
 MH0_LAYOUTS = frozenset(("node_major", "lane_major", "edge_major"))
 MH0_REDUCTIONS = frozenset(("reduce_forces", "reduce_stress"))
-MH0_GENERATED = frozenset(("phi1", "m1", "readout"))
+MH0_GENERATED = frozenset(("r0", "phi1", "m1", "readout"))
 
 # Each entry is one admitted contract instance.  ``parameters`` states the
 # instance's shape, layout, precision, and derivative requirements so a failure

@@ -368,8 +368,13 @@ class Adapter:
     def node_energies(self, evaluator) -> np.ndarray:
         return np.asarray(evaluator.node_energies, dtype=np.float64)
 
-    def node_forces(self, evaluator) -> np.ndarray:
-        return np.asarray(evaluator.node_forces, dtype=np.float64)
+    def node_forces(self, evaluator, graph: Graph) -> np.ndarray:
+        # Device workspaces may retain spare edge capacity; only the prepared
+        # graph's active directed edges belong to the observable force array.
+        values = np.asarray(evaluator.node_forces, dtype=np.float64).reshape(-1)
+        extent = 3 * len(graph.sources)
+        assert values.size >= extent, (values.size, extent)
+        return values[:extent].copy()
 
     def field_adjoint(self, evaluator):
         return None
@@ -400,7 +405,7 @@ class Adapter:
         evaluator.compute_node_energies_forces(*graph.arguments)
         return {
             "energies": self.node_energies(evaluator),
-            "directed_forces": self.node_forces(evaluator),
+            "directed_forces": self.node_forces(evaluator, graph),
             "field_adjoint": self.field_adjoint(evaluator),
         }
 
@@ -428,7 +433,7 @@ class Adapter:
             "graph": graph,
             "generation": generation,
             "energies": self.node_energies(evaluator),
-            "directed_forces": self.node_forces(evaluator),
+            "directed_forces": self.node_forces(evaluator, graph),
             "field_adjoint": self.field_adjoint(evaluator),
             "atom_forces": self.reduce_forces(evaluator, generation, graph),
             "stress": self.reduce_stress(evaluator, generation, graph),
@@ -451,6 +456,15 @@ class Adapter:
         """Observable facts proving the admitted artifact served execution."""
         raise NotImplementedError
 
+    def expected_buffer_dtype(self) -> str:
+        """Geometry/retention ABI precision, distinct from compute precision."""
+        return "float64"
+
+    def assert_generated_binding(self, binding) -> None:
+        assert binding["implementation_id"].startswith("generated"), binding
+        assert binding["portable_covered"] is True, binding
+        assert binding["artifact_required"] is False, binding
+
     def compiler_free_marker(self) -> tuple[str, ...]:
         """Diagnostic substrings that only the compiler-free path reports."""
         raise NotImplementedError
@@ -466,7 +480,10 @@ class Adapter:
         host runner reports an unready device artifact with its reason, a
         device runner reports the admitted artifact.
         """
-        evaluator = self.evaluator("portable")
+        active_target = self.evaluator("portable").family_capabilities["target"]
+        evaluator = self.evaluator(
+            "generated" if active_target in ACCELERATOR_SURFACES else "portable"
+        )
         capabilities = evaluator.family_capabilities
         status = {}
         for surface in ACCELERATOR_SURFACES:

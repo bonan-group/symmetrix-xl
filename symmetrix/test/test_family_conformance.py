@@ -19,7 +19,7 @@ independent things per admitted instance:
   host can prepare, against the reference.  A surface this runner cannot qualify
   is reported with the runner it requires instead of being skipped.
 * **Contract-instance portability.**
-  ``test_host_portable_coverage_per_contract_instance`` asserts coverage per
+  ``test_portable_coverage_per_contract_instance`` asserts coverage per
   admitted instance -- one qualified binding per operator node with that node's
   declared buffer contracts (shape, layout, dtype), the declared
   compute/accumulator precision, and the declared derivative requirements --
@@ -265,7 +265,7 @@ def test_lifecycle_matches_the_reference(lifecycle_case):
         err_msg=f"{adapter.key}/{tier} reused-generation energies",
     )
     np.testing.assert_allclose(
-        adapter.node_forces(result["evaluator"]),
+        adapter.node_forces(result["evaluator"], reusable),
         moved_reference["directed_forces"],
         rtol=adapter.rtol,
         atol=adapter.atol,
@@ -334,7 +334,7 @@ def test_compiler_free_evaluation_needs_no_artifact(instance, monkeypatch, tmp_p
             atol=instance.atol,
         )
         np.testing.assert_allclose(
-            instance.node_forces(evaluator),
+            instance.node_forces(evaluator, graph),
             reference["directed_forces"],
             rtol=instance.rtol,
             atol=instance.atol,
@@ -429,17 +429,11 @@ def test_tier_parity_per_operator_kind(instance):
         stepped == instance.generated_kinds
     ), f"{instance.key} generated tier covers {sorted(stepped)}"
     assert generated_report["admitted"] is True
-    # A generated binding is served by an identified artifact, never by an
-    # unnamed implementation, and its portable coverage survives underneath.
+    # Each family declares whether its direct binding preserves a portable
+    # implementation underneath or requires the admitted artifact exclusively.
     for binding in generated_report["bindings"]:
         if binding["tier"] == "generated":
-            assert binding["implementation_id"].startswith("generated")
-            # A host program keeps its portable implementation underneath the
-            # generated one, so the admitted artifact accelerates the node
-            # rather than becoming the only way to serve it: `artifact_required`
-            # stays false and the host admission invariant holds either way.
-            assert binding["portable_covered"] is True, binding
-            assert binding["artifact_required"] is False, binding
+            instance.assert_generated_binding(binding)
         else:
             assert binding["tier"] in PORTABLE_TIERS, binding
             assert binding["portable_covered"] is True, binding
@@ -476,10 +470,10 @@ def test_tier_parity_per_operator_kind(instance):
 # ---------------------------------------------------------------------------
 
 
-def test_host_portable_coverage_per_contract_instance(instance):
+def test_portable_coverage_per_contract_instance(instance):
     """Portable coverage is asserted per instance, not per operator kind.
 
-    Every operator *node* of the compiled program is covered by the host
+    Every operator *node* of the compiled program is covered by the selected
     portable implementation, at the declared compute precision, with the
     declared accumulator, and with the node's own declared buffer contracts
     (shape, layout, dtype, irreps).  The declared layout orders and the declared
@@ -505,7 +499,7 @@ def test_host_portable_coverage_per_contract_instance(instance):
         assert binding["precision"]["accumulator"] == "float64"
         for contract in (*operator["inputs"], *operator["outputs"]):
             assert contract["layout"] in LAYOUT_ORDERS, contract
-            assert contract["dtype"] == capabilities["precision"], contract
+            assert contract["dtype"] == instance.expected_buffer_dtype(), contract
             assert isinstance(contract["irreps"], str)
             shape = contract["shape"]
             # The extent contract every family declares: a leading dynamic
@@ -523,7 +517,7 @@ def test_host_portable_coverage_per_contract_instance(instance):
     assert (
         declared_layouts == instance.expected_layouts
     ), f"{instance.key} declares layouts {sorted(declared_layouts)}"
-    assert declared_dtypes == {"float64"}
+    assert declared_dtypes == {instance.expected_buffer_dtype()}
     assert seen_shape_extents, "a program must declare at least one buffer extent"
 
     # The derivative-requirement instance: every declared reduction consumes
@@ -549,7 +543,10 @@ def test_host_portable_coverage_per_contract_instance(instance):
     assert reduction_keys == set(
         instance.expected_reductions
     ), f"{instance.key} declares reductions {sorted(reduction_keys)}"
-    assert capabilities["target"] == "host"
+    execution_space = native_symmetrix._kokkos_default_execution_space()
+    assert capabilities["target"] == {"Cuda": "cuda", "HIP": "hip"}.get(
+        execution_space, "host"
+    )
     assert capabilities["portable"] is True
     # Every family declares its stress capability honestly.  An instance whose
     # program declares no reduction node still serves stress from its evaluator,
@@ -657,7 +654,9 @@ def test_field_derivative_requirement_is_served(adapters):
                 start = component * len(result["graph"].xyz)
                 stop = start + len(result["graph"].xyz)
                 numerical[start:stop] += (
-                    sign * adapter.node_forces(generated) / (2.0 * step)
+                    sign
+                    * adapter.node_forces(generated, result["graph"])
+                    / (2.0 * step)
                 )
         np.testing.assert_allclose(
             response["force_derivative"],
@@ -685,6 +684,8 @@ def test_unqualified_surface_is_reported_with_its_runner(adapters, monkeypatch):
     the missing surface and the runner it needs instead of quietly passing, for
     every instance whose family declares a host artifact.
     """
+    if native_symmetrix._kokkos_default_execution_space() in ("Cuda", "HIP"):
+        pytest.skip("host C++ compiler admission requires a CPU backend")
     monkeypatch.setattr(shutil, "which", lambda _name: None)
     declared = HOST_COMPILER_GATED_INSTANCES
     assert declared, "no instance declares a host-compiler-gated generated tier"
@@ -715,14 +716,18 @@ def test_accelerator_surfaces_report_their_required_runner(instance):
     status = instance.accelerator_status()
     assert set(status) == set(ACCELERATOR_SURFACES)
     execution_space = native_symmetrix._kokkos_default_execution_space()
-    host_runner = execution_space in ("OpenMP", "Serial")
+    active_target = {"Cuda": "cuda", "HIP": "hip"}.get(execution_space, "host")
     for surface in ACCELERATOR_SURFACES:
         entry = status[surface]
         assert entry["runner"], entry
-        if host_runner:
+        if surface != active_target:
             # No accelerator build is selected, so this is unqualified and the
             # requirement is recorded instead of skipped.
             assert entry["qualified"] is False, entry
             assert entry["reason"], entry
+            assert entry["round_trip"] is False, entry
+            assert entry["artifact_id"] == "", entry
         else:
+            assert entry["qualified"] is True, entry
+            assert entry["artifact_id"], entry
             assert entry["round_trip"], entry

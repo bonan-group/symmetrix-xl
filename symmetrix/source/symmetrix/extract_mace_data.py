@@ -1932,7 +1932,9 @@ def extract_mace_data(
             payload = extract_mace_nonlinear_head_payload(single_model)
         else:
             payload = _extract_mh0_head_payload(
-                single_model, atomic_numbers, default_data["execution_contracts"]
+                single_model,
+                atomic_numbers,
+                default_data.get("execution_contracts", {}),
             )
         if _prediction_head_payload_layout(payload, nonlinear) != expected_layout:
             raise ValueError(

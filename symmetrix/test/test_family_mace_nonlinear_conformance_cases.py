@@ -80,53 +80,11 @@ class MH1Adapter(Adapter):
             return evaluator
         if shutil.which("c++") is None:
             raise Unqualified("the MH-1 host artifact", CXX_RUNNER)
-        from symmetrix.jit import prepare_jit_artifact
-        from symmetrix.mace_nonlinear_execution_contract import (
-            make_execution_mh1_v4_contract,
-        )
-        from symmetrix.mace_nonlinear_jit_codegen import (
-            MH1_HOST_PLUGIN_V7_ABI,
-            MH1_HOST_PLUGIN_V7_ABI_VERSION,
-            execution_mh1_node_program_metadata,
-            render_jit_mh1_host_plugin_v7,
-        )
-
-        contract = make_execution_mh1_v4_contract(dict(self._models["mh1_data"]))
-        metadata = execution_mh1_node_program_metadata(
-            contract, backend="host", node_state_policy="recompute-v1"
-        )
-        metadata = {
-            **metadata,
-            "abi": MH1_HOST_PLUGIN_V7_ABI,
-            "abi_version": MH1_HOST_PLUGIN_V7_ABI_VERSION,
-        }
-        prepared = prepare_jit_artifact(
-            render_jit_mh1_host_plugin_v7(
-                contract, precision=self.precision, node_state_policy="recompute-v1"
-            ),
-            abi={"tag": metadata["abi"], "version": metadata["abi_version"]},
-            build={
-                "generator": "symmetrix.jit.mh1-host-v7-composed",
-                "precision": self.precision,
-                "contract": metadata,
-            },
-            cache_root=self._models["jit_cache"],
-            cxx_flags=None,
-            artifact_name="jit_mh1_host_plugin",
-        )
-        if not prepared.available:
-            raise Unqualified("the MH-1 staged host artifact", CXX_RUNNER)
-        evaluator._set_execution_mh1_v4_contract_identity(
-            contract["tag"],
-            contract["generation_fingerprint"],
-            contract["semantic_fingerprint"],
-            contract["structure_fingerprint"],
-            contract["runtime_layout_fingerprint"],
-            contract["interaction_count"],
-        )
-        evaluator.set_streamed_edges("direct")
-        evaluator._load_jit_mh1_host_plugin_v7(str(prepared.artifact_path))
-        return evaluator
+        # Direct execution composes the node plugin with canonical M0/M1
+        # modules; loading the node plugin alone is intentionally fail-closed.
+        return Symmetrix(
+            str(self.model_path()), dtype=self.precision, streamed_edges="direct"
+        ).evaluator
 
     def bindings_on(self, evaluator) -> dict[str, str]:
         return {
@@ -175,8 +133,13 @@ class MH1Adapter(Adapter):
         return {
             "artifact_id": evaluator.family_artifact_readiness["artifact_id"],
             "staged_host_backend": backend.startswith("pair_spline_v1_staged"),
-            "forward_launches": int(
-                evaluator.execution_mh1_generated_forward_launch_count
+            "product_forward_launches": sum(
+                evaluator._execution_mh1_product_module_forward_launch_count(layer)
+                for layer in range(evaluator.mh1_layer_count)
+            ),
+            "product_reverse_launches": sum(
+                evaluator._execution_mh1_product_module_reverse_launch_count(layer)
+                for layer in range(evaluator.mh1_layer_count)
             ),
         }
 
