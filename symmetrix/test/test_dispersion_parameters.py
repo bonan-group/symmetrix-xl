@@ -284,18 +284,90 @@ def test_generated_parameters_reproduce_from_pinned_source(tmp_path):
         ).read_bytes()
 
 
+def _assert_reference_bytes_match_runtime(generated, expected, torch_version):
+    actual_payload = json.loads(generated)
+    expected_payload = json.loads(expected)
+    assert isinstance(actual_payload["source"]["torch"], str)
+    assert actual_payload["source"]["torch"] == torch_version
+    assert isinstance(expected_payload["source"]["torch"], str)
+    assert expected == (
+        json.dumps(expected_payload, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    # Runtime provenance varies independently of the pinned upstream source.
+    # Every scientific value and every other provenance/format byte stays exact.
+    expected_payload["source"]["torch"] = torch_version
+    assert generated == (
+        json.dumps(expected_payload, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def test_reference_regeneration_accepts_truthful_torch_runtime_metadata():
+    expected = b'{\n  "cases": [\n    1.0\n  ],\n  "source": {\n    "ase": "3.29.0",\n    "torch": "old"\n  }\n}\n'
+    generated = expected.replace(b'"torch": "old"', b'"torch": "current"')
+
+    _assert_reference_bytes_match_runtime(generated, expected, "current")
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        (b'"torch": "old"', b'"torch": "forged"'),
+        (b"    1.0\n", b"    1.0000000000000002\n"),
+        (b"    1.0\n", b"    1\n"),
+        (b'"ase": "3.29.0"', b'"ase": "changed"'),
+        (b'"source": {', b'"extra": true,\n  "source": {'),
+    ),
+    ids=(
+        "forged-runtime",
+        "scientific-last-digit",
+        "numeric-type",
+        "other-provenance",
+        "extra-key",
+    ),
+)
+def test_reference_regeneration_rejects_unapproved_changes(replacement):
+    expected = b'{\n  "cases": [\n    1.0\n  ],\n  "source": {\n    "ase": "3.29.0",\n    "torch": "old"\n  }\n}\n'
+    generated = expected.replace(*replacement)
+    if replacement[0] != b'"torch": "old"':
+        generated = generated.replace(b'"torch": "old"', b'"torch": "current"')
+
+    with pytest.raises(AssertionError):
+        _assert_reference_bytes_match_runtime(generated, expected, "current")
+
+
+def test_reference_regeneration_rejects_stale_runtime_even_with_identical_payload():
+    expected = (
+        b'{\n  "cases": [\n    1.0\n  ],\n  "source": {\n    "torch": "old"\n  }\n}\n'
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_reference_bytes_match_runtime(expected, expected, "current")
+
+
+def test_reference_regeneration_rejects_noncanonical_json():
+    expected = (
+        b'{\n  "cases": [\n    1.0\n  ],\n  "source": {\n    "torch": "old"\n  }\n}\n'
+    )
+    generated = b'{"cases":[1.0],"source":{"torch":"current"}}'
+
+    with pytest.raises(AssertionError):
+        _assert_reference_bytes_match_runtime(generated, expected, "current")
+
+
 def test_reference_cases_reproduce_from_pinned_source(tmp_path):
     configured_source = os.environ.get("SYMMETRIX_TORCH_DFTD_SOURCE")
     source = Path(configured_source or "/tmp/torch-dftd-audit")
     if not (source / "torch_dftd" / "_version.py").is_file():
         pytest.skip("pinned torch-dftd 0.5.3 source is unavailable")
-    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch")
 
     output = tmp_path / "reference.json"
     completed = _run_reference_generator(source, output)
 
     assert completed.returncode == 0, completed.stderr
-    assert output.read_bytes() == REFERENCE_CASES.read_bytes()
+    _assert_reference_bytes_match_runtime(
+        output.read_bytes(), REFERENCE_CASES.read_bytes(), str(torch.__version__)
+    )
 
 
 def test_generators_do_not_mutate_pinned_source(tmp_path):
