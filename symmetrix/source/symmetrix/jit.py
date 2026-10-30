@@ -3113,6 +3113,22 @@ def _configure_nvrtc_adapter(
             "nvrtc_options must not override the target architecture or "
             "enable device debug"
         )
+    if (major_version, minor_version) == (13, 2) and architecture_code == 120:
+        # NVRTC13.2 split compilation emits invalid dotted identifiers when
+        # scalarizing shared arrays on sm120. Serial compilation preserves
+        # the same math; select it before options enter the artifact key.
+        safe_flags = tuple(
+            "--split-compile=1"
+            if flag.partition("=")[0] in ("--split-compile", "-split-compile")
+            else flag
+            for flag in flags
+        )
+        if safe_flags != flags:
+            diagnostics.append(
+                "NVRTC 13.2 sm_120 requires --split-compile=1 to avoid "
+                "invalid shared-symbol PTX identifiers"
+            )
+        flags = safe_flags
     # NVRTC 13.1 rejects -O3. Its default compilation is the release policy.
     options = ("--std=c++20", f"--gpu-architecture={architecture}", *flags)
     compiler = {

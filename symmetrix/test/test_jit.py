@@ -268,6 +268,69 @@ def test_nvrtc_rejects_r0_floating_policy_option_mismatch(jit, tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    "version,architecture,requested,effective",
+    [
+        ((13, 2), 120, ("--split-compile=2",), ("--split-compile=1",)),
+        ((13, 2), 120, ("--split-compile=0",), ("--split-compile=1",)),
+        ((13, 2), 120, ("--split-compile=4",), ("--split-compile=1",)),
+        ((13, 2), 120, ("--split-compile=1",), ("--split-compile=1",)),
+        ((13, 2), 90, ("--split-compile=2",), ("--split-compile=2",)),
+        ((13, 1), 120, ("--split-compile=2",), ("--split-compile=2",)),
+        ((13, 3), 120, ("--split-compile=2",), ("--split-compile=2",)),
+        ((14, 0), 120, ("--split-compile=2",), ("--split-compile=2",)),
+        ((13, 2), 120, ("-split-compile=2",), ("--split-compile=1",)),
+        ((13, 2), 120, ("-split-compile=1",), ("--split-compile=1",)),
+        (
+            (13, 2),
+            120,
+            ("--split-compile=4", "-split-compile=2"),
+            ("--split-compile=1", "--split-compile=1"),
+        ),
+        ((13, 3), 120, ("-split-compile=2",), ("-split-compile=2",)),
+    ],
+)
+def test_nvrtc_split_compile_workaround_is_target_scoped_and_source_bound(
+    jit, tmp_path, version, architecture, requested, effective
+):
+    """Avoid NVRTC13.2's invalid split PTX without changing other compilers."""
+    calls = []
+
+    def compile_source(source, options):
+        calls.append(tuple(options))
+        return b"compiler-bound cubin", ""
+
+    request = dict(
+        abi={"tag": "symmetrix.jit.cuda-module/1", "version": 1},
+        build={"generator": "nvrtc-target-policy-test"},
+        compute_capability=f"sm_{architecture}",
+        cache_root=tmp_path / "cache",
+        nvrtc_information={
+            "available": True,
+            "library": "libnvrtc.so",
+            "major": version[0],
+            "minor": version[1],
+            "supported_architectures": [architecture],
+        },
+        compile_source=compile_source,
+    )
+    source = 'extern "C" __global__ void kernel() {}\n'
+    result = jit.prepare_nvrtc_jit_artifact(source, nvrtc_options=requested, **request)
+    options = [
+        "--std=c++20",
+        f"--gpu-architecture=sm_{architecture}",
+        *effective,
+    ]
+    assert result.status == "built"
+    assert calls == [tuple(options)]
+    assert result.manifest["compiler_options"] == options
+    assert result.manifest["key_inputs"]["cxx_flags"] == options
+    cached = jit.prepare_nvrtc_jit_artifact(source, nvrtc_options=effective, **request)
+    assert cached.status == "cached"
+    assert cached.cache_key == result.cache_key
+    assert len(calls) == 1
+
+
 def test_nvrtc_rejects_unsupported_exact_architecture(jit, tmp_path):
     result = jit.prepare_nvrtc_jit_artifact(
         'extern "C" __global__ void kernel() {}\n',
