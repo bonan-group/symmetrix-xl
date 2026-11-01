@@ -60,6 +60,58 @@ def test_standard_mace_torch_backend_remains_an_explicit_diagnostic(tmp_path):
     }
 
 
+def test_hip_is_a_first_class_benchmark_device(tmp_path):
+    args = benchmark.parser().parse_args(
+        [
+            "run",
+            "--implementation",
+            "symmetrix",
+            "--device",
+            "hip",
+            "--output",
+            str(tmp_path / "record.json"),
+        ]
+    )
+
+    assert args.device == "hip"
+
+
+def test_hip_records_synchronized_samples_without_cuda_profiler():
+    args = benchmark.parser().parse_args(
+        [
+            "run",
+            "--implementation",
+            "symmetrix",
+            "--device",
+            "hip",
+            "--output",
+            "record.json",
+        ]
+    )
+
+    assert args.cuda_profiler_range is False
+
+
+def test_symmetrix_worker_accepts_a_converted_runtime_model(tmp_path):
+    args = benchmark.parser().parse_args(
+        [
+            "run",
+            "--implementation",
+            "symmetrix",
+            "--device",
+            "hip",
+            "--model",
+            str(tmp_path / "source.model"),
+            "--converted-model",
+            str(tmp_path / "runtime.json"),
+            "--output",
+            str(tmp_path / "record.json"),
+        ]
+    )
+
+    assert args.converted_model == tmp_path / "runtime.json"
+
+
 def test_symmetrix_benchmark_accepts_forced_pme(tmp_path):
     args = benchmark.parser().parse_args(
         [

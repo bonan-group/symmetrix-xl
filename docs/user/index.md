@@ -11,6 +11,7 @@ overview
 getting_started
 installation
 models
+checkpoints
 execution
 dispersion_corrections
 backends

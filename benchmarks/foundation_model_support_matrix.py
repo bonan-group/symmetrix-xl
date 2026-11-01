@@ -832,7 +832,11 @@ def direct_identity(calculator, backend: str, profile: str = "speed") -> dict:
             ),
         }
         ready_names = (
-            ("jit_mh1_cuda_plugin_ready", "jit_mh1_cuda_plugin_v4_ready")
+            (
+                "jit_mh1_cuda_plugin_ready",
+                "jit_mh1_cuda_plugin_v4_ready",
+                "jit_mh1_cuda_plugin_v5_ready",
+            )
             if backend in {"cuda", "hip"}
             else (
                 "jit_mh1_host_plugin_ready",

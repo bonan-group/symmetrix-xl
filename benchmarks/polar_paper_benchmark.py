@@ -3,7 +3,7 @@
 
 Each implementation is run in a separate process.  Both workers regenerate the
 same deterministic structures and record a SHA-256 over species, FP64
-coordinates, cell, PBC flags, and electronic inputs.  CUDA timings are fenced
+coordinates, cell, PBC flags, and electronic inputs.  CUDA/HIP timings are fenced
 before and after every sample and exclude calculator construction, graph/JIT
 warmup, and the correctness snapshot.
 
@@ -170,15 +170,18 @@ def _torch_calculator(model_path: Path, device: str, dtype: str, backend: str):
     from polar_torch_baseline import accelerated_backend_status
     from mace.calculators import MACECalculator
 
+    # PyTorch exposes HIP devices through the CUDA-compatible device string.
+    torch_device = "cuda" if device == "hip" else device
+
     model = torch.load(str(model_path), map_location="cpu", weights_only=False)
     oracle.prepare_checkpoint(model, gto_module)
     model.electric_potential_descriptor.set_pbc_handling("auto")
     model.coulomb_energy.set_pbc_handling("auto")
-    model = model.to(device=device, dtype=getattr(torch, dtype))
+    model = model.to(device=torch_device, dtype=getattr(torch, dtype))
     calculator = MACECalculator(
         models=[model],
         model_type="PolarMACE",
-        device=device,
+        device=torch_device,
         default_dtype=dtype,
         **_torch_calculator_options(backend),
         info_keys={
@@ -192,12 +195,13 @@ def _torch_calculator(model_path: Path, device: str, dtype: str, backend: str):
     backend_status = accelerated_backend_status(calculator, backend)
 
     def fence() -> None:
-        if device == "cuda":
+        if device in ("cuda", "hip"):
             torch.cuda.synchronize()
 
     identity = {
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
+        "torch_hip": torch.version.hip,
         "mace_torch": _version("mace-torch"),
         "graph_electrostatics": _version("graph-electrostatics"),
         "backend": backend,
@@ -206,7 +210,9 @@ def _torch_calculator(model_path: Path, device: str, dtype: str, backend: str):
         "converted_model_pbc_handling": pbc_status,
         "pbc_handling": "auto",
         "cuda_available": torch.cuda.is_available(),
-        "device_name": torch.cuda.get_device_name(0) if device == "cuda" else None,
+        "device_name": (
+            torch.cuda.get_device_name(0) if device in ("cuda", "hip") else None
+        ),
     }
     return calculator, fence, identity, lambda: None
 
@@ -364,8 +370,20 @@ def _solver_diagnostics(implementation: str, calculator, atoms) -> dict[str, Any
 
 def run(args: argparse.Namespace) -> int:
     model_path = args.model.expanduser().resolve()
+    converted_model = getattr(args, "converted_model", None)
+    runtime_model_path = (
+        converted_model.expanduser().resolve()
+        if converted_model is not None
+        else model_path
+    )
     if not model_path.is_file():
         raise SystemExit(f"model not found: {model_path}")
+    if not runtime_model_path.is_file():
+        raise SystemExit(f"runtime model not found: {runtime_model_path}")
+    if converted_model is not None and args.implementation != "symmetrix":
+        raise SystemExit(
+            "--converted-model is only valid for --implementation symmetrix"
+        )
     requested = tuple(item for item in args.systems.split(",") if item)
     unknown = sorted(set(requested) - set(system_names()))
     if unknown:
@@ -391,7 +409,7 @@ def run(args: argparse.Namespace) -> int:
         )
     else:
         calculator, fence, identity, close = _symmetrix_calculator(
-            model_path,
+            runtime_model_path,
             args.device,
             args.dtype,
             args.realspace_strategy,
@@ -435,7 +453,7 @@ def run(args: argparse.Namespace) -> int:
             ),
             "warmups": args.warmups,
             "repeats": args.repeats,
-            "synchronized": args.device == "cuda",
+            "synchronized": args.device in ("cuda", "hip"),
             "cuda_profiler_range": args.cuda_profiler_range,
             "cuda_profiler_library": cuda_profiler_library,
             "reset_before_sample": True,
@@ -454,6 +472,11 @@ def run(args: argparse.Namespace) -> int:
             "path": str(model_path),
             "sha256": _sha256(model_path),
             "bytes": model_path.stat().st_size,
+        },
+        "runtime_model": {
+            "path": str(runtime_model_path),
+            "sha256": _sha256(runtime_model_path),
+            "bytes": runtime_model_path.stat().st_size,
         },
         "environment": {
             "python": sys.version.split()[0],
@@ -641,7 +664,13 @@ def parser() -> argparse.ArgumentParser:
         "--implementation", required=True, choices=("mace-torch", "symmetrix")
     )
     worker.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    worker.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    worker.add_argument(
+        "--converted-model",
+        type=Path,
+        help="converted JSON model used by the Symmetrix worker; the source model "
+        "still identifies the comparison record",
+    )
+    worker.add_argument("--device", choices=("cpu", "cuda", "hip"), default="cuda")
     worker.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     worker.add_argument(
         "--torch-backend",
