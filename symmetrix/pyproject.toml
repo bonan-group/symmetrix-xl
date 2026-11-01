@@ -123,7 +123,6 @@ markers = [
     "lammps: requires a compatible LAMMPS build",
     "slow: long-running correctness coverage",
     "extended: matrix-expanded coverage outside the default internal verification profile",
-    "standard_e2e: explicit ASE-backed end-to-end coverage retained in the default profile",
     "sanitizer: runs under a declared diagnostic tool",
     "performance: produces qualified timing data",
 ]
