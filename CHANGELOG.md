@@ -4,6 +4,8 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ## Unreleased
 
+## 0.1.2 - 2026-11-01
+
 - Model JSON format version 4 for every exported variant: the first readout and
   the H1->H2 skip are stored without the inverse of `interactions[1].linear_up`
   (`h1_affine_mode` `m0_composite` or `pre_linear_up`). Format-1/2 files still

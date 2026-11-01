@@ -1113,7 +1113,7 @@ def test_gpu_wheel_project_owns_no_frontend_files(tmp_path):
         "Architecture-qualified Symmetrix native backend"
     )
     assert metadata["project"]["dependencies"] == [
-        "symmetrix-xl==0.1.1",
+        "symmetrix-xl==0.1.2",
         "nvidia-cuda-runtime>=13,<14",
         "nvidia-cuda-nvrtc>=13,<14",
         "nvidia-cublas>=13,<14",
@@ -1195,7 +1195,7 @@ def test_cuda12_wheel_declares_split_nvidia_dependencies(tmp_path):
     )
 
     assert metadata["project"]["dependencies"] == [
-        "symmetrix-xl==0.1.1",
+        "symmetrix-xl==0.1.2",
         "nvidia-cuda-runtime-cu12>=12,<13",
         "nvidia-cuda-nvrtc-cu12>=12,<13",
         "nvidia-cublas-cu12>=12,<13",

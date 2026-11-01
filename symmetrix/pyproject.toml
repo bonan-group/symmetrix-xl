@@ -32,7 +32,7 @@ cmake.define.SYMMETRIX_METAL = "ON"
 
 [project]
 name = "symmetrix-xl"
-version = "0.1.1"
+version = "0.1.2"
 description = "Symmetrix — a package for functions equivariant under: translation, rotation, inversion, and exchange of particles."
 readme = "README.md"
 requires-python = ">=3.10"
