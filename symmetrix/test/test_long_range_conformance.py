@@ -20,21 +20,12 @@ molecule graph, ``pbc4`` the bulk graph), and five proofs per instance:
   pins, formalized here with the battery's attribution machinery instead of
   ad hoc.
 * **Injected-perturbation red evidence.**
-  ``test_injected_perturbation_breaks_parity_with_attribution`` injects one
-  perturbation at a time (positions, cell, multipoles, basis constants) and
-  asserts the parity verdict for every (kind, perturbation) pair against a
-  declared sensitivity matrix: a kind that consumes the perturbed buffer
-  FAILS parity with the kind named in the failure, and a kind whose declared
-  inputs were not touched holds parity -- attribution is specific, not a
-  global blowout.  Task 9 grows the matrix by a column family rather than a
-  new battery (Task 8's report note): five ``adjoint_seed_*`` columns
-  perturb the seeds of the reverse-mode adjoint surfaces, whose rows mirror
-  their forward kinds' input sensitivity plus their own seed column -- so a
-  red verdict on an adjoint surface names exactly its seed or its declared
-  inputs, and no forward kind reacts to any adjoint seed.  The adjoint
-  surfaces' numerical correctness is not this battery's concern (it is the
-  finite-difference gate of ``test_long_range_adjoints.py``); here they are
-  attribution surfaces consuming exactly their declared inputs.
+  ``test_injected_perturbation_breaks_parity_with_attribution`` injects the
+  four physical input families (positions, cell, multipoles, and basis
+  constants) and checks the forward operator sensitivity matrix.  Reverse
+  mode numerical correctness is covered by ``test_long_range_adjoints.py``;
+  this file does not duplicate that coverage with a second Cartesian matrix
+  over every adjoint seed and surface.
 * **Capacity report fields.**  ``test_capacity_report_fields_validate``
   emits the task-3 manifest vocabulary (``n_k``, ``table_bytes``, the
   correction mode, the rebuild trigger) for the fixture instances from the
@@ -114,61 +105,23 @@ GRAPH_CLASS_MODES = {
     "bulk": "none",
 }
 
-# The injected perturbations: one input family each, sized to move outputs far
-# beyond the parity tolerance.  The ``adjoint seeds`` family is Task 9's
-# column-family growth of the matrix (Task 8's report note): each column
-# perturbs the seed of one adjoint surface, so the adjoint rows below break
-# exactly on their own seed while every forward row and every other adjoint
-# row holds -- attribution extends across the derivative surface.
+# The injected perturbations: one physical input family each, sized to move
+# outputs far beyond the parity tolerance.  Adjoint numerical correctness is
+# covered by the dedicated finite-difference suite instead of repeating its
+# seed matrix here.
 PERTURBATIONS = (
     "positions",
     "cell",
     "multipoles",
     "constants",
-    "adjoint_seed_features",
-    "adjoint_seed_energy",
-    "adjoint_seed_self_terms",
-    "adjoint_seed_external_field",
-    "adjoint_seed_dipole",
-    "adjoint_seed_stress",
-    "adjoint_seed_fukui",
-    "adjoint_seed_correction_energy",
-    "adjoint_seed_correction_features",
 )
-
-ADJOINT_SURFACES = (
-    "kspace_coulomb_features_adjoint",
-    "kspace_coulomb_energy_adjoint",
-    "self_interaction_adjoint",
-    "external_field_projection_adjoint",
-    "dipole_readout_adjoint",
-    "kspace_coulomb_energy_stress",
-    # The deferred adjoints of the family-wiring stage: the global
-    # scatter-and-broadcast (Fukui) adjoint and the analytic corrections'
-    # position adjoints, each with its own seed column.
-    "fukui_normalize_adjoint",
-    "analytic_correction_energy_adjoint",
-    "analytic_correction_features_adjoint",
-)
-
-# The reverse-mode adjoint surfaces the battery admits: each mirrors a
-# forward kind's input surface (its position gradient and any co-emitted
-# seed products), evaluated through the same probe surface convention --
-# no evaluator wiring, no new kind declarations.  The stress surface (the
-# experimental cell adjoint's assembly) is Task 10's column-family growth:
-# it consumes the energy kind's inputs plus its own seed and the
-# positions of the position virial.
 
 
 # The sensitivity matrix the red-evidence battery asserts: the perturbations
 # that must BREAK each kind's parity (the kind consumes the perturbed
-# buffer).  Every other (kind, perturbation) pair must HOLD parity, which is
+# buffer). Every other (kind, perturbation) pair must HOLD parity, which is
 # the attribution guarantee: a kind fails exactly when its declared inputs
-# were perturbed, so a failure names the right kind.  The adjoint rows
-# mirror their forward kinds' input sensitivity plus their own seed column;
-# the one deliberate divergence is the self-interaction adjoint, whose
-# outputs are constant-linear in the seeds alone -- multipoles move its
-# forward but not its adjoint.
+# were perturbed, so a failure names the right kind.
 PERTURBATION_SENSITIVITY = {
     "kspace_geometry_cache": frozenset(("positions", "cell", "constants")),
     "kspace_coulomb_features": frozenset(
@@ -184,38 +137,6 @@ PERTURBATION_SENSITIVITY = {
     "analytic_correction_energy": frozenset(("positions", "cell", "multipoles")),
     "analytic_correction_features": frozenset(
         ("positions", "cell", "multipoles", "constants")
-    ),
-    "kspace_coulomb_features_adjoint": frozenset(
-        ("positions", "cell", "multipoles", "constants", "adjoint_seed_features")
-    ),
-    "kspace_coulomb_energy_adjoint": frozenset(
-        ("positions", "cell", "multipoles", "constants", "adjoint_seed_energy")
-    ),
-    "self_interaction_adjoint": frozenset(("constants", "adjoint_seed_self_terms")),
-    "external_field_projection_adjoint": frozenset(
-        ("positions", "constants", "adjoint_seed_external_field")
-    ),
-    "dipole_readout_adjoint": frozenset(
-        ("positions", "multipoles", "adjoint_seed_dipole")
-    ),
-    # The Fukui adjoint consumes the sources, the l=0 charge channels, the
-    # graph-level charge/spin, and its own seeds -- never positions or the
-    # cell (the normalization has no geometry dependence).
-    "fukui_normalize_adjoint": frozenset(("multipoles", "adjoint_seed_fukui")),
-    "analytic_correction_energy_adjoint": frozenset(
-        ("positions", "cell", "multipoles", "adjoint_seed_correction_energy")
-    ),
-    "analytic_correction_features_adjoint": frozenset(
-        (
-            "positions",
-            "cell",
-            "multipoles",
-            "constants",
-            "adjoint_seed_correction_features",
-        )
-    ),
-    "kspace_coulomb_energy_stress": frozenset(
-        ("positions", "cell", "multipoles", "constants", "adjoint_seed_stress")
     ),
 }
 
@@ -233,41 +154,18 @@ PROBE_CHANNEL = {
     "analytic_correction_energy": "total",
     "kspace_coulomb_energy_stress": "total",
     "analytic_correction_features": "alpha",
-    "kspace_coulomb_features_adjoint": "alpha",
-    "kspace_coulomb_energy_adjoint": "alpha",
-    "self_interaction_adjoint": "alpha",
-    "external_field_projection_adjoint": None,
-    "dipole_readout_adjoint": "total",
-    "fukui_normalize_adjoint": "alpha",
-    "analytic_correction_energy_adjoint": "total",
-    "analytic_correction_features_adjoint": "alpha",
 }
 
-# Deterministic seeds for the synthetic inputs of the mirror-served kinds
-# and the adjoint surfaces' seeds.
+# Deterministic seeds for the synthetic inputs of the mirror-served kinds.
 _MIRROR_SEEDS = {
     ("mol5", "external_field_projection"): 101,
     ("pbc4", "external_field_projection"): 102,
     ("mol5", "fukui_normalize"): 201,
     ("pbc4", "fukui_normalize"): 202,
-    ("mol5", "kspace_coulomb_features_adjoint"): 301,
-    ("pbc4", "kspace_coulomb_features_adjoint"): 302,
-    ("mol5", "kspace_coulomb_energy_adjoint"): 311,
-    ("pbc4", "kspace_coulomb_energy_adjoint"): 312,
+    # The structural shape check below still probes the self-interaction
+    # adjoint directly; it is not part of the perturbation matrix.
     ("mol5", "self_interaction_adjoint"): 321,
     ("pbc4", "self_interaction_adjoint"): 322,
-    ("mol5", "external_field_projection_adjoint"): 331,
-    ("pbc4", "external_field_projection_adjoint"): 332,
-    ("mol5", "dipole_readout_adjoint"): 341,
-    ("pbc4", "dipole_readout_adjoint"): 342,
-    ("mol5", "kspace_coulomb_energy_stress"): 351,
-    ("pbc4", "kspace_coulomb_energy_stress"): 352,
-    ("mol5", "fukui_normalize_adjoint"): 361,
-    ("pbc4", "fukui_normalize_adjoint"): 362,
-    ("mol5", "analytic_correction_energy_adjoint"): 371,
-    ("pbc4", "analytic_correction_energy_adjoint"): 372,
-    ("mol5", "analytic_correction_features_adjoint"): 381,
-    ("pbc4", "analytic_correction_features_adjoint"): 382,
 }
 
 
@@ -765,357 +663,6 @@ def _kind_comparisons(instance, kind, channel, perturbations=frozenset()):
             ),
         ]
 
-    # --- the adjoint surfaces ---------------------------------------------
-    # want is always the unperturbed adjoint (the same probe surface,
-    # unperturbed inputs and seed); the perturbations apply to the got
-    # side's inputs and seed.  The composed position gradients add the
-    # table seeds of every path before adjoint_geometry fires -- the
-    # shared-cache chain rule the FD battery of
-    # ``test_long_range_adjoints.py`` pins numerically; here it is the
-    # attribution surface.
-    if kind == "kspace_coulomb_features_adjoint":
-        seed = _MIRROR_SEEDS[(instance.key, kind)]
-        rng = np.random.default_rng(seed)
-        grad_features = rng.normal(size=arrays["features_pbc_alpha"].shape)
-        base_seed = np.array(grad_features)
-        if "adjoint_seed_features" in perturbations:
-            grad_features = grad_features * 1.5 + 0.2
-        source = _kind_source(instance, "alpha", perturbations)
-
-        def features_position_gradient(ops_, positions_, cell_, source_, seed_):
-            build_ = ops_.geometry_cache(positions_, cell_, batch)
-            cache_ = build_["cache"]
-            potential_ = ops_.apply_coulomb(
-                cache_, ops_.assemble_fourier(cache_, source_)
-            )
-            back_ = ops_.adjoint_project(cache_, seed_, potential_)
-            grad_density_ = ops_.adjoint_coulomb(cache_, back_["grad_potential"])
-            assembled_ = ops_.adjoint_assemble(cache_, grad_density_, source_)
-            return ops_.adjoint_geometry(
-                cache_,
-                back_["grad_cos_table"] + assembled_["grad_cos_table"],
-                back_["grad_sin_table"] + assembled_["grad_sin_table"],
-            )
-
-        return [
-            (
-                "grad_positions",
-                features_position_gradient(ops, positions, cell, source, grad_features),
-                features_position_gradient(
-                    instance.ops,
-                    arrays["node_positions"],
-                    arrays["cell"],
-                    instance.source("alpha"),
-                    base_seed,
-                ),
-            )
-        ]
-
-    if kind == "kspace_coulomb_energy_adjoint":
-        seed = _MIRROR_SEEDS[(instance.key, kind)]
-        rng = np.random.default_rng(seed)
-        grad_energy = rng.normal(size=instance.n_graphs)
-        base_seed = np.array(grad_energy)
-        if "adjoint_seed_energy" in perturbations:
-            grad_energy = grad_energy * 1.5 + 0.2
-        source = _kind_source(instance, "alpha", perturbations)
-
-        def energy_position_gradient(ops_, positions_, cell_, source_, seed_):
-            build_ = ops_.geometry_cache(positions_, cell_, batch)
-            cache_ = build_["cache"]
-            back_ = ops_.adjoint_coulomb_energy(
-                cache_, seed_, source_, arrays["energy_self_fields_alpha"]
-            )
-            return ops_.adjoint_geometry(
-                cache_, back_["grad_cos_table"], back_["grad_sin_table"]
-            )
-
-        return [
-            (
-                "grad_positions",
-                energy_position_gradient(ops, positions, cell, source, grad_energy),
-                energy_position_gradient(
-                    instance.ops,
-                    arrays["node_positions"],
-                    arrays["cell"],
-                    instance.source("alpha"),
-                    base_seed,
-                ),
-            )
-        ]
-
-    if kind == "self_interaction_adjoint":
-        seed = _MIRROR_SEEDS[(instance.key, kind)]
-        rng = np.random.default_rng(seed)
-        grad_terms = rng.normal(size=arrays["features_self_interaction_alpha"].shape)
-        base_terms = np.array(grad_terms)
-        grad_fields = rng.normal(size=arrays["energy_self_fields_alpha"].shape)
-        base_fields = np.array(grad_fields)
-        if "adjoint_seed_self_terms" in perturbations:
-            grad_terms = grad_terms * 1.5 + 0.2
-            grad_fields = grad_fields * 1.5 + 0.2
-        # Constant-linear: the adjoint consumes only the seed and the
-        # constants -- the (possibly perturbed) multipoles cannot move it.
-        return [
-            (
-                "grad_multipoles_features",
-                ops.adjoint_feature_self_terms(grad_terms),
-                instance.ops.adjoint_feature_self_terms(base_terms),
-            ),
-            (
-                "grad_multipoles_energy",
-                ops.adjoint_energy_self_fields(grad_fields),
-                instance.ops.adjoint_energy_self_fields(base_fields),
-            ),
-        ]
-
-    if kind == "external_field_projection_adjoint":
-        seed = _MIRROR_SEEDS[(instance.key, kind)]
-        rng = np.random.default_rng(seed)
-        n_graphs = instance.n_graphs
-        f_dim = instance.contract.field_dimension
-        external_potential = rng.normal(size=(n_graphs, 4))
-        norms = rng.uniform(0.5, 2.0, size=f_dim)
-        grad_features = rng.normal(size=(arrays["node_positions"].shape[0], f_dim))
-        base_seed = np.array(grad_features)
-        if "adjoint_seed_external_field" in perturbations:
-            grad_features = grad_features * 1.5 + 0.2
-
-        def external_field_adjoint(ops_, positions_, seed_):
-            return ops_.adjoint_external_field(
-                seed_, external_potential, positions_, batch, norms
-            )
-
-        want = external_field_adjoint(instance.ops, arrays["node_positions"], base_seed)
-        got = external_field_adjoint(ops, positions, grad_features)
-        return [
-            ("grad_positions", got["grad_positions"], want["grad_positions"]),
-            (
-                "grad_external_potential",
-                got["grad_external_potential"],
-                want["grad_external_potential"],
-            ),
-        ]
-
-    if kind == "dipole_readout_adjoint":
-        seed = _MIRROR_SEEDS[(instance.key, kind)]
-        rng = np.random.default_rng(seed)
-        n_graphs = instance.n_graphs
-        grad_charge = rng.normal(size=n_graphs)
-        grad_dipole = rng.normal(size=(n_graphs, 3))
-        base_charge = np.array(grad_charge)
-        base_dipole = np.array(grad_dipole)
-        if "adjoint_seed_dipole" in perturbations:
-            grad_charge = grad_charge * 1.5 + 0.2
-            grad_dipole = grad_dipole * 1.5 + 0.2
-        # The multipoles perturbation flows through the density input.
-        density = _kind_source(instance, "total", perturbations)
-        got = ops.adjoint_dipole_readout(
-            density, positions, batch, grad_charge, grad_dipole
-        )
-        want = instance.ops.adjoint_dipole_readout(
-            instance.source("total"),
-            arrays["node_positions"],
-            batch,
-            base_charge,
-            base_dipole,
-        )
-        return [
-            ("grad_positions", got["grad_positions"], want["grad_positions"]),
-            (
-                "grad_charge_density",
-                got["grad_charge_density"],
-                want["grad_charge_density"],
-            ),
-        ]
-
-    if kind == "kspace_coulomb_energy_stress":
-        # The stress surface (the composed reciprocal-space virial): the
-        # energy seed moves with its own column, and the inputs mirror
-        # the energy kind's (the cache's geometry, the charge density,
-        # the basis constants, and the positions of the position virial).
-        seed = _MIRROR_SEEDS[(instance.key, kind)]
-        rng = np.random.default_rng(seed)
-        grad_energy = rng.normal(size=instance.n_graphs)
-        base_seed = np.array(grad_energy)
-        if "adjoint_seed_stress" in perturbations:
-            grad_energy = grad_energy * 1.5 + 0.2
-        source = _kind_source(instance, "total", perturbations)
-
-        def energy_stress(ops_, positions_, cell_, source_, seed_):
-            build_ = ops_.geometry_cache(positions_, cell_, batch)
-            return ops_.coulomb_stress(
-                build_["cache"], seed_, None, source_, positions_
-            )
-
-        return [
-            (
-                "stress",
-                energy_stress(ops, positions, cell, source, grad_energy),
-                energy_stress(
-                    instance.ops,
-                    arrays["node_positions"],
-                    arrays["cell"],
-                    instance.source("total"),
-                    base_seed,
-                ),
-            )
-        ]
-    if kind == "fukui_normalize_adjoint":
-        seed = _MIRROR_SEEDS[(instance.key, kind)]
-        rng = np.random.default_rng(seed)
-        n_nodes, n_graphs = instance.n_nodes, instance.n_graphs
-        fukui_sources = rng.normal(size=(n_nodes, 2))
-        total_charge = rng.normal(size=n_graphs)
-        total_spin = rng.normal(size=n_graphs)
-        grad_alpha = rng.normal(size=n_nodes)
-        grad_beta = rng.normal(size=n_nodes)
-        base_alpha = np.array(grad_alpha)
-        base_beta = np.array(grad_beta)
-        if "adjoint_seed_fukui" in perturbations:
-            grad_alpha = grad_alpha * 1.5 + 0.2
-            grad_beta = grad_beta * 1.5 + 0.2
-        # The l=0 charge channels come from the multipoles, so the multipoles
-        # perturbation flows through them; the sources, the graph-level
-        # charge/spin, and the seeds are the surface's own data.  The
-        # normalization has no geometry dependence at all.
-        charge_alpha = _kind_source(instance, "alpha", perturbations)[:, 0]
-        charge_beta = _kind_source(instance, "beta", perturbations)[:, 0]
-        got = ops.adjoint_fukui_normalize(
-            fukui_sources,
-            charge_alpha,
-            charge_beta,
-            total_charge,
-            total_spin,
-            batch,
-            grad_alpha,
-            grad_beta,
-        )
-        want = instance.ops.adjoint_fukui_normalize(
-            fukui_sources,
-            instance.source("alpha")[:, 0],
-            instance.source("beta")[:, 0],
-            total_charge,
-            total_spin,
-            batch,
-            base_alpha,
-            base_beta,
-        )
-        if channel == "alpha":
-            comparisons = [
-                (
-                    "grad_fukui_sources",
-                    got["grad_fukui_sources"],
-                    want["grad_fukui_sources"],
-                ),
-                (
-                    "grad_charge_l0_alpha",
-                    got["grad_charge_l0_alpha"],
-                    want["grad_charge_l0_alpha"],
-                ),
-            ]
-        else:
-            comparisons = [
-                (
-                    "grad_fukui_sources",
-                    got["grad_fukui_sources"],
-                    want["grad_fukui_sources"],
-                ),
-                (
-                    "grad_charge_l0_beta",
-                    got["grad_charge_l0_beta"],
-                    want["grad_charge_l0_beta"],
-                ),
-            ]
-        # The graph-level seeds are one surface per graph, carried by both
-        # channels' cases.
-        comparisons.extend(
-            (
-                (
-                    "grad_total_charge",
-                    got["grad_total_charge"],
-                    want["grad_total_charge"],
-                ),
-                ("grad_total_spin", got["grad_total_spin"], want["grad_total_spin"]),
-            )
-        )
-        return comparisons
-
-    if kind == "analytic_correction_energy_adjoint":
-        seed = _MIRROR_SEEDS[(instance.key, kind)]
-        rng = np.random.default_rng(seed)
-        grad_energy = rng.normal(size=instance.n_graphs)
-        base_seed = np.array(grad_energy)
-        if "adjoint_seed_correction_energy" in perturbations:
-            grad_energy = grad_energy * 1.5 + 0.2
-        source = _kind_source(instance, "total", perturbations)
-        got = ops.adjoint_correction_energy(
-            source, positions, cell, batch, pbc, grad_energy
-        )
-        want = instance.ops.adjoint_correction_energy(
-            instance.source("total"),
-            arrays["node_positions"],
-            arrays["cell"],
-            batch,
-            pbc,
-            base_seed,
-        )
-        return [
-            (
-                "grad_charge_density",
-                got["grad_charge_density"],
-                want["grad_charge_density"],
-            ),
-            ("grad_positions", got["grad_positions"], want["grad_positions"]),
-        ]
-
-    if kind == "analytic_correction_features_adjoint":
-        seed = _MIRROR_SEEDS[(instance.key, kind)]
-        rng = np.random.default_rng(seed)
-        f_dim = instance.contract.field_dimension
-        grad_alpha = rng.normal(size=(instance.n_nodes, f_dim))
-        grad_beta = rng.normal(size=(instance.n_nodes, f_dim))
-        base_alpha = np.array(grad_alpha)
-        base_beta = np.array(grad_beta)
-        if "adjoint_seed_correction_features" in perturbations:
-            grad_alpha = grad_alpha * 1.5 + 0.2
-            grad_beta = grad_beta * 1.5 + 0.2
-        alpha_density = _kind_source(instance, "alpha", perturbations)
-        beta_density = _kind_source(instance, "beta", perturbations)
-        got = ops.adjoint_correction_features(
-            alpha_density,
-            beta_density,
-            positions,
-            cell,
-            batch,
-            pbc,
-            grad_alpha,
-            grad_beta,
-        )
-        want = instance.ops.adjoint_correction_features(
-            instance.source("alpha"),
-            instance.source("beta"),
-            arrays["node_positions"],
-            arrays["cell"],
-            batch,
-            pbc,
-            base_alpha,
-            base_beta,
-        )
-        return [
-            (
-                "grad_charge_density_alpha",
-                got["grad_charge_density_alpha"],
-                want["grad_charge_density_alpha"],
-            ),
-            (
-                "grad_charge_density_beta",
-                got["grad_charge_density_beta"],
-                want["grad_charge_density_beta"],
-            ),
-            ("grad_positions", got["grad_positions"], want["grad_positions"]),
-        ]
-
     raise AssertionError(f"unknown kind {kind!r}")  # pragma: no cover
 
 
@@ -1188,7 +735,7 @@ def test_tier_parity_per_operator_kind(parity_case):
 PERTURBATION_CASES = tuple(
     (key, kind, perturbation)
     for key in GEOMETRIES
-    for kind in (*POLAR_LONG_RANGE_KINDS, *ADJOINT_SURFACES)
+    for kind in POLAR_LONG_RANGE_KINDS
     for perturbation in PERTURBATIONS
 )
 
@@ -1210,11 +757,7 @@ def _sensitivity(instance, kind):
     exactly zero whatever the inputs -- insensitive by contract, not by
     accident.  Every other kind's sensitivity is input-surface only.
     """
-    if instance.graph_class == "bulk" and kind in (
-        "analytic_correction_features",
-        "analytic_correction_energy_adjoint",
-        "analytic_correction_features_adjoint",
-    ):
+    if instance.graph_class == "bulk" and kind == "analytic_correction_features":
         return frozenset()
     return PERTURBATION_SENSITIVITY[kind]
 

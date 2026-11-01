@@ -51,13 +51,44 @@ the test process; reusing a root owned by another user additionally requires
 
 ## Builds and qualification
 
-Keep CPU, CUDA, HIP, LAMMPS, and comparison builds in separate fresh virtual
-environments and task-specific build roots. Use
+Keep CPU, CUDA, HIP, and LAMMPS builds in separate task-specific build roots.
+The CPU frontend and architecture-qualified CUDA/HIP add-on distributions may
+coexist in one task virtual environment. Use separate virtual environments for
+comparison packages or conflicting toolchains. Use
 `python tools/symmetrix_build.py install`; use `--generator 'Unix Makefiles'`
 when Ninja or CUDA `nvcc_wrapper` requires it. Use `uv` for dependencies.
 Discard a build root when the compiler, Python, backend, architecture,
 SpheriCart policy, incompatible CMake options, or cache validity changes;
 never repair a mixed cache in place.
+
+CUDA availability must be checked in two parts: the toolkit/compiler and the
+runtime device. Do not conclude that CUDA is unavailable from a sandboxed
+probe, a missing `PATH` entry, or a failed `nvidia-smi` call alone. GPU probes
+(`nvidia-smi`, `torch.cuda.is_available()`, and device-count checks) require an
+unsandboxed shell. Compiler probes should check the known toolkit roots before
+reporting the toolkit missing:
+
+```bash
+nvidia-smi
+for cuda_root in /usr/local/cuda-13.3 /usr/local/cuda-12.9 /usr/local/cuda; do
+  if test -x "$cuda_root/bin/nvcc"; then
+    echo "CUDA toolkit: $cuda_root"
+    "$cuda_root/bin/nvcc" --version
+  fi
+done
+```
+
+Treat these as separate states in reports: **toolkit available/device
+unavailable**, **device available/toolkit unavailable**, or **both available**.
+Only the second state prevents compilation; only the first prevents runtime
+GPU qualification. The local CUDA 13 toolkit is normally at
+`/usr/local/cuda-13.3` when that path exists.
+
+For release and verification runs, one task virtual environment may contain
+the CPU frontend and architecture-qualified accelerator add-ons. Keep their
+build roots separate, set `SYMMETRIX_BACKEND` before importing Symmetrix, and
+use a fresh Python process for each backend; a native backend cannot be switched
+after it has been loaded in a process.
 
 CPU development example:
 
@@ -138,10 +169,11 @@ benchmark.
 
 ## GPU, profiling, LAMMPS, and MPI
 
-Run `nvidia-smi` first and record GPU model, driver, compute capability, memory,
-and competing processes. Before diagnosing a comparison failure, probe
-`torch.cuda.is_available()` and device count using the exact benchmark
-interpreter: a restricted shell can hide the GPU from PyTorch. For a baseline
+Run `nvidia-smi` first **from an unsandboxed shell** and record GPU model,
+driver, compute capability, memory, and competing processes. A restricted or
+sandboxed shell can report a false negative even when the host has a usable
+GPU. Before diagnosing a comparison failure, probe `torch.cuda.is_available()`
+and device count using the exact benchmark interpreter, also unsandboxed. For a baseline
 using another CUDA major version, verify imports/device execution, inspect
 dependencies with `ldd`, keep matching runtime/NVRTC libraries inside that
 isolated environment, and label the result as cross-major; never prepend those

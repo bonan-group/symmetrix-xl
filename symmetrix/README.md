@@ -57,6 +57,18 @@ model, graph policy, hardware, warmup, and measurement protocol. Release
 documentation does not reproduce timings from comparison packages; consult the
 paper when evaluating performance claims.
 
+### Release qualification scope
+
+Public documentation states approved release behavior only. Before final wheel
+builds, an internal pre-release verification plan runs the selected
+CPU/CUDA/HIP correctness cases and OpenMP scaling/throughput/tile/speedup cases
+exactly once to detect regressions; results remain private unless explicitly
+approved for publication. Correctness must pass with no unacceptable regression;
+wheel evidence requires archive/install
+integrity, source/Python/catalog identity, a strict native-first doctor with
+one compatible OpenMP runtime and OpenBLAS, no native issues, and applicable
+numerical smoke/E-F/S checks.
+
 ## Installation
 
 Symmetrix-XL supports CPython 3.10 through 3.14 on Linux x86-64.
@@ -410,12 +422,20 @@ source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_
 uv pip install --no-build-isolation --reinstall-package symmetrix-xl \
   -e "./symmetrix[test]" \
   --config-setting="cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint"
-pytest symmetrix/test
+# Default internal verification profile (~2,000 representative cases).
+pytest -m "not extended" symmetrix/test
+# Matrix-expanded coverage only, when needed.
+pytest -m extended symmetrix/test
+# Full compact plus extended suite.
+# pytest symmetrix/test
 uvx pre-commit run --all-files
 ```
 
-Keep CPU, CUDA, HIP, and LAMMPS builds in separate environments and build
-directories.
+Keep CPU, CUDA, HIP, and LAMMPS builds in separate build directories. The CPU
+frontend and architecture-qualified accelerator add-ons may coexist in one
+virtual environment; select the backend with `SYMMETRIX_BACKEND` before import
+and use a fresh process for each backend. Use separate environments for
+comparison packages or conflicting toolchains.
 
 ## License
 

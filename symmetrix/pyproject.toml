@@ -122,6 +122,7 @@ markers = [
     "jit: exercises runtime specialization or its cache",
     "lammps: requires a compatible LAMMPS build",
     "slow: long-running correctness coverage",
+    "extended: matrix-expanded coverage outside the default internal verification profile",
     "sanitizer: runs under a declared diagnostic tool",
     "performance: produces qualified timing data",
 ]

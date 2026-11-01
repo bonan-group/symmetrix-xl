@@ -13,6 +13,83 @@ from model_downloads import (
 _REQUIRED_NODES = set()
 _REQUIRED_PASSED_CALLS = set()
 
+# The normal internal verification run keeps one representative item per test
+# function, or one smoke item for a fully extended module. Matrix-heavy
+# families remain available through ``-m extended``.
+# These modules are intentionally extended as a whole because their smoke
+# value is already represented by neighboring tests, while their full matrices
+# multiply geometries, precisions, schedules, and generated variants.
+_EXTENDED_MODULES = frozenset(
+    {
+        "test_ase_omat_md_backend_scale.py",
+        "test_build_tool.py",
+        "test_d3_kokkos.py",
+        "test_develop_build.py",
+        "test_fourier_d3_capability.py",
+        "test_fourier_d3_coordination.py",
+        "test_fourier_d3_evaluator.py",
+        "test_fourier_d3_factors.py",
+        "test_fourier_d3_qualification.py",
+        "test_fourier_d3_reciprocal.py",
+        "test_fourier_d3_reference.py",
+        "test_fourier_d3_reverse.py",
+        "test_fourier_d3_storage.py",
+        "test_jit.py",
+        "test_jit_artifact_envelope.py",
+        "test_jit_codegen.py",
+        "test_jit_device_artifact.py",
+        "test_jit_operator_artifact.py",
+        "test_jit_operator_codegen.py",
+        "test_mace_alchemical.py",
+        "test_mace_kokkos_source_partitioning.py",
+        "test_mace_les_calculator.py",
+        "test_mace_les_jit.py",
+        "test_mace_les_kokkos.py",
+        "test_mace_polar_consumer.py",
+        "test_mace_polar_frontend.py",
+        "test_mace_streamed_edges.py",
+        "test_prebuilt_operator_build.py",
+        "test_polar_end_to_end_fixtures.py",
+        "test_polar_mace_serial_benchmark.py",
+        "test_polar_mh1_backbone_fixtures.py",
+        "test_polar_paper_benchmark.py",
+        "test_polar_oracle_fixtures.py",
+        "test_polar_particle_mesh_workspace.py",
+        "test_standard_mace_streamed_benchmark.py",
+        "test_symmetrix_calc_jit.py",
+    }
+)
+
+
+def _mark_extended_matrix_cases(items):
+    """Mark matrix expansion cases while retaining compact smoke coverage."""
+
+    if any(
+        not hasattr(item, "nodeid") or not hasattr(item, "originalname")
+        for item in items
+    ):
+        return
+
+    by_module = {}
+    by_function = {}
+    for item in items:
+        module = item.nodeid.split("::", 1)[0].rsplit("/", 1)[-1]
+        by_module.setdefault(module, []).append(item)
+        function = (module, item.originalname)
+        by_function.setdefault(function, []).append(item)
+
+    extended_modules = set(_EXTENDED_MODULES)
+    for module, module_items in by_module.items():
+        if module in extended_modules:
+            for item in module_items[1:]:
+                item.add_marker(pytest.mark.extended)
+
+    for (module, _), function_items in by_function.items():
+        if module in extended_modules:
+            continue
+        for item in function_items[1:]:
+            item.add_marker(pytest.mark.extended)
+
 
 def _require_macefield():
     try:
@@ -122,6 +199,12 @@ def pytest_collection_modifyitems(config, items):
                         reason="OAM execution is unsupported on the HIP backend"
                     )
                 )
+
+    if _required_test_manifest() is None:
+        _mark_extended_matrix_cases(items)
+        for item in items:
+            if "performance" in item.keywords or "slow" in item.keywords:
+                item.add_marker(pytest.mark.extended)
 
     manifest = _required_test_manifest()
     if manifest is None:

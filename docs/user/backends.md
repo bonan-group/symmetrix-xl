@@ -29,6 +29,17 @@ configuration, including whether the build is OpenMP-enabled and its active
 thread count, OpenMP runtime compatibility, and maximum active levels, just like
 `symmetrix doctor`.
 
+## Release qualification scope
+
+Public documentation states approved release behavior only. Before final wheel
+builds, internal pre-release verification runs the
+selected CPU/CUDA/HIP correctness cases and one OpenMP scaling case. Its
+performance results detect regressions and are not public unless separately
+approved. Correctness must pass with no unacceptable regression. Public wheel
+checks retain archive/install/RECORD/catalog identity, strict native-first
+doctor results, one-runtime OpenBLAS compatibility, no-native-issues status,
+source/Python/catalog identity, and applicable numerical smoke/E-F/S checks.
+
 To install a published backend wheel from the command line, use:
 
 ```bash

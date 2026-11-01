@@ -71,7 +71,9 @@ def identity_probe(tmp_path_factory):
 
 
 @pytest.mark.parametrize(
-    "payload", [b"", b"abc", bytes(range(256)) * 513 + b"\x00tail"]
+    "payload",
+    [b"", b"abc", bytes(range(256)) * 513 + b"\x00tail"],
+    ids=["empty", "ascii", "binary"],
 )
 def test_relocated_runtime_matches_compiled_hash_without_build_path(
     identity_probe, tmp_path, payload

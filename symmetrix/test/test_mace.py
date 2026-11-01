@@ -1,3 +1,4 @@
+import gc
 import ase
 from ase.neighborlist import neighbor_list
 import json
@@ -29,63 +30,64 @@ model = "mace-off-small"
 # model = "mace-mpa-medium"
 # model = "mace-omat-0-medium"
 
-# The serial MACE evaluator is retired, so MACEKokkos is the only MACE evaluator
-# left.  The cached models below are the original Symmetrix pair-spline format
-# (named v1 here): the native loader still admits them through the materialized
-# edge representation and warns that it did, while set_streamed_edges refuses
-# such a model, so the loader's own routing is the only one it can run in.  The
-# Python calculator frontend refuses the format outright, which is why this
-# exploration constructs the native evaluator directly.
-if not symmetrix._kokkos_is_initialized():
-    symmetrix._init_kokkos()
-
-# load model
-if model == "mace-off-small":
-    evaluator = symmetrix.MACEKokkos(str(JSON_MODELS["MACE-OFF23_small-1-8.json"]))
-elif model == "mace-off-medium":
-    evaluator = symmetrix.MACEKokkos("MACE-OFF23_medium-1-8.json")
-elif model == "mace-off-large":
-    evaluator = symmetrix.MACEKokkos("MACE-OFF23_large-1-8.json")
-elif model == "mace-mp-small":
-    evaluator = symmetrix.MACEKokkos("mace-small-density-agnesi-stress-1-8.json")
-elif model == "mace-mp-medium":
-    evaluator = symmetrix.MACEKokkos("mace-medium-density-agnesi-stress-1-8.json")
-elif model == "mace-mp-large":
-    evaluator = symmetrix.MACEKokkos("mace-large-density-agnesi-stress.json")
-elif model == "mace-mpa-medium":
-    evaluator = symmetrix.MACEKokkos("mace-mpa-0-medium-1-8.json")
-elif model == "mace-omat-0-medium":
-    evaluator = symmetrix.MACEKokkos("mace-omat-0-medium-1-8.json")
-
-# prepare for tests
-atoms = ase.Atoms("OHH", positions=[[0.0, -2.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-ase_atomic_numbers = atoms.get_atomic_numbers().tolist()
-mace_atomic_numbers = evaluator.atomic_numbers
-i_list, j_list, r, xyz = neighbor_list("ijdD", atoms, 5.0)
-xyz = -xyz  # TODO: why exactly is this necessary!?
-num_nodes = np.max(i_list) + 1
-node_types = [
-    mace_atomic_numbers.index(ase_atomic_numbers[i]) for i in range(num_nodes)
-]
-num_neigh = [sum(j_list == i) for i in range(num_nodes)]
-neigh_types = [mace_atomic_numbers.index(ase_atomic_numbers[j]) for j in j_list]
-evaluator.compute_node_energies_forces(
-    num_nodes, node_types, num_neigh, j_list, neigh_types, xyz.flatten(), r
-)
+evaluator = None
+atoms = None
+ase_atomic_numbers = None
+mace_atomic_numbers = None
+i_list = j_list = r = xyz = None
+num_nodes = None
+node_types = num_neigh = neigh_types = None
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _release_evaluator():
-    """Drop the module-level evaluator before the session finalizes Kokkos.
+def _prepare_evaluator():
+    """Prepare the exploratory evaluator only when this module has tests."""
 
-    ``MACEKokkos`` counts as a live Symmetrix evaluator and the session fixture
-    refuses to finalize Kokkos while one is alive; this exploration keeps its
-    evaluator in a module global, so the reference is dropped explicitly.
-    """
+    global evaluator, atoms, ase_atomic_numbers, mace_atomic_numbers
+    global i_list, j_list, r, xyz, num_nodes, node_types, num_neigh, neigh_types
 
+    # The serial MACE evaluator is retired, so MACEKokkos is the only MACE
+    # evaluator left. The cached model is the original pair-spline format.
+    if not symmetrix._kokkos_is_initialized():
+        symmetrix._init_kokkos()
+    if model == "mace-off-small":
+        evaluator = symmetrix.MACEKokkos(
+            str(JSON_MODELS["MACE-OFF23_small-1-8.json"])
+        )
+    elif model == "mace-off-medium":
+        evaluator = symmetrix.MACEKokkos("MACE-OFF23_medium-1-8.json")
+    elif model == "mace-off-large":
+        evaluator = symmetrix.MACEKokkos("MACE-OFF23_large-1-8.json")
+    elif model == "mace-mp-small":
+        evaluator = symmetrix.MACEKokkos("mace-small-density-agnesi-stress-1-8.json")
+    elif model == "mace-mp-medium":
+        evaluator = symmetrix.MACEKokkos("mace-medium-density-agnesi-stress-1-8.json")
+    elif model == "mace-mp-large":
+        evaluator = symmetrix.MACEKokkos("mace-large-density-agnesi-stress.json")
+    elif model == "mace-mpa-medium":
+        evaluator = symmetrix.MACEKokkos("mace-mpa-0-medium-1-8.json")
+    elif model == "mace-omat-0-medium":
+        evaluator = symmetrix.MACEKokkos("mace-omat-0-medium-1-8.json")
+
+    atoms = ase.Atoms(
+        "OHH", positions=[[0.0, -2.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    )
+    ase_atomic_numbers = atoms.get_atomic_numbers().tolist()
+    mace_atomic_numbers = evaluator.atomic_numbers
+    i_list, j_list, r, xyz = neighbor_list("ijdD", atoms, 5.0)
+    xyz = -xyz
+    num_nodes = np.max(i_list) + 1
+    node_types = [
+        mace_atomic_numbers.index(ase_atomic_numbers[i]) for i in range(num_nodes)
+    ]
+    num_neigh = [sum(j_list == i) for i in range(num_nodes)]
+    neigh_types = [mace_atomic_numbers.index(ase_atomic_numbers[j]) for j in j_list]
+    evaluator.compute_node_energies_forces(
+        num_nodes, node_types, num_neigh, j_list, neigh_types, xyz.flatten(), r
+    )
     yield
-    global evaluator
     evaluator = None
+    gc.collect()
 
 
 def numerical_gradient(f, x):

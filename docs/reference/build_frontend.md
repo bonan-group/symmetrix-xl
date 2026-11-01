@@ -39,8 +39,14 @@ python tools/symmetrix_build.py --help
 python tools/symmetrix_build.py <command> --help
 ```
 
-Use a fresh virtual environment and a separate `--build-root` for every
-backend and architecture. `wheel-matrix` target specifications include forms
+For release qualification, use a fresh virtual environment and a separate
+`--build-root` for every backend and architecture. For ordinary development,
+the CPU frontend and architecture-qualified accelerator add-ons may share one
+task environment as long as their build roots remain separate. Before
+diagnosing CUDA as unavailable, check the
+toolkit at `/usr/local/cuda-13.3/bin/nvcc` (and other configured toolkit roots)
+and run `nvidia-smi` from an unsandboxed shell. A failed sandboxed GPU probe is
+not evidence that the host has no CUDA device. `wheel-matrix` target specifications include forms
 such as `cpu:x86-64-v3`, `cuda:13:sm120`, and `hip:7:gfx1151`. Direct CMake
 configuration remains a diagnostic path; the supported installation workflow
 is described in {doc}`/user/installation`, with backend-specific requirements

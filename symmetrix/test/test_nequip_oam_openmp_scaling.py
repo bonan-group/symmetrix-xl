@@ -1,4 +1,4 @@
-"""Qualify the NequIP-OAM Kokkos evaluator under OpenMP thread counts.
+"""Check NequIP-OAM scaling under OpenMP thread counts.
 
 The OAM Kokkos path dispatches owner work inside ``Kokkos::parallel_for`` over
 nodes, so its speedup must be *measured* per thread count, never requested.
@@ -26,23 +26,18 @@ representative CPU per core, ascending) and libgomp binds the team to those
 places.  Two host properties are load bearing:
 
 * the reserved CPU set must be the dense ascending prefix of the physical
-  cores.  On this 2-CCD host those representatives are ``{0, 1, ...}``; both
-  contiguous halves of the machine reach the same eight-worker throughput, but
-  the sparse ``{0, 2, 4, ...}`` half reproduces ~28% slower evaluations
-  (10.4 ms vs 8.1 ms) even though the diagnostics confirm one bound worker per
-  allocated CPU.  The four-worker cases are unaffected, so this is a
-  worker-count-dependent placement cost that the harness avoids by
-  construction;
+  cores.  The checked-in 320-atom SrTiO3 case is small enough for the ordinary
+  test environment while still exercising the full periodic OAM graph;
 * the 8-worker team needs the warm-up calls.  The first parallel evaluations of
   a process pay thread-pool and page-placement costs, and timing from call one
   understates 8-worker throughput by ~30%.
 
 The harness skips cleanly when the host cannot supply at least two disjoint
 physical cores, cannot pin them, or resolves a host BLAS that is not an
-OpenMP-enabled OpenBLAS build.  The last one is part of the qualification
+OpenMP-enabled OpenBLAS build.  The last one is part of the test
 environment rather than of the evaluator: a pthread OpenBLAS forces host GEMMs
 to one thread, and the harness's own strict diagnostics report that as a
-warning rather than the ``status: ok`` this qualification requires, so the
+warning rather than the ``status: ok`` this test requires, so the
 thread-count gates below cannot be measured on such a host.  See
 ``docs/developer/build_and_test.md`` for the build that selects the
 OpenMP flavor.
@@ -62,7 +57,7 @@ but wrong here: the gate skips when the host cannot supply two disjoint
 pinnable physical cores, and its speedup constants are only valid where the
 reserved CPUs are the dense ascending prefix of the physical cores (see above).
 Registering it would turn those host properties into red CI for a
-non-defect.  Qualification therefore runs it explicitly, with the environment
+non-defect.  The performance test therefore runs it explicitly, with the environment
 and CPU set it documents, rather than through the mandatory manifest.
 """
 
@@ -72,6 +67,7 @@ from __future__ import annotations
 # ruff: noqa: E402
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -88,11 +84,19 @@ bootstrap_explicit_extension()
 import numpy as np
 import pytest
 
-FIXTURE = Path(__file__).parent / "data" / "nequip" / "oam_s_v2_minimal.json"
+MODEL_ENV = "SYMMETRIX_OAM_S_MODEL"
+# The production OAM-S checkpoint is deliberately external to the repository.
+# The path is configurable, but its content is pinned so a different or
+# reduced checkpoint cannot silently turn this into a small-model test.
+PRODUCTION_MODEL_SHA256 = "a5cca35ae7278bc81ad894017ba62722b96edba59ea92f3c24ae0ba45d8cf1c7"
+OAM_DTYPE = os.environ.get("SYMMETRIX_OAM_DTYPE", "float32")
+if OAM_DTYPE not in {"float32", "float64"}:
+    raise ValueError("SYMMETRIX_OAM_DTYPE must be float32 or float64")
+STRUCTURE_FIXTURE = Path(__file__).parent / "data" / "nequip" / "oam_srtio3_4x4x4.json"
 
-#: The qualification record that documents the environment this harness
+#: The test record that documents the environment this harness
 #: requires: an OpenMP-enabled OpenBLAS selected without ``LD_LIBRARY_PATH``.
-QUALIFICATION_DOC = "docs/developer/build_and_test.md"
+OPENMP_DOC = "docs/developer/build_and_test.md"
 
 THREAD_COUNTS = (1, 2, 4, 8)
 #: Minimum steady-state speedup over the one-thread subprocess.
@@ -104,20 +108,11 @@ WARMUP_CALLS = 6
 TIMED_CALLS = 15
 WORKER_TIMEOUT_SECONDS = 1800.0
 
-#: The synthetic crystal repeats one basis over a cubic lattice: 13x13x13 nodes
-#: (2197 nodes) with 56 neighbours each inside the 4.5 A model cutoff, i.e.
-#: 123032 directed edges.  Directories are receiver-major, matching the
-#: evaluator's neighbour-list contract.
-#:
-#: Sizes above this are deliberately avoided: the receiver-owned workspace grows
-#: with the edge count, and on this host eight workers stop beating four once
-#: it outgrows one CCD's 32 MB L3 (measured per-edge cost 0.065 -> 0.080 us at
-#: 229376 -> 275128 edges) while four workers stay flat at ~0.075 us.  That is a
-#: memory-hierarchy limit of the host, not the evaluator, so the harness stays
-#: at the smallest graph the qualification contract allows.
-LATTICE_SITES = 13
-LATTICE_CONSTANT = 2.0
-NODE_TYPE_ATOMIC_NUMBERS = (1, 6)
+#: The checked-in 4x4x4 SrTiO3 structure has 320 atoms and 9856 directed
+#: periodic edges inside the 4.5 A OAM cutoff. Neighbor entries are
+#: receiver-major, matching the evaluator's contract.
+STRUCTURE_ATOMS = 320
+STRUCTURE_EDGES = 9856
 
 #: Reassociation tolerance between thread counts.  The receiver-owned ABI v2
 #: owners accumulate per receiver/source without atomics, so this contract
@@ -189,60 +184,68 @@ def _available_physical_cpus() -> list[int]:
     return physical
 
 
-def _neighbor_offsets() -> tuple[list[tuple[int, int, int]], list[float]]:
-    """Lattice offsets inside the model cutoff, shell ordered."""
+def _production_model() -> tuple[Path, str]:
+    """Return the externally supplied, content-pinned production OAM-S model."""
 
-    cutoff = 4.5
-    limit = int(np.ceil(cutoff / LATTICE_CONSTANT))
-    shells = []
-    for x in range(-limit, limit + 1):
-        for y in range(-limit, limit + 1):
-            for z in range(-limit, limit + 1):
-                offset = (x, y, z)
-                distance = LATTICE_CONSTANT * float(np.linalg.norm(offset))
-                if 0.0 < distance < cutoff:
-                    shells.append((distance, offset))
-    shells.sort(key=lambda shell: (shell[0], shell[1]))
-    return [offset for _, offset in shells], [distance for distance, _ in shells]
+    value = os.environ.get(MODEL_ENV)
+    if not value:
+        raise RuntimeError(
+            f"{MODEL_ENV} must point to the approved external OAM-S checkpoint"
+        )
+    path = Path(value).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"external OAM-S checkpoint does not exist: {path}")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != PRODUCTION_MODEL_SHA256:
+        raise AssertionError(
+            "external OAM-S checkpoint has unexpected SHA-256: "
+            f"{digest}; expected {PRODUCTION_MODEL_SHA256}"
+        )
+    return path, digest
 
 
-def _scaling_graph():
-    """Receiver-major periodic-crystal graph spanning the whole OAM cutoff."""
+def _scaling_graph(model_path: Path):
+    """Build the receiver-major periodic graph for the 320-atom SrTiO3 case."""
 
-    offsets, distances = _neighbor_offsets()
-    neighbors = len(offsets)
-    sites = LATTICE_SITES
-    grid = np.stack(
-        np.meshgrid(
-            np.arange(sites), np.arange(sites), np.arange(sites), indexing="ij"
-        ),
-        axis=-1,
-    ).reshape(-1, 3)
-    num_nodes = int(grid.shape[0])
+    from ase import Atoms
+    from ase.neighborlist import neighbor_list
 
-    sources = np.empty((num_nodes, neighbors), dtype=np.int32)
-    for index, offset in enumerate(offsets):
-        wrapped = (grid + np.asarray(offset, dtype=np.int64)) % sites
-        rows = wrapped[:, 0] * sites + wrapped[:, 1]
-        sources[:, index] = rows * sites + wrapped[:, 2]
-
-    node_types = np.asarray(
-        [NODE_TYPE_ATOMIC_NUMBERS[(int(x) + int(y) + int(z)) % 2] for x, y, z in grid],
-        dtype=np.int32,
+    structure = json.loads(STRUCTURE_FIXTURE.read_text(encoding="utf-8"))
+    atomic_numbers = np.asarray(structure["atomic_numbers"], dtype=np.int32)
+    atoms = Atoms(
+        numbers=atomic_numbers,
+        positions=np.asarray(structure["positions"], dtype=np.float64),
+        cell=np.asarray(structure["cell"], dtype=np.float64),
+        pbc=structure["pbc"],
     )
-    indices = sources.reshape(-1)
-    xyz = np.tile(
-        LATTICE_CONSTANT * np.asarray(offsets, dtype=np.float64), (num_nodes, 1)
-    ).reshape(-1)
+    model = json.loads(model_path.read_text(encoding="utf-8"))
+    type_map = {
+        int(key): int(value)
+        for key, value in model["atomic_number_to_model_type"].items()
+    }
+    node_types = np.asarray(
+        [type_map[int(number)] for number in atomic_numbers], dtype=np.int32
+    )
+    receivers, indices, displacement = neighbor_list(
+        "ijD", atoms, float(structure["cutoff_A"])
+    )
+    order = np.argsort(receivers, kind="stable")
+    receivers = np.asarray(receivers[order], dtype=np.int32)
+    indices = np.asarray(indices[order], dtype=np.int32)
+    displacement = np.asarray(displacement[order], dtype=np.float64)
+    num_nodes = len(atomic_numbers)
+    num_neigh = np.bincount(receivers, minlength=num_nodes).astype(np.int32)
+    assert num_nodes == STRUCTURE_ATOMS
+    assert len(indices) == STRUCTURE_EDGES
     return {
         "num_nodes": num_nodes,
         "node_types": node_types,
-        "num_neigh": np.full(num_nodes, neighbors, dtype=np.int32),
+        "num_neigh": num_neigh,
         "indices": indices,
         "neigh_types": node_types[indices],
-        "xyz": xyz,
-        "distances": np.tile(np.asarray(distances, dtype=np.float64), num_nodes),
-        "neighbors_per_node": neighbors,
+        "xyz": displacement.reshape(-1),
+        "distances": np.linalg.norm(displacement, axis=1),
+        "neighbors_per_node": int(num_neigh.max()),
     }
 
 
@@ -277,7 +280,7 @@ def _worker_command(arguments: list[str]) -> list[str]:
 def _probe_host_blas() -> dict:
     """Report the host BLAS the workers will select, from a throwaway process.
 
-    The probe asks the pinned extension when a qualification run pins one, so it
+    The probe asks the pinned extension when a performance run pins one, so it
     goes through this module's own child entry point instead of a bare
     interpreter, and it runs in a child because ``_openmp_runtime_info`` starts
     an OpenMP worker team that must not exist in the pytest process.
@@ -358,12 +361,18 @@ def _worker_main(argv: list[str]) -> int:
     if not native._kokkos_is_initialized():
         native._init_kokkos()
 
-    graph = _scaling_graph()
+    model_path, model_sha256 = _production_model()
+    graph = _scaling_graph(model_path)
     artifact = prepare_nequip_oam_receiver_host_artifact(
-        FIXTURE, "float64", native_module=native
+        model_path, OAM_DTYPE, native_module=native
     )
-    evaluator = native.NequIPOAMKokkos(
-        str(FIXTURE),
+    evaluator_class = (
+        native.NequIPOAMKokkosFloat
+        if OAM_DTYPE == "float32"
+        else native.NequIPOAMKokkos
+    )
+    evaluator = evaluator_class(
+        str(model_path),
         str(artifact.artifact_path),
         host_active_target=artifact.active_host_target,
         host_artifact_origin=artifact.artifact_origin,
@@ -429,6 +438,8 @@ def _worker_main(argv: list[str]) -> int:
     host_blas = runtime["runtime"]["host_blas"]
     report = {
         "threads": threads,
+        "dtype": OAM_DTYPE,
+        "model_sha256": model_sha256,
         "cpus": cpus,
         "graph": {
             "nodes": int(num_nodes),
@@ -488,6 +499,11 @@ def _worker_main(argv: list[str]) -> int:
 def test_oam_kokkos_openmp_thread_scaling(tmp_path):
     """Parity, participation and speedup of the OAM Kokkos path under threads."""
 
+    if MODEL_ENV not in os.environ:
+        pytest.skip(
+            "production OAM-S scaling requires SYMMETRIX_OAM_S_MODEL pointing "
+            "to the approved full checkpoint"
+        )
     native = _native()
     if not native._kokkos_is_initialized():
         native._init_kokkos()
@@ -500,7 +516,7 @@ def test_oam_kokkos_openmp_thread_scaling(tmp_path):
     )
     if openblas_build is not None and openblas_build["status"] == "warning":
         pytest.skip(
-            "OAM OpenMP scaling qualification requires an OpenMP-enabled, "
+            "OAM OpenMP scaling requires an OpenMP-enabled, "
             f"runtime-compatible BLAS: {openblas_build['message']}"
         )
     if shutil.which("taskset") is None:
@@ -509,10 +525,10 @@ def test_oam_kokkos_openmp_thread_scaling(tmp_path):
     physical = _available_physical_cpus()
     if len(physical) < 2:
         pytest.skip(
-            "at least two disjoint physical cores are required to qualify OAM "
+            "at least two disjoint physical cores are required to test OAM "
             f"OpenMP thread scaling; this process may use {len(physical)}"
         )
-    qualified_counts = [
+    runnable_counts = [
         threads for threads in THREAD_COUNTS if threads <= len(physical)
     ]
 
@@ -522,12 +538,13 @@ def test_oam_kokkos_openmp_thread_scaling(tmp_path):
             "the host loader resolves a non-OpenMP OpenBLAS build "
             f"({host_blas.get('library_path')!r}), which forces host GEMMs to a "
             "single thread; the thread-count gates require the OpenMP OpenBLAS "
-            f"build documented in {QUALIFICATION_DOC}"
+            f"build documented in {OPENMP_DOC}"
         )
 
-    graph = _scaling_graph()
-    assert graph["num_nodes"] >= 2000
-    assert graph["indices"].size >= 100000
+    model_path, model_sha256 = _production_model()
+    graph = _scaling_graph(model_path)
+    assert graph["num_nodes"] == STRUCTURE_ATOMS
+    assert graph["indices"].size == STRUCTURE_EDGES
 
     jit_cache = tmp_path / "jit-cache"
     # The execution JIT cache is a security boundary: the native loader
@@ -535,7 +552,7 @@ def test_oam_kokkos_openmp_thread_scaling(tmp_path):
     jit_cache.mkdir(mode=0o700)
     jit_cache.chmod(0o700)
     reports: dict[int, dict] = {}
-    for threads in qualified_counts:
+    for threads in runnable_counts:
         reports[threads] = _run_worker(
             threads,
             physical[:threads],
@@ -548,6 +565,7 @@ def test_oam_kokkos_openmp_thread_scaling(tmp_path):
     reference_forces = np.asarray(reference["forces"], dtype=np.float64)
 
     for threads, report in reports.items():
+        assert report["model_sha256"] == model_sha256
         assert report["graph"]["nodes"] == graph["num_nodes"]
         assert report["graph"]["edges"] == graph["indices"].size
         assert report["runtime"]["kokkos_execution_space"] == "OpenMP"
@@ -628,7 +646,7 @@ def main(argv: list[str] | None = None) -> int:
     if not arguments or "--worker" not in arguments:
         raise SystemExit(
             "test_nequip_oam_openmp_scaling.py is a pytest module; run it through "
-            "pytest, or pass --worker for a single qualification subprocess"
+            "pytest, or pass --worker for a single performance subprocess"
         )
     arguments.remove("--worker")
     return _worker_main(arguments)

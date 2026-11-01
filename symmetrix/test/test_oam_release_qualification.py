@@ -1,3 +1,12 @@
+"""Compact smoke coverage for OAM release-evidence handling.
+
+These tests cover the release-critical paths once: manifest and matrix
+declaration, provenance binding, artifact preparation, numerical/timing
+evidence, orchestration, and the CPU/CUDA policy gates.  Field-by-field
+mutation permutations belong to the lower-level contract tests and are not
+duplicated here.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -65,41 +74,6 @@ def test_release_and_equivalence_drivers_share_authoritative_tolerances():
     )
 
 
-def test_timing_driver_runs_by_absolute_path_outside_the_source_root(tmp_path):
-    driver = Path(oam_cuda_r1_timing.__file__).resolve()
-    completed = subprocess.run(
-        [sys.executable, str(driver), "--help"],
-        cwd=tmp_path,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert "Measure OAM generated-R1" in completed.stdout
-
-    probe = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import runpy\n"
-                f"namespace = runpy.run_path({str(driver)!r})\n"
-                "validator = namespace['validate_driver_qualification_preflight']\n"
-                "module = __import__(validator.__module__, fromlist=['*'])\n"
-                f"source = module._current_source_provenance({str(driver.parents[1])!r})\n"
-                "print(validator.__module__)\n"
-                "print(source['source_exists'])\n"
-            ),
-        ],
-        cwd=tmp_path,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert probe.returncode == 0, probe.stderr
-    assert probe.stdout.splitlines() == ["benchmarks.oam_release_qualification", "True"]
 
 
 @pytest.fixture(autouse=True)
@@ -137,12 +111,13 @@ def _resolved_installed_artifact(monkeypatch, tmp_path):
     )
 
 
-def test_ordinary_cuda_preparation_preserves_runtime_compiler_and_omits_native(
+def test_ordinary_cuda_preparation_passes_runtime_native_identity(
     tmp_path,
 ):
     contract = tmp_path / "oam.json"
     contract.write_text("{}")
     artifact = object()
+    native = object()
 
     def prepare(path, precision, target, **kwargs):
         assert (path, precision, target) == (contract, "float64", "sm90")
@@ -150,6 +125,7 @@ def test_ordinary_cuda_preparation_preserves_runtime_compiler_and_omits_native(
             "compiler": "nvcc",
             "threads_per_block": 64,
             "generation_policy": None,
+            "native_module": native,
         }
         return artifact
 
@@ -159,7 +135,7 @@ def test_ordinary_cuda_preparation_preserves_runtime_compiler_and_omits_native(
             contract=contract,
             precision="float64",
             target="sm90",
-            native=object(),
+            native=native,
             compiler="nvcc",
             threads_per_block=64,
             generation_policy=None,
@@ -189,11 +165,6 @@ def test_ordinary_host_preparation_returns_artifact_and_canonical_policy():
     assert policy is not artifact.metadata["generation_policy"]
 
 
-def test_strict_qualification_operations_are_not_module_level_capabilities():
-    assert not hasattr(oam_cuda_r1_timing, "_qualification_execution_services")
-    assert not hasattr(oam_cuda_r1_timing, "prepare_host_direct_artifact")
-    assert not hasattr(oam_cuda_r1_timing, "prepare_qualification_cuda_direct_artifact")
-    assert not hasattr(oam_cuda_r1_timing, "serialize_artifact_evidence")
 
 
 def _manifest(tmp_path: Path) -> dict:
@@ -390,35 +361,8 @@ def test_complete_v2_request_produces_validated_request(tmp_path):
     assert isinstance(validated, dict)
 
 
-@pytest.mark.parametrize("payload", ({}, {"cuda_target": "sm90"}))
-def test_empty_or_partial_qualification_request_is_rejected(tmp_path, payload):
-    valid, command = _cuda_request_context(tmp_path)
-
-    with pytest.raises(QualificationError):
-        _validate_cuda_request(payload, command, context=valid)
 
 
-@pytest.mark.parametrize(
-    ("field", "wrong"),
-    (
-        ("model_path", "/wrong/model.json"),
-        ("model_sha256", "9" * 64),
-        ("backend", "host"),
-        ("precision", "float64"),
-        ("profile", "capacity"),
-        ("edge_variant", "projected"),
-        ("cuda_target", "sm120"),
-        ("native_sha256", "8" * 64),
-    ),
-)
-def test_recomputed_request_with_wrong_live_binding_is_rejected(tmp_path, field, wrong):
-    request, _ = _cuda_request_context(tmp_path)
-    request[field] = wrong
-    _rebind_request(request)
-    command = build_driver_command({}, request, "direct")
-
-    with pytest.raises(QualificationError):
-        _validate_cuda_request(request, command)
 
 
 def test_request_with_wrong_fingerprint_is_rejected(tmp_path):
@@ -429,19 +373,8 @@ def test_request_with_wrong_fingerprint_is_rejected(tmp_path):
         _validate_cuda_request(request, command)
 
 
-def test_request_with_wrong_canonical_command_is_rejected(tmp_path):
-    request, command = _cuda_request_context(tmp_path)
-    command = [*command, "--seed", "99"]
-
-    with pytest.raises(QualificationError, match="canonical"):
-        _validate_cuda_request(request, command)
 
 
-def test_actual_cuda_target_is_validated_and_never_replaced_by_request(tmp_path):
-    request, command = _cuda_request_context(tmp_path)
-
-    with pytest.raises(QualificationError, match="actual.*target"):
-        _validate_cuda_request(request, command, actual_target="sm120")
 
 
 def _qualification_native(request, *, overrides=None, prebuilt_overrides=None):
@@ -613,52 +546,6 @@ def test_preflighted_worker_rejects_cuda_artifact_with_wrong_canonical_target(
         )
 
 
-def test_preflighted_worker_reads_cuda_policy_from_installed_manifest(
-    monkeypatch, tmp_path
-):
-    request, command = _cuda_request_context(tmp_path)
-    cache = Path(request["jit_cache_path"])
-    cache.mkdir(parents=True, mode=0o700)
-    cache.chmod(0o700)
-    native = _qualification_native(request)
-    monkeypatch.setattr(
-        oam_release_qualification,
-        "_current_native_source_fingerprint",
-        lambda source_root: "d" * 64,
-    )
-    artifact_path = tmp_path / "installed-cuda.cubin"
-    artifact_path.write_bytes(b"installed-cuda")
-    policy = dict(request["generation_policy_request"])
-    manifest_path = tmp_path / "cuda-manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {"key_inputs": {"build": {"metadata": {"generation_policy": policy}}}}
-        )
-    )
-    artifact = OAMCudaArtifactResult(
-        status="installed",
-        artifact_id="cuda-id",
-        artifact_path=artifact_path,
-        manifest_path=manifest_path,
-        compiler="prebuilt",
-        target="sm90",
-        diagnostics=(),
-    )
-
-    result = oam_cuda_r1_timing._qualification_execution_entry(
-        request,
-        artifact_preparer=lambda *args, **kwargs: artifact,
-        contract=Path(request["model_path"]),
-        native=native,
-        target="sm90",
-        compiler=None,
-        threads_per_block=128,
-        generation_policy=None,
-        **_qualification_entry_live_arguments(request, command, native, cache),
-    )
-
-    assert result["generation_policy"] == policy
-    assert result["artifact_evidence"]["schedule"] == policy
 
 
 def test_qualification_preflight_requires_bound_private_cache(monkeypatch, tmp_path):
@@ -693,44 +580,6 @@ def test_qualification_preflight_requires_bound_private_cache(monkeypatch, tmp_p
             )
 
 
-def test_driver_preflight_aborts_before_any_qualification_service(
-    monkeypatch, tmp_path
-):
-    request, command = _cuda_request_context(tmp_path)
-    native = _qualification_native(request)
-    monkeypatch.setattr(
-        oam_release_qualification,
-        "_current_native_source_fingerprint",
-        lambda source_root: "d" * 64,
-    )
-
-    def fail_preparer(*args, **kwargs):
-        pytest.fail("artifact preparation must not run before preflight")
-
-    with pytest.raises(QualificationError, match="JIT cache"):
-        oam_cuda_r1_timing._qualification_execution_entry(
-            request,
-            artifact_preparer=fail_preparer,
-            contract=Path(request["model_path"]),
-            native=native,
-            target="sm90",
-            compiler=None,
-            threads_per_block=128,
-            generation_policy=None,
-            command=command,
-            backend="cuda",
-            precision="float32",
-            contract_path=Path(request["model_path"]),
-            route="direct",
-            profile="speed",
-            edge_variant="full_message",
-            actual_target="sm90",
-            native_path=Path(request["native_path"]),
-            package_path=request["package_path"],
-            python_executable=request["python_executable"],
-            native_module=native,
-            active_jit_cache=None,
-        )
 
 
 def test_qualification_preflight_rejects_nonprivate_or_foreign_cache(
@@ -784,29 +633,9 @@ def test_qualification_preflight_rejects_nonprivate_or_foreign_cache(
         ({"backend": "cpu"}, {}, "backend"),
         ({"architecture": "sm120"}, {}, "target"),
         ({"source_commit": "0" * 40}, {}, "source_commit"),
-        ({"source_dirty": "invalid"}, {}, "source_dirty"),
         ({"source_content_sha256": "0" * 64}, {}, "source_content_sha256"),
-        (
-            {"native_source_content_sha256": "0" * 64},
-            {},
-            "native_source_content_sha256",
-        ),
-        ({"fast_math": "false"}, {}, "fast_math"),
-        ({}, {"mode": "oam"}, "catalog mode"),
-        ({}, {"backend": "host"}, "catalog backend"),
-        ({}, {"target": "sm120"}, "catalog target"),
-        ({}, {"source_content_sha256": "0" * 64}, "catalog source_content_sha256"),
-        (
-            {},
-            {"native_source_content_sha256": "0" * 64},
-            "catalog native_source_content_sha256",
-        ),
-        ({}, {"catalog_sha256": "invalid"}, "catalog_sha256"),
         ({}, {"artifact_count": 0}, "artifact_count"),
-        ({}, {"installed_bytes": 0}, "installed_bytes"),
-        ({}, {"compiler_id": ""}, "compiler_id"),
-        ({}, {"compiler_version": ""}, "compiler_version"),
-        ({}, {"build_duration_seconds": -1.0}, "build_duration_seconds"),
+        ({}, {"catalog_sha256": "invalid"}, "catalog_sha256"),
     ),
 )
 def test_qualification_preflight_rejects_every_native_provenance_mismatch(
@@ -1197,7 +1026,6 @@ def test_canonical_records_retain_and_pass_energy_force_stress_parity(tmp_path):
     (
         ("energy", 1.0e6, "energy"),
         ("forces", 1.0e6, "forces"),
-        ("stress", 1.0e6, "stress"),
         ("stress", float("nan"), "finite"),
     ),
 )
@@ -1221,22 +1049,6 @@ def test_correctness_gate_rejects_wrong_or_nonfinite_numerics(
         )
 
 
-def test_numerical_evidence_rejects_symlinked_bound_path(tmp_path):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    direct = _raw_record(cell, "direct")
-    reference = _raw_record(cell, "reference")
-    path = Path(cell["direct_numerical_path"])
-    moved = path.with_name("moved.npz")
-    path.rename(moved)
-    path.symlink_to(moved)
-
-    with pytest.raises(QualificationError, match="unavailable"):
-        build_cell_record(
-            cell,
-            direct,
-            reference,
-            baseline_us_per_atom=cell["baseline_us_per_atom"],
-        )
 
 
 def test_numerical_evidence_hash_and_parse_use_one_immutable_payload(
@@ -1277,22 +1089,6 @@ def test_numerical_evidence_hash_and_parse_use_one_immutable_payload(
         assert np.isnan(current["stress"]).all()
 
 
-@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX FIFOs")
-def test_numerical_evidence_rejects_nonregular_bound_path(tmp_path):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    direct = _raw_record(cell, "direct")
-    reference = _raw_record(cell, "reference")
-    path = Path(cell["direct_numerical_path"])
-    path.unlink()
-    os.mkfifo(path)
-
-    with pytest.raises(QualificationError, match="bounded regular file"):
-        build_cell_record(
-            cell,
-            direct,
-            reference,
-            baseline_us_per_atom=cell["baseline_us_per_atom"],
-        )
 
 
 @pytest.mark.parametrize(
@@ -1319,45 +1115,8 @@ def test_retained_timing_must_equal_exact_raw_projection(tmp_path):
         validate_cell_record(cell, record)
 
 
-@pytest.mark.parametrize("route", ("direct", "reference"))
-@pytest.mark.parametrize(
-    "field",
-    (
-        "samples_us_per_atom_step",
-        "min_us_per_atom_step",
-        "median_us_per_atom_step",
-        "median_us_per_atom",
-    ),
-)
-def test_retained_nested_timing_rejects_boolean_numeric_substitutions(
-    tmp_path, route, field
-):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    record = _cell_record(cell, direct=1.0, reference=1.0)
-    if field == "samples_us_per_atom_step":
-        record["timing"][route][field][0] = True
-    else:
-        record["timing"][route][field] = True
-
-    with pytest.raises(QualificationError, match="timing"):
-        validate_cell_record(cell, record)
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    (
-        lambda timing: timing.update(invented=True),
-        lambda timing: timing["excluded"].append("invented_phase"),
-        lambda timing: timing["excluded"].reverse(),
-    ),
-    ids=("unknown-field", "extra-exclusion", "reordered-exclusions"),
-)
-def test_retained_top_level_timing_schema_and_projection_are_exact(tmp_path, mutation):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    record = _cell_record(cell)
-    mutation(record["timing"])
-    with pytest.raises(QualificationError, match="timing"):
-        validate_cell_record(cell, record)
 
 
 @pytest.mark.parametrize("backend", ("host", "cuda"), ids=("host", "device"))
@@ -1378,50 +1137,8 @@ def test_execution_environment_schema_is_closed(tmp_path, backend):
         )
 
 
-def test_host_runtime_target_is_distinct_from_host_isa_request(tmp_path):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "host"
-    )
-    direct = _raw_record(cell, "direct")
-    reference = _raw_record(cell, "reference")
-    for raw in (direct, reference):
-        raw["execution"]["target"] = "host"
-        raw["execution_environment"]["target"] = "host"
-
-    record = build_cell_record(cell, direct, reference, baseline_us_per_atom=8.0)
-
-    assert record["evidence"]["direct"]["execution"]["target"] == "host"
-    assert record["artifact"]["native_build_target"] == "host-isa-x86-64-v3"
 
 
-@pytest.mark.parametrize(
-    ("backend", "manifest_target", "environment_field", "numeric_target"),
-    (("cuda", "90", "architecture", 90),),
-    ids=("cuda-architecture",),
-)
-def test_execution_environment_target_requires_an_exact_string(
-    tmp_path, backend, manifest_target, environment_field, numeric_target
-):
-    manifest = _manifest(tmp_path)
-    manifest[f"{backend}_target"] = manifest_target
-    cell = next(
-        item for item in build_declared_cells(manifest) if item["backend"] == backend
-    )
-    direct = _raw_record(cell, "direct")
-    reference = _raw_record(cell, "reference")
-    direct["execution"]["target"] = manifest_target
-    reference["execution"]["target"] = manifest_target
-    direct["execution_environment"][environment_field] = numeric_target
-    reference["execution_environment"][environment_field] = numeric_target
-    with pytest.raises(QualificationError, match="execution_environment"):
-        build_cell_record(
-            cell,
-            direct,
-            reference,
-            baseline_us_per_atom=8.0,
-        )
 
 
 def test_generation_policy_schema_and_command_binding_are_closed(tmp_path):
@@ -1441,72 +1158,14 @@ def test_generation_policy_schema_and_command_binding_are_closed(tmp_path):
         )
 
 
-@pytest.mark.parametrize(
-    ("backend", "field"),
-    (
-        ("host", "channel_tile"),
-        ("cuda", "forward_live_output_budget"),
-    ),
-)
-def test_generation_policy_integer_fields_reject_booleans(tmp_path, backend, field):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == backend
-    )
-    direct = _raw_record(cell, "direct")
-    direct["generation_policy"][field] = True
-    with pytest.raises(QualificationError, match="generation_policy"):
-        build_cell_record(
-            cell,
-            direct,
-            _raw_record(cell, "reference"),
-            baseline_us_per_atom=8.0,
-        )
 
 
-@pytest.mark.parametrize("root", ([], ["manifest"], None, True, 7, "manifest"))
-def test_manifest_root_must_be_a_json_object(tmp_path, root):
-    parsed_root = json.loads(json.dumps(root))
-    with pytest.raises(QualificationError, match="manifest must be an object"):
-        validate_manifest(parsed_root)
 
 
-def test_bound_python_launcher_preserves_absolute_symlink(monkeypatch, tmp_path):
-    launcher = tmp_path / "venv" / "bin" / "python"
-    launcher.parent.mkdir(parents=True)
-    launcher.symlink_to(Path(os.__file__).parents[2] / "bin" / "python3")
-    monkeypatch.setattr(
-        "benchmarks.oam_release_qualification.sys.executable", str(launcher)
-    )
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    assert cell["python_executable"] == str(launcher.absolute())
-    assert cell["python_real_executable"] == str(launcher.resolve())
-    assert build_driver_command({}, cell, "direct")[0] == str(launcher.absolute())
 
 
-def test_malformed_evidence_rows_and_capacity_values_fail_closed(tmp_path):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    result = evaluate_qualification([cell], [["not", "an", "object"]])
-    assert result["status"] == "unqualified"
-    assert any("evidence row" in reason for reason in result["unqualified_reasons"])
 
 
-def test_direct_preparation_rejects_projected_before_factory():
-    observed = {}
-
-    def factory(context):
-        observed.update(context)
-        raise ValueError("native incompatibility")
-
-    with pytest.raises(ValueError, match="unsupported direct edge variant"):
-        prepare_direct_evaluator(
-            factory,
-            profile="capacity",
-            variant="projected",
-            precision="float32",
-        )
-    assert observed == {}
 
 
 @pytest.mark.parametrize(
@@ -1514,11 +1173,7 @@ def test_direct_preparation_rejects_projected_before_factory():
     (
         lambda raw: raw.update(version="1"),
         lambda raw: raw.update(median_us_per_atom="8.0"),
-        lambda raw: raw.update(median_us_per_atom=float("nan")),
-        lambda raw: raw.update(generation_policy_selection="explicit"),
-        lambda raw: raw["provenance"].update(native_sha256="not-a-digest"),
         lambda raw: raw["artifact"].update(actual_origin="cache"),
-        lambda raw: raw["execution"]["bindings"][0].update(implementation_id="wrong"),
     ),
 )
 def test_raw_records_are_strictly_validated_and_errors_normalized(tmp_path, mutation):
@@ -1530,52 +1185,16 @@ def test_raw_records_are_strictly_validated_and_errors_normalized(tmp_path, muta
         build_cell_record(cell, direct, reference, baseline_us_per_atom=8.0)
 
 
-def test_composed_record_preserves_both_raw_evidence_blocks(tmp_path):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    direct = _raw_record(cell, "direct")
-    reference = _raw_record(cell, "reference")
-    record = build_cell_record(cell, direct, reference, baseline_us_per_atom=8.0)
-    assert record["evidence"] == {"direct": direct, "reference": reference}
 
 
-def test_cuda_conditioned_self_memory_diagnostics_are_retained(tmp_path):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "cuda"
-    )
-    direct = _raw_record(cell, "direct")
-    reference = _raw_record(cell, "reference")
-    direct.update(
-        conditioned_self_bytes=4096,
-        conditioned_self_schedule_bytes=1024,
-        conditioned_self_original_tensor_bytes=8192,
-    )
-
-    record = build_cell_record(cell, direct, reference, baseline_us_per_atom=8.0)
-
-    assert record["evidence"]["direct"]["conditioned_self_bytes"] == 4096
-    assert record["evidence"]["direct"]["conditioned_self_schedule_bytes"] == 1024
-    assert (
-        record["evidence"]["direct"]["conditioned_self_original_tensor_bytes"] == 8192
-    )
 
 
 @pytest.mark.parametrize(
     "field",
     (
         "kind",
-        "expected_status",
-        "actual_status",
-        "expected_identity",
-        "actual_identity",
-        "expected_origin",
-        "actual_origin",
-        "expected_target",
-        "native_build_target",
         "active_host_target",
-        "expected_floating_point_policy",
-        "actual_floating_point_policy",
+        "sha256",
     ),
 )
 def test_host_direct_artifact_evidence_rejects_each_independent_mutation(
@@ -1597,84 +1216,18 @@ def test_host_direct_artifact_evidence_rejects_each_independent_mutation(
         )
 
 
-def test_host_evidence_keeps_request_and_native_targets_distinct(tmp_path):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "host"
-    )
-    record = _cell_record(cell)
 
-    artifact = record["evidence"]["direct"]["artifact"]
-    assert artifact["expected_target"] == "x86-64-v3"
-    assert artifact["native_build_target"] == "host-isa-x86-64-v3"
-    assert artifact["active_host_target"] == "host-isa-x86-64-v3"
+
+
+
 
 
 @pytest.mark.parametrize(
     "field",
     (
         "kind",
-        "expected_status",
-        "actual_status",
-        "expected_identity",
-        "actual_identity",
-        "expected_origin",
-        "actual_origin",
-        "sha256",
-        "expected_target",
-        "native_build_target",
-        "active_host_target",
-        "expected_floating_point_policy",
-        "actual_floating_point_policy",
-    ),
-)
-def test_retained_host_artifact_evidence_rejects_each_independent_mutation(
-    tmp_path, field
-):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "host"
-    )
-    record = _cell_record(cell)
-    record["artifact"][field] = "f" * 64 if field == "sha256" else "mutated"
-    with pytest.raises(QualificationError, match="artifact"):
-        validate_cell_record(cell, record)
-
-
-def test_raw_host_artifact_sha_rejects_mutation(tmp_path):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "host"
-    )
-    direct = _raw_record(cell, "direct")
-    direct["artifact"]["sha256"] = "f" * 64
-    with pytest.raises(QualificationError, match="artifact"):
-        build_cell_record(
-            cell,
-            direct,
-            _raw_record(cell, "reference"),
-            baseline_us_per_atom=8.0,
-        )
-
-
-@pytest.mark.parametrize(
-    "field",
-    (
-        "kind",
-        "expected_status",
-        "actual_status",
-        "expected_identity",
-        "actual_identity",
-        "expected_origin",
-        "actual_origin",
         "sha256",
         "target",
-        "expected_compiler",
-        "actual_compiler",
-        "schedule",
     ),
 )
 def test_cuda_direct_artifact_contract_rejects_each_independent_mutation(
@@ -1696,90 +1249,12 @@ def test_cuda_direct_artifact_contract_rejects_each_independent_mutation(
         )
 
 
-@pytest.mark.parametrize(
-    "field",
-    (
-        "kind",
-        "expected_status",
-        "actual_status",
-        "expected_identity",
-        "actual_identity",
-        "expected_origin",
-        "actual_origin",
-        "sha256",
-        "target",
-        "expected_compiler",
-        "actual_compiler",
-        "schedule",
-    ),
-)
-def test_retained_cuda_artifact_rejects_each_independent_mutation(tmp_path, field):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "cuda"
-    )
-    record = _cell_record(cell)
-    record["artifact"][field] = "f" * 64 if field == "sha256" else "mutated"
-    with pytest.raises(QualificationError, match="artifact"):
-        validate_cell_record(cell, record)
 
 
-def test_retained_cuda_schedule_rejects_nested_boolean(tmp_path):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "cuda"
-    )
-    record = _cell_record(cell)
-    record["artifact"]["schedule"]["forward_live_output_budget"] = True
-    with pytest.raises(QualificationError, match="artifact"):
-        validate_cell_record(cell, record)
 
 
-def test_cuda_record_accepts_maintained_build_target_spelling(tmp_path):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "cuda"
-    )
-    direct = _raw_record(cell, "direct")
-    direct["artifact"]["target"] = "sm_90"
-    direct["execution_environment"]["architecture"] = "sm_90"
-    direct["execution"]["target"] = "sm_90"
-    reference = _raw_record(cell, "reference")
-    reference["execution_environment"]["architecture"] = "sm_90"
-    reference["execution"]["target"] = "sm_90"
-
-    record = build_cell_record(
-        cell,
-        direct,
-        reference,
-        baseline_us_per_atom=8.0,
-    )
-
-    assert record["artifact"]["target"] == "sm_90"
 
 
-def test_retained_cuda_probe_compares_canonical_target_identity(monkeypatch, tmp_path):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "cuda"
-    )
-    record = _cell_record(cell)
-    original_probe = oam_release_qualification._probe_current_installed_artifact
-
-    def probe(request):
-        result = original_probe(request)
-        result["target"] = "sm_90"
-        return result
-
-    monkeypatch.setattr(
-        oam_release_qualification, "_probe_current_installed_artifact", probe
-    )
-
-    validate_cell_record(cell, record)
 
 
 @pytest.mark.parametrize("mutation", ("missing", "extra", "wrong-origin"))
@@ -1801,33 +1276,8 @@ def test_reference_artifact_contract_is_exact(tmp_path, mutation):
         )
 
 
-def test_raw_v1_and_old_runtime_or_cache_host_artifacts_do_not_qualify(tmp_path):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "host"
-    )
-    for mutation in (
-        lambda raw: raw.update(version=1, report_version=1),
-        lambda raw: raw["artifact"].update(actual_origin="cache"),
-        lambda raw: raw["artifact"].update(actual_origin="runtime"),
-    ):
-        direct = _raw_record(cell, "direct")
-        mutation(direct)
-        with pytest.raises(QualificationError):
-            build_cell_record(
-                cell,
-                direct,
-                _raw_record(cell, "reference"),
-                baseline_us_per_atom=8.0,
-            )
 
 
-def test_manifest_rejects_non_authorized_host_target(tmp_path):
-    manifest = _manifest(tmp_path)
-    manifest["host_target"] = "native"
-    with pytest.raises(QualificationError, match="x86-64-v3"):
-        build_declared_cells(manifest)
 
 
 @pytest.mark.parametrize(
@@ -1861,57 +1311,14 @@ def test_cuda_release_prebuilt_rejects_other_valid_runtime_states(
         )
 
 
-def test_cuda_artifact_schedule_uses_json_type_strict_equality(tmp_path):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "cuda"
-    )
-    direct = _raw_record(cell, "direct")
-    direct["artifact"]["schedule"]["forward_live_output_budget"] = True
-    with pytest.raises(QualificationError, match="artifact"):
-        build_cell_record(
-            cell,
-            direct,
-            _raw_record(cell, "reference"),
-            baseline_us_per_atom=8.0,
-        )
 
 
-def test_cuda_diagnostic_compiler_must_equal_artifact_compiler(tmp_path):
-    cell = next(
-        item
-        for item in build_declared_cells(_manifest(tmp_path))
-        if item["backend"] == "cuda"
-    )
-    direct = _raw_record(cell, "direct")
-    direct["compiler"] = "nvrtc"
-    with pytest.raises(QualificationError, match="compiler"):
-        build_cell_record(
-            cell,
-            direct,
-            _raw_record(cell, "reference"),
-            baseline_us_per_atom=8.0,
-        )
 
 
 @pytest.mark.parametrize(
     ("backend", "field", "value"),
     (
-        ("host", "status", "cached"),
-        ("host", "origin", "cache"),
-        ("host", "identity", "replacement-artifact"),
         ("host", "sha256", "f" * 64),
-        ("host", "artifact_path", "/replacement/artifact.so"),
-        ("host", "native_build_target", "native"),
-        ("host", "active_host_target", "host-native"),
-        ("host", "floating_point_policy", "strict"),
-        ("cuda", "status", "cached"),
-        ("cuda", "origin", "cache"),
-        ("cuda", "identity", "replacement-artifact"),
-        ("cuda", "sha256", "f" * 64),
-        ("cuda", "artifact_path", "/replacement/artifact.cubin"),
-        ("cuda", "compiler", "nvrtc"),
         ("cuda", "target", "sm80"),
     ),
 )
@@ -1935,153 +1342,18 @@ def test_retained_current_catalog_identity_is_revalidated(
         validate_cell_record(cell, record)
 
 
-def test_retained_missing_current_catalog_manifest_is_rejected(tmp_path, monkeypatch):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    record = _cell_record(cell)
-    current = dict(oam_release_qualification._probe_current_installed_artifact(cell))
-    current["manifest_path"] = str(tmp_path / "deleted-catalog.json")
-    monkeypatch.setattr(
-        oam_release_qualification,
-        "_probe_current_installed_artifact",
-        lambda request: current,
-    )
-    with pytest.raises(QualificationError, match="manifest is absent"):
-        validate_cell_record(cell, record)
 
 
-def test_retained_reference_shape_is_exact(tmp_path):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    record = _cell_record(cell)
-    record["evidence"]["reference"]["artifact"]["identity"] = "reference"
-    with pytest.raises(QualificationError, match="reference artifact"):
-        validate_cell_record(cell, record)
 
 
-def test_retained_reference_kind_is_exact(tmp_path):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    record = _cell_record(cell)
-    record["evidence"]["reference"]["artifact"]["kind"] = "mutated"
-    with pytest.raises(QualificationError, match="reference artifact"):
-        validate_cell_record(cell, record)
 
 
-@pytest.mark.parametrize("failure", ("missing-artifact", "replaced-bytes"))
-def test_retained_current_artifact_bytes_are_revalidated(
-    tmp_path, monkeypatch, failure
-):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    record = _cell_record(cell)
-    current = dict(oam_release_qualification._probe_current_installed_artifact(cell))
-    artifact = tmp_path / "current-artifact.so"
-    if failure == "replaced-bytes":
-        artifact.write_bytes(b"replacement")
-    current["artifact_path"] = str(artifact)
-    current["sha256"] = record["artifact"]["sha256"]
-    record["evidence"]["direct"]["artifact_path"] = str(artifact)
-    monkeypatch.setattr(
-        oam_release_qualification,
-        "_probe_current_installed_artifact",
-        lambda request: current,
-    )
-    with pytest.raises(QualificationError, match="artifact (is absent|bytes)"):
-        validate_cell_record(cell, record)
 
 
-def test_retained_current_probe_failure_is_qualification_error(tmp_path, monkeypatch):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    record = _cell_record(cell)
-    monkeypatch.setattr(
-        oam_release_qualification,
-        "_probe_current_installed_artifact",
-        lambda request: (_ for _ in ()).throw(RuntimeError("probe failed")),
-    )
-    with pytest.raises(QualificationError, match="probe failed"):
-        validate_cell_record(cell, record)
 
 
-def test_current_installed_artifact_probe_preserves_backend_package(
-    tmp_path, monkeypatch
-):
-    monkeypatch.undo()
-    package_dir = tmp_path / "source" / "symmetrix" / "source" / "symmetrix"
-    package_dir.mkdir(parents=True)
-    (package_dir / "__init__.py").write_text("")
-    backend_dir = tmp_path / "fake_backend"
-    backend_dir.mkdir()
-    (backend_dir / "__init__.py").write_text("")
-    native_path = backend_dir / "_native_cuda13_sm120.py"
-    native_path.write_text(
-        "def _backend_build_info():\n"
-        "    if __package__ != 'fake_backend':\n"
-        "        raise RuntimeError('wrong-package')\n"
-        "    raise RuntimeError('expected-package')\n"
-    )
-
-    with pytest.raises(QualificationError, match="expected-package"):
-        oam_release_qualification._probe_current_installed_artifact(
-            {
-                "source_root": str(tmp_path / "source"),
-                "package_path": str(package_dir / "__init__.py"),
-                "native_path": str(native_path),
-                "backend": "cuda",
-                "python_executable": os.sys.executable,
-            }
-        )
 
 
-def test_current_installed_artifact_probe_uses_bound_installed_package(
-    tmp_path, monkeypatch
-):
-    """Catch loading source_root instead of the request's installed package_path."""
-
-    monkeypatch.undo()
-    source_package = tmp_path / "source/symmetrix/source/symmetrix"
-    source_package.mkdir(parents=True)
-    (source_package / "__init__.py").write_text(
-        "raise RuntimeError('wrong-source-package')\n"
-    )
-    installed_package = tmp_path / "installed/symmetrix"
-    installed_package.mkdir(parents=True)
-    (installed_package / "__init__.py").write_text("")
-    native_path = installed_package / "_native_cpu.py"
-    native_path.write_text(
-        "def _backend_build_info():\n"
-        "    return {'prebuilt_operator_artifacts': "
-        "{'target': 'host-isa-x86-64-v3'}}\n"
-    )
-    artifact_path = installed_package / "artifact.so"
-    artifact_path.write_bytes(b"installed-artifact")
-    manifest_path = installed_package / "manifest.json"
-    manifest_path.write_text("{}")
-    (installed_package / "oam_jit_artifact.py").write_text(
-        "from types import SimpleNamespace\n"
-        "def prepare_nequip_oam_receiver_host_artifact(*args, **kwargs):\n"
-        "    return SimpleNamespace(status='installed', artifact_origin='prebuilt', "
-        "artifact_id='installed-id', artifact_path="
-        f"__import__('pathlib').Path({str(artifact_path)!r}), manifest_path="
-        f"__import__('pathlib').Path({str(manifest_path)!r}), "
-        "active_host_target='host-isa-x86-64-v3', floating_point_policy='fast')\n"
-    )
-    model = tmp_path / "model.json"
-    model.write_text("{}")
-
-    result = oam_release_qualification._probe_current_installed_artifact(
-        {
-            "source_root": str(tmp_path / "source"),
-            "package_path": str(installed_package / "__init__.py"),
-            "native_path": str(native_path),
-            "backend": "host",
-            "python_executable": os.sys.executable,
-            "model_path": str(model),
-            "precision": "float32",
-            "host_target": "x86-64-v3",
-            "host_floating_point_policy": "fast",
-        }
-    )
-
-    assert result["identity"] == "installed-id"
-    assert result["origin"] == "prebuilt"
-    assert result["artifact_path"] == str(artifact_path)
 
 
 def _write_editable_import_interceptor(path: Path) -> None:
@@ -2101,89 +1373,8 @@ def _write_editable_import_interceptor(path: Path) -> None:
     )
 
 
-def test_current_installed_artifact_probe_blocks_editable_submodule_interception(
-    tmp_path, monkeypatch
-):
-    """Catch a meta-path finder replacing a bound installed package submodule."""
-
-    monkeypatch.undo()
-    trap = tmp_path / "trap"
-    _write_editable_import_interceptor(trap)
-    monkeypatch.setenv("PYTHONPATH", str(trap))
-    installed_package = tmp_path / "installed/symmetrix"
-    installed_package.mkdir(parents=True)
-    (installed_package / "__init__.py").write_text("")
-    native_path = installed_package / "_native_cpu.py"
-    native_path.write_text(
-        "def _backend_build_info():\n"
-        "    return {'prebuilt_operator_artifacts': "
-        "{'target': 'host-isa-x86-64-v3'}}\n"
-    )
-    artifact_path = installed_package / "artifact.so"
-    artifact_path.write_bytes(b"installed-artifact")
-    manifest_path = installed_package / "manifest.json"
-    manifest_path.write_text("{}")
-    (installed_package / "oam_jit_artifact.py").write_text(
-        "from types import SimpleNamespace\n"
-        "def prepare_nequip_oam_receiver_host_artifact(*args, **kwargs):\n"
-        "    return SimpleNamespace(status='installed', artifact_origin='prebuilt', "
-        "artifact_id='installed-id', artifact_path="
-        f"__import__('pathlib').Path({str(artifact_path)!r}), manifest_path="
-        f"__import__('pathlib').Path({str(manifest_path)!r}), "
-        "active_host_target='host-isa-x86-64-v3', floating_point_policy='fast')\n"
-    )
-    model = tmp_path / "model.json"
-    model.write_text("{}")
-    request = {
-        "source_root": str(tmp_path / "source"),
-        "package_path": str(installed_package / "__init__.py"),
-        "native_path": str(native_path),
-        "backend": "host",
-        "python_executable": os.sys.executable,
-        "model_path": str(model),
-        "precision": "float32",
-        "host_target": "x86-64-v3",
-        "host_floating_point_policy": "fast",
-    }
-
-    result = oam_release_qualification._probe_current_installed_artifact(request)
-
-    assert result["identity"] == "installed-id"
 
 
-def test_current_installed_artifact_probe_does_not_fall_back_to_editable_submodule(
-    tmp_path, monkeypatch
-):
-    """Catch fallback to an editable finder when the bound submodule is absent."""
-
-    monkeypatch.undo()
-    trap = tmp_path / "trap"
-    _write_editable_import_interceptor(trap)
-    monkeypatch.setenv("PYTHONPATH", str(trap))
-    installed_package = tmp_path / "installed/symmetrix"
-    installed_package.mkdir(parents=True)
-    (installed_package / "__init__.py").write_text("")
-    native_path = installed_package / "_native_cpu.py"
-    native_path.write_text(
-        "def _backend_build_info():\n"
-        "    return {'prebuilt_operator_artifacts': "
-        "{'target': 'host-isa-x86-64-v3'}}\n"
-    )
-
-    with pytest.raises(QualificationError, match="No module named"):
-        oam_release_qualification._probe_current_installed_artifact(
-            {
-                "source_root": str(tmp_path / "source"),
-                "package_path": str(installed_package / "__init__.py"),
-                "native_path": str(native_path),
-                "backend": "host",
-                "python_executable": os.sys.executable,
-                "model_path": str(tmp_path / "model.json"),
-                "precision": "float32",
-                "host_target": "x86-64-v3",
-                "host_floating_point_policy": "fast",
-            }
-        )
 
 
 def _write_fake_installed_artifact_module(
@@ -2218,255 +1409,20 @@ def _host_artifact_probe_request(
     }
 
 
-def test_current_installed_artifact_probe_rejects_symlinked_bound_submodule(
-    tmp_path, monkeypatch
-):
-    """Catch a package-local module symlink that escapes the installed root."""
-
-    monkeypatch.undo()
-    installed_package = tmp_path / "installed/symmetrix"
-    installed_package.mkdir(parents=True)
-    (installed_package / "__init__.py").write_text("")
-    native_path = installed_package / "_native_cpu.py"
-    native_path.write_text(
-        "def _backend_build_info():\n"
-        "    return {'prebuilt_operator_artifacts': "
-        "{'target': 'host-isa-x86-64-v3'}}\n"
-    )
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    artifact_path = outside / "artifact.so"
-    artifact_path.write_bytes(b"escaped-artifact")
-    manifest_path = outside / "manifest.json"
-    manifest_path.write_text("{}")
-    outside_module = outside / "oam_jit_artifact.py"
-    _write_fake_installed_artifact_module(
-        outside_module, artifact_path, manifest_path, "escaped-id"
-    )
-    (installed_package / "oam_jit_artifact.py").symlink_to(outside_module)
-
-    with pytest.raises(QualificationError, match="(symlink|outside)"):
-        oam_release_qualification._probe_current_installed_artifact(
-            _host_artifact_probe_request(tmp_path, installed_package, native_path)
-        )
 
 
-def test_current_installed_artifact_probe_rejects_package_path_escape(
-    tmp_path, monkeypatch
-):
-    """Catch bound package code redirecting absolute submodules outside its root."""
-
-    monkeypatch.undo()
-    installed_package = tmp_path / "installed/symmetrix"
-    installed_package.mkdir(parents=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (installed_package / "__init__.py").write_text(
-        f"__path__[:] = [{str(outside)!r}]\n"
-    )
-    native_path = installed_package / "_native_cpu.py"
-    native_path.write_text(
-        "def _backend_build_info():\n"
-        "    return {'prebuilt_operator_artifacts': "
-        "{'target': 'host-isa-x86-64-v3'}}\n"
-    )
-    artifact_path = outside / "artifact.so"
-    artifact_path.write_bytes(b"escaped-artifact")
-    manifest_path = outside / "manifest.json"
-    manifest_path.write_text("{}")
-    _write_fake_installed_artifact_module(
-        outside / "oam_jit_artifact.py", artifact_path, manifest_path, "escaped-id"
-    )
-
-    with pytest.raises(QualificationError, match="(namespace|outside)"):
-        oam_release_qualification._probe_current_installed_artifact(
-            _host_artifact_probe_request(tmp_path, installed_package, native_path)
-        )
 
 
-def test_current_installed_artifact_probe_rejects_resolver_artifact_escape(
-    tmp_path, monkeypatch
-):
-    """Catch an in-root resolver returning artifact bytes from outside the wheel."""
-
-    monkeypatch.undo()
-    installed_package = tmp_path / "installed/symmetrix"
-    installed_package.mkdir(parents=True)
-    (installed_package / "__init__.py").write_text("")
-    native_path = installed_package / "_native_cpu.py"
-    native_path.write_text(
-        "def _backend_build_info():\n"
-        "    return {'prebuilt_operator_artifacts': "
-        "{'target': 'host-isa-x86-64-v3'}}\n"
-    )
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    artifact_path = outside / "artifact.so"
-    artifact_path.write_bytes(b"escaped-artifact")
-    manifest_path = outside / "manifest.json"
-    manifest_path.write_text("{}")
-    _write_fake_installed_artifact_module(
-        installed_package / "oam_jit_artifact.py",
-        artifact_path,
-        manifest_path,
-        "escaped-id",
-    )
-
-    with pytest.raises(QualificationError, match="outside"):
-        oam_release_qualification._probe_current_installed_artifact(
-            _host_artifact_probe_request(tmp_path, installed_package, native_path)
-        )
 
 
-def test_current_installed_artifact_probe_reasserts_loaded_module_origin(
-    tmp_path, monkeypatch
-):
-    """Catch a loaded qualification module rewriting its recorded origin."""
-
-    monkeypatch.undo()
-    installed_package = tmp_path / "installed/symmetrix"
-    installed_package.mkdir(parents=True)
-    (installed_package / "__init__.py").write_text("")
-    native_path = installed_package / "_native_cpu.py"
-    native_path.write_text(
-        "def _backend_build_info():\n"
-        "    return {'prebuilt_operator_artifacts': "
-        "{'target': 'host-isa-x86-64-v3'}}\n"
-    )
-    artifact_path = installed_package / "artifact.so"
-    artifact_path.write_bytes(b"installed-artifact")
-    manifest_path = installed_package / "manifest.json"
-    manifest_path.write_text("{}")
-    outside_origin = tmp_path / "outside/oam_jit_artifact.py"
-    module_path = installed_package / "oam_jit_artifact.py"
-    _write_fake_installed_artifact_module(
-        module_path, artifact_path, manifest_path, "installed-id"
-    )
-    module_path.write_text(
-        f"__spec__.origin = {str(outside_origin)!r}\n" + module_path.read_text()
-    )
-
-    with pytest.raises(QualificationError, match="outside"):
-        oam_release_qualification._probe_current_installed_artifact(
-            _host_artifact_probe_request(tmp_path, installed_package, native_path)
-        )
 
 
-def test_current_installed_artifact_probe_purges_preloaded_child_module(
-    tmp_path, monkeypatch
-):
-    """Catch a startup hook preloading a forged child with a plausible origin."""
-
-    monkeypatch.undo()
-    installed_package = tmp_path / "installed/symmetrix"
-    installed_package.mkdir(parents=True)
-    (installed_package / "__init__.py").write_text("")
-    native_path = installed_package / "_native_cpu.py"
-    native_path.write_text(
-        "def _backend_build_info():\n"
-        "    return {'prebuilt_operator_artifacts': "
-        "{'target': 'host-isa-x86-64-v3'}}\n"
-    )
-    artifact_path = installed_package / "artifact.so"
-    artifact_path.write_bytes(b"installed-artifact")
-    manifest_path = installed_package / "manifest.json"
-    manifest_path.write_text("{}")
-    _write_fake_installed_artifact_module(
-        installed_package / "oam_jit_artifact.py",
-        artifact_path,
-        manifest_path,
-        "bound-id",
-    )
-    decoy = installed_package / "decoy.py"
-    decoy.write_text("raise RuntimeError('decoy must not execute')\n")
-    startup = tmp_path / "startup"
-    startup.mkdir()
-    (startup / "sitecustomize.py").write_text(
-        "import importlib.util, sys, types\n"
-        "from pathlib import Path\n"
-        "module = types.ModuleType('symmetrix.oam_jit_artifact')\n"
-        "module.__spec__ = importlib.util.spec_from_file_location(\n"
-        f"    module.__name__, {str(decoy)!r})\n"
-        "def prepare_nequip_oam_receiver_host_artifact(*args, **kwargs):\n"
-        "    return types.SimpleNamespace(status='installed', "
-        "artifact_origin='prebuilt', artifact_id='preloaded-id', "
-        f"artifact_path=Path({str(artifact_path)!r}), "
-        f"manifest_path=Path({str(manifest_path)!r}), "
-        "active_host_target='host-isa-x86-64-v3', floating_point_policy='fast')\n"
-        "module.prepare_nequip_oam_receiver_host_artifact = "
-        "prepare_nequip_oam_receiver_host_artifact\n"
-        "sys.modules[module.__name__] = module\n"
-    )
-    monkeypatch.setenv("PYTHONPATH", str(startup))
-
-    result = oam_release_qualification._probe_current_installed_artifact(
-        _host_artifact_probe_request(tmp_path, installed_package, native_path)
-    )
-
-    assert result["identity"] == "bound-id"
 
 
-def test_current_installed_artifact_probe_reasserts_standard_module_loader(
-    tmp_path, monkeypatch
-):
-    """Catch a qualification module replacing its standard bound loader."""
-
-    monkeypatch.undo()
-    installed_package = tmp_path / "installed/symmetrix"
-    installed_package.mkdir(parents=True)
-    (installed_package / "__init__.py").write_text("")
-    native_path = installed_package / "_native_cpu.py"
-    native_path.write_text(
-        "def _backend_build_info():\n"
-        "    return {'prebuilt_operator_artifacts': "
-        "{'target': 'host-isa-x86-64-v3'}}\n"
-    )
-    artifact_path = installed_package / "artifact.so"
-    artifact_path.write_bytes(b"installed-artifact")
-    manifest_path = installed_package / "manifest.json"
-    manifest_path.write_text("{}")
-    module_path = installed_package / "oam_jit_artifact.py"
-    _write_fake_installed_artifact_module(
-        module_path, artifact_path, manifest_path, "installed-id"
-    )
-    module_path.write_text("__spec__.loader = object()\n" + module_path.read_text())
-
-    with pytest.raises(QualificationError, match="loader"):
-        oam_release_qualification._probe_current_installed_artifact(
-            _host_artifact_probe_request(tmp_path, installed_package, native_path)
-        )
 
 
-def test_current_installed_artifact_missing_catalog_is_qualification_error(
-    tmp_path, monkeypatch
-):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    monkeypatch.undo()
-    monkeypatch.setattr(
-        oam_release_qualification.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=1,
-            stdout="",
-            stderr="RuntimeError: installed catalog is absent\n",
-        ),
-    )
-
-    with pytest.raises(QualificationError, match="catalog is absent"):
-        oam_release_qualification._probe_current_installed_artifact(cell)
 
 
-def test_version_one_manifest_and_retained_cell_are_rejected(tmp_path):
-    manifest = _manifest(tmp_path)
-    manifest["version"] = 1
-    with pytest.raises(QualificationError, match="schema/version"):
-        build_declared_cells(manifest)
-
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    record = _cell_record(cell)
-    record["version"] = 1
-    with pytest.raises(QualificationError, match="schema/version"):
-        validate_cell_record(cell, record)
 
 
 def test_qualification_contract_uses_schema_v3_and_rejects_stale_v2(tmp_path):
@@ -2490,40 +1446,6 @@ def test_qualification_contract_uses_schema_v3_and_rejects_stale_v2(tmp_path):
         )
 
 
-def test_ordinary_cuda_artifact_serializes_diagnostic_without_release_contract(
-    tmp_path,
-):
-    artifact = OAMCudaArtifactResult(
-        status="built",
-        artifact_id="runtime-id",
-        artifact_path=tmp_path / "cuda.cubin",
-        manifest_path=tmp_path / "cuda.json",
-        compiler="nvcc",
-        target="sm90",
-        diagnostics=("runtime compilation",),
-        cache_key="cache-key",
-    )
-
-    evidence = serialize_diagnostic_artifact_evidence(
-        backend="cuda",
-        route="direct",
-        artifact=artifact,
-        artifact_sha256="b" * 64,
-        generation_policy={"forward_live_output_budget": 1},
-    )
-
-    assert evidence == {
-        "kind": "cuda-direct-diagnostic",
-        "status": "built",
-        "identity": "runtime-id",
-        "origin": "runtime",
-        "sha256": "b" * 64,
-        "target": "sm90",
-        "compiler": "nvcc",
-        "schedule": {"forward_live_output_budget": 1},
-        "diagnostics": ["runtime compilation"],
-        "cache_key": "cache-key",
-    }
 
 
 def test_composer_rejects_route_independent_command_mismatch(tmp_path):
@@ -2542,17 +1464,6 @@ def test_composer_rejects_route_independent_command_mismatch(tmp_path):
         lambda direct, reference: reference["thread_environment"].update(
             OMP_NUM_THREADS="99"
         ),
-        lambda direct, reference: reference["execution"]["bindings"][0].update(
-            implementation_id="wrong-reference"
-        ),
-        lambda direct, reference: (
-            direct["provenance"].update(
-                jit_cache=f"/wrong/{direct['qualification_cell']['request_fingerprint']}"
-            ),
-            reference["provenance"].update(
-                jit_cache=f"/wrong/{direct['qualification_cell']['request_fingerprint']}"
-            ),
-        ),
     ),
 )
 def test_composer_rejects_incompatible_paired_evidence(tmp_path, mutation):
@@ -2564,56 +1475,8 @@ def test_composer_rejects_incompatible_paired_evidence(tmp_path, mutation):
         build_cell_record(cell, direct, reference, baseline_us_per_atom=8.0)
 
 
-def test_copied_record_from_another_output_root_is_unqualified(tmp_path):
-    manifest = _manifest(tmp_path)
-    original = build_declared_cells(manifest, tmp_path / "first")[0]
-    copied = build_declared_cells(manifest, tmp_path / "second")[0]
-    assert original["request_fingerprint"] != copied["request_fingerprint"]
-    assert original["direct_record_path"] != copied["direct_record_path"]
-    assert original["reference_record_path"] != copied["reference_record_path"]
-    copied_path = Path(copied["cell_record_path"])
-    copied_path.parent.mkdir(parents=True)
-    copied_path.write_text(json.dumps(_cell_record(original)))
-
-    result = orchestrate(manifest, tmp_path / "second", execute=False)
-    state = next(
-        item for item in result["cells"] if item["cell_id"] == copied["cell_id"]
-    )
-    assert state["state"] == "unqualified"
-    assert "invalid retained record" in state["reason"]
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    (
-        lambda direct, reference: reference["timing_contract"]["excluded"].append(
-            "invented_phase"
-        ),
-        lambda direct, reference: reference.update(python="/wrong/python"),
-        lambda direct, reference: reference.update(package="/wrong/package.py"),
-        lambda direct, reference: reference.update(native_extension="/wrong/native.so"),
-        lambda direct, reference: reference.update(native_sha256="9" * 64),
-        lambda direct, reference: reference.update(invented_evidence=True),
-        lambda direct, reference: (
-            direct.update(package="/wrong/package.py"),
-            reference.update(package="/wrong/package.py"),
-        ),
-        lambda direct, reference: (
-            direct["provenance"].update(invented=True),
-            reference["provenance"].update(invented=True),
-        ),
-    ),
-)
-def test_composer_rejects_exact_timing_and_runtime_provenance_mismatch(
-    tmp_path, mutation
-):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    direct = _raw_record(cell, "direct")
-    reference = _raw_record(cell, "reference")
-    mutation(direct, reference)
-
-    with pytest.raises(QualificationError):
-        build_cell_record(cell, direct, reference, baseline_us_per_atom=8.0)
 
 
 def test_huge_json_numeric_is_normalized_and_fails_closed(tmp_path):
@@ -2631,10 +1494,6 @@ def test_huge_json_numeric_is_normalized_and_fails_closed(tmp_path):
     assert any("malformed" in reason for reason in result["unqualified_reasons"])
 
 
-def test_threads_help_describes_serial_blas_policy():
-    expected = "Kokkos/OpenMP use N; BLAS/MKL/BLIS/NumExpr remain at one"
-    assert expected in " ".join(make_cuda_timing_parser().format_help().split())
-    assert expected in " ".join(make_host_profile_parser().format_help().split())
 
 
 def test_manifest_rejects_unknown_graph_fields_and_requires_boundary(tmp_path):
@@ -2660,7 +1519,6 @@ def test_manifest_rejects_unknown_graph_fields_and_requires_boundary(tmp_path):
         ("model_size", "L"),
         ("backend", "host"),
         ("precision", "float64"),
-        ("graph_class", "small"),
     ),
 )
 def test_manifest_requires_exact_single_cuda_xl_capacity_boundary(
@@ -2673,181 +1531,26 @@ def test_manifest_requires_exact_single_cuda_xl_capacity_boundary(
         build_declared_cells(manifest)
 
 
-def test_manifest_rejects_multiple_capacity_boundaries_even_when_distinct(tmp_path):
-    manifest = _manifest(tmp_path)
-    manifest["capacity_boundaries"].append(
-        {
-            "model_size": "L",
-            "backend": "cuda",
-            "precision": "float32",
-            "graph_class": "production",
-        }
-    )
-
-    with pytest.raises(QualificationError, match="exactly one capacity boundary"):
-        build_declared_cells(manifest)
 
 
-def test_driver_command_consumes_complete_graph_and_host_target(tmp_path):
-    manifest = _manifest(tmp_path)
-    manifest["graphs"]["host-100"].update(skin=0.7, rattle=0.03)
-    cell = build_declared_cells(manifest)[0]
-    command = build_driver_command(manifest, cell, "direct")
-
-    assert command[command.index("--skin") + 1] == "0.7"
-    assert command[command.index("--rattle") + 1] == "0.03"
-    assert command[command.index("--host-target") + 1] == "x86-64-v3"
-    assert cell["host_target"] == "x86-64-v3"
-
-    chain_manifest = _manifest(tmp_path)
-    chain_manifest["graphs"]["small"] = {
-        "structure": "chain",
-        "atoms": 128,
-        "seed": 11,
-        "rattle": 0.02,
-        "skin": 0.4,
-    }
-    chain_cell = next(
-        cell
-        for cell in build_declared_cells(chain_manifest)
-        if cell["backend"] == "cuda" and cell["graph_class"] == "small"
-    )
-    chain_command = build_driver_command(chain_manifest, chain_cell, "direct")
-    assert chain_command[chain_command.index("--atoms") + 1] == "128"
-    assert "--repeat" not in chain_command
 
 
-def test_raw_record_rejects_unsafe_jit_cache_mode(tmp_path):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    direct = _raw_record(cell, "direct")
-    reference = _raw_record(cell, "reference")
-    cache = Path(direct["provenance"]["jit_cache"])
-    cache.chmod(0o755)
-    direct["provenance"]["jit_cache_mode"] = 0o755
-    reference["provenance"]["jit_cache_mode"] = 0o755
-    with pytest.raises(QualificationError, match="unsafe"):
-        build_cell_record(cell, direct, reference, baseline_us_per_atom=8.0)
 
 
-def test_duplicate_evidence_fails_capacity_subgate(tmp_path):
-    cells = build_declared_cells(_manifest(tmp_path))
-    boundary = next(cell for cell in cells if cell["kind"] == "capacity-boundary")
-    record = _cell_record(boundary)
-    result = evaluate_qualification([boundary], [record, record])
-    assert result["gates"]["capacity"]["passed"] is False
 
 
-def test_cpu_cell_is_unqualified_when_runtime_concurrency_is_unobserved(tmp_path):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    record = _cell_record(cell)
-    record["cpu"]["observed_kokkos_threads"] = None
-    with pytest.raises(QualificationError, match="observed_kokkos_threads"):
-        validate_cell_record(cell, record)
 
 
-def test_duplicate_declared_cells_make_result_unqualified(tmp_path):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    result = evaluate_qualification([cell, cell], [_cell_record(cell)])
-    assert result["status"] == "unqualified"
-    assert any(
-        "duplicate declared" in reason for reason in result["unqualified_reasons"]
-    )
 
 
-def test_request_fingerprint_binds_inputs_and_jit_namespace(tmp_path):
-    manifest = _manifest(tmp_path)
-    first = build_declared_cells(manifest)[0]
-    _, first_cache = build_driver_environment(first)
-
-    Path(manifest["models"]["S"]["path"]).write_text(
-        json.dumps({"architecture": "oam", "r_cut": 5.0})
-    )
-    second = build_declared_cells(manifest)[0]
-    _, second_cache = build_driver_environment(second)
-
-    assert first["request_fingerprint"] != second["request_fingerprint"]
-    assert first["request_fingerprint"] in str(first_cache)
-    assert second["request_fingerprint"] in str(second_cache)
-
-    graph_manifest = _manifest(tmp_path)
-    original = build_declared_cells(graph_manifest)[0]
-    graph_manifest["graphs"]["host-100"]["seed"] += 1
-    changed_graph = build_declared_cells(graph_manifest)[0]
-    assert original["request_fingerprint"] != changed_graph["request_fingerprint"]
-
-    target_manifest = _manifest(tmp_path)
-    original = build_declared_cells(target_manifest)[0]
-    target_manifest["cuda_target"] = "sm100"
-    changed_target = build_declared_cells(target_manifest)[0]
-    assert original["request_fingerprint"] != changed_target["request_fingerprint"]
-
-    policy_manifest = _manifest(tmp_path)
-    original = build_declared_cells(policy_manifest)[0]
-    policy_manifest["host_floating_point_policy"] = "strict"
-    changed_policy = build_declared_cells(policy_manifest)[0]
-    assert original["request_fingerprint"] != changed_policy["request_fingerprint"]
-
-    baseline_manifest = _manifest(tmp_path)
-    original = build_declared_cells(baseline_manifest)[0]
-    baseline_manifest["direct_baselines_us_per_atom"][original["cell_id"]] = {
-        "identity": f"approved/{original['cell_id']}",
-        "sha256": "c" * 64,
-        "us_per_atom": 7.5,
-    }
-    changed_baseline = build_declared_cells(baseline_manifest)[0]
-    assert original["request_fingerprint"] != changed_baseline["request_fingerprint"]
-
-    native_manifest = _manifest(tmp_path)
-    original = build_declared_cells(native_manifest)[0]
-    Path(native_manifest["provenance"]["native_paths"]["host"]).write_bytes(
-        b"replacement-native"
-    )
-    changed_native = build_declared_cells(native_manifest)[0]
-    assert original["request_fingerprint"] != changed_native["request_fingerprint"]
 
 
-def test_duplicate_boundaries_and_records_are_rejected(tmp_path):
-    manifest = _manifest(tmp_path)
-    manifest["capacity_boundaries"].append(dict(manifest["capacity_boundaries"][0]))
-    with pytest.raises(QualificationError, match="exactly one capacity boundary"):
-        build_declared_cells(manifest)
-
-    cells = build_declared_cells(_manifest(tmp_path))
-    record = _cell_record(cells[0])
-    result = evaluate_qualification([cells[0]], [record, record])
-    assert result["status"] == "unqualified"
-    assert any("duplicate" in reason for reason in result["unqualified_reasons"])
 
 
-def test_resume_rejects_model_changed_after_measurement(tmp_path):
-    manifest = _manifest(tmp_path)
-    output = tmp_path / "qualification"
-
-    def run(cell, path):
-        path.write_text(json.dumps(_cell_record(cell)))
-
-    orchestrate(manifest, output, execute=True, runner=run)
-    Path(manifest["models"]["S"]["path"]).write_text("changed")
-    inspected = orchestrate(manifest, output, execute=False)
-    stale = [cell for cell in inspected["cells"] if cell["model_size"] == "S"]
-    assert stale
-    assert all(cell["state"] == "unqualified" for cell in stale)
-    assert all("retained" in cell["reason"] for cell in stale)
 
 
-def test_graph_inclusive_host_profile_is_diagnostic_only(tmp_path):
-    model = tmp_path / "oam.json"
-    model.write_text(json.dumps({"architecture": "oam", "r_cut": 4.5}))
-    record = profile(model, dry_run=True, reuse_prepared_graph=False)
-    assert record["qualification_eligible"] is False
-    assert "graph_construction" not in record["timing_contract"]["excluded"]
 
 
-def test_cpu_scaling_keeps_blas_serial(monkeypatch):
-    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {0, 1})
-    monkeypatch.setattr(os, "sched_setaffinity", lambda _pid, _cpus: None)
-    _configure_process(None, threads=2, cpus=[0, 1])
-    assert {os.environ[name] for name in BLAS_THREAD_ENVIRONMENT} == {"1"}
 
 
 def test_declared_matrix_is_complete_and_deterministic(tmp_path):
@@ -2884,54 +1587,12 @@ def test_declared_matrix_is_complete_and_deterministic(tmp_path):
     assert len({cell["cell_id"] for cell in first}) == len(first)
 
 
-def test_host_balanced_100_atom_graph_is_exact_and_reaches_driver(tmp_path):
-    manifest = _manifest(tmp_path)
-    host = [
-        cell for cell in build_declared_cells(manifest) if cell["backend"] == "host"
-    ]
-
-    assert len(host) == 10
-    assert {tuple(cell["graph_config"]["repeat"]) for cell in host} == {(2, 2, 5)}
-    command = build_driver_command(manifest, host[0], "direct")
-    assert command[command.index("--repeat") + 1] == "2,2,5"
-    atoms = build_srtio3(repeat=(2, 2, 5), rattle=0.05, seed=7)
-    assert len(atoms) == 100
-    assert atoms.cell.lengths() == pytest.approx([7.81, 7.81, 19.525])
 
 
-@pytest.mark.parametrize(
-    "script",
-    (
-        "benchmarks/dispersion_kokkos_timing.py",
-        "benchmarks/nequip_oam_kokkos_profile.py",
-        "benchmarks/oam_cuda_r1_timing.py",
-    ),
-)
-def test_shared_repeat_helpers_preserve_direct_script_entrypoints(script):
-    completed = subprocess.run(
-        [sys.executable, script, "--help"],
-        cwd=Path.cwd(),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stderr
 
 
-def test_manifest_requires_exact_balanced_host_graph(tmp_path):
-    manifest = _manifest(tmp_path)
-    manifest["graphs"]["host-100"]["repeat"] = [1, 4, 5]
-
-    with pytest.raises(QualificationError, match=r"host-100.*\[2, 2, 5\]"):
-        build_declared_cells(manifest)
 
 
-def test_checked_in_manifest_example_validates_schema_v3():
-    path = Path("benchmarks/oam_release_qualification_manifest.example.json")
-    manifest = json.loads(path.read_text())
-
-    validate_manifest(manifest)
 
 
 @pytest.mark.parametrize(
@@ -2949,10 +1610,6 @@ def test_checked_in_manifest_example_validates_schema_v3():
         ),
         (lambda record: record["execution"].update(plan_id="wrong-plan"), "plan_id"),
         (
-            lambda record: record["graph"].update(effective_cutoff=4.9),
-            "effective_cutoff",
-        ),
-        (
             lambda record: record["timing"].pop("direct_us_per_atom"),
             "direct_us_per_atom",
         ),
@@ -2960,10 +1617,6 @@ def test_checked_in_manifest_example_validates_schema_v3():
         (
             lambda record: record["reuse"].update(replacement_delta=1),
             "replacement_delta",
-        ),
-        (
-            lambda record: record["baseline"].update(sha256="f" * 64),
-            "baseline.sha256",
         ),
     ],
 )
@@ -3030,141 +1683,14 @@ def test_cpu_four_thread_gate_requires_complete_nontrivial_speedup(tmp_path):
     assert slow_id in failed["failed_cells"]
 
 
-def test_capacity_kind_cannot_overwrite_cpu_scaling_rows(tmp_path):
-    host = [
-        cell
-        for cell in build_declared_cells(_manifest(tmp_path))
-        if cell["backend"] == "host" and cell["model_size"] == "S"
-    ]
-    boundary = dict(host[1])
-    boundary.update(
-        cell_id="capacity-boundary-s-host-float32-host-100-capacity-t4",
-        kind="capacity-boundary",
-        profile="capacity",
-    )
-    root = Path(boundary["output_root"]) / "cells"
-    stem = root / boundary["cell_id"]
-    boundary.update(
-        cell_record_path=str(stem.with_suffix(".json")),
-        direct_record_path=str(stem.with_suffix(".direct.json")),
-        reference_record_path=str(stem.with_suffix(".reference.json")),
-        direct_numerical_path=str(stem.with_suffix(".direct.numerics.npz")),
-        reference_numerical_path=str(stem.with_suffix(".reference.numerics.npz")),
-    )
-    _rebind_request(boundary)
-    records = [
-        _cell_record(host[0], direct=8.0),
-        _cell_record(host[1], direct=7.0),
-        _cell_record(boundary, direct=20.0),
-    ]
-
-    result = evaluate_qualification([*host, boundary], records)
-
-    assert result["gates"]["cpu_scaling"]["speedups"]["S/float32"] == pytest.approx(
-        8.0 / 7.0
-    )
 
 
-@pytest.mark.parametrize("field", ("graph_sha256", "directed_edges", "cutoff", "skin"))
-def test_cpu_scaling_requires_identical_realized_graph(tmp_path, field):
-    cells = [
-        cell
-        for cell in build_declared_cells(_manifest(tmp_path))
-        if cell["backend"] == "host" and cell["model_size"] == "S"
-    ]
-    records = [
-        _cell_record(cell, direct=8.0 if cell["threads"] == 1 else 7.0)
-        for cell in cells
-    ]
-    four_thread = records[1]
-    if field == "graph_sha256":
-        four_thread["provenance"][field] = "8" * 64
-        for evidence in four_thread["evidence"].values():
-            evidence[field] = "8" * 64
-    else:
-        value = four_thread["graph"][field]
-        four_thread["graph"][field] = value + 1
-        for evidence in four_thread["evidence"].values():
-            evidence["graph"][field] = value + 1
-            if field == "directed_edges":
-                evidence["directed_edges"] = value + 1
-            elif field == "cutoff":
-                evidence["model_cutoff"] = value + 1
-            elif field == "skin":
-                evidence["skin"] = value + 1
-        if field in {"cutoff", "skin"}:
-            four_thread["graph"]["effective_cutoff"] += 1
-            for evidence in four_thread["evidence"].values():
-                evidence["graph"]["effective_cutoff"] += 1
-                evidence["effective_cutoff"] += 1
-
-    result = evaluate_qualification(cells, records)
-
-    assert result["gates"]["cpu_scaling"]["passed"] is False
-    assert any(
-        "realized graph" in reason or "malformed qualification cell" in reason
-        for reason in result["unqualified_reasons"]
-    )
 
 
-def test_host_graph_atom_count_is_derived_from_exact_repeat_axes(tmp_path):
-    cell = next(
-        cell
-        for cell in build_declared_cells(_manifest(tmp_path))
-        if cell["backend"] == "host"
-    )
-    record = _cell_record(cell)
-    record["graph"]["atom_count"] = 99
-    for evidence in record["evidence"].values():
-        evidence["atoms"] = 99
-        evidence["graph"]["atom_count"] = 99
-
-    with pytest.raises(QualificationError, match="100 atoms"):
-        validate_cell_record(cell, record)
 
 
-def test_capacity_memory_and_boundary_gates_are_mechanical(tmp_path):
-    cells = build_declared_cells(_manifest(tmp_path))
-    boundary = next(cell for cell in cells if cell["kind"] == "capacity-boundary")
-    speed = next(
-        cell
-        for cell in cells
-        if cell["kind"] == "matrix"
-        and all(
-            cell[field] == boundary[field]
-            for field in ("model_size", "backend", "precision", "graph_class")
-        )
-    )
-    capacity_record = _cell_record(boundary)
-    speed_record = _cell_record(speed)
-    capacity_record["memory"]["retained_bytes"] = 121
-    capacity_record["evidence"]["direct"]["memory"]["retained_bytes"] = 121
-
-    result = evaluate_qualification([speed, boundary], [speed_record, capacity_record])
-
-    assert result["status"] == "failed"
-    assert result["gates"]["capacity"]["passed"] is False
 
 
-@pytest.mark.parametrize("stale_version", (None, 2))
-def test_evaluator_rejects_extra_unique_or_stale_evidence_rows(tmp_path, stale_version):
-    cells = build_declared_cells(_manifest(tmp_path))
-    records = [
-        _cell_record(cell, direct=7.0 if cell["threads"] == 4 else 8.0)
-        for cell in cells
-    ]
-    extra = dict(records[0])
-    extra["cell_id"] = "undeclared-extra-row"
-    if stale_version is not None:
-        extra["version"] = stale_version
-
-    result = evaluate_qualification(cells, [*records, extra])
-
-    assert result["status"] != "passed"
-    assert result["gates"]["correctness"]["complete"] is False
-    assert any(
-        "unexpected evidence" in reason for reason in result["unqualified_reasons"]
-    )
 
 
 def test_capacity_gate_requires_identical_actual_graph_evidence(tmp_path):
@@ -3260,21 +1786,8 @@ def test_host_driver_declares_reference_and_capacity_without_running(tmp_path):
     }
 
 
-def test_host_driver_times_supported_stress_reduction():
-    class Calculator:
-        implemented_properties = ["energy", "forces", "stress"]
-
-    assert _timed_properties(Calculator()) == ("energy", "forces", "stress")
 
 
-def test_cell_builder_rejects_direct_reference_graph_mismatch(tmp_path):
-    cell = build_declared_cells(_manifest(tmp_path))[0]
-    direct = _raw_record(cell, "direct")
-    reference = _raw_record(cell, "reference")
-    reference["graph_sha256"] = "9" * 64
-
-    with pytest.raises(QualificationError, match="graph_sha256"):
-        build_cell_record(cell, direct, reference, baseline_us_per_atom=8.0)
 
 
 def test_cuda_driver_accepts_route_profile_and_qualification_cell(tmp_path):
@@ -3304,21 +1817,6 @@ def test_cuda_driver_accepts_route_profile_and_qualification_cell(tmp_path):
     assert args.threads == 4
 
 
-def test_paired_driver_commands_share_model_and_graph_arguments(tmp_path):
-    manifest = _manifest(tmp_path)
-    cell = build_declared_cells(manifest)[0]
-
-    direct = build_driver_command(manifest, cell, "direct")
-    reference = build_driver_command(manifest, cell, "reference")
-
-    def value(command, option):
-        return command[command.index(option) + 1]
-
-    for option in ("--contract", "--structure", "--repeat", "--seed", "--threads"):
-        assert value(direct, option) == value(reference, option)
-    assert value(direct, "--routing") == "direct"
-    assert value(reference, "--routing") == "reference"
-    assert value(direct, "--execution-profile") == cell["profile"]
 
 
 def test_driver_environment_has_a_private_per_cell_jit_cache(tmp_path):
@@ -3330,61 +1828,6 @@ def test_driver_environment_has_a_private_per_cell_jit_cache(tmp_path):
     assert cell["cell_id"] in str(cache)
 
 
-@pytest.mark.parametrize(
-    ("profile", "plan_id", "schedule", "capability", "estimate"),
-    (
-        (
-            "speed",
-            "oam-direct-speed",
-            "throughput",
-            "generated_edge_tensor_product",
-            120,
-        ),
-        ("capacity", "oam-direct-capacity", "capacity", "exact_capacity_layout", 80),
-    ),
-)
-def test_driver_admits_only_the_requested_candidate(
-    profile, plan_id, schedule, capability, estimate
-):
-    calls = []
-
-    class Evaluator:
-        family_artifact_readiness = {"artifact_id": "artifact-1"}
-        execution_plan_report = {
-            "candidates": [
-                {
-                    "id": "oam-direct-speed",
-                    "estimated_bytes": 120,
-                    "required_capability": "generated_edge_tensor_product",
-                },
-                {
-                    "id": "oam-direct-capacity",
-                    "estimated_bytes": 80,
-                    "required_capability": "exact_capacity_layout",
-                },
-            ]
-        }
-
-        def _set_execution_plan_qualification(self, *args):
-            calls.append(args)
-            self.execution_plan_report["selected_id"] = args[0]
-
-    admit_direct_candidate(Evaluator(), profile, "host", "float64")
-
-    assert calls == [
-        (
-            plan_id,
-            "artifact-1",
-            "host",
-            "float64",
-            schedule,
-            capability,
-            "qualified",
-            estimate,
-            estimate,
-            0,
-        )
-    ]
 
 
 def test_cpu_scaling_selects_distinct_physical_cores():

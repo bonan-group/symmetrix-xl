@@ -92,6 +92,18 @@ model, graph policy, hardware, warmup, and measurement protocol. Release
 documentation does not reproduce timings from comparison packages; consult the
 paper when evaluating performance claims.
 
+### Release qualification scope
+
+Public documentation states approved release behavior only. Before final wheel
+builds, an internal pre-release verification plan runs the selected
+CPU/CUDA/HIP correctness cases and OpenMP scaling/throughput/tile/speedup cases
+exactly once to detect regressions; results remain private unless explicitly
+approved for publication. Correctness must pass with no unacceptable regression;
+wheel evidence requires archive/install
+integrity, source/Python/catalog identity, a strict native-first doctor with
+one compatible OpenMP runtime and OpenBLAS, no native issues, and applicable
+numerical smoke/E-F/S checks.
+
 -----
 
 ### Quick Start

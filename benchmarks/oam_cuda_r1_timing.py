@@ -193,10 +193,15 @@ def prepare_direct_evaluator(factory, *, profile, variant, precision):
     return evaluator
 
 
-def prepare_diagnostic_host_direct_artifact(preparer, contract, precision):
+def prepare_diagnostic_host_direct_artifact(
+    preparer, contract, precision, *, native=None
+):
     """Prepare an ordinary host artifact using the configured JIT/cache policy."""
 
-    artifact = preparer(contract, precision)
+    if native is None:
+        artifact = preparer(contract, precision)
+    else:
+        artifact = preparer(contract, precision, native_module=native)
     generation_policy = artifact.metadata.get("generation_policy")
     if not isinstance(generation_policy, dict):
         raise RuntimeError("OAM host artifact has no canonical generation policy")
@@ -221,7 +226,7 @@ def prepare_cuda_direct_artifact(
         "threads_per_block": threads_per_block,
         "generation_policy": generation_policy,
     }
-    return preparer(contract, precision, target, **arguments)
+    return preparer(contract, precision, target, native_module=native, **arguments)
 
 
 def serialize_diagnostic_artifact_evidence(
@@ -705,6 +710,7 @@ def main(argv=None):
                 prepare_nequip_oam_receiver_host_artifact,
                 args.contract,
                 args.precision,
+                native=native,
             )
         model_start = time.perf_counter()
         evaluator = prepare_direct_evaluator(

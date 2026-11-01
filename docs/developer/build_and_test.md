@@ -1,11 +1,48 @@
 # Build and Test
 
+## Check CUDA before declaring it unavailable
+
+CUDA checks have two independent parts: the compiler/toolkit and the runtime
+GPU. Run device checks from an unsandboxed shell; a restricted shell can hide a
+working GPU from both `nvidia-smi` and PyTorch. Check the toolkit explicitly
+before concluding that a CUDA build cannot start:
+
+```bash
+nvidia-smi
+for cuda_root in /usr/local/cuda-13.3 /usr/local/cuda-12.9 /usr/local/cuda; do
+  if test -x "$cuda_root/bin/nvcc"; then
+    echo "CUDA toolkit: $cuda_root"
+    "$cuda_root/bin/nvcc" --version
+  fi
+done
+```
+
+Report the result as one of these states:
+
+- toolkit and GPU available;
+- toolkit available, GPU unavailable (compile-only CUDA work is still possible);
+- GPU available, toolkit unavailable (runtime probing is possible, but a native
+  CUDA build cannot start).
+
+Do not report “CUDA is not installed” solely because `nvcc` is absent from
+`PATH`, or because a sandboxed `nvidia-smi` call failed. On the standard local
+host, check `/usr/local/cuda-13.3/bin/nvcc` before using a generic PATH lookup.
+
 Keep CPU, CUDA, HIP, and LAMMPS configurations in separate fresh build
-directories and virtual environments. Do not reconfigure an editable
-installation to qualify a different backend. The maintained build frontend
-records the resolved toolchain and package identity; `AGENTS.md` records the
-qualification environment rules. See {doc}`/reference/build_frontend` for its
-command surface.
+directories. The CPU frontend and architecture-qualified accelerator add-ons
+may coexist in one virtual environment because they are separate distributions.
+Do not reconfigure an editable installation to qualify a different backend.
+Set `SYMMETRIX_BACKEND` before import and use a fresh process for each backend.
+Reserve separate environments for comparison packages or conflicting
+toolchains. The maintained build frontend records the resolved toolchain and
+package identity; `AGENTS.md` records the backend selection rules. See
+{doc}`/reference/build_frontend` for its command surface.
+
+For ordinary development, one task virtual environment may contain the CPU
+frontend and one or more architecture-qualified accelerator add-ons. Build each
+backend in its own build root and start a fresh Python process after switching
+`SYMMETRIX_BACKEND`. Reserve separate environments for release qualification,
+comparison packages, or experiments that require conflicting toolchains.
 
 For an isolated OpenMP build:
 
