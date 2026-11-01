@@ -163,7 +163,7 @@ def _make_different_size_compact_model(model):
             model.pop(key)
     model.update(
         {
-            "symmetrix_format_version": 2,
+            "symmetrix_format_version": 4,
             "radial_representation": "compact",
             "model_type": "MACE",
             "has_field_coupling": False,

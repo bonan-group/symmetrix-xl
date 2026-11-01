@@ -49,9 +49,14 @@ and `symmetrix_prepare_jit_device_artifact`. The converter is
 head, compact/pair-spline format, and device-artifact preparation options and
 requires the optional `symmetrix-xl[mace]` dependencies. Omitting the species
 options creates the preferred universal compact export. Explicit species
-selection is limited to restricted format-v2 exports or the original Symmetrix
-pair-spline format (named v1 here); format-v3 nonlinear models always retain
-the complete checkpoint domain.
+selection is limited to restricted exports or pair-spline radial data;
+nonlinear models always retain the complete checkpoint domain. Exports use
+format version 4. `symmetrix_recompose_mace_json --input OLD --output NEW`
+converts a format-1/2 JSON (which carries the inverse of `linear_up`; such
+files still load, with a warning; re-export to v4 is recommended but optional)
+to format 4 without the checkpoint;
+`--validate-only FILE...` checks files and prints the warning and cancellation
+estimate of old ones.
 `symmetrix_calibrate_kernel_launch` explicitly calibrates bounded GPU launch
 profiles for a model and structure; normal `kernel_launch_policy="automatic"`
 execution consumes a compatible calibration record but does not benchmark.

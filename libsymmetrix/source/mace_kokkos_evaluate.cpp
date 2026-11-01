@@ -809,6 +809,14 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
     if (!dual_layer_tiled_plan_active || single_layer_readout
         || phase < 1 || phase > 3)
         throw std::logic_error("Invalid dual-layer tiled evaluation phase.");
+    if (h1_affine_v4()
+        && (h1_affine_graph_M0_scalar.extent_int(0) < execution_prepared_num_feature_nodes
+            || h1_affine_graph_M0_direct_adj.extent_int(0)
+                < execution_prepared_num_feature_nodes
+            || h1_affine_M0_scalar.extent_int(0) < dual_layer_workspace_active_capacity
+            || h1_affine_M0_direct_adj.extent_int(0) < dual_layer_workspace_active_capacity))
+        throw std::logic_error(
+            "Dual-layer tiled m0_composite state was not prepared with the graph.");
     const auto all_node_types =
         Kokkos::View<const int*>(execution_prepared_node_types);
     const auto all_num_neigh =
@@ -953,6 +961,24 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
                     graph_h1_adjoint(feature,LM,k) =
                         tile_h1_adjoint(receiver,LM,k);
                 });
+            if (h1_affine_v4()) {
+                // Keep the receiver's scalar M0 block for phase 2 (skip input).
+                const auto tile_m0 = h1_affine_M0_scalar;
+                const auto graph_m0 = h1_affine_graph_M0_scalar;
+                Kokkos::parallel_for(
+                    "MACEKokkos::scatter_dual_layer_phase1_m0_composite",
+                    Kokkos::MDRangePolicy<decltype(factorized_execution_space),
+                        Kokkos::Rank<2>>(
+                        factorized_execution_space, {0,0},
+                        {receiver_count,num_channels}),
+                    KOKKOS_LAMBDA (const int receiver, const int k) {
+                        const int global_receiver = receiver_begin+receiver;
+                        const int feature = identity_receiver_features
+                            ? global_receiver : receiver_features(global_receiver);
+                        graph_m0(feature,k) = tile_m0(receiver,0,k);
+                    });
+                complete_device_stage("MACEKokkos::scatter_dual_layer_phase1_m0_composite");
+            }
         } else if (phase == 2) {
             const auto tile_h1 = H1;
             const auto tile_h1_adjoint = H1_adj;
@@ -984,9 +1010,43 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
                 receiver_count, batch_node_types, batch_num_neigh,
                 batch_neigh_types, batch_r);
             compute_M1(receiver_count, batch_node_types);
+            if (h1_affine_v4()) {
+                const auto tile_m0 = h1_affine_M0_scalar;
+                const auto graph_m0 = h1_affine_graph_M0_scalar;
+                Kokkos::parallel_for(
+                    "MACEKokkos::gather_dual_layer_phase2_m0_composite",
+                    Kokkos::MDRangePolicy<decltype(factorized_execution_space),
+                        Kokkos::Rank<2>>(
+                        factorized_execution_space, {0,0},
+                        {receiver_count,num_channels}),
+                    KOKKOS_LAMBDA (const int receiver, const int k) {
+                        const int global_receiver = receiver_begin+receiver;
+                        const int feature = identity_receiver_features
+                            ? global_receiver : receiver_features(global_receiver);
+                        tile_m0(receiver,0,k) = graph_m0(feature,k);
+                    });
+                complete_device_stage("MACEKokkos::gather_dual_layer_phase2_m0_composite");
+            }
             compute_H2(receiver_count, batch_node_types);
             compute_readout_2(receiver_count);
             reverse_H2(receiver_count, batch_node_types, false);
+            if (h1_affine_v4()) {
+                const auto tile_direct = h1_affine_M0_direct_adj;
+                const auto graph_direct = h1_affine_graph_M0_direct_adj;
+                Kokkos::parallel_for(
+                    "MACEKokkos::scatter_dual_layer_phase2_m0_composite_adjoint",
+                    Kokkos::MDRangePolicy<decltype(factorized_execution_space),
+                        Kokkos::Rank<2>>(
+                        factorized_execution_space, {0,0},
+                        {receiver_count,num_channels}),
+                    KOKKOS_LAMBDA (const int receiver, const int k) {
+                        const int global_receiver = receiver_begin+receiver;
+                        const int feature = identity_receiver_features
+                            ? global_receiver : receiver_features(global_receiver);
+                        graph_direct(feature,k) = tile_direct(receiver,k);
+                    });
+                complete_device_stage("MACEKokkos::scatter_dual_layer_phase2_m0_composite_adjoint");
+            }
             reverse_M1(receiver_count, batch_node_types);
             reverse_A1_scaled(
                 receiver_count, batch_node_types, batch_num_neigh,
@@ -1040,6 +1100,24 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
             compute_A0_scaled(
                 receiver_count, batch_node_types, batch_num_neigh,
                 batch_neigh_types, batch_r);
+            if (h1_affine_v4()) {
+                const auto tile_direct = h1_affine_M0_direct_adj;
+                const auto graph_direct = h1_affine_graph_M0_direct_adj;
+                Kokkos::parallel_for(
+                    "MACEKokkos::gather_dual_layer_phase3_m0_composite_adjoint",
+                    Kokkos::MDRangePolicy<decltype(factorized_execution_space),
+                        Kokkos::Rank<2>>(
+                        factorized_execution_space, {0,0},
+                        {receiver_count,num_channels}),
+                    KOKKOS_LAMBDA (const int receiver, const int k) {
+                        const int global_receiver = receiver_begin+receiver;
+                        const int feature = identity_receiver_features
+                            ? global_receiver : receiver_features(global_receiver);
+                        tile_direct(receiver,k) = graph_direct(feature,k);
+                    });
+                complete_device_stage("MACEKokkos::gather_dual_layer_phase3_m0_composite_adjoint");
+                h1_affine_direct_rows = receiver_count;
+            }
             reverse_H1(receiver_count);
             if (use_m0_module())
                 reverse_M0_module(receiver_count, batch_node_types);

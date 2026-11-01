@@ -196,13 +196,15 @@ symmetrix_extract_mace \
 ```
 
 Universal compact exports are preferred. By omitting `--chemical-symbols` and
-`--atomic-numbers`, format v2 retains the checkpoint's complete element domain
-without generating the per-element-pair spline tables used by the original
-Symmetrix format (named v1 here). Format-v3 nonlinear MACE exports likewise
-retain the complete domain and do not support element subsets. Universal files
-still contain the checkpoint's element-indexed learned parameters. Use a subset
-only for an intentionally restricted format-v2 deployment or an original-format
-`--radial-format pair-splines` file.
+`--atomic-numbers`, the compact export retains the checkpoint's complete
+element domain without generating per-element-pair spline tables
+(`--radial-format pair-splines`). Nonlinear MACE exports likewise retain the
+complete domain and do not support element subsets. Universal files still
+contain the checkpoint's element-indexed learned parameters. Use a subset only
+for an intentionally restricted deployment or a pair-spline file. Exports use
+format version 4 (no inverse of `linear_up`); format-1/2 JSON still loads, with
+a warning, and is converted with
+`symmetrix_recompose_mace_json --input old.json --output new.json`.
 
 The converter retains all compatible prediction heads. Use `--head` to select
 the default head without discarding the others:

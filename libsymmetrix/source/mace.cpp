@@ -406,6 +406,9 @@ void MACECPU<Precision>::compute_electric_field_hessian(
 {
     if (not has_field_coupling)
         throw std::invalid_argument("MACECPU<Precision>::compute_electric_field_hessian requires field coupling.");
+    // Format 4 (pre_linear_up): readout_1 / skip on the pre-linear_up scalar
+    // block; format 1/2: the old maps on the post-linear_up H1.
+    const bool v4 = h1_affine_v4();
     if (electric_field.size() != 3)
         throw std::invalid_argument("MACECPU<Precision>::compute_electric_field_hessian requires a graph-level electric field.");
 
@@ -502,6 +505,30 @@ void MACECPU<Precision>::compute_electric_field_hessian(
             }
         }
 
+        // Field tangent of the scalar pre-linear_up features (input of the
+        // format-4 readout_1 / skip maps): the field paths into lm = 0.
+        auto h1_affine_scalar_dot = std::vector<Precision>(
+            static_cast<std::size_t>(num_nodes)*num_channels, 0.0);
+        for (int i=0; i<num_nodes; ++i) {
+            for (const auto& path : field_coupling_paths) {
+                for (const auto& angular : path.angular_entries) {
+                    if (angular.field_component != seed || angular.output_lm != 0)
+                        continue;
+                    const Precision coefficient =
+                        static_cast<Precision>(angular.coefficient);
+                    for (int input=0; input<num_channels; ++input) {
+                        const Precision input_value =
+                            H1_pre_field[h1_index(i, angular.input_lm, input)];
+                        for (int output=0; output<num_channels; ++output)
+                            h1_affine_scalar_dot[i*num_channels+output] +=
+                                coefficient * input_value
+                                * static_cast<Precision>(
+                                    path.channel_matrix[input*num_channels+output]);
+                    }
+                }
+            }
+        }
+
         auto Phi1r_dot = std::vector<Precision>(Phi1r.size(), 0.0);
         auto Phi1_dot = std::vector<Precision>(Phi1.size(), 0.0);
         int ij = 0;
@@ -586,11 +613,14 @@ void MACECPU<Precision>::compute_electric_field_hessian(
         auto H2_dot = std::vector<Precision>(H2.size(), 0.0);
         for (int i=0; i<num_nodes; ++i) {
             auto H2_dot_i = H2_dot.data()+i*num_channels;
-            auto H1_dot_i = H1_dot.data()+i*num_LM*num_channels;
+            // pre_linear_up skip S0_z on the pre-linear_up scalar tangent (v4),
+            // or the old skip on the post-linear_up tangent.
             symmetrix_blas_gemv<Precision>(CblasRowMajor, CblasTrans,
                         num_channels, num_channels,
-                        1.0, H2_weights_for_H1[node_types[i]].data(), num_channels,
-                        H1_dot_i, 1,
+                        1.0, (v4 ? H2_weights_for_M0 : H2_weights_for_H1)[node_types[i]].data(),
+                        num_channels,
+                        v4 ? h1_affine_scalar_dot.data()+i*num_channels
+                           : H1_dot.data()+i*num_LM*num_channels, 1,
                         0.0, H2_dot_i, 1);
             auto M1_dot_i = M1_dot.data()+i*num_channels;
             symmetrix_blas_gemv<Precision>(CblasRowMajor, CblasTrans,
@@ -604,9 +634,19 @@ void MACECPU<Precision>::compute_electric_field_hessian(
         auto H1_adj_dot = std::vector<Precision>(H1.size(), 0.0);
         auto H2_adj_local = std::vector<Precision>(H2.size(), 0.0);
         auto H2_adj_dot = std::vector<Precision>(H2.size(), 0.0);
+        // Direct (readout_1 + skip) adjoint of the pre-linear_up scalar block and
+        // its tangent; added after the linear_up reverse below.
+        auto direct_adj = std::vector<Precision>(
+            static_cast<std::size_t>(num_nodes)*num_channels, 0.0);
+        auto direct_adj_dot = std::vector<Precision>(
+            static_cast<std::size_t>(num_nodes)*num_channels, 0.0);
         for (int i=0; i<num_nodes; ++i) {
-            for (int k=0; k<num_channels; ++k)
-                H1_adj_local[i*num_LM*num_channels+k] = readout_1_weights[k];
+            for (int k=0; k<num_channels; ++k) {
+                if (v4)
+                    direct_adj[i*num_channels+k] = readout_1_weights_for_M0[k];
+                else
+                    H1_adj_local[i*num_LM*num_channels+k] = readout_1_weights[k];
+            }
             auto x = std::vector<Precision>(H2.begin()+i*num_channels, H2.begin()+(i+1)*num_channels);
             auto x_dot = std::vector<Precision>(H2_dot.begin()+i*num_channels, H2_dot.begin()+(i+1)*num_channels);
             auto [f, g, g_dot] = readout_2->evaluate_gradient_directional(x, x_dot);
@@ -621,18 +661,21 @@ void MACECPU<Precision>::compute_electric_field_hessian(
         for (int i=0; i<num_nodes; ++i) {
             auto H2_adj_i = H2_adj_local.data()+i*num_channels;
             auto H2_adj_dot_i = H2_adj_dot.data()+i*num_channels;
-            auto H1_adj_i = H1_adj_local.data()+i*num_LM*num_channels;
-            auto H1_adj_dot_i = H1_adj_dot.data()+i*num_LM*num_channels;
+            const auto& skip = v4 ? H2_weights_for_M0 : H2_weights_for_H1;
+            auto skip_adj_i = v4 ? direct_adj.data()+i*num_channels
+                                 : H1_adj_local.data()+i*num_LM*num_channels;
+            auto skip_adj_dot_i = v4 ? direct_adj_dot.data()+i*num_channels
+                                     : H1_adj_dot.data()+i*num_LM*num_channels;
             symmetrix_blas_gemv<Precision>(CblasRowMajor, CblasNoTrans,
                         num_channels, num_channels,
-                        1.0, H2_weights_for_H1[node_types[i]].data(), num_channels,
+                        1.0, skip[node_types[i]].data(), num_channels,
                         H2_adj_i, 1,
-                        1.0, H1_adj_i, 1);
+                        1.0, skip_adj_i, 1);
             symmetrix_blas_gemv<Precision>(CblasRowMajor, CblasNoTrans,
                         num_channels, num_channels,
-                        1.0, H2_weights_for_H1[node_types[i]].data(), num_channels,
+                        1.0, skip[node_types[i]].data(), num_channels,
                         H2_adj_dot_i, 1,
-                        1.0, H1_adj_dot_i, 1);
+                        1.0, skip_adj_dot_i, 1);
             auto M1_adj_i = M1_adj_local.data()+i*num_channels;
             auto M1_adj_dot_i = M1_adj_dot.data()+i*num_channels;
             symmetrix_blas_gemv<Precision>(CblasRowMajor, CblasNoTrans,
@@ -855,6 +898,13 @@ void MACECPU<Precision>::compute_electric_field_hessian(
                             1.0, H1_adj_dot_il, num_channels,
                             weights_l, num_channels,
                             0.0, H1_pre_adj_dot_il, num_channels);
+            }
+        }
+
+        for (int i=0; v4 && i<num_nodes; ++i) {
+            for (int k=0; k<num_channels; ++k) {
+                H1_adj_local[i*num_LM*num_channels+k] += direct_adj[i*num_channels+k];
+                H1_adj_dot[i*num_LM*num_channels+k] += direct_adj_dot[i*num_channels+k];
             }
         }
 
@@ -1641,6 +1691,13 @@ template <typename Precision>
 void MACECPU<Precision>::compute_H1(
     const int num_nodes)
 {
+    if (has_field_coupling)
+        throw std::invalid_argument(
+            "compute_H1 is the field-free H1 entry; a MACEField model is evaluated "
+            "by compute_H1_product, the field coupling (compute_field_H1) and "
+            "compute_H1_linear_up, as in compute_node_energies_forces_field.");
+    // Scalar input of the format-4 maps, retained before H1 is formed.
+    capture_h1_affine_scalar(num_nodes);
     H1.resize(M0.size());
     for (int i=0; i<num_nodes; ++i) {
         for (int l=0; l<=L_max; ++l) {
@@ -1693,6 +1750,66 @@ void MACECPU<Precision>::reverse_H1(
                 num_channels);  // const MKL_INT ldc
         }
     }
+    // Direct scalar adjoint q + T_z H2_adj (formed in reverse_H2); H1_adj held
+    // only the message-passing adjoint, so nothing is counted twice.
+    add_h1_affine_direct_adjoint(num_nodes);
+}
+
+template <typename Precision>
+void MACECPU<Precision>::capture_h1_affine_scalar(
+    const int num_nodes)
+{
+    // Scalar input of the format-4 readout_1 / skip maps (h1_affine_schema.hpp):
+    // called by compute_H1 (M0, or M0 P0 for pre_linear_up; the residual is
+    // added in add_H1_first_residual) and, with field coupling, by
+    // compute_H1_linear_up (H1 = field-coupled pre-linear_up features).
+    if (!h1_affine_v4())
+        return;
+    h1_affine_scalar.resize(static_cast<std::size_t>(num_nodes)*num_channels);
+    for (int i=0; i<num_nodes; ++i) {
+        auto scalar_i = h1_affine_scalar.data()+i*num_channels;
+        if (has_field_coupling) {
+            std::copy_n(H1.data()+i*num_LM*num_channels, num_channels, scalar_i);
+        } else if (h1_affine_pre_linear_up()) {
+            symmetrix_blas_gemv<Precision>(
+                CblasRowMajor, CblasTrans, num_channels, num_channels,
+                1.0, H1_product_weights.data(), num_channels,
+                M0.data()+i*num_LM*num_channels, 1, 0.0, scalar_i, 1);
+        } else {
+            std::copy_n(M0.data()+i*num_LM*num_channels, num_channels, scalar_i);
+        }
+    }
+}
+
+template <typename Precision>
+void MACECPU<Precision>::add_h1_affine_direct_adjoint(
+    const int num_nodes)
+{
+    if (!h1_affine_v4())
+        return;
+    // Only the rows whose readouts were evaluated (reverse_H2) carry a direct
+    // adjoint; the H1 reverse may also cover ghost / feature rows after them,
+    // and an MPI rank may own no readout rows at all (zero rows: no-op).
+    const int rows = std::min<int>(num_nodes, M0_direct_adj.size()/num_channels);
+    for (int i=0; i<rows; ++i) {
+        const auto direct_i = M0_direct_adj.data()+i*num_channels;
+        if (has_field_coupling) {
+            // Pre-linear_up H1 adjoint (after reverse_H1_linear_up).
+            auto H1_adj_i0 = H1_adj.data()+i*num_LM*num_channels;
+            for (int k=0; k<num_channels; ++k)
+                H1_adj_i0[k] += direct_i[k];
+        } else if (h1_affine_pre_linear_up()) {
+            // M0_adj += P0 direct (the scalar input was M0 P0 + residual).
+            symmetrix_blas_gemv<Precision>(
+                CblasRowMajor, CblasNoTrans, num_channels, num_channels,
+                1.0, H1_product_weights.data(), num_channels,
+                direct_i, 1, 1.0, M0_adj.data()+i*num_LM*num_channels, 1);
+        } else {
+            auto M0_adj_i0 = M0_adj.data()+i*num_LM*num_channels;
+            for (int k=0; k<num_channels; ++k)
+                M0_adj_i0[k] += direct_i[k];
+        }
+    }
 }
 
 template <typename Precision>
@@ -1743,12 +1860,26 @@ void MACECPU<Precision>::add_H1_first_residual(
                 H1[(i*num_LM+lm)*num_channels+k]
                     += weights[offset+lm*num_channels+k];
     }
+    if (fused && h1_affine_pre_linear_up()
+            && h1_affine_scalar.size() >= static_cast<std::size_t>(num_nodes)*num_channels) {
+        // pre_linear_up scalar input: M0 P0 + residual.
+        for (int i=0; i<num_nodes; ++i) {
+            const auto offset = static_cast<std::size_t>(node_types[i])
+                *num_LM*num_channels;
+            for (int k=0; k<num_channels; ++k)
+                h1_affine_scalar[i*num_channels+k]
+                    += H1_first_residual_weights[offset+k];
+        }
+    }
 }
 
 template <typename Precision>
 void MACECPU<Precision>::compute_H1_linear_up(
     const int num_nodes)
 {
+    // Field-coupled pre-linear_up scalar block: input of the format-4 maps.
+    if (has_field_coupling)
+        capture_h1_affine_scalar(num_nodes);
     auto H1_before_linear_up = H1;
     for (int i=0; i<num_nodes; ++i) {
         for (int l=0; l<=L_max; ++l) {
@@ -1801,6 +1932,9 @@ void MACECPU<Precision>::reverse_H1_linear_up(
                 num_channels);
         }
     }
+    // Direct readout_1 + skip adjoint on the pre-linear_up scalar block.
+    if (has_field_coupling)
+        add_h1_affine_direct_adjoint(num_nodes);
 }
 
 template <typename Precision>
@@ -2384,16 +2518,21 @@ void MACECPU<Precision>::compute_H2(
     std::span<const int> node_types)
 {
     H2.resize(static_cast<std::size_t>(num_nodes)*num_channels);
+    // H2 = T_z^T x (x = h1_affine_scalar, format 4) + W M1.
+    const bool v4 = h1_affine_v4();
+    const auto& skip_weights = v4 ? H2_weights_for_M0 : H2_weights_for_H1;
+    const auto& skip_input = v4 ? h1_affine_scalar : H1;
+    const int skip_stride = v4 ? num_channels : num_LM*num_channels;
     for (int i=0; i<num_nodes; ++i) {
         auto H2_i = H2.data()+i*num_channels;
-        auto H1_i = H1.data()+i*num_LM*num_channels;
+        auto H1_i = skip_input.data()+i*skip_stride;
         symmetrix_blas_gemv<Precision>(
             CblasRowMajor,                            // const CBLAS_LAYOUT Layout
             CblasTrans,                               // const CBLAS_TRANSPOSE trans
             num_channels,                             // const MKL_INT m
             num_channels,                             // const MKL_INT n
             1.0,                                      // const double alpha
-            H2_weights_for_H1[node_types[i]].data(),  // const double *a
+            skip_weights[node_types[i]].data(),       // const double *a
             num_channels,                             // const MKL_INT lda
             H1_i,                                     // const double *x
             1,                                        // const MKL_INT incx
@@ -2427,6 +2566,25 @@ void MACECPU<Precision>::reverse_H2(
     M1_adj.resize(M1.size());
     if (zero_H1_adj)
         std::fill(H1_adj.begin(), H1_adj.end(), 0.0);
+    if (h1_affine_v4()) {
+        // Direct scalar adjoint q + T_z H2_adj; H1_adj is not touched.
+        M0_direct_adj.resize(static_cast<std::size_t>(num_nodes)*num_channels);
+        for (int i=0; i<num_nodes; ++i) {
+            auto H2_adj_i = H2_adj.data()+i*num_channels;
+            auto direct_i = M0_direct_adj.data()+i*num_channels;
+            std::copy(readout_1_weights_for_M0.begin(), readout_1_weights_for_M0.end(), direct_i);
+            symmetrix_blas_gemv<Precision>(
+                CblasRowMajor, CblasNoTrans, num_channels, num_channels,
+                1.0, H2_weights_for_M0[node_types[i]].data(), num_channels,
+                H2_adj_i, 1, 1.0, direct_i, 1);
+            auto M1_adj_i = M1_adj.data()+i*num_channels;
+            symmetrix_blas_gemv<Precision>(
+                CblasRowMajor, CblasNoTrans, num_channels, num_channels,
+                1.0, H2_weights_for_M1.data(), num_channels,
+                H2_adj_i, 1, 0.0, M1_adj_i, 1);
+        }
+        return;
+    }
     for (int i=0; i<num_nodes; ++i) {
         auto H2_adj_i = H2_adj.data()+i*num_channels;
         auto H1_adj_i = H1_adj.data()+i*num_LM*num_channels;
@@ -2472,13 +2630,21 @@ void MACECPU<Precision>::compute_readouts(
     //          There is probably a better way to manage this.
     std::fill(H1_adj.begin(), H1_adj.end(), 0.0);
     H2_adj.resize(H2.size());
+    const bool v4 = h1_affine_v4();
     for (int i=0; i<num_nodes; ++i) {
         // atomic energies
         node_energies[i] += atomic_energies[node_types[i]];
         // first readout
-        for (int k=0; k<num_channels; ++k) {
-            node_energies[i] += readout_1_weights[k]*H1[i*num_LM*num_channels+k];
-            H1_adj[i*num_LM*num_channels+k] = readout_1_weights[k];
+        if (v4) {
+            // E1 = q . x (x = h1_affine_scalar); its adjoint q enters M0_direct_adj
+            // in reverse_H2, H1_adj stays zero for the message-passing reverse.
+            for (int k=0; k<num_channels; ++k)
+                node_energies[i] += readout_1_weights_for_M0[k]*h1_affine_scalar[i*num_channels+k];
+        } else {
+            for (int k=0; k<num_channels; ++k) {
+                node_energies[i] += readout_1_weights[k]*H1[i*num_LM*num_channels+k];
+                H1_adj[i*num_LM*num_channels+k] = readout_1_weights[k];
+            }
         }
         // second readout
         auto x = std::vector<Precision>(H2.begin()+i*num_channels, H2.begin()+(i+1)*num_channels);
@@ -2533,15 +2699,19 @@ void MACECPU<Precision>::load_from_json(
             file["zbl_p"].get<int>());
 
     // Radial representation
+    // H1 affine basis (format 4, or the old basis of format 1/2 with a
+    // warning); the radial loader follows the radial representation.
+    h1_affine_mode = symmetrix::h1_affine::validate(file, num_elements, num_channels);
     const int format_version = file.value("symmetrix_format_version", 1);
-    uses_compact_radial = format_version == 2;
+    const std::string radial_representation = file.value(
+        "radial_representation",
+        std::string(format_version == 1 ? "pair-splines" : ""));
+    uses_compact_radial = radial_representation == "compact";
     if (uses_compact_radial) {
-        if (file.value("radial_representation", std::string()) != "compact")
-            throw std::invalid_argument("Symmetrix format version 2 requires compact radial data.");
         compact_radial_model = std::make_unique<CompactRadialModel>(
             file.at("compact_radial").dump(), atomic_numbers, r_cut);
         type_to_active.assign(atomic_numbers.size(), -1);
-    } else if (format_version == 1) {
+    } else if (radial_representation == "pair-splines") {
         const Precision spl_h = checked_precision_cast<Precision>(
             file["radial_spline_h"].get<double>());
         const Precision spl_min = checked_precision_cast<Precision>(
@@ -2654,6 +2824,9 @@ void MACECPU<Precision>::load_from_json(
         throw std::invalid_argument(
             "Non-residual MACE JSON must not contain H1 residual weights.");
     }
+    if (h1_affine_pre_linear_up() && H1_product_weights.size() != H1_weights.size())
+        throw std::invalid_argument(
+            "The pre_linear_up basis requires H1_product_weights of the H1_weights extent.");
 
     // MACEField H1 coupling
     has_field_coupling = file.value("has_field_coupling", false);
@@ -2740,14 +2913,31 @@ void MACECPU<Precision>::load_from_json(
     }
 
     // H2
-    H2_weights_for_H1 = checked_precision_data<Precision>(
-        file["H2_weights_for_H1"].get<std::vector<std::vector<double>>>());
+    H2_weights_for_H1.clear();
+    H2_weights_for_M0.clear();
+    readout_1_weights.clear();
+    readout_1_weights_for_M0.clear();
+    M0_direct_adj.clear();
+    if (h1_affine_v4()) {
+        H2_weights_for_M0 = checked_precision_data<Precision>(
+            file[symmetrix::h1_affine::skip_key(h1_affine_mode)]
+                .template get<std::vector<std::vector<double>>>());
+    } else {
+        H2_weights_for_H1 = checked_precision_data<Precision>(
+            file["H2_weights_for_H1"].get<std::vector<std::vector<double>>>());
+    }
     H2_weights_for_M1 = checked_precision_data<Precision>(
         file["H2_weights_for_M1"].get<std::vector<double>>());
 
     // Readouts
-    readout_1_weights = checked_precision_data<Precision>(
-        file["readout_1_weights"].get<std::vector<double>>());
+    if (h1_affine_v4()) {
+        readout_1_weights_for_M0 = checked_precision_data<Precision>(
+            file[symmetrix::h1_affine::readout_key(h1_affine_mode)]
+                .template get<std::vector<double>>());
+    } else {
+        readout_1_weights = checked_precision_data<Precision>(
+            file["readout_1_weights"].get<std::vector<double>>());
+    }
     auto readout_2_weights_1 = checked_precision_data<Precision>(
         file["readout_2_weights_1"].get<std::vector<double>>());
     auto readout_2_weights_2 = checked_precision_data<Precision>(

@@ -95,7 +95,9 @@ def foundation_r1_test_model(
         readout_2_weights_1[hidden * channels + hidden % channels] = 0.4
 
     return {
-        "symmetrix_format_version": 2,
+        "symmetrix_format_version": 4,
+        "h1_affine_mode": "m0_composite",
+        "h1_affine_version": 1,
         "radial_representation": "compact",
         "model_type": "MACE",
         "num_elements": num_elements,
@@ -157,11 +159,11 @@ def foundation_r1_test_model(
         "A1_scaled": False,
         "M1_monomials": m1_monomials,
         "M1_weights": m1_weights,
-        "H2_weights_for_H1": [
+        "H2_weights_for_M0": [
             [0.0] * (channels * channels) for _ in range(num_elements)
         ],
         "H2_weights_for_M1": repeated_diagonal(1, 0.5),
-        "readout_1_weights": [0.0] * channels,
+        "readout_1_weights_for_M0": [0.0] * channels,
         "readout_2_weights_1": readout_2_weights_1,
         "readout_2_weights_2": [0.4] * 16,
         "readout_2_scale_factor": 1.0,

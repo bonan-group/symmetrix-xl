@@ -18,7 +18,8 @@ def test_macefield_response_uses_widened_edge_offsets():
     # channel-tiled weight tables each index rows with std::size_t.
     assert source.count("const std::size_t harmonic_offset =") == 6
     assert source.count("const std::size_t gradient_offset =") == 4
-    assert source.count("Kokkos::IndexType<std::size_t>") == 5
+    # Includes the format-4 pre-linear_up scalar tangent.
+    assert source.count("Kokkos::IndexType<std::size_t>") == 6
     assert (
         re.search(
             r"response_mode == MACEStreamedEdgesMode::generic\s*\n\s*"

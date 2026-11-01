@@ -1430,6 +1430,9 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
     const bool graph_state_fits =
         dual_layer_graph_h1.size() >= graph_elements
         && dual_layer_graph_h1_adjoint.size() >= graph_elements;
+    // m0_composite keeps the receiver scalar M0 block and the direct scalar
+    // adjoint between the tiled phases (outside the shared arena).
+    ensure_h1_affine_capacity(capacity, num_feature_nodes);
     const bool arena_fits = dual_layer_workspace_arena.data() != nullptr
         && dual_layer_workspace_planned_capacity >= capacity;
     const bool edge_receiver_fits = dual_layer_edge_local_receivers.extent(0)

@@ -2,6 +2,21 @@
 
 All notable changes to Symmetrix-XL are documented in this file.
 
+## Unreleased
+
+- Model JSON format version 4 for every exported variant: the first readout and
+  the H1->H2 skip are stored without the inverse of `interactions[1].linear_up`
+  (`h1_affine_mode` `m0_composite` or `pre_linear_up`). Format-1/2 files still
+  load with the old arithmetic and print a warning with an fp32 cancellation
+  estimate computed from the file; `symmetrix_recompose_mace_json` converts
+  them. Re-export to v4 is recommended but optional.
+- The serial `symmetrix/mace` pair style and the field-free `compute_H1` entry
+  refuse MACEField models (the serial pair style crashed on them); MACEField
+  runs through `symmetrix/mace/kk electric_field Ex Ey Ez` or the field entries.
+- Fixed the LAMMPS pair styles' `mpi_message_passing` and
+  `no_mpi_message_passing` modes, which omitted the first-interaction residual
+  of residual-first models.
+
 ## 0.1.1 - 2026-09-22
 
 - Added automatic installation of architecture-qualified accelerator backends.

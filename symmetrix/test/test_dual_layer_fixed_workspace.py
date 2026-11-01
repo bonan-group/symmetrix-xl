@@ -58,7 +58,7 @@ def dual_layer_model(tmp_path_factory):
         "activation_scale": 1.0,
         "postprocess": "tanh-square",
     }
-    model["readout_1_weights"] = [
+    model["readout_1_weights_for_M0"] = [
         0.001 * (1 + channel % 7) for channel in range(model["num_channels"])
     ]
     output = tmp_path_factory.mktemp("dual-layer-workspace") / "model.json"

@@ -1386,7 +1386,7 @@ def test_mh1_rejects_invalid_species_mapping_before_evaluation(tmp_path, use_kok
 
 def test_mh1_full_schema_preserves_dynamic_architecture(mh1_si_artifact):
     data, _ = mh1_si_artifact
-    assert data["symmetrix_format_version"] == 3
+    assert data["symmetrix_format_version"] == 4
     assert data["model_type"] == "MACE_Nonlinear"
     assert data["head"] == "matpes_r2scan"
     assert data["atomic_numbers"] == data["model_atomic_numbers"]

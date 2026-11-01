@@ -418,6 +418,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
 
   utils::logmesg(lmp, "Loading MACEKokkos model from \'{}\' ... ", arg[2]);
   mace = std::make_unique<MACEKokkos<Precision>>(arg[2], prediction_head);
+  utils::logmesg(lmp, "(h1_affine_mode {}) ", mace->h1_affine_mode_name());
   mace->set_allow_fixed_workspace(allow_fixed_workspace);
   if (debug_single_layer_workspace_receivers != 0)
     mace->set_single_layer_workspace_receiver_limit_for_testing(
@@ -1702,6 +1703,9 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
     mace->compute_H1_product(num_nodes);
   else
     mace->compute_H1(num_nodes);
+  // First-interaction residual (b_z, or b_z U when fused), as in the whole-model
+  // evaluation; added before the H1 communication and the field coupling.
+  mace->add_H1_first_residual(num_nodes, node_types, !mace->has_field_coupling);
 
   // sort H1 contributions by i (rather than ii)
   const int num_h1_nodes = k_list->inum + atom->nghost;
@@ -2129,12 +2133,16 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_mpi_message_pass
   }
   mace->compute_A0_scaled(num_local_nodes+num_ghost_nodes, node_types, num_neigh, neigh_types, r);
   mace->compute_M0(num_local_nodes+num_ghost_nodes, node_types);
+  // First-interaction residual (b_z before the field coupling, b_z U when
+  // fused), as in the whole-model evaluation.
   if (mace->has_field_coupling) {
     mace->compute_H1_product(num_local_nodes+num_ghost_nodes);
+    mace->add_H1_first_residual(num_local_nodes+num_ghost_nodes, node_types, false);
     mace->compute_field_H1(num_local_nodes+num_ghost_nodes, electric_field);
     mace->compute_H1_linear_up(num_local_nodes+num_ghost_nodes);
   } else {
     mace->compute_H1(num_local_nodes+num_ghost_nodes);
+    mace->add_H1_first_residual(num_local_nodes+num_ghost_nodes, node_types, true);
   }
 
   if (mace->streamed_edges == MACEStreamedEdgesMode::materialized) {

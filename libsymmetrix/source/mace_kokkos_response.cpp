@@ -66,6 +66,11 @@ struct AnalyticFieldReverseReducer {
     Kokkos::View<int*> entry_path;
     Kokkos::View<Precision*> entry_coefficient;
     Kokkos::View<Precision***,Kokkos::LayoutRight> path_up_matrix;
+    // Format 4 (pre_linear_up): field paths without linear_up and the direct
+    // readout_1 + skip adjoint (and tangent) on the pre-linear_up scalar block.
+    Kokkos::View<Precision***,Kokkos::LayoutRight> path_matrix;
+    Kokkos::View<Precision**,Kokkos::LayoutRight> direct;
+    Kokkos::View<Precision**,Kokkos::LayoutRight> direct_dot;
     Kokkos::View<const double*> electric_field;
     Kokkos::View<double*> electric_field_hessian;
 
@@ -83,6 +88,9 @@ struct AnalyticFieldReverseReducer {
             value += H1_linear_up_weights(l,input,output)
                 * H1_adj_dot(i,lm,output);
         }
+        const bool v4 = direct.extent(0) > 0;
+        if (v4 && lm == 0)
+            value += direct_dot(i,input);
         const Precision input_feature = H1_pre_field(i,lm,input);
         for (int entry=0; entry<num_entries; ++entry) {
             if (entry_input_lm(entry) != lm)
@@ -102,6 +110,16 @@ struct AnalyticFieldReverseReducer {
                     + (component == seed ? output_adj : Precision(0)));
                 local_hessian[component] += static_cast<double>(
                     weight * input_feature * output_adj_dot);
+            }
+            if (!v4 || output_lm != 0)
+                continue;
+            for (int output=0; output<num_channels; ++output) {
+                const Precision weight = coefficient
+                    * path_matrix(path,input,output);
+                value += weight * (field_value*direct_dot(i,output)
+                    + (component == seed ? direct(i,output) : Precision(0)));
+                local_hessian[component] += static_cast<double>(
+                    weight * input_feature * direct_dot(i,output));
             }
         }
         H1_product_adj_dot(i,lm,input) = value;

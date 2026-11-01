@@ -210,11 +210,14 @@ MaceMH1FamilyDescriptor analyze_mh1_family_architecture(
 
 void validate_mace_nonlinear_schema(const nlohmann::json& data)
 {
+    // Format 4 is the current label of every exported model; nonlinear MACE
+    // keeps linear_up as its own layer (no inverse), so format 3 stays loadable.
     if (!data.is_object()
         || data.value("model_type", std::string()) != "MACE_Nonlinear"
-        || data.at("symmetrix_format_version").get<int>() != 3)
+        || (data.at("symmetrix_format_version").get<int>() != 3
+            && data.at("symmetrix_format_version").get<int>() != 4))
         throw std::invalid_argument(
-            "MACE_Nonlinear evaluator requires format-version-3 nonlinear JSON.");
+            "MACE_Nonlinear evaluator requires format-version-3 or -4 nonlinear JSON.");
 
     const auto atomic_numbers = data.at("atomic_numbers").get<std::vector<int>>();
     const auto model_atomic_numbers =
