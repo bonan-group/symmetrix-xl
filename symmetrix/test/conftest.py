@@ -60,6 +60,20 @@ _EXTENDED_MODULES = frozenset(
     }
 )
 
+# These are the minimum ASE-backed end-to-end checks for the default profile.
+# Keep the node IDs explicit so adding or reordering parameter cases cannot
+# silently replace numerical coverage with a policy-only smoke test.
+_STANDARD_E2E_NODEIDS = frozenset(
+    {
+        "test/test_symmetrix_calc.py::test_symmetrix_vs_pytorch",
+        "test/test_oam_cuda_r1.py::test_public_calculator_executes_generated_cuda",
+        "test/test_nequip_oam_kokkos_forward.py::test_oam_float32_evaluates_a_certified_float64_export",
+        "test/test_mh1.py::test_generalized_mh1_generated_cuda_execution_matches_generic[c4-e2-b4-l2-linear]",
+        "test/test_polar_end_to_end_fixtures.py::test_the_family_evaluates_the_total_energy_force_and_dipole[singlet-mol_h2o-S]",
+        "test/test_polar_end_to_end_fixtures.py::test_the_family_evaluates_the_total_energy_force_and_dipole[field-bulk_w4-S]",
+    }
+)
+
 
 def _mark_extended_matrix_cases(items):
     """Mark matrix expansion cases while retaining compact smoke coverage."""
@@ -82,13 +96,15 @@ def _mark_extended_matrix_cases(items):
     for module, module_items in by_module.items():
         if module in extended_modules:
             for item in module_items[1:]:
-                item.add_marker(pytest.mark.extended)
+                if item.nodeid not in _STANDARD_E2E_NODEIDS:
+                    item.add_marker(pytest.mark.extended)
 
     for (module, _), function_items in by_function.items():
         if module in extended_modules:
             continue
         for item in function_items[1:]:
-            item.add_marker(pytest.mark.extended)
+            if item.nodeid not in _STANDARD_E2E_NODEIDS:
+                item.add_marker(pytest.mark.extended)
 
 
 def _require_macefield():

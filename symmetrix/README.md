@@ -422,7 +422,7 @@ source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_
 uv pip install --no-build-isolation --reinstall-package symmetrix-xl \
   -e "./symmetrix[test]" \
   --config-setting="cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint"
-# Default internal verification profile (~2,000 representative cases).
+# Default internal verification profile (~2,000 cases, including explicit ASE end-to-end checks).
 pytest -m "not extended" symmetrix/test
 # Matrix-expanded coverage only, when needed.
 pytest -m extended symmetrix/test
