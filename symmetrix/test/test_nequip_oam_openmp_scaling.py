@@ -85,10 +85,12 @@ import numpy as np
 import pytest
 
 MODEL_ENV = "SYMMETRIX_OAM_S_MODEL"
-# The production OAM-S checkpoint is deliberately external to the repository.
-# The path is configurable, but its content is pinned so a different or
-# reduced checkpoint cannot silently turn this into a small-model test.
-PRODUCTION_MODEL_SHA256 = "a5cca35ae7278bc81ad894017ba62722b96edba59ea92f3c24ae0ba45d8cf1c7"
+# The production OAM-S export is deliberately external to the repository.  It
+# is the maintained JSON export linked to the canonical 0.1 archive; the old
+# ``a5cca...`` cache is a rejected legacy candidate.  The path is configurable,
+# but its content is pinned so a different or reduced checkpoint cannot turn
+# this into a small-model test.
+PRODUCTION_MODEL_SHA256 = "c11d730c1dbe0a3b93093fefe7132defb0a189706d644a4b3577cb1193e5d662"
 OAM_DTYPE = os.environ.get("SYMMETRIX_OAM_DTYPE", "float32")
 if OAM_DTYPE not in {"float32", "float64"}:
     raise ValueError("SYMMETRIX_OAM_DTYPE must be float32 or float64")
