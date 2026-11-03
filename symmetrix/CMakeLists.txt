@@ -311,6 +311,13 @@ set(SYMMETRIX_BUILD_OPENMP_VERSION "")
 set(SYMMETRIX_BUILD_OPENMP_RUNTIME_PATH "")
 set(SYMMETRIX_BUILD_OPENMP_RUNTIME_SHA256 "")
 file(REAL_PATH "${CMAKE_CXX_COMPILER}" SYMMETRIX_BUILD_CXX_COMPILER_PATH)
+if(SYMMETRIX_REDACT_BUILD_PATHS)
+  # Release wheels retain the compiler name for diagnostics but must not
+  # expose the absolute checkout path used to invoke nvcc_wrapper.
+  get_filename_component(_symmetrix_compiler_name
+    "${SYMMETRIX_BUILD_CXX_COMPILER_PATH}" NAME)
+  set(SYMMETRIX_BUILD_CXX_COMPILER_PATH "${_symmetrix_compiler_name}")
+endif()
 set(SYMMETRIX_BUILD_DEVICE_COMPILER_ID "")
 set(SYMMETRIX_BUILD_DEVICE_COMPILER_VERSION "")
 if(_symmetrix_resolved_device_backend STREQUAL "CUDA"
