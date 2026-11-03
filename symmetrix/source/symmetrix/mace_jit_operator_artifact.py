@@ -516,7 +516,16 @@ def _plan_low_memory_operator_modules(
                 and installed_full_target == module_target
             )
         )
-        if implementation == "builtin" and not installed_precedes_builtin:
+        # Contract-backed low-memory operators recover from missing or rejected
+        # prebuilt modules through the requested backend's runtime compiler.
+        runtime_operator_contract = stage in ("M0", "M1", "R0") and isinstance(
+            contract, Mapping
+        )
+        if (
+            implementation == "builtin"
+            and not installed_precedes_builtin
+            and not runtime_operator_contract
+        ):
             modules[request_key] = {
                 "status": "builtin",
                 "implementation": "builtin",
@@ -772,7 +781,7 @@ def _plan_low_memory_operator_modules(
                 )
             continue
 
-        if implementation == "builtin":
+        if implementation == "builtin" and not runtime_operator_contract:
             stage_diagnostics = tuple(
                 _operator_request_diagnostic_prefix(request_key, stage, schedule)
                 + diagnostic

@@ -947,7 +947,7 @@ def test_residual_first_parameter_gradients_reject(
         evaluator.set_execution_parameter_gradients(True)
 
 
-def test_residual_first_legacy_pair_splines_match_compact(
+def test_residual_first_v4_pair_splines_match_compact(
     residual_first_macefield_artifacts,
 ):
     _skip_without_kokkos()

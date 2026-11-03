@@ -50,11 +50,14 @@ Published packages do not include the larger optional MACE R1/R0/M0/M1 bundle.
 OAM selection compares the exact
 resolved layer, irrep/channel, angular, tensor-product, radial, and
 normalization descriptor; paths and learned values are not selection keys.
-Models with an uncommon architecture or weighted-edge contract compile the
-exact missing artifacts on first use and reuse them from
-`SYMMETRIX_JIT_CACHE`; this is supported behavior, not a compatibility
-fallback. A runtime compiler is still required unless every required stage has
-an exact installed artifact or was prepared earlier.
+For capacity specialization, exact installed M0/M1/R0 artifacts are preferred.
+When a contract-backed module is missing, the runtime compiler generates and
+caches it in `SYMMETRIX_JIT_CACHE` for the selected backend; compiler or load
+failures are reported rather than silently retaining a builtin operator or
+switching backends. Models with uncommon architectures or weighted-edge
+contracts compile their exact missing artifacts on first use and reuse them
+from the same cache. A runtime compiler is required unless every required
+stage has an exact installed artifact or was prepared earlier.
 
 R0 diagnostics describe four independent questions. `r0_implementation` is
 `generic` or `generated`; `r0_backend` is `host`, `cuda`, or `hip`;

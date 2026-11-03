@@ -130,10 +130,8 @@ FAMILY_REQUESTS: Mapping[str, tuple[RequestRow, ...]] = {
             admitted=True,
             artifact="None",
             lammps=(
-                "The original Symmetrix format (named v1 here) is retired, so "
-                "the compatibility spelling resolves only for supported "
-                "standard MACE/MACEField controls. MACELES is not supported "
-                "in LAMMPS"
+                "Format-v4 pair-spline radial data is materialized-only; "
+                "compact radial data supplies the streamed compatibility path"
             ),
         ),
     ),

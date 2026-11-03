@@ -687,11 +687,13 @@ def test_zero_skin_singular_non_periodic_inputs_build_with_ase(
 
 
 @pytest.mark.parametrize("dtype", ["float64", "float32"])
-def test_legacy_pair_spline_models_are_refused(
+def test_pair_spline_models_are_refused_for_streamed_calculator(
     legacy_standard_model_path,
     dtype,
 ):
-    with pytest.raises(ValueError, match="the original Symmetrix pair-spline format"):
+    with pytest.raises(
+        ValueError, match="pair-spline radial representation does not support streamed"
+    ):
         Symmetrix(
             legacy_standard_model_path,
             dtype=dtype,
@@ -717,7 +719,7 @@ def test_multihead_pair_spline_export_preserves_prediction_heads(
         legacy["head"]
     ].items():
         assert legacy[name] == values
-    assert legacy.get("symmetrix_format_version", 1) == 1
+    assert legacy["symmetrix_format_version"] == 4
     assert legacy.get("radial_representation") != "compact"
     assert "compact_radial" not in legacy
     assert "execution_contracts" not in legacy
@@ -1855,14 +1857,10 @@ def test_selected_implementation_id_follows_the_dispatch_not_the_readiness_flags
 ):
     """The binding report states the implementation the dispatch runs.
 
-    The standard model ships the frozen M0 module, so readiness qualifies the
-    frozen tier and the plan names it.  The dispatch gate is narrower: a caller
-    that forces the runtime M0 executor declines the module and runs the generic
-    implementation.  The report follows the dispatch -- the node's
-    ``selected_implementation_id`` moves to the generic implementation while
-    ``implementation_id`` keeps naming the tier that qualified -- and the
-    module's own launch counter stays flat across the evaluation, which is the
-    execution evidence that the dispatch declined it.
+    The scalar standard model has a contract-backed M0 module. A compatible
+    installed artifact is preferred; otherwise the selected backend compiles
+    and loads a runtime module. The binding report names that generated tier;
+    forcing generic dispatch declines the module and reports the generic kernel.
     """
     _require_execution_fixed_weight_backend()
 
@@ -1878,7 +1876,7 @@ def test_selected_implementation_id_follows_the_dispatch_not_the_readiness_flags
             diagnostics=("origin=prebuilt status=skipped reason=disabled",),
         )
 
-    # This test exercises builtin-to-runtime dispatch reporting.  Package-mode
+    # This test exercises generated-to-generic dispatch reporting. Package-mode
     # tests cover exact installed artifact selection separately.
     monkeypatch.setattr(
         installed_operator_artifact,
@@ -1910,10 +1908,15 @@ def test_selected_implementation_id_follows_the_dispatch_not_the_readiness_flags
     # evaluator's own dispatch state selected, in the registry's vocabulary.
     # R0 may independently resolve an exact installed artifact, so its loader
     # route is intentionally outside this M0 dispatch test.
-    assert evaluator.m0_implementation == "builtin"
-    assert bindings()["m0"]["implementation_id"] == "builtin_m0"
-    assert bindings()["m0"]["selected_implementation_id"] == "builtin_m0"
-    assert bindings()["m0"]["tier"] == "frozen"
+    expected_implementation = (
+        "host_plugin"
+        if _kokkos_execution_space() in {"OpenMP", "Serial"}
+        else "device_module"
+    )
+    assert evaluator.m0_implementation == expected_implementation
+    assert bindings()["m0"]["implementation_id"] == "generated_m0"
+    assert bindings()["m0"]["selected_implementation_id"] == "generated_m0"
+    assert bindings()["m0"]["tier"] == "generated"
 
     evaluator._set_standard_m0_executor("standard")
     launches = evaluator.standard_m0_module_forward_launch_count
@@ -1923,7 +1926,7 @@ def test_selected_implementation_id_follows_the_dispatch_not_the_readiness_flags
     # Forcing the runtime executor declines the module the plan names, and the
     # report follows the dispatch rather than the readiness flags.
     evaluator._set_standard_m0_executor("runtime")
-    assert bindings()["m0"]["implementation_id"] == "builtin_m0"
+    assert bindings()["m0"]["implementation_id"] == "generated_m0"
     assert bindings()["m0"]["selected_implementation_id"] == "generic_m0"
     launches = evaluator.standard_m0_module_forward_launch_count
     evaluator.compute_node_energies_forces(*native_args)
@@ -1995,6 +1998,92 @@ def test_r0_reporting_follows_actual_dispatch_with_a_loaded_module(
         evaluator.r0_profile,
         evaluator.r0_module_id,
     ) == generated_identity
+
+
+@pytest.mark.jit
+def test_host_builtin_r0_compiles_and_reuses_cache_when_prebuilt_is_missing(
+    scalar_standard_model_path, tmp_path, monkeypatch
+):
+    if _kokkos_execution_space() not in {"OpenMP", "Serial"}:
+        pytest.skip("host R0 runtime compilation requires a host Kokkos build")
+
+    from symmetrix import mace_jit_operator_artifact
+    from symmetrix.installed_operator_artifact import InstalledOperatorResolution
+
+    cache_root = tmp_path / "jit-cache"
+    cache_root.mkdir(mode=0o700)
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(cache_root))
+    resolve = mace_jit_operator_artifact.resolve_installed_operator_artifact
+
+    def without_prebuilt_operators(**arguments):
+        if arguments["operator"] in ("M0", "R0"):
+            return InstalledOperatorResolution(
+                status="absent",
+                origin=None,
+                artifact_path=None,
+                artifact_id=None,
+                diagnostics=(
+                    f"prebuilt {arguments['operator']} unavailable for runtime fallback test",
+                ),
+            )
+        return resolve(**arguments)
+
+    monkeypatch.setattr(
+        mace_jit_operator_artifact,
+        "resolve_installed_operator_artifact",
+        without_prebuilt_operators,
+    )
+    atoms = _small_structure()
+    control = Symmetrix(
+        scalar_standard_model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        execution_profile="speed",
+    )
+    assert control.evaluator._r0_loader_implementation == "builtin"
+    assert control.evaluator.m0_implementation == "builtin"
+    control.calculate(atoms, properties=["energy", "forces", "stress"])
+    expected = {
+        name: np.array(control.results[name], copy=True)
+        for name in ("energy", "forces", "stress")
+    }
+
+    compiled = Symmetrix(
+        scalar_standard_model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        low_memory=True,
+    )
+    assert compiled.evaluator._r0_loader_implementation == "host_plugin"
+    assert compiled.evaluator.r0_artifact_origin == "runtime"
+    assert compiled.jit_operator_modules["R0"]["status"] == "built"
+    assert compiled.evaluator.m0_implementation == "host_plugin"
+    assert compiled.jit_operator_modules["M0"]["status"] == "built"
+    assert compiled.jit_operator_modules["M0"]["origin"] == "runtime"
+    assert compiled.jit_operator_modules["M0"]["compiler"] == "host-cxx"
+    compiled.calculate(atoms, properties=["energy", "forces", "stress"])
+
+    cached = Symmetrix(
+        scalar_standard_model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        low_memory=True,
+    )
+    assert cached.evaluator._r0_loader_implementation == "host_plugin"
+    assert cached.evaluator.r0_artifact_origin == "cache"
+    assert cached.jit_operator_modules["R0"]["status"] == "cached"
+    cached.calculate(atoms, properties=["energy", "forces", "stress"])
+
+    assert cached.evaluator.m0_implementation == "host_plugin"
+    assert cached.jit_operator_modules["M0"]["status"] == "cached"
+    assert cached.jit_operator_modules["M0"]["origin"] == "cache"
+    for name in ("energy", "forces", "stress"):
+        np.testing.assert_allclose(
+            compiled.results[name], expected[name], rtol=0.0, atol=8e-5
+        )
+        np.testing.assert_allclose(
+            cached.results[name], expected[name], rtol=0.0, atol=8e-5
+        )
 
 
 @pytest.mark.cuda
@@ -2398,7 +2487,6 @@ def test_device_h2_stages_matches_the_reference_routing(
 @pytest.mark.cuda
 def test_r0_reverse_persistent_grid_is_a_whole_resident_wave(
     scalar_standard_model_path,
-    monkeypatch,
 ):
     """The coordinate reverse launches one whole resident wave per declaration.
 
@@ -2412,29 +2500,8 @@ def test_r0_reverse_persistent_grid_is_a_whole_resident_wave(
     """
 
     _require_execution_fixed_weight_backend()
-    from symmetrix import mace_jit_operator_artifact
-    from symmetrix.installed_operator_artifact import InstalledOperatorResolution
-
-    resolve_installed = mace_jit_operator_artifact.resolve_installed_operator_artifact
-
-    def resolve_without_prebuilt_r0(**arguments):
-        if arguments["operator"] == "R0":
-            return InstalledOperatorResolution(
-                status="disabled",
-                origin=None,
-                artifact_path=None,
-                artifact_id=None,
-                diagnostics=("builtin R0 launch-profile qualification",),
-            )
-        return resolve_installed(**arguments)
-
-    # Installed R0 modules use their generated persistent profile and bypass
-    # the builtin launch-profile override being qualified here.
-    monkeypatch.setattr(
-        mace_jit_operator_artifact,
-        "resolve_installed_operator_artifact",
-        resolve_without_prebuilt_r0,
-    )
+    # The speed profile bypasses capacity specialization and exercises the
+    # native builtin R0 launch-profile override directly.
     profile_id = "standard-r0-module-module-v2-cuda-float32-generic"
     # Large enough that the persistent grid is not clipped to the edge count.
     atoms = _small_structure().repeat((6, 6, 6))
@@ -2444,7 +2511,10 @@ def test_r0_reverse_persistent_grid_is_a_whole_resident_wave(
     # invalidates the prepared graph), so each grid gets its own calculator --
     # the same application point the calibration path uses.
     default = Symmetrix(
-        scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+        scalar_standard_model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        execution_profile="speed",
     )
     assert default.evaluator._r0_loader_implementation == "builtin"
     compute_unit_count = default.evaluator.execution_device_execution_environment[
@@ -2467,7 +2537,10 @@ def test_r0_reverse_persistent_grid_is_a_whole_resident_wave(
         default.evaluator._set_kernel_launch_profile_override(profile_id, 5)
 
     doubled = Symmetrix(
-        scalar_standard_model_path, dtype="float32", streamed_edges="direct"
+        scalar_standard_model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        execution_profile="speed",
     )
     assert doubled.evaluator._r0_loader_implementation == "builtin"
     doubled.evaluator._set_kernel_launch_profile_override(profile_id, 6)
@@ -2812,15 +2885,17 @@ def test_scalar_standard_m0_low_memory_matches_retained_direct(
     assert evaluator.low_memory
     assert evaluator.standard_m0_module_id == "standard-m0-lmax0-module-v1"
     m0 = calculators["low_memory"].jit_operator_modules["M0"]
-    if m0["status"] == "loaded":
-        assert m0["origin"] == "prebuilt"
-        assert evaluator.standard_m0_selected_executor == "runtime"
-        assert evaluator.m0_implementation in {"host_plugin", "device_module"}
-    else:
-        assert m0["status"] == "builtin"
-        assert m0["compiler"] is None
-        assert evaluator.standard_m0_selected_executor == "standard"
-        assert evaluator.m0_implementation == "builtin"
+    assert m0["status"] in {"loaded", "built", "cached"}
+    assert (
+        m0["origin"]
+        == {
+            "loaded": "prebuilt",
+            "built": "runtime",
+            "cached": "cache",
+        }[m0["status"]]
+    )
+    assert evaluator.standard_m0_selected_executor == "runtime"
+    assert evaluator.m0_implementation in {"host_plugin", "device_module"}
     assert evaluator.standard_r0_selected_executor != "v1"
     assert evaluator.factorized_jit_artifact_id
     assert evaluator.factorized_fallback_evaluation_count == 0

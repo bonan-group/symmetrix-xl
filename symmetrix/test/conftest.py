@@ -265,7 +265,7 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def finalize_kokkos_after_tests():
+def finalize_kokkos_after_tests(request):
     yield
 
     import symmetrix
@@ -273,9 +273,25 @@ def finalize_kokkos_after_tests():
     if symmetrix.selected_backend() is None:
         return
     native = symmetrix.load_backend()
-    gc.collect()
-    if native._kokkos_is_initialized():
-        native._finalize_kokkos()
+    # Pytest retains failed-call tracebacks until session teardown.  Those
+    # frames can keep an ASE calculator (and its native evaluator) alive even
+    # after the test body has returned.  Do not turn the original test failure
+    # into a secondary teardown error; a clean session still requires strict
+    # evaluator ownership before finalizing Kokkos.
+    for _ in range(3):
+        if gc.collect() == 0:
+            break
+    if not native._kokkos_is_initialized():
+        return
+    live = getattr(native, "_kokkos_live_object_count", lambda: 0)()
+    if live:
+        if request.session.testsfailed:
+            return
+        raise RuntimeError(
+            "Cannot finalize Kokkos while "
+            f"{live} Symmetrix evaluator object(s) are alive."
+        )
+    native._finalize_kokkos()
 
 
 @pytest.fixture(scope="session")

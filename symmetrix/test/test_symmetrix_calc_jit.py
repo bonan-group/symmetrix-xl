@@ -1313,7 +1313,7 @@ def test_low_memory_r1_host_jit_prefers_generated_m0_plugin(jit_harness, monkeyp
     assert calls[0]["prefer_host_m0_plugin"] is True
 
 
-def test_low_memory_host_keeps_builtin_m0_and_compiles_r1_r0_with_two_workers(
+def test_low_memory_host_compiles_m0_r1_r0_with_two_workers(
     jit_harness, monkeypatch, tmp_path
 ):
     jit = importlib.import_module(f"{_PACKAGE_NAME}.jit")
@@ -1409,15 +1409,18 @@ def test_low_memory_host_keeps_builtin_m0_and_compiles_r1_r0_with_two_workers(
     )
 
     assert len(compile_threads) == 2
-    assert set(prepared_sources) == {"generated source", "generated R0 source"}
-    load_events = [event[0] for event in evaluator.events if "load" in event[0]]
-    assert load_events == ["load", "r0_load"]
-    assert calculator.jit_operator_modules["M0"] == {
-        "status": "builtin",
-        "implementation": "builtin",
-        "compiler": None,
-        "artifact_id": "builtin-m0",
+    assert set(prepared_sources) == {
+        "generated source",
+        "generated M0 source",
+        "generated R0 source",
     }
+    load_events = [event[0] for event in evaluator.events if "load" in event[0]]
+    assert load_events == ["load", "m0_load", "r0_load"]
+    assert calculator.jit_operator_modules["M0"]["status"] == "built"
+    assert calculator.jit_operator_modules["M0"]["origin"] == "runtime"
+    assert calculator.jit_operator_modules["M0"]["implementation"] == "host_plugin"
+    assert calculator.jit_operator_modules["M0"]["compiler"] == "host-cxx"
+    assert calculator.jit_operator_modules["M0"]["artifact_id"] == "m0-artifact"
     assert calculator.jit_operator_modules["R0"]["artifact_id"] == "r0-artifact"
 
 

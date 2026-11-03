@@ -57,11 +57,10 @@ __all__ = [
 #: captured by) the polar family and vice versa.
 POLAR_MODEL_TYPE = "MACE_Polar"
 
-#: The nonlinear backbone schema version the polar family serializes.  The
-#: polar deltas ride the shared version-3 nonlinear schema; the family is
-#: distinguished by its model type and its embedded contract, not by a second
-#: version number.
-POLAR_FORMAT_VERSION = 3
+#: The current nonlinear backbone schema version the polar family serializes.
+#: Format 3 remains loadable for legacy checkpoints; new exports use format 4
+#: so the inverse-free H1 affine contract is explicit in the model document.
+POLAR_FORMAT_VERSION = 4
 
 #: The shapes the polar family admits for ``scale_shift``: a scalar tensor (the
 #: MH-1 spelling and the one a synthetic backbone carries) and the released
@@ -161,10 +160,9 @@ def validate_mace_polar_model_data(model_data: Mapping[str, Any]) -> Mapping[str
             f"got {model_type!r}"
         )
     version = data.get("symmetrix_format_version")
-    if version != POLAR_FORMAT_VERSION:
+    if version not in (3, POLAR_FORMAT_VERSION):
         raise ValueError(
-            "the PolarMACE evaluator requires "
-            f"format-version-{POLAR_FORMAT_VERSION} nonlinear JSON"
+            "the PolarMACE evaluator requires " "format-version-3 or -4 nonlinear JSON"
         )
 
     scale_shift = _require_mapping(data.get("scale_shift"), "scale_shift")

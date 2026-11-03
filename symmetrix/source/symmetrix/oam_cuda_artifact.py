@@ -392,8 +392,6 @@ def prepare_nequip_oam_cuda_artifact(
             diagnostics=installed.diagnostics,
         )
 
-    policy = resolve_jit_policy()
-    compiler = _validated_compiler(compiler)
     if native_module is not None:
         installed = resolve_installed_oam_artifact(
             architecture=generated["architecture"],
@@ -417,6 +415,8 @@ def prepare_nequip_oam_cuda_artifact(
                 cache_key=None,
             )
 
+    policy = resolve_jit_policy()
+    compiler = _validated_compiler(compiler)
     if native_module is None:
         raise OAMCudaArtifactError(
             "runtime OAM CUDA artifacts require an explicit native module "

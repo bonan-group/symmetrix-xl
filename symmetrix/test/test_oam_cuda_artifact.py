@@ -332,6 +332,11 @@ def test_installed_cuda_architecture_avoids_runtime_compiler_probe(
     monkeypatch.setattr(artifact_module, "resolve_installed_oam_artifact", resolve)
     monkeypatch.setattr(
         artifact_module,
+        "resolve_jit_policy",
+        lambda: pytest.fail("installed prebuilt must precede JIT policy resolution"),
+    )
+    monkeypatch.setattr(
+        artifact_module,
         "_selected_compiler",
         lambda compiler: pytest.fail("runtime compiler must not be probed"),
     )
@@ -349,6 +354,51 @@ def test_installed_cuda_architecture_avoids_runtime_compiler_probe(
     assert result.compiler == "prebuilt"
     assert resolved[0]["architecture"]["layer_count"] == 2
     assert resolved[0]["artifact_id"] == result.artifact_id
+
+
+@pytest.mark.parametrize("status", ("absent", "rejected"))
+def test_unavailable_installed_cuda_artifact_tries_cuda_jit_and_surfaces_failure(
+    monkeypatch, tmp_path, status
+):
+    _stub_renderer(monkeypatch)
+    calls = []
+
+    monkeypatch.setattr(
+        artifact_module,
+        "resolve_installed_oam_artifact",
+        lambda **kwargs: SimpleNamespace(
+            available=False,
+            status=status,
+            artifact_path=None,
+            manifest_path=None,
+            diagnostics=(f"origin=prebuilt status={status} family=OAM reason=test",),
+        ),
+    )
+
+    def fail_cuda_jit(source, **kwargs):
+        calls.append(kwargs["artifact_name"])
+        return SimpleNamespace(
+            available=False,
+            status="fallback",
+            artifact_path=None,
+            manifest_path=None,
+            diagnostics=("backend=cuda compiler=nvrtc",),
+            cache_key="cuda-cache-key",
+            reason="NVRTC compilation failed",
+        )
+
+    monkeypatch.setattr(artifact_module, "prepare_nvrtc_jit_artifact", fail_cuda_jit)
+    with pytest.raises(OAMCudaArtifactError, match="NVRTC compilation failed"):
+        prepare_nequip_oam_cuda_artifact(
+            FIXTURE,
+            "float32",
+            "sm_90",
+            "nvrtc",
+            cache_root=tmp_path,
+            native_module=_native_context(),
+        )
+
+    assert calls == [artifact_module.OAM_CUDA_NVRTC_ARTIFACT_NAME]
 
 
 @pytest.mark.parametrize("catalog_mode", ("r0", "full", "oam"))

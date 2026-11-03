@@ -225,9 +225,7 @@ def test_builtin_request_record_uses_layer_key(monkeypatch):
         target={"compute_capability_code": 120},
         jit_generation_version=2,
         operator_requests=(
-            operator_artifact._OperatorArtifactRequest(
-                "product_0", "M0", {"name": "layer0"}
-            ),
+            operator_artifact._OperatorArtifactRequest("product_0", "M0", None),
         ),
     )
 

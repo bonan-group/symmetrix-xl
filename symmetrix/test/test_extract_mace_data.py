@@ -256,6 +256,18 @@ def test_extract_maceles_serializes_charge_readouts_without_energy_scaling():
     }
 
 
+def test_extract_maceles_pre_linear_readout_stays_on_retained_basis():
+    data = extract_mace_data_module._extract_mace_les_parameters(
+        _scalar_maceles_model(),
+        num_channels=1,
+        l_max=0,
+        base_contracts=_base_contracts(),
+        h1_affine_mode="pre_linear_up",
+    )
+
+    assert data["readout_1_weights"] == pytest.approx([4.0])
+
+
 def test_prediction_head_payload_keeps_les_parameters_per_maceles_head():
     data = {
         "model_type": "MACELES",
@@ -623,7 +635,7 @@ def test_macefield_extractor_includes_field_schema(macefield_model_path, tmp_pat
     assert len(data["H1_product_weights"]) == 32768
     assert len(data["H1_linear_up_weights"]) == 32768
 
-    assert data["symmetrix_format_version"] == 2
+    assert data["symmetrix_format_version"] == 4
     assert data["radial_representation"] == "compact"
     assert "radial_spline_values_0" not in data
     assert "radial_spline_values_1" not in data
@@ -705,7 +717,7 @@ def test_macefield_extractor_includes_field_schema(macefield_model_path, tmp_pat
     extract_mace_data is None,
     reason=f"extract_mace_data is not available: {extract_mace_data_import_error}",
 )
-def test_macefield_extractor_retains_legacy_pair_splines(
+def test_macefield_extractor_emits_v4_pair_splines(
     macefield_model_path,
     caplog,
 ):
@@ -718,7 +730,9 @@ def test_macefield_extractor_retains_legacy_pair_splines(
         radial_format="pair-splines",
     )
 
-    assert "symmetrix_format_version" not in data
+    assert data["symmetrix_format_version"] == 4
+    assert data["h1_affine_mode"] == "pre_linear_up"
+    assert data["radial_representation"] == "pair-splines"
     assert "compact_radial" not in data
     assert "execution_contracts" not in data
     assert data["radial_spline_min"] == pytest.approx(1e-12)
@@ -728,14 +742,14 @@ def test_macefield_extractor_retains_legacy_pair_splines(
     assert len(data["radial_spline_values_1"]) == 3
     assert len(data["A0_spline_values"]) == 3
     assert len(data["A1_spline_values"]) == 3
-    assert "original Symmetrix pair-spline format (named v1 here)" in caplog.text
+    assert "Generating format-v4 pair-spline radial tables" in caplog.text
 
 
 @pytest.mark.skipif(
     extract_mace_data is None,
     reason=f"extract_mace_data is not available: {extract_mace_data_import_error}",
 )
-def test_legacy_pair_splines_retain_low_node_count_support(macefield_model_path):
+def test_v4_pair_splines_retain_low_node_count_support(macefield_model_path):
     for num_spline_points in (2, 3):
         data = extract_mace_data(
             macefield_model_path,
@@ -799,10 +813,9 @@ def test_compact_radial_values_match_pair_splines(
     legacy_path.write_text(json.dumps(legacy))
 
     compact_model = _reference_evaluator(compact_path)
-    # The pair-spline export is the original format (named v1 here): the native
-    # loader still admits it through the materialized representation and
-    # announces that routing, while set_streamed_edges refuses it outright.
-    with pytest.warns(UserWarning, match="original Symmetrix pair-spline format"):
+    # Format-v4 pair-spline data remains on materialized execution because
+    # streamed edges require the compact radial representation.
+    with pytest.warns(UserWarning, match="pair-spline radial representation"):
         legacy_model = native_symmetrix.MACEKokkos(str(legacy_path))
     compact_model.prepare_active_types(
         np.asarray([0, 1, 0, 1], dtype=np.int32)[::2],

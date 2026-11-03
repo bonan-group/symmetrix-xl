@@ -49,7 +49,7 @@ def _foreign_model_type(data):
 
 
 def _unknown_format_version(data):
-    data["symmetrix_format_version"] = 4
+    data["symmetrix_format_version"] = 5
 
 
 def _leading_size_two_scale(data):

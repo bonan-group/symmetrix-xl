@@ -544,12 +544,15 @@ class Symmetrix(Calculator):
         Execution routing for compact MACE models; ``auto`` resolves from model
         capability, and every documented spelling resolves through one explicit
         alias table onto the family's two routings. ``direct`` runs the
-        prepared factorized plan and requires a model-specific RTC artifact,
-        which does not fall back. ``reference`` runs the generic streamed
-        implementation through the whole-evaluator entry point on the default
-        host execution space with no artifact at all. Admitted single-layer
-        models use built-in direct M0/R0 execution without an R1 stage,
-        although capacity planning may still specialize those operators.
+        prepared factorized plan and requires its model-specific RTC artifact;
+        for capacity specialization, exact installed M0/M1/R0 artifacts take
+        precedence and missing contract-backed modules compile at runtime on the
+        requested backend. Compilation failures surface instead of silently
+        retaining builtin operators or changing backends. ``reference`` runs
+        the generic streamed implementation through the whole-evaluator entry
+        point on the default host execution space with no artifact at all.
+        Admitted single-layer models use built-in direct M0/R0 execution without
+        an R1 stage, although capacity planning may still specialize those operators.
         The ``non-compiled``, ``generic``, ``all_interactions`` and
         ``materialized`` spellings resolve to ``reference``; ``generic`` and
         ``all_interactions`` are deprecated. ``factorized`` and
@@ -1345,18 +1348,13 @@ class Symmetrix(Calculator):
         ) and family_registry.supports_surface(
             self._family_entry, self.evaluator, "mode_handshake"
         ):
-            # The original Symmetrix pair-spline format (named v1 here) was only
-            # ever served by the retired materialized edge representation.  Both
-            # routings of the families that declare the streamed-edge handshake
-            # stream edges now, so the format is refused with the conversion
-            # that enables them instead of a silent downgrade.  A family that
-            # declares no handshake (the PolarMACE family, whose reference
-            # routing is the whole-evaluator entry point) states its own
-            # routing set instead of being refused as a retired format.
+            # Pair-spline radial data is materialized; the streamed-edge
+            # handshake is available only for compact radial data. Refuse an
+            # explicit streamed request instead of silently downgrading. A
+            # family without that handshake states its own routing set.
             raise ValueError(
-                "the original Symmetrix pair-spline format (named v1 here) is no "
-                "longer supported: re-export the model with "
-                "radial_format='compact' to enable streamed execution."
+                "the pair-spline radial representation does not support streamed "
+                "execution: re-export the model with radial_format='compact'."
             )
 
         if (

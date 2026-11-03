@@ -818,6 +818,92 @@ def _runtime_specialized_macefield_path(tmp_path_factory, macefield_model_path):
 @pytest.mark.cuda
 @pytest.mark.gpu
 @pytest.mark.jit
+def test_cuda_builtin_r0_compiles_when_prebuilt_artifact_is_missing(
+    _standard_r0_operator_model_path, tmp_path, monkeypatch
+):
+    _require_cuda_nvrtc()
+    from symmetrix import mace_jit_operator_artifact
+    from symmetrix.installed_operator_artifact import InstalledOperatorResolution
+
+    monkeypatch.setenv("SYMMETRIX_JIT_CUDA_JIT_BACKEND", "nvrtc")
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
+    resolve = mace_jit_operator_artifact.resolve_installed_operator_artifact
+
+    def without_prebuilt_operator(**arguments):
+        if arguments["operator"] in ("M0", "R0"):
+            return InstalledOperatorResolution(
+                status="absent",
+                origin=None,
+                artifact_path=None,
+                artifact_id=None,
+                diagnostics=(
+                    f"prebuilt {arguments['operator']} unavailable for runtime fallback test",
+                ),
+            )
+        return resolve(**arguments)
+
+    monkeypatch.setattr(
+        mace_jit_operator_artifact,
+        "resolve_installed_operator_artifact",
+        without_prebuilt_operator,
+    )
+    atoms = Atoms(
+        "HLi",
+        positions=[[0.0, 0.0, 0.0], [1.2, 0.1, 0.0]],
+        cell=[8.0, 8.0, 8.0],
+        pbc=False,
+    )
+    control = Symmetrix(
+        _standard_r0_operator_model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        low_memory=False,
+    )
+    assert control.evaluator.m0_implementation == "builtin"
+    expected = _evaluate(control, atoms)
+
+    compiled = Symmetrix(
+        _standard_r0_operator_model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        low_memory=True,
+    )
+    assert compiled.evaluator.m0_implementation == "device_module"
+    assert compiled.jit_operator_modules["M0"]["status"] == "built"
+    assert compiled.jit_operator_modules["M0"]["origin"] == "runtime"
+    assert compiled.jit_operator_modules["M0"]["compiler"] == "nvrtc"
+    assert compiled.evaluator._r0_loader_implementation == "device_module"
+    assert compiled.evaluator.r0_artifact_origin == "runtime"
+    assert compiled.jit_operator_modules["R0"]["status"] == "built"
+    actual = _evaluate(compiled, atoms)
+
+    cached = Symmetrix(
+        _standard_r0_operator_model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        low_memory=True,
+    )
+    assert cached.evaluator.m0_implementation == "device_module"
+    assert cached.jit_operator_modules["M0"]["status"] == "cached"
+    assert cached.jit_operator_modules["M0"]["origin"] == "cache"
+    assert cached.evaluator._r0_loader_implementation == "device_module"
+    assert cached.evaluator.r0_artifact_origin == "cache"
+    assert cached.jit_operator_modules["R0"]["status"] == "cached"
+    repeated = _evaluate(cached, atoms)
+
+    for candidate in (actual, repeated):
+        assert candidate["energy"] == pytest.approx(
+            expected["energy"], rel=0.0, abs=8e-5
+        )
+        for name in ("energies", "forces", "stress"):
+            np.testing.assert_allclose(
+                candidate[name], expected[name], rtol=0.0, atol=8e-5
+            )
+
+
+@pytest.mark.cuda
+@pytest.mark.gpu
+@pytest.mark.jit
 @pytest.mark.parametrize("schedule", ("table", "chunk32", "tiled128x4-v1"))
 @pytest.mark.parametrize("r0_schedule", ("receiver-edge16", "receiver-edge32"))
 @pytest.mark.parametrize("dtype", ("float32", "float64"))
@@ -1448,11 +1534,19 @@ def test_cuda_runtime_m0_supports_macefield_analytical_response(
     assert retained.evaluator.m0_implementation == "generic"
     assert retained.evaluator.r0_implementation == "generated"
     assert retained.evaluator._r0_loader_implementation == "builtin"
-    assert compact.evaluator.m0_implementation == "device_module"
-    assert compact.evaluator.r0_implementation == "generated"
-    assert compact.evaluator._r0_loader_implementation == "builtin"
+    assert compact.evaluator._r0_loader_implementation == "device_module"
     assert compact.jit_operator_modules["M0"]["compiler"] == "nvrtc"
-    assert compact.jit_operator_modules["R0"]["status"] == "builtin"
+    assert compact.jit_operator_modules["R0"]["implementation"] == "generated"
+    assert compact.jit_operator_modules["R0"]["artifact_origin"] in (
+        "prebuilt",
+        "runtime",
+        "cache",
+    )
+    assert compact.jit_operator_modules["R0"]["status"] in (
+        "loaded",
+        "built",
+        "cached",
+    )
 
     properties = (
         "energy",

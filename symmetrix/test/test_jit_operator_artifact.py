@@ -134,8 +134,10 @@ def _operator_metadata(artifact_id, schema="symmetrix.jit.operator-module/1"):
     }
 
 
-def test_prepare_operator_modules_compiles_missing_stages(monkeypatch, tmp_path):
-    evaluator = _Evaluator()
+def test_prepare_operator_modules_compiles_missing_stages_from_builtin(
+    monkeypatch, tmp_path
+):
+    evaluator = _Evaluator(m0="builtin", m1="builtin", r0="builtin")
     monkeypatch.setenv("SYMMETRIX_M0_RTC_SCHEDULE", "tiled128x4-v1")
     monkeypatch.setenv("SYMMETRIX_M1_RTC_SCHEDULE", "chunk32")
     calls = []
@@ -541,7 +543,7 @@ def test_host_m0_fallback_uses_one_native_policy_for_identity_and_manifest(
 def test_prepare_operator_modules_builds_architecture_specialized_host_r0(
     monkeypatch, tmp_path
 ):
-    evaluator = _Evaluator(m0="builtin")
+    evaluator = _Evaluator(m0="builtin", r0="builtin")
     calls = []
     rendered_targets = []
     monkeypatch.setenv("SYMMETRIX_JIT_HOST_TARGET", "x86-64-v3")
@@ -808,8 +810,8 @@ def test_exact_installed_device_m0_precedes_builtin(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("mode", ("off", "r0"))
-def test_non_full_device_catalog_short_circuits_builtin_m0_before_rtc(
-    monkeypatch, mode
+def test_non_full_device_catalog_compiles_builtin_m0_with_nvrtc(
+    monkeypatch, tmp_path, mode
 ):
     evaluator = _Evaluator(m0="builtin", r0="builtin")
     target = "" if mode == "off" else "sm_120"
@@ -829,22 +831,24 @@ def test_non_full_device_catalog_short_circuits_builtin_m0_before_rtc(
         "installed_operator_build_target",
         installed_artifact.installed_operator_build_target,
     )
-    monkeypatch.setenv("SYMMETRIX_M0_RTC_SCHEDULE", "invalid-schedule")
-    monkeypatch.setenv("SYMMETRIX_JIT_NVCC", "/definitely/missing-nvcc")
+    monkeypatch.setenv("SYMMETRIX_M0_RTC_SCHEDULE", "chunk32")
     monkeypatch.setattr(
         operator_codegen,
         "render_jit_m0_device_module",
-        lambda *args, **kwargs: pytest.fail("builtin M0 rendered RTC source"),
-    )
-    monkeypatch.setattr(
-        operator_artifact,
-        "resolve_installed_operator_artifact",
-        lambda **arguments: pytest.fail("non-full M0 probed installed artifacts"),
+        lambda contract, **arguments: (
+            "m0-runtime-source",
+            {
+                **_operator_metadata("m0-generated"),
+                "operator": "M0",
+                "generated_identity": {"artifact_id": "m0-generated"},
+                "schedule": "chunk32",
+            },
+        ),
     )
     monkeypatch.setattr(
         jit_runtime,
         "prepare_nvrtc_jit_artifact",
-        lambda *args, **kwargs: pytest.fail("builtin M0 prepared RTC state"),
+        lambda source, **arguments: _result(tmp_path, "m0-runtime"),
     )
 
     modules, diagnostics = operator_artifact.prepare_low_memory_operator_modules(
@@ -856,21 +860,33 @@ def test_non_full_device_catalog_short_circuits_builtin_m0_before_rtc(
         jit_generation_version=14,
     )
 
-    assert modules["M0"] == {
-        "status": "builtin",
-        "implementation": "builtin",
-        "compiler": None,
-        "artifact_id": "builtin-m0",
-    }
-    assert diagnostics == ()
+    assert evaluator.loads == [("M0", str(tmp_path / "m0-runtime.cubin"), "chunk32", 8)]
+    assert modules["M0"]["status"] == "built"
+    assert modules["M0"]["origin"] == "runtime"
+    assert modules["M0"]["implementation"] == "device_module"
+    assert modules["M0"]["compiler"] == "nvrtc"
+    assert modules["R0"]["status"] == "builtin"
+    assert diagnostics == (
+        "stage=M0 schedule=chunk32: origin=prebuilt status=absent "
+        "operator=M0 reason=catalog-absent",
+        "stage=M0 schedule=chunk32: compiled-m0-runtime",
+        "stage=M0 schedule=chunk32: origin=runtime status=compiled",
+    )
 
 
 @pytest.mark.parametrize("mode", ("off", "r0"))
-def test_non_full_host_catalog_short_circuits_builtin_m0_before_compiler_probe(
-    monkeypatch, mode
+def test_non_full_host_catalog_compiles_builtin_m0_with_host_jit(
+    monkeypatch, tmp_path, mode
 ):
     evaluator = _Evaluator(m0="builtin", r0="builtin")
     target = "" if mode == "off" else "x86-64-v3"
+    policy = jit_runtime.HostJitPolicy(
+        requested="automatic",
+        selected="native",
+        effective_target="x86-64-v3",
+        flags=("-march=x86-64-v3",),
+        diagnostics=(),
+    )
     monkeypatch.setattr(
         native_module,
         "_backend_build_info",
@@ -887,22 +903,34 @@ def test_non_full_host_catalog_short_circuits_builtin_m0_before_compiler_probe(
         "installed_operator_build_target",
         installed_artifact.installed_operator_build_target,
     )
-    monkeypatch.setenv("SYMMETRIX_M0_RTC_SCHEDULE", "invalid-schedule")
-    monkeypatch.setenv("CXX", "/definitely/missing-cxx")
-    monkeypatch.setattr(
-        operator_codegen,
-        "render_jit_m0_host_plugin",
-        lambda *args, **kwargs: pytest.fail("builtin M0 rendered host source"),
-    )
-    monkeypatch.setattr(
-        operator_artifact,
-        "resolve_installed_operator_artifact",
-        lambda **arguments: pytest.fail("non-full M0 probed installed artifacts"),
-    )
+    monkeypatch.setenv("SYMMETRIX_M0_RTC_SCHEDULE", "chunk32")
     monkeypatch.setattr(
         jit_runtime,
         "probe_compiler_identity",
-        lambda: pytest.fail("builtin M0 probed the host compiler"),
+        lambda: (("c++",), {"id": "GNU"}),
+    )
+    monkeypatch.setattr(
+        jit_runtime, "resolve_host_jit_policy", lambda *args, **kwargs: policy
+    )
+    monkeypatch.setattr(
+        operator_codegen,
+        "render_jit_m0_host_plugin",
+        lambda contract, **arguments: (
+            "host-m0-runtime-source",
+            {
+                **_operator_metadata(
+                    "host-m0-generated", schema="symmetrix.jit.m0-host-plugin/1"
+                ),
+                "abi_version": 1,
+                "operator": "M0",
+                "generated_identity": {"artifact_id": "host-m0-generated"},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        jit_runtime,
+        "prepare_jit_artifact",
+        lambda source, **arguments: _result(tmp_path, "host-m0-runtime"),
     )
 
     modules, diagnostics = operator_artifact.prepare_low_memory_operator_modules(
@@ -915,18 +943,22 @@ def test_non_full_host_catalog_short_circuits_builtin_m0_before_compiler_probe(
         prefer_host_m0_plugin=True,
     )
 
-    assert modules["M0"] == {
-        "status": "builtin",
-        "implementation": "builtin",
-        "compiler": None,
-        "artifact_id": "builtin-m0",
-    }
-    assert diagnostics == ()
+    assert evaluator.loads == [("M0-host", str(tmp_path / "host-m0-runtime.cubin"))]
+    assert modules["M0"]["status"] == "built"
+    assert modules["M0"]["implementation"] == "host_plugin"
+    assert modules["M0"]["compiler"] == "host-cxx"
+    assert modules["R0"]["status"] == "builtin"
+    assert diagnostics == (
+        "stage=M0 schedule=chunk32: origin=prebuilt status=absent "
+        "operator=M0 reason=catalog-absent",
+        "stage=M0 schedule=chunk32: compiled-host-m0-runtime",
+        "stage=M0 schedule=chunk32: origin=runtime status=compiled",
+    )
 
 
 @pytest.mark.parametrize("reason", ("load-failed", "checksum-mismatch"))
-def test_rejected_full_installed_device_m0_recovers_to_builtin_without_rtc(
-    monkeypatch, reason
+def test_rejected_full_installed_device_m0_recovers_through_runtime_jit(
+    monkeypatch, tmp_path, reason
 ):
     evaluator = _Evaluator(m0="builtin", r0="builtin")
     monkeypatch.setattr(
@@ -938,11 +970,11 @@ def test_rejected_full_installed_device_m0_recovers_to_builtin_without_rtc(
         operator_codegen,
         "render_jit_m0_device_module",
         lambda contract, **arguments: (
-            "unused-source",
+            "m0-runtime-source",
             {
-                **_operator_metadata("canonical-installed-m0"),
+                **_operator_metadata("m0-generated"),
                 "operator": "M0",
-                "generated_identity": {"artifact_id": "canonical-installed-m0"},
+                "generated_identity": {"artifact_id": "m0-generated"},
                 "schedule": "chunk32",
             },
         ),
@@ -960,7 +992,7 @@ def test_rejected_full_installed_device_m0_recovers_to_builtin_without_rtc(
     monkeypatch.setattr(
         jit_runtime,
         "prepare_nvrtc_jit_artifact",
-        lambda *args, **kwargs: pytest.fail("builtin recovery prepared RTC state"),
+        lambda source, **arguments: _result(tmp_path, "m0-runtime"),
     )
 
     modules, diagnostics = operator_artifact.prepare_low_memory_operator_modules(
@@ -972,22 +1004,28 @@ def test_rejected_full_installed_device_m0_recovers_to_builtin_without_rtc(
         jit_generation_version=14,
     )
 
-    assert modules["M0"] == {
-        "status": "builtin",
-        "origin": "builtin",
-        "implementation": "builtin",
-        "compiler": None,
-        "artifact_id": "builtin-m0",
-        "diagnostics": (
-            "stage=M0 schedule=chunk32: origin=prebuilt status=rejected "
-            f"operator=M0 reason={reason}",
-        ),
-    }
-    assert diagnostics == modules["M0"]["diagnostics"]
+    assert evaluator.loads == [("M0", str(tmp_path / "m0-runtime.cubin"), "chunk32", 8)]
+    assert modules["M0"]["status"] == "built"
+    assert modules["M0"]["origin"] == "runtime"
+    assert modules["M0"]["implementation"] == "device_module"
+    assert modules["M0"]["compiler"] == "nvrtc"
+    assert diagnostics == (
+        "stage=M0 schedule=chunk32: origin=prebuilt status=rejected "
+        f"operator=M0 reason={reason}",
+        "stage=M0 schedule=chunk32: compiled-m0-runtime",
+        "stage=M0 schedule=chunk32: origin=runtime status=compiled",
+    )
 
 
-def test_rejected_installed_host_r0_recovers_to_builtin_without_compiler(monkeypatch):
+def test_rejected_installed_host_r0_uses_runtime_jit(monkeypatch, tmp_path):
     evaluator = _Evaluator(m0="builtin", r0="builtin")
+    policy = jit_runtime.HostJitPolicy(
+        requested="automatic",
+        selected="native",
+        effective_target="host-runtime-test",
+        flags=("-march=native",),
+        diagnostics=(),
+    )
     monkeypatch.setattr(
         operator_artifact,
         "installed_operator_build_target",
@@ -996,21 +1034,23 @@ def test_rejected_installed_host_r0_recovers_to_builtin_without_compiler(monkeyp
     monkeypatch.setattr(
         jit_runtime,
         "probe_compiler_identity",
-        lambda: pytest.fail("builtin recovery probed the compiler"),
+        lambda: (("c++",), {"id": "GNU"}),
+    )
+    monkeypatch.setattr(
+        jit_runtime, "resolve_host_jit_policy", lambda *args, **kwargs: policy
     )
     monkeypatch.setattr(
         operator_codegen,
         "render_jit_r0_host_plugin",
         lambda contract, **arguments: (
-            "unused-source",
+            "runtime-r0-source",
             {
                 **_operator_metadata(
-                    "canonical-installed-r0",
-                    schema="symmetrix.jit.r0-host-plugin/2",
+                    "runtime-r0", schema="symmetrix.jit.r0-host-plugin/2"
                 ),
                 "abi_version": 2,
                 "operator": "R0",
-                "generated_identity": {"artifact_id": "canonical-installed-r0"},
+                "generated_identity": {"artifact_id": "runtime-r0"},
                 "schedule": "host-owner",
                 "compatibility_version": 2,
             },
@@ -1026,6 +1066,11 @@ def test_rejected_installed_host_r0_recovers_to_builtin_without_compiler(monkeyp
             ),
         ),
     )
+    monkeypatch.setattr(
+        jit_runtime,
+        "prepare_jit_artifact",
+        lambda source, **arguments: _result(tmp_path, "runtime-r0"),
+    )
 
     modules, diagnostics = operator_artifact.prepare_low_memory_operator_modules(
         evaluator,
@@ -1034,24 +1079,22 @@ def test_rejected_installed_host_r0_recovers_to_builtin_without_compiler(monkeyp
         backend="host",
         target={"backend": "host"},
         jit_generation_version=14,
+        cache_root=tmp_path / "cache",
     )
 
-    assert evaluator.loads == []
-    assert modules["R0"] == {
-        "status": "builtin",
-        "implementation": "generated",
-        "backend": "host",
-        "artifact_origin": None,
-        "schedule": "frozen",
-        "profile": "fixed-weight-coordinate",
-        "compiler": None,
-        "artifact_id": "builtin-r0",
-        "diagnostics": (
-            "stage=R0 schedule=host-owner: origin=prebuilt status=rejected "
-            "operator=R0 reason=checksum-mismatch",
-        ),
-    }
-    assert diagnostics == modules["R0"]["diagnostics"]
+    assert evaluator.loads == [
+        ("R0-host", str(tmp_path / "runtime-r0.cubin"), "host-runtime-test")
+    ]
+    assert modules["R0"]["implementation"] == "generated"
+    assert modules["R0"]["artifact_origin"] == "runtime"
+    assert modules["R0"]["target"] == "host-runtime-test"
+    assert modules["R0"]["artifact_id"] == "r0-host-artifact"
+    assert diagnostics == (
+        "stage=R0 schedule=host-owner: origin=prebuilt status=rejected "
+        "operator=R0 reason=checksum-mismatch",
+        "stage=R0 schedule=host-owner: compiled-runtime-r0",
+        "stage=R0 schedule=host-owner: origin=runtime status=compiled",
+    )
 
 
 def test_unsupported_installed_target_keeps_runtime_canonical_identity(
@@ -1186,7 +1229,7 @@ def test_operator_codegen_failure_names_stage_and_selected_schedule(monkeypatch)
 def test_operator_preparation_failure_names_stage_and_selected_schedule(
     monkeypatch,
 ):
-    evaluator = _Evaluator(m0="builtin")
+    evaluator = _Evaluator(m0="builtin", r0="builtin")
     monkeypatch.setattr(
         operator_codegen,
         "render_jit_r0_host_plugin",
@@ -1225,6 +1268,64 @@ def test_operator_preparation_failure_names_stage_and_selected_schedule(
             target={},
             jit_generation_version=3,
         )
+
+
+@pytest.mark.parametrize("stage", ("M0", "M1"))
+def test_builtin_operator_fails_closed_when_runtime_jit_is_unavailable(
+    monkeypatch, stage
+):
+    evaluator = _Evaluator(m0="builtin", m1="builtin", r0="builtin")
+    contracts = {operator: {"fixture": operator.lower()} for operator in (stage, "R0")}
+
+    def render(operator):
+        def render_contract(contract, **arguments):
+            assert contract == contracts[operator]
+            schedule = "receiver-edge16" if operator == "R0" else "chunk32"
+            return f"{operator.lower()}-source", {
+                **_operator_metadata(f"{operator.lower()}-generated"),
+                "operator": operator,
+                "schedule": schedule,
+                "generated_identity": {"artifact_id": f"{operator.lower()}-generated"},
+            }
+
+        return render_contract
+
+    for operator in (stage, "R0"):
+        monkeypatch.setattr(
+            operator_codegen,
+            f"render_jit_{operator.lower()}_device_module",
+            render(operator),
+        )
+    monkeypatch.setattr(
+        operator_artifact,
+        "_submit_operator_artifact_jobs",
+        lambda executor, jobs: {},
+    )
+    monkeypatch.setattr(
+        jit_runtime,
+        "load_validated_jit_artifact",
+        lambda prepare, load, artifact_key: SimpleNamespace(
+            status="unavailable",
+            result=SimpleNamespace(reason="the CUDA compiler is unavailable"),
+            diagnostics=("compiler lookup failed",),
+            quarantines=(),
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"stage={stage} schedule=chunk32.*the CUDA compiler is unavailable",
+    ):
+        operator_artifact.prepare_low_memory_operator_modules(
+            evaluator,
+            model_data={"execution_contracts": contracts},
+            precision="float32",
+            backend="cuda",
+            target={"compute_capability_code": 120},
+            jit_generation_version=14,
+        )
+
+    assert evaluator.loads == []
 
 
 def test_prepare_operator_modules_compiles_generic_host_m0(monkeypatch, tmp_path):

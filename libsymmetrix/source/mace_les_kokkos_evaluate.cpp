@@ -102,9 +102,11 @@ void MACELESKokkos<Precision>::compute_les_charges(const int num_nodes)
         throw std::logic_error("LES charge evaluation requires MACELES parameters.");
     if (num_nodes < 0)
         throw std::invalid_argument("LES charge node count cannot be negative.");
-    if (this->H1.extent(0) < static_cast<std::size_t>(num_nodes)
-        || this->H1.extent(1) == 0
-        || this->H1.extent_int(2) != this->num_channels
+    const auto h1 = this->h1_affine_v4()
+        ? this->h1_affine_M0_scalar : this->H1;
+    if (h1.extent(0) < static_cast<std::size_t>(num_nodes)
+        || h1.extent(1) == 0
+        || h1.extent_int(2) != this->num_channels
         || this->H2.extent(0) < static_cast<std::size_t>(num_nodes)
         || this->H2.extent_int(1) != this->num_channels)
         throw std::invalid_argument(
@@ -144,7 +146,6 @@ void MACELESKokkos<Precision>::compute_les_charges(const int num_nodes)
     const bool async_inference = this->use_factorized_async_inference();
     const auto execution_space = async_inference
         ? this->factorized_execution_space : Kokkos::DefaultExecutionSpace();
-    const auto h1 = this->H1;
     const auto weights = les_.readout_1_weights;
     const auto charge_1 = les_.charge_readout_1;
     const int channels = this->num_channels;
@@ -336,7 +337,6 @@ void MACELESKokkos<Precision>::accumulate_les_charge_readout_adjoints(
 
     const auto execution_space = this->use_factorized_async_inference()
         ? this->factorized_execution_space : Kokkos::DefaultExecutionSpace();
-    const auto h1_adjoint = this->H1_adj;
     const auto h2_adjoint = this->H2_adj;
     const auto charge_adjoint = les_.charge_adjoints;
     const auto readout_1_weights = les_.readout_1_weights;
@@ -345,21 +345,41 @@ void MACELESKokkos<Precision>::accumulate_les_charge_readout_adjoints(
     const int channels = this->num_channels;
     const std::size_t entries = static_cast<std::size_t>(num_nodes)
         *static_cast<std::size_t>(channels);
-    Kokkos::parallel_for(
-        "Accumulate LES charge readout adjoints",
-        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
-            execution_space, std::size_t(0), entries),
-        KOKKOS_LAMBDA (const std::size_t index) {
-            const int node = static_cast<int>(
-                index/static_cast<std::size_t>(channels));
-            const int channel = static_cast<int>(
-                index%static_cast<std::size_t>(channels));
-            const double seed = output_scale*charge_adjoint(node);
-            h1_adjoint(node,0,channel) += static_cast<Precision>(
-                seed*readout_1_weights(channel));
-            h2_adjoint(node,channel) +=
-                seed*readout_2_gradient(node,channel);
-        });
+    if (this->h1_affine_v4()) {
+        this->ensure_h1_affine_capacity(num_nodes);
+        const auto direct = this->h1_affine_M0_direct_adj;
+        Kokkos::parallel_for(
+            "Accumulate LES affine charge readout adjoints",
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                execution_space, std::size_t(0), entries),
+            KOKKOS_LAMBDA (const std::size_t index) {
+                const int node = static_cast<int>(
+                    index/static_cast<std::size_t>(channels));
+                const int channel = static_cast<int>(
+                    index%static_cast<std::size_t>(channels));
+                const double seed = output_scale*charge_adjoint(node);
+                direct(node,channel) += seed*readout_1_weights(channel);
+                h2_adjoint(node,channel) +=
+                    seed*readout_2_gradient(node,channel);
+            });
+    } else {
+        const auto h1_adjoint = this->H1_adj;
+        Kokkos::parallel_for(
+            "Accumulate LES charge readout adjoints",
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                execution_space, std::size_t(0), entries),
+            KOKKOS_LAMBDA (const std::size_t index) {
+                const int node = static_cast<int>(
+                    index/static_cast<std::size_t>(channels));
+                const int channel = static_cast<int>(
+                    index%static_cast<std::size_t>(channels));
+                const double seed = output_scale*charge_adjoint(node);
+                h1_adjoint(node,0,channel) += static_cast<Precision>(
+                    seed*readout_1_weights(channel));
+                h2_adjoint(node,channel) +=
+                    seed*readout_2_gradient(node,channel);
+            });
+    }
     if (!this->use_factorized_async_inference())
         execution_space.fence("LES charge readout reverse");
 }

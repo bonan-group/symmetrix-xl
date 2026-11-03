@@ -57,8 +57,14 @@ inline nlohmann::json select_prediction_head(
     if (data.value("model_type", std::string("MACE")) == "MACE_Nonlinear") {
         expected_fields = {"atomic_energies", "scale_shift", "readouts"};
     } else {
+        const std::string readout_1 = data.value(
+            "symmetrix_format_version", 1) == 4
+            ? (data.value("h1_affine_mode", std::string()) == "pre_linear_up"
+                ? "readout_1_weights_for_H1_pre_linear_up"
+                : "readout_1_weights_for_M0")
+            : "readout_1_weights";
         expected_fields = {
-            "atomic_energies", "readout_1_weights",
+            "atomic_energies", readout_1,
             "readout_2_weights_1", "readout_2_weights_2"};
         if (data.value("has_zbl", false))
             expected_fields.insert("zbl_c");

@@ -131,7 +131,7 @@ def test_compact_fixture_pins_independent_layer_channels_and_keep_last_output():
     """Catch a real serialized definition collapsing both layers to one width."""
 
     topology, _ = _build_topology()
-    assert topology["symmetrix_format_version"] == 3
+    assert topology["symmetrix_format_version"] == 4
     assert topology["model_type"] == "MACE_Polar"
     assert topology["num_interactions"] == 2
 

@@ -283,7 +283,7 @@ def test_the_document_keeps_the_recorded_public_requests(matrix):
         assert spelling in document
     # The hand-maintained table's compatibility row survives as declared data.
     assert "Format-aware compatibility default" in document
-    assert "original Symmetrix format (named v1 here)" in document
+    assert "Format-v4 pair-spline radial data is materialized-only" in document
 
 
 def test_polar_lammps_rows_state_the_qualified_one_rank_boundary(matrix):

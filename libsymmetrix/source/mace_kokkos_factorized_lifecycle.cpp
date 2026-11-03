@@ -1554,6 +1554,9 @@ void MACEKokkos<Precision>::prepare_dual_layer_tiled_workspace(
     dual_layer_workspace_active_edge_capacity = edge_capacity;
     dual_layer_workspace_planned_edge_capacity = std::max(
         dual_layer_workspace_planned_edge_capacity, edge_capacity);
+    // Format-4 affine state lives outside the tiled arena and must cover both
+    // receiver tiles and the full feature graph between phases.
+    ensure_h1_affine_capacity(capacity, num_feature_nodes);
 
     const std::size_t channels = static_cast<std::size_t>(num_channels);
     const std::size_t receivers = static_cast<std::size_t>(capacity);

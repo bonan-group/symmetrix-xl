@@ -26,6 +26,15 @@ from .mace_les_schema import (
     validate_mace_les_parameters,
 )
 from .prediction_heads import PREDICTION_HEADS_SCHEMA_VERSION
+from .h1_affine import (
+    BASIS_KEYS,
+    FORMAT_VERSION,
+    H1_AFFINE_MODE_M0_COMPOSITE,
+    H1_AFFINE_MODE_PRE_LINEAR_UP,
+    H1_AFFINE_TOOL_VERSION,
+    H1_AFFINE_VERSION,
+    LEGACY_KEYS,
+)
 
 _MACE_FIELD_MODULE = "mace.modules.extensions"
 _MACE_MODELS_MODULE = "mace.modules.models"
@@ -42,7 +51,14 @@ def _is_maceles(model) -> bool:
     )
 
 
-def _extract_mace_les_parameters(model, num_channels, l_max, base_contracts):
+def _extract_mace_les_parameters(
+    model,
+    num_channels,
+    l_max,
+    base_contracts,
+    h1_affine_mode=None,
+    h1_product_scalar_weights=None,
+):
     """Serialize scalar MACELES charge heads without a runtime LES dependency."""
 
     if not _is_maceles(model):
@@ -79,14 +95,26 @@ def _extract_mace_les_parameters(model, num_channels, l_max, base_contracts):
             "and two LES readouts."
         )
 
-    fuse = np.reshape(
-        model.interactions[1].linear_up.weight.numpy(force=True)
-        / np.sqrt(num_channels),
-        [l_max + 1, num_channels, num_channels],
-    )[0]
     linear = model.les_readouts[0]
-    linear_weights = linear.linear.weight.numpy(force=True) / np.sqrt(num_channels)
-    linear_weights = np.linalg.inv(fuse) @ linear_weights
+    linear_weights = np.asarray(
+        linear.linear.weight.numpy(force=True), dtype=np.float64
+    ).reshape(num_channels) / np.sqrt(num_channels)
+    if h1_affine_mode is None:
+        # Direct callers of this private helper retain the historical payload
+        # contract.  The normal exporter always supplies a format-4 mode and
+        # takes the native-map branch below.
+        fuse = np.reshape(
+            model.interactions[1].linear_up.weight.numpy(force=True)
+            / np.sqrt(num_channels),
+            [l_max + 1, num_channels, num_channels],
+        )[0]
+        linear_weights = np.linalg.solve(fuse, linear_weights)
+    elif h1_affine_mode == H1_AFFINE_MODE_M0_COMPOSITE:
+        if h1_product_scalar_weights is None:
+            raise RuntimeError(
+                "MACELES m0_composite extraction requires the native product map."
+            )
+        linear_weights = np.asarray(h1_product_scalar_weights) @ linear_weights
 
     nonlinear = model.les_readouts[1]
     nonlinear_weights_1 = nonlinear.linear_1.weight
@@ -122,6 +150,9 @@ def _extract_mace_les_parameters(model, num_channels, l_max, base_contracts):
             "M0": base_contracts["M0"]["semantic_fingerprint"],
             "R1": base_contracts["R1"]["fingerprint"],
         },
+        # Keep the intrinsic LES schema stable.  Format-4 MACE backbones use
+        # this vector on the retained affine scalar block; legacy v1/v2 files
+        # continue to interpret it on post-linear-up H1.
         "readout_1_weights": linear_weights.tolist(),
         "readout_2_hidden_size": hidden,
         "readout_2_weights_1": (
@@ -425,8 +456,8 @@ def _extract_single_head_data(
         table size and is only written to the JSON when given.
     radial_format: str, default "compact"
         compact stores the shared radial model and materializes splines for
-        active compositions at runtime. pair-splines stores the original
-        Symmetrix format (named v1 here) with pair tables.
+        active compositions at runtime. pair-splines stores format-v4 JSON
+        with explicit pair tables and remains on materialized edge execution.
 
     Returns
     -------
@@ -451,9 +482,9 @@ def _extract_single_head_data(
         raise ValueError("Compact radial output requires at least 4 spline points.")
     if radial_format == "pair-splines":
         logging.warning(
-            "Generating the original Symmetrix pair-spline format "
-            "(named v1 here). "
-            "Use radial_format='compact' for the optimized format-v2 runtime."
+            "Generating format-v4 pair-spline radial tables. This representation "
+            "uses materialized edge execution; use radial_format='compact' for "
+            "streamed execution."
         )
 
     # ensure that splines goes smoothly to 0 at outer cutoff
@@ -603,6 +634,16 @@ def _extract_single_head_data(
             f"residual interaction={first_interaction_residual}, "
             f"products[0].use_sc={bool(model.products[0].use_sc)}."
         )
+
+    # Inverse-free H1 affine basis.  Plain two-interaction models can compose
+    # the first projection with the scalar M0 maps; residual-first and
+    # field-coupled models must retain the checkpoint's pre-linear-up basis.
+    h1_affine_mode = (
+        H1_AFFINE_MODE_PRE_LINEAR_UP
+        if num_interactions == 2 and (is_macefield or first_interaction_residual)
+        else H1_AFFINE_MODE_M0_COMPOSITE
+    )
+    readout_1_key, h2_skip_key = BASIS_KEYS[h1_affine_mode]
 
     if single_layer_invariant_readout:
         readout_product = model.readout_products[0]
@@ -956,9 +997,12 @@ def _extract_single_head_data(
     output["num_elements"] = len(atomic_numbers)
     output["atomic_energies"] = atomic_energies
 
+    output["symmetrix_format_version"] = FORMAT_VERSION
+    output["h1_affine_mode"] = h1_affine_mode
+    output["h1_affine_version"] = H1_AFFINE_VERSION
+    output["radial_representation"] = radial_format
+
     if radial_format == "compact":
-        output["symmetrix_format_version"] = 2
-        output["radial_representation"] = "compact"
         output["compact_radial"] = serialize_compact_radial(model, atomic_numbers)
 
     ### --- ZBL ---
@@ -1296,6 +1340,11 @@ def _extract_single_head_data(
     for l in range(L_max + 1):
         H1_weights[l, :, :] = weights_0[l, :, :] @ weights_1[l, :, :]
     output["H1_weights"] = H1_weights.flatten().tolist()
+    # Scalar product and linear-up maps are retained for the inverse-free
+    # affine payload and for the pre-linear-up basis used by residual/field
+    # models.  The old exporter formed inv(linear_up) below; never do that.
+    h1_product_scalar_weights = np.asarray(weights_0[0], dtype=np.float64)
+    h1_linear_up_scalar_weights = np.asarray(weights_1[0], dtype=np.float64)
     if is_macefield or first_interaction_residual:
         output["H1_product_weights"] = weights_0.flatten().tolist()
         output["H1_linear_up_weights"] = weights_1.flatten().tolist()
@@ -1340,14 +1389,14 @@ def _extract_single_head_data(
         output["M1_weights"], output["M1_monomials"] = extract_scalar_contraction(
             readout_product, L_max
         )
-        output["H2_weights_for_H1"] = [
+        output[h2_skip_key] = [
             [0.0] * (num_channels * num_channels) for _ in atomic_numbers
         ]
         output["H2_weights_for_M1"] = (
             readout_product.linear.weight.numpy(force=True).flatten()
             / np.sqrt(num_channels)
         ).tolist()
-        output["readout_1_weights"] = [0.0] * num_channels
+        output[readout_1_key] = [0.0] * num_channels
         output["Phi1_l"] = []
         output["Phi1_l1"] = []
         output["Phi1_l2"] = []
@@ -1706,27 +1755,26 @@ def _extract_single_head_data(
     ### ----- H2 -----
 
     logging.info("H2")
-    weights_to_fuse = model.interactions[1].linear_up.weight_view_for_instruction(
-        0
-    ).numpy(force=True) / np.sqrt(num_channels)
-    weights_to_fuse_rank = np.linalg.matrix_rank(weights_to_fuse)
-    if weights_to_fuse_rank < num_channels:
-        raise RuntimeError(
-            "ERROR: fusing weights have too low rank {weights_to_fuse_rank} < {num_channels}"
-        )
-    # H2 weights for H1
-    H2_weights_for_H1 = []
+    # Native scalar skip S0_z maps the pre-linear-up H1 scalar block to H2.
+    # m0_composite stores P0 @ S0_z; pre_linear_up stores S0_z directly.
+    H2_skip = []
     for i, a in enumerate(atomic_numbers):
         model_i = model.atomic_numbers.tolist().index(a)
-        w = (
+        native_skip = np.asarray(
             model.interactions[1]
             .skip_tp.weight_view_for_instruction(0)[:, model_i, :]
-            .numpy(force=True)
-        )
-        H2_weights_for_H1.append(w / np.sqrt(len(model.atomic_numbers) * num_channels))
-        H2_weights_for_H1[i] = np.linalg.inv(weights_to_fuse) @ H2_weights_for_H1[i]
-        H2_weights_for_H1[i] = H2_weights_for_H1[i].flatten().tolist()
-    output["H2_weights_for_H1"] = H2_weights_for_H1
+            .numpy(force=True),
+            dtype=np.float64,
+        ) / np.sqrt(len(model.atomic_numbers) * num_channels)
+        if native_skip.shape != (num_channels, num_channels):
+            raise RuntimeError(
+                f"skip_tp instruction 0 has shape {native_skip.shape}, "
+                f"expected ({num_channels}, {num_channels})"
+            )
+        if h1_affine_mode == H1_AFFINE_MODE_M0_COMPOSITE:
+            native_skip = h1_product_scalar_weights @ native_skip
+        H2_skip.append(native_skip.flatten().tolist())
+    output[h2_skip_key] = H2_skip
     # H2 weights for M1
     output["H2_weights_for_M1"] = (
         model.products[1].linear.weight.numpy(force=True) / np.sqrt(num_channels)
@@ -1734,19 +1782,43 @@ def _extract_single_head_data(
 
     ### ----- READOUTS -----
 
-    # linear readout
-    weights_to_fuse = np.reshape(
-        model.interactions[1].linear_up.weight.numpy(force=True)
-        / np.sqrt(num_channels),
-        [L_max + 1, num_channels, num_channels],
-    )
-    readout_1_weights = model.readouts[0].linear.weight.numpy(force=True) / np.sqrt(
-        num_channels
-    )
-    readout_1_weights = np.linalg.inv(weights_to_fuse[0, :, :]) @ readout_1_weights
-    output["readout_1_weights"] = (
-        readout_1_weights * model.scale_shift.scale.item()
-    ).tolist()
+    # Linear readout in the same inverse-free basis as the skip map.
+    native_readout = np.asarray(
+        model.readouts[0].linear.weight.numpy(force=True), dtype=np.float64
+    ).reshape(-1) / np.sqrt(num_channels)
+    if native_readout.size != num_channels:
+        raise RuntimeError(
+            f"readouts[0].linear has {native_readout.size} weights, "
+            f"expected {num_channels}"
+        )
+    readout_1 = native_readout * model.scale_shift.scale.item()
+    if h1_affine_mode == H1_AFFINE_MODE_M0_COMPOSITE:
+        readout_1 = h1_product_scalar_weights @ readout_1
+    output[readout_1_key] = readout_1.tolist()
+    singular_P0 = np.linalg.svd(h1_product_scalar_weights, compute_uv=False)
+    singular_U0 = np.linalg.svd(h1_linear_up_scalar_weights, compute_uv=False)
+    singular_C0 = np.linalg.svd(H1_weights[0], compute_uv=False)
+    output["h1_affine_provenance"] = {
+        "source": "native_checkpoint",
+        "origin": "native_checkpoint",
+        "exporter": "symmetrix.extract_mace_data",
+        "exporter_version": H1_AFFINE_TOOL_VERSION,
+        "torch_version": torch.__version__,
+        "numpy_version": np.__version__,
+        "conditioning": {
+            "sigma_min_C": float(singular_C0[-1]),
+            "sigma_max_C": float(singular_C0[0]),
+            "sigma_min_U0": float(singular_U0[-1]),
+            "sigma_max_U0": float(singular_U0[0]),
+            "cond_U0": (
+                float(singular_U0[0] / singular_U0[-1]) if singular_U0[-1] > 0 else None
+            ),
+            "sigma_min_P0": float(singular_P0[-1]),
+            "sigma_max_P0": float(singular_P0[0]),
+            "readout_1_l2": float(np.linalg.norm(readout_1)),
+            "skip_fro": float(np.linalg.norm(np.asarray(H2_skip))),
+        },
+    }
 
     # nonlinear readout
     readout_2_weights_1 = model.readouts[1].linear_1.weight
@@ -1778,7 +1850,12 @@ def _extract_single_head_data(
 
     if _is_maceles(model):
         output["les"] = _extract_mace_les_parameters(
-            model, num_channels, L_max, output["execution_contracts"]
+            model,
+            num_channels,
+            L_max,
+            output["execution_contracts"],
+            h1_affine_mode,
+            h1_product_scalar_weights,
         )
 
     return output
@@ -1788,9 +1865,12 @@ def _prediction_head_payload(data):
     if data.get("model_type") == "MACE_Nonlinear":
         fields = ("atomic_energies", "scale_shift", "readouts")
     else:
+        readout_key = BASIS_KEYS.get(
+            data.get("h1_affine_mode"), (LEGACY_KEYS[0], LEGACY_KEYS[1])
+        )[0]
         fields = (
             "atomic_energies",
-            "readout_1_weights",
+            readout_key,
             "readout_2_weights_1",
             "readout_2_weights_2",
         )
@@ -1801,7 +1881,12 @@ def _prediction_head_payload(data):
     return {name: data[name] for name in fields}
 
 
-def _extract_mh0_head_payload(model, atomic_numbers, base_contracts):
+def _extract_mh0_head_payload(
+    model,
+    atomic_numbers,
+    base_contracts,
+    h1_affine_mode=H1_AFFINE_MODE_M0_COMPOSITE,
+):
     num_channels = model.node_embedding.linear.irreps_out.count("0e")
     L_max = model.products[0].linear.irreps_out.lmax
     atomic_energies = [
@@ -1811,20 +1896,22 @@ def _extract_mh0_head_payload(model, atomic_numbers, base_contracts):
         + model.scale_shift.shift.item()
         for number in atomic_numbers
     ]
-    weights_to_fuse = np.reshape(
-        model.interactions[1].linear_up.weight.numpy(force=True)
-        / np.sqrt(num_channels),
-        [L_max + 1, num_channels, num_channels],
-    )
-    readout_1 = model.readouts[0].linear.weight.numpy(force=True) / np.sqrt(
-        num_channels
-    )
-    readout_1 = np.linalg.inv(weights_to_fuse[0]) @ readout_1
+    readout_1 = np.asarray(
+        model.readouts[0].linear.weight.numpy(force=True), dtype=np.float64
+    ).reshape(num_channels) / np.sqrt(num_channels)
+    if h1_affine_mode == H1_AFFINE_MODE_M0_COMPOSITE:
+        product_weights = np.reshape(
+            model.products[0].linear.weight.numpy(force=True),
+            [L_max + 1, num_channels, num_channels],
+        ) / np.sqrt(num_channels)
+        readout_1 = np.asarray(product_weights[0], dtype=np.float64) @ readout_1
     readout_2_weights_1 = model.readouts[1].linear_1.weight
     hidden_size = readout_2_weights_1.numel() // num_channels
     payload = {
         "atomic_energies": atomic_energies,
-        "readout_1_weights": (readout_1 * model.scale_shift.scale.item()).tolist(),
+        BASIS_KEYS[h1_affine_mode][0]: (
+            readout_1 * model.scale_shift.scale.item()
+        ).tolist(),
         "readout_2_weights_1": (
             torch.reshape(readout_2_weights_1, (num_channels, hidden_size))
             .T.numpy(force=True)
@@ -1843,7 +1930,15 @@ def _extract_mh0_head_payload(model, atomic_numbers, base_contracts):
         ).tolist()
     if _is_maceles(model):
         payload["les"] = _extract_mace_les_parameters(
-            model, num_channels, L_max, base_contracts
+            model,
+            num_channels,
+            L_max,
+            base_contracts,
+            h1_affine_mode,
+            np.asarray(
+                model.products[0].linear.weight.numpy(force=True), dtype=np.float64
+            ).reshape(L_max + 1, num_channels, num_channels)[0]
+            / np.sqrt(num_channels),
         )
     return payload
 
@@ -1935,6 +2030,7 @@ def extract_mace_data(
                 single_model,
                 atomic_numbers,
                 default_data.get("execution_contracts", {}),
+                default_data["h1_affine_mode"],
             )
         if _prediction_head_payload_layout(payload, nonlinear) != expected_layout:
             raise ValueError(

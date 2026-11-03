@@ -475,8 +475,12 @@ def test_full_installed_device_catalog_respects_operator_request_without_compile
     assert not (tmp_path / "empty-cache").exists()
 
 
-def test_runtime_device_fallback_retains_catalog_absent_diagnostic(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    ("installed_status", "installed_reason"),
+    (("absent", "catalog-absent"), ("rejected", "abi-mismatch")),
+)
+def test_runtime_device_fallback_retains_catalog_diagnostic(
+    monkeypatch, tmp_path, installed_status, installed_reason
 ):
     evaluator = _Evaluator("cuda")
     artifact = tmp_path / "runtime-r1.cubin"
@@ -538,7 +542,20 @@ def test_runtime_device_fallback_retains_catalog_absent_diagnostic(
     monkeypatch.setattr(
         device_artifact,
         "_factorized_device_backend_plan",
-        lambda *args, **kwargs: runtime_plan,
+        lambda backend, *args, **kwargs: (
+            runtime_plan if backend == "cuda" else pytest.fail("device backend changed")
+        ),
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "resolve_installed_operator_artifact",
+        lambda **kwargs: SimpleNamespace(
+            status=installed_status,
+            diagnostics=(
+                f"origin=prebuilt status={installed_status} operator=R1 "
+                f"reason={installed_reason}",
+            ),
+        ),
     )
     monkeypatch.setattr(
         device_artifact, "native_source_content_sha256", lambda native: "a" * 64
@@ -557,10 +574,115 @@ def test_runtime_device_fallback_retains_catalog_absent_diagnostic(
     )
 
     assert result.origin == "runtime"
+    assert result.backend == "cuda"
     assert result.diagnostics == (
-        "origin=prebuilt status=absent operator=R1 reason=catalog-absent",
+        f"origin=prebuilt status={installed_status} operator=R1 "
+        f"reason={installed_reason}",
         "origin=runtime status=compiled",
     )
+
+
+@pytest.mark.parametrize("backend", ("cuda", "hip"))
+def test_device_compiler_unavailable_fails_without_backend_fallback(
+    monkeypatch, tmp_path, backend
+):
+    evaluator = _Evaluator(backend)
+    selected_compiler = "nvrtc" if backend == "cuda" else "hiprtc"
+    installed_plan = SimpleNamespace(
+        metadata={
+            "generated_identity": {"operator": "R1", "artifact_id": "generated-r1"},
+            "abi": f"symmetrix.jit.{backend}-plugin/4",
+            "abi_version": 4,
+            "capabilities": 0x3,
+            "persistent_blocks_per_compute_unit": 8,
+        },
+        loader=evaluator.load,
+        ready_attribute=f"execution_{backend}_plugin_ready",
+        artifact_attribute=f"execution_{backend}_plugin_artifact_id",
+        variant_id="variant-installed",
+        edge_policy={"persistent_blocks_per_compute_unit": 8},
+    )
+    prepare_calls = []
+
+    def prepare(source, **arguments):
+        prepare_calls.append((source, arguments))
+        return SimpleNamespace(
+            status="unavailable",
+            available=False,
+            artifact_path=None,
+            cache_key="cache-unavailable",
+            reason=f"{selected_compiler} is unavailable",
+            diagnostics=(f"{selected_compiler} unavailable",),
+        )
+
+    runtime_plan = SimpleNamespace(
+        selected_compiler=selected_compiler,
+        policy="automatic",
+        metadata={
+            "artifact_id": "artifact-runtime",
+            "persistent_blocks_per_compute_unit": 8,
+        },
+        loader=evaluator.load,
+        ready_attribute=f"execution_{backend}_plugin_ready",
+        artifact_attribute=f"execution_{backend}_plugin_artifact_id",
+        variant_id="variant-runtime",
+        edge_policy={"persistent_blocks_per_compute_unit": 8},
+        build_attempt=lambda compiler: SimpleNamespace(
+            source=f"{backend} R1 source",
+            prepare=prepare,
+            arguments={"build": {"compiler": compiler}},
+        ),
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "_factorized_device_installed_plan",
+        lambda *args, **kwargs: installed_plan,
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "resolve_installed_operator_artifact",
+        lambda **kwargs: SimpleNamespace(
+            status="absent",
+            diagnostics=("origin=prebuilt status=absent operator=R1",),
+        ),
+    )
+    monkeypatch.setattr(
+        device_artifact,
+        "_factorized_device_backend_plan",
+        lambda selected_backend, *args, **kwargs: (
+            runtime_plan
+            if selected_backend == backend
+            else pytest.fail("requested device backend changed")
+        ),
+    )
+    monkeypatch.setattr(
+        device_artifact, "native_source_content_sha256", lambda native: "a" * 64
+    )
+
+    with pytest.raises(
+        device_artifact.JitDeviceArtifactError,
+        match=f"{selected_compiler} is unavailable",
+    ) as error:
+        device_artifact._prepare_and_validate(
+            evaluator=evaluator,
+            contract={"fixture": "r1"},
+            precision="float32",
+            environment=evaluator.execution_device_execution_environment,
+            model_path=tmp_path / "model.json",
+            model_type="MACE",
+            model_data={"execution_contracts": {"R1": {"fixture": "r1"}}},
+            include_low_memory_operators=False,
+            cache_root=tmp_path / "cache",
+        )
+
+    assert len(prepare_calls) == 1
+    assert prepare_calls[0][0] == f"{backend} R1 source"
+    assert prepare_calls[0][1]["build"]["compiler"] == selected_compiler
+    assert error.value.diagnostics == (
+        "origin=prebuilt status=absent operator=R1",
+        f"{selected_compiler} unavailable",
+    )
+    assert evaluator.events == []
 
 
 def test_cuda_r1_m0_r0_compile_concurrently_then_load_in_order(monkeypatch, tmp_path):

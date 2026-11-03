@@ -218,9 +218,9 @@ std::unique_ptr<MACEKokkos<Precision>> load_mace_kokkos(
     if (!evaluator->supports_streamed_edges()) {
         if (PyErr_WarnEx(
                 PyExc_UserWarning,
-                "Loaded the original Symmetrix pair-spline format (named v1 here); using "
+                "Loaded a pair-spline radial representation; using "
                 "streamed_edges='materialized'. Re-export with radial_format='compact' "
-                "to enable streamed_edges='non-compiled' execution.",
+                "to enable streamed execution.",
                 1) < 0)
             throw py::error_already_set();
     }

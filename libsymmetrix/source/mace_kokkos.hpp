@@ -19,6 +19,7 @@
 
 #include "compact_radial.hpp"
 #include "mace_field_coupling.hpp"
+#include "mace_h1_affine_schema.hpp"
 #include "cubic_spline_kokkos.hpp"
 #include "cubic_spline_set_kokkos.hpp"
 #include "device_backend.hpp"
@@ -1056,7 +1057,32 @@ bool first_interaction_residual = false;
 Kokkos::View<Precision***,Kokkos::LayoutRight> H1_first_residual_weights;
 Kokkos::View<Precision***,Kokkos::LayoutRight> H1_first_residual_fused_weights;
 void compute_H1(const int num_nodes);
+// Fused H1 reverse plus the direct inverse-free affine adjoint.
 void reverse_H1(const int num_nodes);
+void reverse_H1_fused(const int num_nodes);
+
+// In format v4, the first readout and H1->H2 skip act on a retained scalar
+// block rather than the post-linear_up H1 block.  Keeping this state separate
+// prevents the message adjoint from being mixed with the direct readout/skip
+// adjoint in FP32.
+symmetrix::h1_affine::Mode h1_affine_mode = symmetrix::h1_affine::Mode::legacy;
+bool h1_affine_v4() const {
+    return h1_affine_mode != symmetrix::h1_affine::Mode::legacy;
+}
+bool h1_affine_pre_linear_up() const {
+    return h1_affine_mode == symmetrix::h1_affine::Mode::pre_linear_up;
+}
+std::string h1_affine_mode_name() const {
+    return symmetrix::h1_affine::mode_name(h1_affine_mode);
+}
+int h1_affine_direct_rows = 0;
+Kokkos::View<Precision***,Kokkos::LayoutRight> h1_affine_M0_scalar;
+Kokkos::View<double**,Kokkos::LayoutRight> h1_affine_M0_direct_adj;
+Kokkos::View<Precision**,Kokkos::LayoutRight> h1_affine_graph_M0_scalar;
+Kokkos::View<double**,Kokkos::LayoutRight> h1_affine_graph_M0_direct_adj;
+void ensure_h1_affine_capacity(int local_rows, int graph_rows = 0);
+void capture_h1_affine_M0_scalar(int num_nodes);
+void add_h1_affine_direct_adjoint(int num_nodes);
 void compute_H1_product(const int num_nodes);
 void compute_H1_linear_up(const int num_nodes);
 void reverse_H1_linear_up(const int num_nodes);
@@ -1950,12 +1976,15 @@ Kokkos::View<H2WeightPrecision*> H2_weights_for_M1;
 Kokkos::View<H2WeightPrecision**,Kokkos::LayoutRight>
     H2_weights_for_H1_reverse;
 Kokkos::View<H2WeightPrecision*> H2_weights_for_M1_reverse;
+Kokkos::View<H2WeightPrecision**,Kokkos::LayoutRight>
+    H2_weights_for_M0, H2_weights_for_M0_reverse;
 void compute_H2(int num_nodes, Kokkos::View<const int*> node_types);
 void reverse_H2(int num_nodes, Kokkos::View<const int*> node_types, bool zero_H1_adj = true);
 void ensure_h1_adjoint_capacity();
 
 // Readouts
 Kokkos::View<double*> readout_1_weights;
+Kokkos::View<double*> readout_1_weights_for_M0;
 MultilayerPerceptronKokkos readout_2;
 Kokkos::View<double*> readout_2_output;
 double compute_readouts(

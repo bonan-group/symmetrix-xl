@@ -11,6 +11,16 @@ from symmetrix.mace_alchemical import (
 )
 
 
+def _e3nn_o3():
+    """Import e3nn under PyTorch's weights-only safe-global policy."""
+
+    import torch
+
+    with torch.serialization.safe_globals([slice]):
+        from e3nn import o3
+    return o3
+
+
 def test_expand_dual_topology_preserves_upstream_slot_edges():
     config = AlchemicalConfig(
         groups=(
@@ -225,7 +235,8 @@ def upstream_alchemical_model_path(tmp_path_factory):
     import json
     import torch
     import torch.nn.functional as F
-    from e3nn import o3
+
+    o3 = _e3nn_o3()
     from mace import modules
     from mace.modules import ScaleShiftMACE
     from symmetrix.extract_mace_data import _extract_single_head_data
@@ -401,7 +412,8 @@ def omat0_alchemical_model_path(tmp_path_factory):
     from pathlib import Path
     import torch
     import torch.nn.functional as F
-    from e3nn import o3
+
+    o3 = _e3nn_o3()
     from mace import modules
     from mace.modules import ScaleShiftMACE
     from symmetrix.extract_mace_data import _extract_single_head_data
@@ -547,9 +559,14 @@ def test_alchemical_model_retains_unsupported_feature_guards(
     elif unsupported == "soft_transform":
         model["compact_radial"]["distance_transform"]["type"] = "soft"
     else:
+        readout_key = (
+            "readout_1_weights_for_M0"
+            if "readout_1_weights_for_M0" in model
+            else "readout_1_weights"
+        )
         fields = [
             "atomic_energies",
-            "readout_1_weights",
+            readout_key,
             "readout_2_weights_1",
             "readout_2_weights_2",
             "zbl_c",

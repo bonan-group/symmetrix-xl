@@ -290,11 +290,12 @@ void validate_mace_backbone_schema(
     const auto fail = [&prefix](const std::string& message) {
         throw std::invalid_argument(prefix + message);
     };
+    const int format_version = data.at("symmetrix_format_version").get<int>();
     if (!data.is_object()
         || data.value("model_type", std::string()) != rules.model_type
-        || data.at("symmetrix_format_version").get<int>() != 3)
+        || (format_version != 3 && format_version != 4))
         fail(std::string("evaluator requires model_type ") + rules.model_type
-            + " and format-version-3 nonlinear JSON.");
+            + " and format-version-3 or -4 nonlinear JSON.");
 
     const auto atomic_numbers = data.at("atomic_numbers").get<std::vector<int>>();
     const auto model_atomic_numbers =

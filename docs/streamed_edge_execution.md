@@ -30,9 +30,13 @@ build or runtime dependency.
 
 The compact two-interaction pipeline contains radial stages R0/R1, node
 message stages M0/M1, dense transforms, readouts, and coordinate or field
-reverse stages. Built-in standard modules cover common M0/R0 structures;
-other admitted structures use runtime-generated modules. R1 and compatible
-MACE-MH-1 programs are specialized from versioned model contracts.
+reverse stages. Native built-in modules remain available on execution paths
+that do not request operator specialization. When capacity planning requests a
+contract-backed M0, M1, or R0 module, resolution prefers an exact installed
+artifact and otherwise compiles and caches the module for the requested
+backend. Compilation or loading failures are reported; the planner does not
+silently retain a builtin operator or change execution backends. R1 and
+compatible MACE-MH-1 programs are specialized from versioned model contracts.
 
 For admitted MH-1 models, each nonlinear layer stops at a canonical product
 boundary. Non-final products dispatch ordinary M0 modules and the final scalar

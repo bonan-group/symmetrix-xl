@@ -2655,6 +2655,34 @@ void MACEKokkos<Precision>::compute_H2(int num_nodes, Kokkos::View<const int*> n
     auto H2_weights_for_M1 = this->H2_weights_for_M1;
     auto M1 = this->M1;
 
+    if (h1_affine_v4()) {
+        if (h1_affine_M0_scalar.extent(0)
+                < static_cast<std::size_t>(num_nodes))
+            throw std::logic_error(
+                "format-4 compute_H2 requires compute_H1 for the same nodes first.");
+        auto scalar = this->h1_affine_M0_scalar;
+        auto skip = this->H2_weights_for_M0;
+        auto m1_weights = this->H2_weights_for_M1;
+        Kokkos::parallel_for(
+            "Compute H2 inverse-free affine",
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                execution_space, 0, num_nodes*num_channels),
+            KOKKOS_LAMBDA (const int ik) {
+                const int i = ik / num_channels;
+                const int k = ik % num_channels;
+                Precision output = Precision(0);
+                for (int kp=0; kp<num_channels; ++kp) {
+                    output += static_cast<Precision>(skip(
+                        node_types(i),kp*num_channels+k)) * scalar(i,0,kp);
+                    output += static_cast<Precision>(m1_weights(
+                        kp*num_channels+k)) * M1(i,kp);
+                }
+                H2(i,k) = static_cast<double>(output);
+            });
+        complete_device_stage("MACEKokkos::compute_H2");
+        return;
+    }
+
     if constexpr (std::is_same_v<
             typename Kokkos::DefaultExecutionSpace::memory_space,
             Kokkos::HostSpace>) {
@@ -2818,6 +2846,51 @@ void MACEKokkos<Precision>::reverse_H2(int num_nodes, Kokkos::View<const int*> n
     auto H2_weights_for_M1 = this->H2_weights_for_M1;
     auto H2_weights_for_H1_reverse = this->H2_weights_for_H1_reverse;
     auto H2_weights_for_M1_reverse = this->H2_weights_for_M1_reverse;
+
+    if (h1_affine_v4()) {
+        ensure_h1_affine_capacity(num_nodes);
+        h1_affine_direct_rows = num_nodes;
+        auto direct = this->h1_affine_M0_direct_adj;
+        auto readout = this->readout_1_weights_for_M0;
+        auto skip = this->H2_weights_for_M0;
+        auto skip_reverse = this->H2_weights_for_M0_reverse;
+        auto m1_reverse = this->H2_weights_for_M1_reverse;
+        auto node_weights = this->alchemical_node_weights;
+        const bool has_node_weights = node_weights.extent(0) != 0;
+        const bool has_skip_reverse = skip_reverse.extent(0) > 0;
+        const bool has_m1_reverse = m1_reverse.extent(0) > 0;
+        Kokkos::parallel_for(
+            "Reverse H2 inverse-free affine",
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                execution_space, 0, num_nodes*num_channels),
+            KOKKOS_LAMBDA (const int ik) {
+                const int i = ik / num_channels;
+                const int k = ik % num_channels;
+                double direct_sum = static_cast<double>(readout(k))
+                    * (has_node_weights ? node_weights(i) : 1.0);
+                double m1_sum = 0.0;
+                for (int kp=0; kp<num_channels; ++kp) {
+                    const double adjoint = H2_adj(i,kp);
+                    const double skip_value = has_skip_reverse
+                        ? static_cast<double>(skip_reverse(
+                            node_types(i),kp*num_channels+k))
+                        : static_cast<double>(skip(
+                            node_types(i),k*num_channels+kp));
+                    const double m1_value = has_m1_reverse
+                        ? static_cast<double>(m1_reverse(kp*num_channels+k))
+                        : static_cast<double>(H2_weights_for_M1(
+                            k*num_channels+kp));
+                    direct_sum += skip_value*adjoint;
+                    m1_sum += m1_value*adjoint;
+                }
+                // A MACELES affine charge readout may have contributed before
+                // reverse_H2; preserve it alongside the H2/readout adjoint.
+                direct(i,k) += direct_sum;
+                M1_adj(i,k) = static_cast<Precision>(m1_sum);
+            });
+        complete_device_stage("MACEKokkos::reverse_H2");
+        return;
+    }
 
     if constexpr (std::is_same_v<
             typename Kokkos::DefaultExecutionSpace::memory_space,
@@ -3026,9 +3099,17 @@ void MACEKokkos<Precision>::compute_readout_1(
     auto num_channels = this->num_channels;
     auto node_energies = this->node_energies;
     auto atomic_energies = this->atomic_energies;
-    auto H1 = this->H1;
+    const bool h1_v4 = h1_affine_v4();
+    if (h1_v4
+            && h1_affine_M0_scalar.extent(0)
+                < static_cast<std::size_t>(num_nodes))
+        throw std::logic_error(
+            "format-4 compute_readout_1 requires compute_H1 for the same nodes first.");
+    auto H1 = h1_v4 ? this->h1_affine_M0_scalar : this->H1;
     auto H1_adj = this->H1_adj;
-    auto readout_1_weights = this->readout_1_weights;
+    auto readout_1_weights = h1_v4
+        ? this->readout_1_weights_for_M0 : this->readout_1_weights;
+    const bool seed_h1_adjoint = initialize_h1_adjoint && !h1_v4;
     const auto node_weights = alchemical_node_weights;
 
     // atomic energies
@@ -3047,7 +3128,7 @@ void MACEKokkos<Precision>::compute_readout_1(
         KOKKOS_LAMBDA (const int i) {
         for (int k=0; k<num_channels; ++k) {
             node_energies(i) += readout_1_weights(k) * H1(i,0,k);
-            if (initialize_h1_adjoint)
+            if (seed_h1_adjoint)
                 H1_adj(i,0,k) = readout_1_weights(k)
                     * (node_weights.extent(0) != 0 ? node_weights(i) : 1.0);
         }

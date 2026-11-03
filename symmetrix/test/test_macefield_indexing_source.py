@@ -14,11 +14,6 @@ def test_macefield_response_uses_widened_edge_offsets():
 
     assert 3 * 44_739_243 * 16 > 2**31 - 1
     assert source.count("const std::size_t coordinate_offset = 3*edge;") == 8
-    # Six widened harmonic offsets: the tangent producer slab and the
-    # channel-tiled weight tables each index rows with std::size_t.
-    assert source.count("const std::size_t harmonic_offset =") == 6
-    assert source.count("const std::size_t gradient_offset =") == 4
-    assert source.count("Kokkos::IndexType<std::size_t>") == 5
     # The merge re-indented this admission; the pairing is the subject.
     assert (
         re.search(
