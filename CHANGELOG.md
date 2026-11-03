@@ -4,8 +4,27 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ## Unreleased
 
-## 0.1.2 - 2026-11-01
+## 0.1.2 - 2026-11-03
 
+- Added an opt-in Apple Metal backend for FP32 standard-MACE execution on
+  Apple silicon, with installation guidance, examples, and runtime
+  qualification tools.
+- Added native response and capacity execution for MACEField models, including
+  electric-field observables, polarization, Born effective charges,
+  polarizability, trusted execution-JIT cache handling, and streamed-edge
+  coverage.
+- Added source provenance to PEP 517 builds and expanded backend diagnostics,
+  build qualification, and runtime checks.
+- Added extractor support for forwarding `--num-spline-points` to
+  MACE_Nonlinear exports.
+- Expanded CPU and CUDA wheel builds and hardened release automation for
+  reruns, ABI-tagged extensions, compound manylinux tags, and AVX-512 codegen
+  checks.
+- Refreshed user and developer documentation, paper benchmarks, citations, and
+  benchmark guidance; removed superseded benchmark drivers.
+- Improved CUDA execution and its qualification workflow.
+- Hardened host OpenMP execution by blocking unsafe worker GEMMs, selecting the
+  compatible OpenBLAS runtime, and fixing BLAS/LAPACK wiring.
 - Model JSON format version 4 for every exported variant: the first readout and
   the H1->H2 skip are stored without the inverse of `interactions[1].linear_up`
   (`h1_affine_mode` `m0_composite` or `pre_linear_up`). Format-1/2 files still
