@@ -1,5 +1,12 @@
 # Stage the pinned provider without modifying its source submodule.
 function(symmetrix_prepare_cufft_runtime)
+    # Git applies the staging patch; declare it here instead of relying on
+    # another subproject's discovery order.
+    find_package(Git QUIET)
+    if(NOT GIT_FOUND OR NOT GIT_EXECUTABLE)
+        message(FATAL_ERROR
+            "Git is required to stage the cuFFT runtime provider but was not found.")
+    endif()
     set(base "${SYMMETRIX_KOKKOSFFT_SOURCE_DIR}")
     set(staged "${CMAKE_CURRENT_BINARY_DIR}/external/kokkosfft-runtime-source")
     set(patch "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/kokkosfft-2.0.0-cufft-runtime.patch")

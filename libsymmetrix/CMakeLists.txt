@@ -197,8 +197,10 @@ if(Kokkos_ENABLE_HIP)
     else()
         message(WARNING
             "Kokkos HIP is enabled while SYMMETRIX_SPHERICART_HIP is OFF; "
-            "MACE spherical harmonics will copy edge geometry to the host on "
-            "every evaluation. Use this configuration only as a diagnostic.")
+            "MACE spherical harmonics fall back to the hardcoded Kokkos "
+            "device kernels, which support l_max values from 0 through 6 "
+            "and reject larger models at runtime. Use this configuration "
+            "only as a diagnostic.")
     endif()
 endif()
 if(Kokkos_ENABLE_CUDA AND NOT SYMMETRIX_SPHERICART_CUDA)

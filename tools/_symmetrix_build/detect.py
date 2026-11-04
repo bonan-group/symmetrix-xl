@@ -715,7 +715,9 @@ def validate_source_checkout(repo_root: str | Path, runner: CommandRunner) -> No
             + ", ".join(missing)
         )
     if not runner.which("git"):
-        raise BuildError("git is required to prepare the patched SpheriCart source")
+        raise BuildError(
+            "git is required to initialize submodules and stage the cuFFT runtime"
+        )
 
 
 def validate_cpu_prerequisites(runner: CommandRunner) -> None:
