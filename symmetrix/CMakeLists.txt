@@ -38,7 +38,7 @@ set(SYMMETRIX_PYTHON_INSTALL_PACKAGE "" CACHE STRING
     "Python package receiving the native extension.")
 set(SYMMETRIX_DISTRIBUTION_NAME "symmetrix-xl" CACHE STRING
     "Owning Python distribution recorded in backend metadata.")
-set(SYMMETRIX_FRONTEND_VERSION "0.1.1" CACHE STRING
+set(SYMMETRIX_FRONTEND_VERSION "0.1.2" CACHE STRING
     "Compatible Symmetrix Python frontend version.")
 set(SYMMETRIX_BACKEND_SELECTOR "" CACHE STRING
     "Runtime backend selector recorded in backend metadata.")
@@ -311,6 +311,13 @@ set(SYMMETRIX_BUILD_OPENMP_VERSION "")
 set(SYMMETRIX_BUILD_OPENMP_RUNTIME_PATH "")
 set(SYMMETRIX_BUILD_OPENMP_RUNTIME_SHA256 "")
 file(REAL_PATH "${CMAKE_CXX_COMPILER}" SYMMETRIX_BUILD_CXX_COMPILER_PATH)
+if(SYMMETRIX_REDACT_BUILD_PATHS)
+  # Release wheels retain the compiler name for diagnostics but must not
+  # expose the absolute checkout path used to invoke nvcc_wrapper.
+  get_filename_component(_symmetrix_compiler_name
+    "${SYMMETRIX_BUILD_CXX_COMPILER_PATH}" NAME)
+  set(SYMMETRIX_BUILD_CXX_COMPILER_PATH "${_symmetrix_compiler_name}")
+endif()
 set(SYMMETRIX_BUILD_DEVICE_COMPILER_ID "")
 set(SYMMETRIX_BUILD_DEVICE_COMPILER_VERSION "")
 if(_symmetrix_resolved_device_backend STREQUAL "CUDA"

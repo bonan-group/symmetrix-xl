@@ -12,19 +12,18 @@ import hashlib
 import importlib.metadata
 import json
 import os
-from pathlib import Path
 import platform
 import resource
 import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 from ase.build import bulk
 from ase.calculators.calculator import all_changes
 from ase.neighborlist import neighbor_list
-
 
 PROPERTIES = ("energy", "forces", "stress")
 
@@ -50,19 +49,88 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_atoms(repeat: int, seed: int):
-    atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982).repeat((repeat,) * 3)
+def build_atoms(
+    repeat: int,
+    seed: int,
+    structure: str = "aln-wurtzite",
+):
+    if structure == "aln-wurtzite":
+        atoms = bulk("AlN", "wurtzite", a=3.112, c=4.982).repeat((repeat,) * 3)
+    elif structure == "srtio3-cubic":
+        from ase.spacegroup import crystal
+
+        atoms = crystal(
+            symbols=["Sr", "Ti", "O"],
+            basis=[(0, 0, 0), (0.5, 0.5, 0.5), (0.5, 0.5, 0)],
+            spacegroup=221,
+            cellpar=[3.905, 3.905, 3.905, 90, 90, 90],
+        ).repeat((repeat,) * 3)
+    else:
+        raise ValueError(f"unknown structure: {structure}")
     rng = np.random.default_rng(seed)
     atoms.positions += rng.normal(scale=0.01, size=atoms.positions.shape)
     return atoms
 
 
 def directed_edges(atoms, cutoff: float) -> int:
-    return int(len(neighbor_list("i", atoms, cutoff)))
+    return len(neighbor_list("i", atoms, cutoff))
 
 
-def synchronize(device: str) -> None:
+def input_state_sha256(atoms) -> str:
+    digest = hashlib.sha256()
+    arrays = (
+        np.asarray(atoms.numbers, dtype="<i8"),
+        np.asarray(atoms.positions, dtype="<f8"),
+        np.asarray(atoms.cell, dtype="<f8"),
+        np.asarray(atoms.pbc, dtype=np.uint8),
+    )
+    for array in arrays:
+        digest.update(str(array.shape).encode("ascii"))
+        digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def species_for_structure(structure: str) -> tuple[str, ...]:
+    if structure == "aln-wurtzite":
+        return ("Al", "N")
+    if structure == "srtio3-cubic":
+        return ("Sr", "Ti", "O")
+    raise ValueError(f"unknown structure: {structure}")
+
+
+def workload_metadata(atoms, args, model_cutoff: float, effective_cutoff: float):
+    structure_name = {
+        "aln-wurtzite": "perturbed-wurtzite-AlN",
+        "srtio3-cubic": "perturbed-cubic-SrTiO3",
+    }[args.structure]
+    return {
+        "structure": structure_name,
+        "repeat": args.repeat,
+        "seed": args.seed,
+        "atoms": len(atoms),
+        "chemical_formula": atoms.get_chemical_formula(mode="hill"),
+        "species": list(species_for_structure(args.structure)),
+        "cell_A": np.asarray(atoms.cell, dtype=float).tolist(),
+        "pbc": np.asarray(atoms.pbc, dtype=bool).tolist(),
+        "input_state_sha256": input_state_sha256(atoms),
+        "position_noise_std_A": 0.01,
+        "properties": list(PROPERTIES),
+        "precision": args.dtype,
+        "skin_A": args.skin if args.implementation == "current" else 0.0,
+        "effective_cutoff_A": effective_cutoff,
+        "directed_edges_at_model_cutoff": directed_edges(atoms, model_cutoff),
+        "directed_edges_at_effective_cutoff": directed_edges(atoms, effective_cutoff),
+    }
+
+
+def synchronize(device: str, calculator=None) -> None:
     if device == "cuda":
+        evaluator = getattr(calculator, "evaluator", None)
+        if evaluator is not None:
+            fence = getattr(evaluator, "fence", None)
+            if callable(fence):
+                fence()
+            return
         import torch
 
         torch.cuda.synchronize()
@@ -203,17 +271,19 @@ def make_calculator(args):
             f"Kokkos execution space is {execution_space}, expected {expected_space}"
         )
     if args.implementation == "develop":
+        species = species_for_structure(args.structure)
         calculator = Symmetrix(
             args.checkpoint,
             use_kokkos=True,
             dtype=args.dtype,
-            species=("Al", "N"),
+            species=species,
             head=args.head,
         )
         identity = {
             "implementation": "symmetrix-origin-develop-materialized",
             "execution_space": execution_space,
             "execution_space_query_available": callable(execution_space_query),
+            "species": list(species),
             "streamed_edges": "materialized",
             "low_memory": False,
         }
@@ -273,7 +343,7 @@ def run(args) -> int:
             "BLIS_NUM_THREADS",
         ):
             os.environ[variable] = str(args.threads)
-    atoms = build_atoms(args.repeat, args.seed)
+    atoms = build_atoms(args.repeat, args.seed, args.structure)
     model_cutoff = float(args.cutoff)
     effective_cutoff = model_cutoff + (
         args.skin if args.implementation == "current" else 0.0
@@ -285,14 +355,14 @@ def run(args) -> int:
     outputs = None
     for _ in range(args.warmups):
         outputs = evaluate(calculator, atoms)
-        synchronize(args.device)
+        synchronize(args.device, calculator)
 
     samples_ms = []
     for _ in range(args.samples):
-        synchronize(args.device)
+        synchronize(args.device, calculator)
         start = time.perf_counter()
         outputs = evaluate(calculator, atoms)
-        synchronize(args.device)
+        synchronize(args.device, calculator)
         samples_ms.append(1000.0 * (time.perf_counter() - start))
 
     median_ms = statistics.median(samples_ms)
@@ -300,6 +370,7 @@ def run(args) -> int:
     report = {
         "schema_version": 1,
         "revision": args.revision,
+        "protocol": "complete-ase-energy-forces-stress",
         "identity": identity,
         "model": {
             "checkpoint": str(args.checkpoint.resolve()),
@@ -317,27 +388,19 @@ def run(args) -> int:
             "head": args.head,
             "cutoff_A": model_cutoff,
         },
-        "workload": {
-            "structure": "perturbed-wurtzite-AlN",
-            "repeat": args.repeat,
-            "seed": args.seed,
-            "atoms": len(atoms),
-            "properties": list(PROPERTIES),
-            "precision": args.dtype,
-            "skin_A": args.skin if args.implementation == "current" else 0.0,
-            "effective_cutoff_A": effective_cutoff,
-            "directed_edges_at_model_cutoff": directed_edges(atoms, model_cutoff),
-            "directed_edges_at_effective_cutoff": directed_edges(
-                atoms, effective_cutoff
-            ),
-        },
+        "workload": workload_metadata(atoms, args, model_cutoff, effective_cutoff),
         "timing": {
+            "primary_metric": "median us/atom",
             "boundary": "ASE calculator energy+forces+stress evaluation",
             "warmups": args.warmups,
-            "samples": args.samples,
+            "samples": len(samples_ms),
             "samples_ms": samples_ms,
             "median_ms": median_ms,
             "median_us_per_atom": 1000.0 * median_ms / len(atoms),
+            "total_ms": sum(samples_ms),
+            "mean_us_per_atom": 1000.0
+            * sum(samples_ms)
+            / (len(atoms) * len(samples_ms)),
             "min_ms": min(samples_ms),
             "max_ms": max(samples_ms),
             "setup_ms": setup_ms,
@@ -369,6 +432,7 @@ def run(args) -> int:
                     "cuequivariance",
                     "cuequivariance-torch",
                     "cuequivariance-ops-torch-cu12",
+                    "cuequivariance-ops-torch-cu13",
                     "ase",
                     "numpy",
                 )
@@ -391,6 +455,7 @@ def run(args) -> int:
     args.output.write_text(rendered + "\n")
     print(rendered)
     if args.implementation in ("current", "develop"):
+        atoms.calc = None
         del calculator
         finalize_symmetrix_runtime()
     return 0
@@ -399,10 +464,40 @@ def run(args) -> int:
 def compare_records(records):
     loaded = [json.loads(path.read_text()) for path in records]
     reference = next(
-        record
-        for record in loaded
-        if record["identity"]["implementation"] == "pytorch-mace-e3nn"
+        (
+            record
+            for record in loaded
+            if record["identity"]["implementation"] == "pytorch-mace-cueq"
+        ),
+        None,
     )
+    if reference is None:
+        reference = next(
+            record
+            for record in loaded
+            if record["identity"]["implementation"].startswith("pytorch-mace-")
+        )
+    protocol = reference.get("protocol", "evaluation")
+    case_fields = (
+        "structure",
+        "repeat",
+        "seed",
+        "atoms",
+        "properties",
+        "precision",
+        "input_state_sha256",
+    )
+    for record in loaded:
+        if record.get("protocol", "evaluation") != protocol:
+            raise ValueError("benchmark protocols differ")
+        for field in case_fields:
+            if record["workload"].get(field) != reference["workload"].get(field):
+                raise ValueError(f"benchmark workloads differ in {field}")
+        for field in ("checkpoint_sha256", "head", "cutoff_A"):
+            if record.get("model", {}).get(field) != reference.get("model", {}).get(
+                field
+            ):
+                raise ValueError(f"benchmark model settings differ in {field}")
     reference_outputs = reference["outputs"]
     rows = []
     for record in loaded:
@@ -483,6 +578,11 @@ def parser():
         "--dtype", choices=("float32", "float64"), default="float32"
     )
     run_parser.add_argument("--repeat", type=int, default=6)
+    run_parser.add_argument(
+        "--structure",
+        choices=("aln-wurtzite", "srtio3-cubic"),
+        default="aln-wurtzite",
+    )
     run_parser.add_argument("--seed", type=int, default=20260822)
     run_parser.add_argument("--cutoff", type=float, default=6.0)
     run_parser.add_argument("--skin", type=float, default=0.5)
