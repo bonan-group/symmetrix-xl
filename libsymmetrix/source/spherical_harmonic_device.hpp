@@ -18,6 +18,101 @@ namespace symmetrix {
 inline constexpr double spherical_harmonic_real_normalization =
     3.5449077018110318;
 
+// Y normalization of the direct (y-only) plan, equal to the retained plan's
+// float(double(Y) * C) (normalize_Y in mace_kokkos_first_interaction.cpp) for
+// every float input.  C = hi + lo with hi = C rounded down to float and
+// lo = float(C - hi) > 0 (the sign of zero is kept); both are scaled by 2^64 so
+// value * lo never underflows.  The product rounds once in the FMA and the
+// scale back by 2^-64 is exact while the result is normal.  Nonzero inputs
+// below 2^-126 and |value| >= 2^62 (unreachable: |Y| <= 1 on a unit
+// direction) take the retained double product.  The values of one edge are
+// tested together (one branch per edge), so the double product is not
+// evaluated, nor predicated, on the common path.
+inline constexpr float spherical_harmonic_mace_normalization_hi64 =
+    0x1.c5bf88p+65f;
+inline constexpr float spherical_harmonic_mace_normalization_lo64 =
+    0x1.1b4ef6p+41f;
+static_assert(
+    static_cast<double>(spherical_harmonic_mace_normalization_hi64)*0x1p-64
+        <= spherical_harmonic_mace_normalization
+    && spherical_harmonic_mace_normalization_lo64 > 0.0f
+    && spherical_harmonic_mace_normalization
+        - static_cast<double>(spherical_harmonic_mace_normalization_hi64)*0x1p-64
+        - static_cast<double>(spherical_harmonic_mace_normalization_lo64)*0x1p-64
+        < 0x1p-46
+    && spherical_harmonic_mace_normalization
+        - static_cast<double>(spherical_harmonic_mace_normalization_hi64)*0x1p-64
+        - static_cast<double>(spherical_harmonic_mace_normalization_lo64)*0x1p-64
+        > -0x1p-46,
+    "hi/lo split of the MACE harmonic normalization (C - hi - lo within 2^-46)");
+
+KOKKOS_INLINE_FUNCTION bool spherical_harmonic_mace_normalize_in_fast_range(
+    const float value)
+{
+    const float magnitude = Kokkos::fabs(value);
+    return magnitude < 0x1p62f
+        && (magnitude >= 0x1p-126f || magnitude == 0.0f);
+}
+
+KOKKOS_INLINE_FUNCTION float spherical_harmonic_mace_normalize_fast(
+    const float value)
+{
+    return Kokkos::fma(
+        value, spherical_harmonic_mace_normalization_hi64,
+        value*spherical_harmonic_mace_normalization_lo64)*0x1p-64f;
+}
+
+KOKKOS_INLINE_FUNCTION float spherical_harmonic_mace_normalize_retained(
+    const float value)
+{
+    return static_cast<float>(
+        static_cast<double>(value)*spherical_harmonic_mace_normalization);
+}
+
+KOKKOS_INLINE_FUNCTION float spherical_harmonic_mace_normalize(
+    const float value)
+{
+    return spherical_harmonic_mace_normalize_in_fast_range(value)
+        ? spherical_harmonic_mace_normalize_fast(value)
+        : spherical_harmonic_mace_normalize_retained(value);
+}
+
+KOKKOS_INLINE_FUNCTION double spherical_harmonic_mace_normalize(
+    const double value)
+{
+    return value*spherical_harmonic_mace_normalization;
+}
+
+// raw: the unnormalized values in registers; values: the output, written once
+// per entry (normalizing in place in the output made nvcc store the raw
+// values first, doubling the global stores of the direct Y kernel).
+template<int Size>
+KOKKOS_INLINE_FUNCTION void spherical_harmonic_mace_normalize_values(
+    const float* raw, float* values)
+{
+    bool fast = true;
+    for (int index = 0; index < Size; ++index)
+        fast = fast & spherical_harmonic_mace_normalize_in_fast_range(
+            raw[index]);
+    if (fast) {
+        for (int index = 0; index < Size; ++index)
+            values[index] = spherical_harmonic_mace_normalize_fast(
+                raw[index]);
+    } else {
+        for (int index = 0; index < Size; ++index)
+            values[index] = spherical_harmonic_mace_normalize_retained(
+                raw[index]);
+    }
+}
+
+template<int Size>
+KOKKOS_INLINE_FUNCTION void spherical_harmonic_mace_normalize_values(
+    const double* raw, double* values)
+{
+    for (int index = 0; index < Size; ++index)
+        values[index] = raw[index]*spherical_harmonic_mace_normalization;
+}
+
 template<int LMax, class Precision>
 KOKKOS_INLINE_FUNCTION void spherical_harmonic_device_sample(
     const Precision* xyz, Precision* values, Precision* gradients)
@@ -79,13 +174,12 @@ KOKKOS_INLINE_FUNCTION void normalized_spherical_harmonic_values_from_direction(
     const Precision x2 = x*x;
     const Precision y2 = y*y;
     const Precision z2 = z*z;
+    Precision raw[size];
+    Precision* raw_values = raw;   // the macro's cast() takes a plain pointer
     HARDCODED_SPH_MACRO(
-        LMax, x, y, z, x2, y2, z2, values,
+        LMax, x, y, z, x2, y2, z2, raw_values,
         SYMMETRIX_SPH_IDENTITY_INDEX);
-    const Precision normalization = static_cast<Precision>(
-        spherical_harmonic_real_normalization);
-    for (int index = 0; index < size; ++index)
-        values[index] *= normalization;
+    spherical_harmonic_mace_normalize_values<size>(raw, values);
 }
 
 template<int LMax, class Precision>
