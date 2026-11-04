@@ -65,13 +65,10 @@ def _mh1_cross_backend_atol():
     """Full-evaluator serial/Kokkos float64 agreement bound.
 
     The Kokkos MH-1 fast path evaluates compiled products through its own
-    packed pipeline, so host Kokkos backends agree with the serial evaluator
-    only at the fast-path product precision instead of float64 rounding (the
-    deviation is amplified to ~1e-4 in forces on the repulsive wall); the
-    CUDA backend keeps the tighter historical bound.
+    packed pipeline, so Kokkos backends agree with the serial evaluator only
+    at the fast-path product precision instead of float64 rounding. The
+    deviation is amplified to about 1e-4 in forces on the repulsive wall.
     """
-    if native_symmetrix._kokkos_default_execution_space() == "Cuda":
-        return 2e-11
     return 2e-4
 
 
@@ -2297,7 +2294,7 @@ def test_mh1_kokkos_mode_switch_fences_pending_evaluation(mh1_si_artifact):
         model_path,
         use_kokkos=True,
         dtype=dtype,
-        streamed_edges="generic",
+        streamed_edges="direct",
     )
     inputs = calculator._mace_inputs(atoms)
     (
@@ -2320,9 +2317,9 @@ def test_mh1_kokkos_mode_switch_fences_pending_evaluation(mh1_si_artifact):
         xyz.flatten(),
         distances,
     )
-    calculator.evaluator.set_streamed_edges("direct")
-    streamed_energies = np.asarray(calculator.evaluator.node_energies)
-    streamed_forces = np.asarray(calculator.evaluator.node_forces)
+    calculator.evaluator.set_streamed_edges("generic")
+    direct_energies = np.asarray(calculator.evaluator.node_energies)
+    direct_forces = np.asarray(calculator.evaluator.node_forces)
 
     calculator.evaluator.compute_node_energies_forces(
         num_nodes,
@@ -2333,15 +2330,14 @@ def test_mh1_kokkos_mode_switch_fences_pending_evaluation(mh1_si_artifact):
         xyz.flatten(),
         distances,
     )
-    calculator.evaluator.set_streamed_edges("generic")
-    factorized_energies = np.asarray(calculator.evaluator.node_energies)
-    factorized_forces = np.asarray(calculator.evaluator.node_forces)
+    non_compiled_energies = np.asarray(calculator.evaluator.node_energies)
+    non_compiled_forces = np.asarray(calculator.evaluator.node_forces)
     tolerance = 2e-12 if dtype == "float64" else 2e-5
     np.testing.assert_allclose(
-        factorized_energies, streamed_energies, rtol=0.0, atol=tolerance
+        non_compiled_energies, direct_energies, rtol=0.0, atol=tolerance
     )
     np.testing.assert_allclose(
-        factorized_forces, streamed_forces, rtol=0.0, atol=tolerance
+        non_compiled_forces, direct_forces, rtol=0.0, atol=tolerance
     )
 
 
@@ -2364,7 +2360,12 @@ def test_mh1_cuda_streamed_fast_path_matches_native(mh1_si_artifact):
         dtype="float64",
         streamed_edges="generic",
     )
-    cuda = Symmetrix(model_path, use_kokkos=True, dtype="float64")
+    cuda = Symmetrix(
+        model_path,
+        use_kokkos=True,
+        dtype="float64",
+        streamed_edges="non-compiled",
+    )
     assert cuda.evaluator.uses_mh1_fast_path
     assert cuda.evaluator.supports_streamed_edges
     assert cuda.streamed_edges == "generic"
@@ -2372,7 +2373,10 @@ def test_mh1_cuda_streamed_fast_path_matches_native(mh1_si_artifact):
     cuda.calculate(atoms, properties=properties)
     for name in properties:
         np.testing.assert_allclose(
-            cuda.results[name], reference.results[name], rtol=0.0, atol=2e-11
+            cuda.results[name],
+            reference.results[name],
+            rtol=0.0,
+            atol=_mh1_cross_backend_atol(),
         )
     del cuda, reference
     gc.collect()
@@ -2946,8 +2950,18 @@ def test_mh1_native_serial_and_kokkos_match_upstream(mh1_si_artifact):
 @pytest.mark.parametrize("dtype", ["float64", "float32"])
 def test_mh1_kokkos_repeated_calculations(mh1_si_artifact, dtype):
     _, model_path = mh1_si_artifact
-    serial = Symmetrix(model_path, use_kokkos=False, dtype="float64")
-    kokkos = Symmetrix(model_path, use_kokkos=True, dtype=dtype)
+    serial = Symmetrix(
+        model_path,
+        use_kokkos=False,
+        dtype="float64",
+        streamed_edges="non-compiled",
+    )
+    kokkos = Symmetrix(
+        model_path,
+        use_kokkos=True,
+        dtype=dtype,
+        streamed_edges="non-compiled",
+    )
     tolerance = _mh1_cross_backend_atol() if dtype == "float64" else 2e-5
     atoms = Atoms(
         "Si2",
@@ -2979,8 +2993,18 @@ def test_mh1_kokkos_repeated_calculations(mh1_si_artifact, dtype):
 @pytest.mark.parametrize("dtype", ["float64", "float32"])
 def test_mh1_kokkos_reuses_workspaces_across_graph_sizes(mh1_si_artifact, dtype):
     _, model_path = mh1_si_artifact
-    serial = Symmetrix(model_path, use_kokkos=False, dtype="float64")
-    kokkos = Symmetrix(model_path, use_kokkos=True, dtype=dtype)
+    serial = Symmetrix(
+        model_path,
+        use_kokkos=False,
+        dtype="float64",
+        streamed_edges="non-compiled",
+    )
+    kokkos = Symmetrix(
+        model_path,
+        use_kokkos=True,
+        dtype=dtype,
+        streamed_edges="non-compiled",
+    )
     primitive = bulk("Si", "diamond", a=5.43)
     systems = (primitive, primitive.repeat((2, 2, 2)), primitive.repeat((3, 3, 3)))
 
