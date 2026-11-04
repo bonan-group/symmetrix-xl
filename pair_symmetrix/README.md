@@ -385,7 +385,10 @@ preparation, `--lammps-arguments` includes the matching
 `jit_device_blocks_per_compute_unit` value. In JSON mode the same value is
 available as `persistent_blocks_per_compute_unit`. HIP accepts the setting for
 portable input files but validates its launch policy from the artifact
-descriptor.
+descriptor; the LAMMPS pair style warns when an explicit value differs from that
+descriptor. M0 and R0 device modules loaded with `jit_m0_device_artifact` and
+`jit_r0_device_artifact` honor the setting on both backends; the built-in M0
+and R0 modules do not use it.
 
 ### Building LAMMPS
 

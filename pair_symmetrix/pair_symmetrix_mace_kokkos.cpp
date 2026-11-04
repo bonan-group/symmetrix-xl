@@ -66,6 +66,7 @@ PairSymmetrixMACEKokkos<DeviceType, Precision>::PairSymmetrixMACEKokkos(LAMMPS *
   jit_m0_device_schedule = "chunk32";
   jit_m0_device_schedule_set = false;
   jit_device_blocks_per_compute_unit = 8;
+  jit_device_blocks_per_compute_unit_set = false;
 
   kokkosable = 1;
   reverse_comm_device = 1;
@@ -197,6 +198,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
   jit_m0_device_schedule = "chunk32";
   jit_m0_device_schedule_set = false;
   jit_device_blocks_per_compute_unit = 8;
+  jit_device_blocks_per_compute_unit_set = false;
 
   for (int i=0; i<narg; ++i) {
     const std::string token(arg[i]);
@@ -341,6 +343,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
       if (invalid_value || jit_device_blocks_per_compute_unit < 1
           || jit_device_blocks_per_compute_unit > 32)
         error->all(FLERR, "pair_style symmetrix/mace/kk jit_device_blocks_per_compute_unit requires an integer in [1, 32]");
+      jit_device_blocks_per_compute_unit_set = true;
     } else {
       error->all(FLERR, "The command \'pair_style symmetrix/mace/kk {}\' is invalid", token);
     }
@@ -503,6 +506,21 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
         lmp,
         "Activated Execution JIT device artifact '{}'\n",
         mace->jit_device_plugin_artifact_id());
+#ifdef KOKKOS_ENABLE_HIP
+      // The HIP R1 plugin takes its launch policy from the artifact descriptor
+      // and ignores this keyword; the M0 and R0 device modules still honor it.
+      if (jit_device_blocks_per_compute_unit_set && comm->me == 0) {
+        const int artifact_blocks =
+          mace->jit_device_plugin->persistent_blocks_per_compute_unit();
+        if (jit_device_blocks_per_compute_unit != artifact_blocks)
+          error->warning(
+            FLERR,
+            "pair_style symmetrix/mace/kk jit_device_blocks_per_compute_unit {} differs from "
+            "the HIP R1 device artifact's own {} blocks per compute unit; the R1 artifact keeps "
+            "its value, and the setting applies only to M0 and R0 device modules",
+            jit_device_blocks_per_compute_unit, artifact_blocks);
+      }
+#endif
     } else if (!mace->single_layer_readout) {
       error->all(
         FLERR,
