@@ -27,7 +27,7 @@
 #endif
 #include "nlohmann/json.hpp"
 #include "sphericart.hpp"
-#include "sphericart_cuda.hpp"
+#include "sphericart_device.hpp"
 #include "spherical_harmonic_device.hpp"
 
 #include "tools_kokkos.hpp"
@@ -37,8 +37,8 @@
 
 template <typename Precision>
 struct MACEKokkos<Precision>::SphericalHarmonicsState {
-#ifdef SYMMETRIX_SPHERICART_CUDA
-    sphericart::cuda::SphericalHarmonics<Precision> calculator;
+#if defined(SYMMETRIX_SPHERICART_CUDA) || defined(SYMMETRIX_SPHERICART_HIP)
+    symmetrix::DeviceSphericartCalculator<Precision> calculator;
 #else
     sphericart::SphericalHarmonics<Precision> calculator;
 #endif
@@ -47,7 +47,7 @@ struct MACEKokkos<Precision>::SphericalHarmonicsState {
         : calculator(l_max)
     {}
 
-#ifdef SYMMETRIX_SPHERICART_CUDA
+#if defined(SYMMETRIX_SPHERICART_CUDA) || defined(SYMMETRIX_SPHERICART_HIP)
     ~SphericalHarmonicsState() noexcept
     {
         try {
