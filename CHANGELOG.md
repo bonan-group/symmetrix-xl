@@ -4,7 +4,7 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ## Unreleased
 
-## 0.1.2 - 2026-11-03
+## 0.1.2 - 2026-11-04
 
 - Added an opt-in Apple Metal backend for FP32 standard-MACE execution on
   Apple silicon, with installation guidance, examples, and runtime
