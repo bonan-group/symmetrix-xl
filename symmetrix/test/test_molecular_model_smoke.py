@@ -65,19 +65,19 @@ def test_water_model_family_smoke(
         calculator.calculate(atoms, properties=list(properties))
 
         for property_name in properties:
-            assert property_name in calculator.results, (
-                f"{family} omitted requested {property_name} on {system_name}"
-            )
-            assert np.all(np.isfinite(np.asarray(calculator.results[property_name]))), (
-                f"{family} returned non-finite {property_name} on {system_name}"
-            )
+            assert (
+                property_name in calculator.results
+            ), f"{family} omitted requested {property_name} on {system_name}"
+            assert np.all(
+                np.isfinite(np.asarray(calculator.results[property_name]))
+            ), f"{family} returned non-finite {property_name} on {system_name}"
         for result_name in required_results:
-            assert result_name in calculator.results, (
-                f"{family} omitted family result {result_name} on {system_name}"
-            )
-            assert np.all(np.isfinite(np.asarray(calculator.results[result_name]))), (
-                f"{family} returned non-finite {result_name} on {system_name}"
-            )
+            assert (
+                result_name in calculator.results
+            ), f"{family} omitted family result {result_name} on {system_name}"
+            assert np.all(
+                np.isfinite(np.asarray(calculator.results[result_name]))
+            ), f"{family} returned non-finite {result_name} on {system_name}"
     finally:
         atoms.calc = None
         del calculator

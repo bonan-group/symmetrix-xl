@@ -90,7 +90,9 @@ MODEL_ENV = "SYMMETRIX_OAM_S_MODEL"
 # ``a5cca...`` cache is a rejected legacy candidate.  The path is configurable,
 # but its content is pinned so a different or reduced checkpoint cannot turn
 # this into a small-model test.
-PRODUCTION_MODEL_SHA256 = "c11d730c1dbe0a3b93093fefe7132defb0a189706d644a4b3577cb1193e5d662"
+PRODUCTION_MODEL_SHA256 = (
+    "c11d730c1dbe0a3b93093fefe7132defb0a189706d644a4b3577cb1193e5d662"
+)
 OAM_DTYPE = os.environ.get("SYMMETRIX_OAM_DTYPE", "float32")
 if OAM_DTYPE not in {"float32", "float64"}:
     raise ValueError("SYMMETRIX_OAM_DTYPE must be float32 or float64")
@@ -530,9 +532,7 @@ def test_oam_kokkos_openmp_thread_scaling(tmp_path):
             "at least two disjoint physical cores are required to test OAM "
             f"OpenMP thread scaling; this process may use {len(physical)}"
         )
-    runnable_counts = [
-        threads for threads in THREAD_COUNTS if threads <= len(physical)
-    ]
+    runnable_counts = [threads for threads in THREAD_COUNTS if threads <= len(physical)]
 
     host_blas = _probe_host_blas()
     if host_blas.get("openblas_openmp_enabled") is False:

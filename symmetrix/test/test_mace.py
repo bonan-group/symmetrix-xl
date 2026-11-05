@@ -51,9 +51,7 @@ def _prepare_evaluator():
     if not symmetrix._kokkos_is_initialized():
         symmetrix._init_kokkos()
     if model == "mace-off-small":
-        evaluator = symmetrix.MACEKokkos(
-            str(JSON_MODELS["MACE-OFF23_small-1-8.json"])
-        )
+        evaluator = symmetrix.MACEKokkos(str(JSON_MODELS["MACE-OFF23_small-1-8.json"]))
     elif model == "mace-off-medium":
         evaluator = symmetrix.MACEKokkos("MACE-OFF23_medium-1-8.json")
     elif model == "mace-off-large":
