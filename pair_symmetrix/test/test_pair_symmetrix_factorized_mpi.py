@@ -14,9 +14,13 @@ import pytest
 def _required_path(environment_name, description):
     value = os.environ.get(environment_name)
     if not value:
+        if os.environ.get("SYMMETRIX_REQUIRE_LAMMPS_TESTS"):
+            pytest.fail(f"Set {environment_name} for {description}.")
         pytest.skip(f"Set {environment_name} for {description}.")
     path = Path(value).resolve()
     if not path.is_file():
+        if os.environ.get("SYMMETRIX_REQUIRE_LAMMPS_TESTS"):
+            pytest.fail(f"{description.capitalize()} is unavailable: {path}")
         pytest.skip(f"{description.capitalize()} is unavailable: {path}")
     return path
 
