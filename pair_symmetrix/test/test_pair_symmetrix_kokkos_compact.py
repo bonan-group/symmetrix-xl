@@ -15,6 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 try:
@@ -38,6 +39,7 @@ _RUN_CASE = r"""
 import json
 import sys
 
+import numpy as np
 from lammps import lammps
 
 spec = json.loads(sys.argv[1])
@@ -344,3 +346,55 @@ def test_hip_r1_block_count_warning_names_the_artifact_value(
     artifact_value = next(iter(warned.values()))
     for setting in (1, 32):
         assert (setting in warned) == (setting != artifact_value)
+
+
+@pytest.mark.parametrize(
+    "package_options",
+    ["", "pair/only on"],
+    ids=["default-map", "pair-only"],
+)
+@pytest.mark.parametrize("streamed_edges", ["generic", "direct"])
+def test_kokkos_hashed_atom_map_matches_array_map(
+    request, tmp_path, kokkos_api, compact_model_path, streamed_edges, package_options
+):
+    # On a host-only Kokkos build the atom map is built on the host by default;
+    # pair/only on selects the same host map on device builds. A hashed map then
+    # lives only in the host copy until the pair style syncs it.
+    if streamed_edges == "direct":
+        artifact = request.getfixturevalue("host_artifact_path")
+        pair_style = _pair_style("direct", artifact)
+    else:
+        pair_style = _pair_style("generic")
+    label = f"{streamed_edges}-{'pair-only' if package_options else 'default'}"
+    results = {
+        atom_map: _run_case(
+            tmp_path,
+            f"{label}-{atom_map}",
+            compact_model_path,
+            pair_style,
+            atom_map,
+            package_options,
+        )
+        for atom_map in ("array", "hash")
+    }
+
+    for result in results.values():
+        assert result["natoms"] == len(_POSITIONS)
+        assert (
+            f"resolved='{streamed_edges}'" in result["log_text"]
+        ), "the requested streamed-edge path did not run"
+        if streamed_edges == "direct":
+            assert "Activated Execution JIT host artifact" in result["log_text"]
+
+    reference = results["array"]
+    hashed = results["hash"]
+    for stage in ("initial", "final"):
+        expected_forces = np.asarray(reference[stage]["forces"])
+        assert np.all(np.isfinite(expected_forces))
+        assert np.max(np.abs(expected_forces)) > 0.0
+        assert hashed[stage]["pe"] == pytest.approx(
+            reference[stage]["pe"], rel=1.0e-12, abs=1.0e-10
+        )
+        np.testing.assert_allclose(
+            hashed[stage]["forces"], expected_forces, rtol=1.0e-12, atol=1.0e-10
+        )

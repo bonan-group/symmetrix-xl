@@ -1060,7 +1060,16 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
   auto mace_types = this->mace_types;
   int num_edges = execution_num_edges;
   if (rebuild_topology) {
-    k_map_array.template sync<DeviceType>();
+    // sync the map the atom style uses.  a hash filled on the host (legacy
+    // atom map, e.g. pair/only or atom/map no) is otherwise never copied to
+    // the device and every lookup below returns -1.  sync the atom's own
+    // member, since dual_hash_type keeps its modified flags by value, and
+    // take the copy afterwards, since the sync may reallocate the views
+    if (map_style == Atom::MAP_HASH) {
+      atomKK->k_map_hash.template sync<DeviceType>();
+      k_map_hash = atomKK->k_map_hash;
+    } else
+      k_map_array.template sync<DeviceType>();
     Kokkos::deep_copy(num_neigh, 0);
     Kokkos::parallel_for("PairSymmetrixMACEKokkos::set_node_based_views",
       Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO),
