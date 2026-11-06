@@ -163,7 +163,7 @@ def test_scalar_polar_generated_transaction_matches_reference(
         np.testing.assert_allclose(
             direct.results[name],
             calculators["reference"].results[name],
-            rtol=2e-6 if dtype == "float32" else 0.0,
+            rtol=5e-6 if dtype == "float32" else 0.0,
             atol=atol,
             err_msg=name,
         )

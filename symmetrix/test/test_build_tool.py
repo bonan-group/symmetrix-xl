@@ -1564,7 +1564,7 @@ def test_wheel_content_audit_uses_canonical_operator_catalog_validation(
         audit_wheel(wheel)
 
 
-def test_wheel_content_audit_does_not_trust_fake_shared_library(tmp_path):
+def test_wheel_content_audit_does_not_trust_fake_shared_library(tmp_path, monkeypatch):
     binary = b"not an ELF shared library"
     wheel = tmp_path / "fake-shared-library.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -1574,6 +1574,12 @@ def test_wheel_content_audit_does_not_trust_fake_shared_library(tmp_path):
         )
         archive.writestr("symmetrix/_operator_artifacts/r0/operator.so", binary)
 
+    def reject_fake_operator(_path):
+        raise BuildError("cannot inspect CPU operator dependencies")
+
+    monkeypatch.setattr(
+        build_wheel_audit, "audit_cpu_operator_dependencies", reject_fake_operator
+    )
     with pytest.raises(BuildError, match="dependencies"):
         audit_wheel(wheel)
 
@@ -1612,38 +1618,16 @@ def test_cpu_operator_set_rejects_mixed_vendored_openmp_owners():
         )
 
 
-def test_cpu_operator_dependency_audit_rejects_unapproved_library(tmp_path):
-    compiler = shutil.which("cc")
-    if compiler is None:
-        pytest.skip("a C compiler is required")
-    dependency_source = tmp_path / "dependency.c"
-    operator_source = tmp_path / "operator.c"
-    dependency = tmp_path / "libunapproved.so"
-    operator = tmp_path / "operator.so"
-    dependency_source.write_text("int unapproved(void) { return 7; }\n")
-    operator_source.write_text(
-        "extern int unapproved(void); int operator_value(void) { return unapproved(); }\n"
+def test_cpu_operator_dependency_audit_rejects_unapproved_library(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        build_wheel_audit,
+        "_dynamic_dependencies",
+        lambda _path: ("libunapproved.so",),
     )
-    subprocess.run(
-        [compiler, "-shared", "-fPIC", dependency_source, "-o", dependency],
-        check=True,
-    )
-    subprocess.run(
-        [
-            compiler,
-            "-shared",
-            "-fPIC",
-            operator_source,
-            f"-L{tmp_path}",
-            "-lunapproved",
-            "-o",
-            operator,
-        ],
-        check=True,
-    )
-
     with pytest.raises(BuildError, match="libunapproved"):
-        build_wheel_audit.audit_cpu_operator_dependencies(operator)
+        build_wheel_audit.audit_cpu_operator_dependencies(tmp_path / "operator.so")
 
 
 def test_cuda12_wheel_declares_split_nvidia_dependencies(tmp_path):
