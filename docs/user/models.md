@@ -117,6 +117,27 @@ For FP64 MACE-OMAT-0 stress calculations, add `--num-spline-points 512`.
 The ordinary 256-point default is faster to export and remains suitable when
 its larger compact-radial interpolation error is acceptable.
 
+Metatrain MACE models can be converted from either the training checkpoint or
+the standalone metatomic deployment model. Install the additional integration
+dependencies, then pass the `.ckpt` or `.pt` file to the same command:
+
+```bash
+uv pip install "symmetrix-xl[metatrain]"
+symmetrix_extract_mace --model model.ckpt --output model.json
+symmetrix_extract_mace --model model.pt --output model-from-deployment.json
+```
+
+For a metatrain model, the converter restores the scalar energy scaling and
+per-element composition baseline that metatrain stores outside its embedded
+MACE backbone. For an exported `.pt`, it reconstructs an eager MACE module from
+the scripted topology and validates the learned state before extraction.
+Standard MACE energy heads are supported; arbitrary metatrain heads, extra
+embedding inputs, and non-composition additive models cannot be represented by
+the compact MACE schema and fail explicitly. Models must use scalar energy
+targets in eV and Angstrom coordinates; empty unit metadata from an imported
+native MACE model is interpreted using those conventional MACE units. Exported
+nonlinear readouts must use the SiLU gate.
+
 Omitting `--chemical-symbols` and `--atomic-numbers` produces the preferred
 universal export and retains the checkpoint's complete element domain. The
 compact radial representation stores the shared radial model once with

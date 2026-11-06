@@ -1,6 +1,9 @@
+import copy
 import importlib
 import itertools
 import logging
+import re
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +17,15 @@ from mace.modules.radial import ZBLBasis
 from mace.tools.cg import U_matrix_real
 from mace.tools.scripts_utils import remove_pt_head
 
+from .h1_affine import (
+    BASIS_KEYS,
+    FORMAT_VERSION,
+    H1_AFFINE_MODE_M0_COMPOSITE,
+    H1_AFFINE_MODE_PRE_LINEAR_UP,
+    H1_AFFINE_TOOL_VERSION,
+    H1_AFFINE_VERSION,
+    LEGACY_KEYS,
+)
 from .mace_execution_contract import (
     make_factorized_contract,
     make_generated_m1_contract,
@@ -26,15 +38,6 @@ from .mace_les_schema import (
     validate_mace_les_parameters,
 )
 from .prediction_heads import PREDICTION_HEADS_SCHEMA_VERSION
-from .h1_affine import (
-    BASIS_KEYS,
-    FORMAT_VERSION,
-    H1_AFFINE_MODE_M0_COMPOSITE,
-    H1_AFFINE_MODE_PRE_LINEAR_UP,
-    H1_AFFINE_TOOL_VERSION,
-    H1_AFFINE_VERSION,
-    LEGACY_KEYS,
-)
 
 _MACE_FIELD_MODULE = "mace.modules.extensions"
 _MACE_MODELS_MODULE = "mace.modules.models"
@@ -375,8 +378,496 @@ def _load_legacy_mace_field_checkpoint(model_path, device):
             del mace_models.ScaleShiftFieldMACE
 
 
+def _is_metatrain_mace_checkpoint(checkpoint):
+    if not isinstance(checkpoint, dict):
+        return False
+    if checkpoint.get("architecture_name") == "experimental.mace":
+        return True
+    core = checkpoint.get("core")
+    return (
+        isinstance(core, dict) and core.get("architecture_name") == "experimental.mace"
+    )
+
+
+def _is_metatomic_export(model_path):
+    try:
+        with zipfile.ZipFile(model_path) as archive:
+            return any(
+                name.endswith("/extra/metatomic-version") for name in archive.namelist()
+            )
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def _module_sequence(module):
+    return list(module.children())
+
+
+def _scripted_readout_uses_silu(readout):
+    if not hasattr(readout, "non_linearity"):
+        return True
+    activations = _module_sequence(readout.non_linearity.acts)
+    return bool(activations) and all(
+        "silu" in getattr(activation, "code", "") for activation in activations
+    )
+
+
+def _scripted_mace_correlation(state, interaction_index):
+    pattern = re.compile(
+        rf"products\.{interaction_index}\.symmetric_contractions\."
+        r"contractions\.0\.U_matrix_(\d+)\Z"
+    )
+    orders = [
+        int(match.group(1))
+        for name in state
+        if (match := pattern.match(name)) is not None
+    ]
+    if not orders:
+        raise RuntimeError(
+            "The scripted metatrain MACE model does not expose its correlation order."
+        )
+    return max(orders)
+
+
+def _scripted_radial_basis_size(radial_basis):
+    basis_name = getattr(radial_basis, "original_name", None)
+    attribute = {
+        "BesselBasis": "bessel_weights",
+        "GaussianBasis": "gaussian_weights",
+        "ChebychevBasis": "n",
+    }.get(basis_name)
+    if attribute is None or not hasattr(radial_basis, attribute):
+        raise RuntimeError(
+            "The scripted metatrain MACE model does not expose its radial basis "
+            "size."
+        )
+    values = getattr(radial_basis, attribute)
+    return int(values.shape[-1])
+
+
+def _scripted_radial_applies_cutoff(radial_embedding):
+    if hasattr(radial_embedding, "apply_cutoff"):
+        return bool(radial_embedding.apply_cutoff)
+
+    code = getattr(radial_embedding, "code", "")
+    return_lines = [line.strip() for line in code.splitlines() if line.strip()]
+    if return_lines and return_lines[-1].startswith("return ("):
+        return return_lines[-1].endswith(", None)")
+    raise RuntimeError(
+        "The scripted metatrain MACE model does not expose whether its radial "
+        "cutoff is applied before the interaction network."
+    )
+
+
+def _scripted_per_head_mlp_irreps(readout, head_count):
+    if head_count < 1:
+        raise RuntimeError("The scripted metatrain MACE model has no heads.")
+    if not hasattr(readout, "hidden_irreps"):
+        if getattr(readout, "original_name", None) == "LinearReadoutBlock":
+            return [(1, (0, 1))]
+        raise RuntimeError(
+            "The scripted metatrain MACE readout does not expose its hidden "
+            "irreducible representations."
+        )
+    irreps = []
+    for multiplicity, irrep in list(readout.hidden_irreps):
+        if multiplicity % head_count != 0:
+            raise RuntimeError(
+                "The scripted metatrain MACE readout width is incompatible with "
+                f"its {head_count} heads."
+            )
+        irreps.append((multiplicity // head_count, irrep))
+    return irreps
+
+
+def _reconstruct_scripted_mace_model(scripted, device):
+    from e3nn import o3
+    from mace import modules
+
+    model_name = getattr(scripted, "original_name", None)
+    if model_name not in ("MACE", "ScaleShiftMACE"):
+        raise RuntimeError(
+            "The metatrain export contains unsupported scripted MACE model type "
+            f"{model_name!r}."
+        )
+    if hasattr(scripted, "joint_embedding"):
+        raise RuntimeError(
+            "Metatrain MACE exports with additional embedding inputs are not supported."
+        )
+
+    interactions = _module_sequence(scripted.interactions)
+    products = _module_sequence(scripted.products)
+    readouts = _module_sequence(scripted.readouts)
+    if not interactions or not products or not readouts:
+        raise RuntimeError("The scripted metatrain MACE model is incomplete.")
+    unsupported_activations = [
+        readout.original_name
+        for readout in readouts
+        if not _scripted_readout_uses_silu(readout)
+    ]
+    if unsupported_activations:
+        raise RuntimeError(
+            "The scripted metatrain MACE model uses a readout activation that "
+            "Symmetrix cannot represent."
+        )
+
+    try:
+        interaction_cls = modules.interaction_classes[interactions[-1].original_name]
+        interaction_cls_first = modules.interaction_classes[
+            interactions[0].original_name
+        ]
+        readout_cls = getattr(modules.blocks, readouts[-1].original_name)
+    except (AttributeError, KeyError) as exc:
+        raise RuntimeError(
+            "The scripted metatrain MACE model uses unsupported block types."
+        ) from exc
+
+    radial_basis = scripted.radial_embedding.bessel_fn
+    radial_type = {
+        "BesselBasis": "bessel",
+        "GaussianBasis": "gaussian",
+        "ChebychevBasis": "chebyshev",
+    }.get(radial_basis.original_name)
+    if radial_type is None:
+        raise RuntimeError(
+            "The scripted metatrain MACE model uses an unsupported radial basis "
+            f"{radial_basis.original_name!r}."
+        )
+    num_bessel = _scripted_radial_basis_size(radial_basis)
+    apply_cutoff = _scripted_radial_applies_cutoff(scripted.radial_embedding)
+    distance_transform = getattr(scripted.radial_embedding, "distance_transform", None)
+    distance_transform = (
+        "None"
+        if distance_transform is None
+        else distance_transform.original_name.removesuffix("Transform")
+    )
+
+    state = scripted.state_dict()
+    correlations = [
+        _scripted_mace_correlation(state, index) for index in range(len(interactions))
+    ]
+    atomic_energies = scripted.atomic_energies_fn.atomic_energies.detach().cpu().numpy()
+    heads = list(scripted.heads)
+    scales = np.ones(len(heads), dtype=atomic_energies.dtype)
+    shifts = np.zeros(len(heads), dtype=atomic_energies.dtype)
+    mlp_irreps = _scripted_per_head_mlp_irreps(readouts[-1], len(heads))
+
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(next(scripted.parameters()).dtype)
+    try:
+        model = modules.ScaleShiftMACE(
+            r_max=scripted.r_max.item(),
+            num_bessel=num_bessel,
+            num_polynomial_cutoff=int(scripted.radial_embedding.cutoff_fn.p.item()),
+            max_ell=scripted.spherical_harmonics._lmax,
+            interaction_cls=interaction_cls,
+            interaction_cls_first=interaction_cls_first,
+            num_interactions=int(scripted.num_interactions.item()),
+            num_elements=len(scripted.atomic_numbers),
+            hidden_irreps=o3.Irreps(list(products[0].linear.irreps_out)),
+            MLP_irreps=o3.Irreps(mlp_irreps),
+            atomic_energies=atomic_energies,
+            avg_num_neighbors=float(interactions[0].avg_num_neighbors),
+            atomic_numbers=scripted.atomic_numbers.detach().cpu().tolist(),
+            correlation=correlations,
+            gate=torch.nn.functional.silu,
+            pair_repulsion=hasattr(scripted, "pair_repulsion_fn"),
+            apply_cutoff=apply_cutoff,
+            use_reduced_cg=False,
+            use_so3=False,
+            use_agnostic_product=(
+                products[0].original_name == "AgnosticEquivariantProductBasisBlock"
+            ),
+            use_last_readout_only=len(readouts) == 1,
+            use_embedding_readout=hasattr(scripted, "embedding_readout"),
+            distance_transform=distance_transform,
+            edge_irreps=None,
+            radial_MLP=list(interactions[0].conv_tp_weights.hs[1:-1]),
+            radial_type=radial_type,
+            heads=heads,
+            readout_cls=readout_cls,
+            atomic_inter_scale=scales,
+            atomic_inter_shift=shifts,
+        )
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+    incompatible = model.load_state_dict(state, strict=False)
+    allowed_missing_suffixes = (
+        "_zeroed",
+        "scale_shift.scale",
+        "scale_shift.shift",
+    )
+    unexpected_missing = [
+        name
+        for name in incompatible.missing_keys
+        if not name.endswith(allowed_missing_suffixes)
+    ]
+    allowed_unexpected = {
+        "pair_repulsion_fn.r_max",
+        "pair_repulsion_fn.cutoff.p",
+        "pair_repulsion_fn.cutoff.r_max",
+    }
+    unexpected_keys = [
+        name for name in incompatible.unexpected_keys if name not in allowed_unexpected
+    ]
+    if unexpected_missing or unexpected_keys:
+        raise RuntimeError(
+            "The scripted metatrain MACE state is incompatible with the installed "
+            f"mace-torch version; missing={unexpected_missing}, "
+            f"unexpected={unexpected_keys}."
+        )
+    return model.to(device)
+
+
+def _metatrain_scalar(tensor_map, target, quantity):
+    try:
+        values = tensor_map[target].block(0).values.detach().reshape(-1)
+    except (AttributeError, KeyError, IndexError) as exc:
+        raise RuntimeError(
+            f"The metatrain checkpoint has no usable {quantity} for target {target!r}."
+        ) from exc
+    if values.numel() != 1:
+        raise RuntimeError(
+            f"The metatrain {quantity} for target {target!r} has "
+            f"{values.numel()} values; Symmetrix requires one scalar energy scale."
+        )
+    return values.item()
+
+
+def _metatrain_atomic_baseline(additive_model, target, atomic_numbers):
+    try:
+        block = additive_model.model.weights[target].block(0)
+        values = block.values.detach().reshape(-1)
+        samples = block.samples.values.detach().reshape(-1)
+    except (AttributeError, KeyError, IndexError) as exc:
+        raise RuntimeError(
+            f"The metatrain composition model has no usable weights for target "
+            f"{target!r}."
+        ) from exc
+    if values.numel() != samples.numel():
+        raise RuntimeError(
+            f"The metatrain composition weights for target {target!r} have "
+            "incompatible values and atomic-type labels."
+        )
+    by_atomic_number = {
+        int(number): value for number, value in zip(samples.tolist(), values.tolist())
+    }
+    missing = [
+        int(number) for number in atomic_numbers if int(number) not in by_atomic_number
+    ]
+    if missing:
+        raise RuntimeError(
+            "The metatrain composition model is missing MACE atomic types: "
+            + ", ".join(str(number) for number in missing)
+        )
+    return [by_atomic_number[int(number)] for number in atomic_numbers]
+
+
+def _validate_metatrain_energy_metadata(
+    target, *, dataset_info=None, capabilities=None
+):
+    if (dataset_info is None) == (capabilities is None):
+        raise RuntimeError(
+            "Metatrain MACE conversion requires exactly one source of model "
+            "capabilities."
+        )
+
+    if dataset_info is not None:
+        length_unit = dataset_info.length_unit
+        try:
+            target_info = dataset_info.targets[target]
+        except (AttributeError, KeyError) as exc:
+            raise RuntimeError(
+                f"The metatrain dataset metadata does not describe target {target!r}."
+            ) from exc
+        if not target_info.is_scalar or target_info.sample_kind != "system":
+            raise RuntimeError(
+                "The metatrain MACE target must be a scalar system energy."
+            )
+    else:
+        length_unit = capabilities.length_unit
+        try:
+            target_info = capabilities.outputs[target]
+        except (AttributeError, KeyError) as exc:
+            raise RuntimeError(
+                f"The exported metatrain model does not advertise target {target!r}."
+            ) from exc
+        if target_info.sample_kind != "atom":
+            raise RuntimeError(
+                "The exported metatrain MACE target must provide atom-wise energy "
+                "contributions."
+            )
+
+    quantity = target_info.quantity.strip().casefold()
+    if quantity not in ("", "energy") or (quantity == "" and target != "energy"):
+        raise RuntimeError(
+            f"The metatrain MACE target {target!r} has unsupported quantity "
+            f"{target_info.quantity!r}; Symmetrix requires energy."
+        )
+
+    energy_unit = target_info.unit.strip().casefold()
+    if energy_unit not in ("", "ev", "electronvolt", "electronvolts"):
+        raise RuntimeError(
+            f"The metatrain MACE target uses unsupported unit {target_info.unit!r}; "
+            "Symmetrix requires eV."
+        )
+
+    normalized_length_unit = length_unit.strip().casefold()
+    if normalized_length_unit not in ("", "angstrom", "ångström", "å"):
+        raise RuntimeError(
+            f"The metatrain MACE model uses unsupported length unit {length_unit!r}; "
+            "Symmetrix requires Angstrom."
+        )
+
+
+def _restore_metatrain_mace_model(
+    model, device, *, dataset_info=None, capabilities=None
+):
+    core = getattr(model, "core", None)
+    mace_model = getattr(core, "mace_model", None)
+    if not isinstance(mace_model, torch.nn.Module):
+        raise RuntimeError(
+            "The metatrain model does not contain a supported MACE module."
+        )
+
+    hypers = getattr(core, "hypers", {})
+    target = hypers.get("mace_head_target") if hasattr(hypers, "get") else None
+    if not target:
+        target_candidates = [
+            name
+            for name, head in getattr(
+                core, "heads", torch.nn.ModuleDict()
+            ).named_children()
+            if getattr(head, "original_name", type(head).__name__) == "MACEHeadWrapper"
+        ]
+        if len(target_candidates) == 1:
+            target = target_candidates[0]
+    if not target:
+        raise RuntimeError(
+            "The metatrain MACE checkpoint does not declare its MACE target."
+        )
+    _validate_metatrain_energy_metadata(
+        target, dataset_info=dataset_info, capabilities=capabilities
+    )
+
+    if isinstance(mace_model, torch.jit.RecursiveScriptModule):
+        restored = _reconstruct_scripted_mace_model(mace_model, device)
+    else:
+        restored = copy.deepcopy(mace_model).to(device)
+    heads = list(getattr(restored, "heads", ()))
+    head_index = int(getattr(core, "mace_head_index", 0))
+    if len(heads) > 1:
+        if not 0 <= head_index < len(heads):
+            raise RuntimeError(
+                f"The metatrain MACE head index {head_index} is invalid for "
+                f"heads {heads!r}."
+            )
+
+        from mace.modules.blocks import ScaleShiftBlock
+
+        reference = next(restored.parameters())
+        restored.scale_shift = ScaleShiftBlock(
+            scale=np.ones(len(heads)), shift=np.zeros(len(heads))
+        ).to(device=reference.device, dtype=reference.dtype)
+        restored = _remove_prediction_head(restored, heads[head_index], device)
+
+    scale = 1.0
+    scaler = getattr(model, "scaler", None)
+    if scaler is not None:
+        scale = _metatrain_scalar(scaler.model.scales, target, "energy scale")
+
+    composition = None
+    additive_models = getattr(model, "additive_models", ())
+    if isinstance(additive_models, torch.nn.Module):
+        additive_models = additive_models.children()
+    for additive_model in additive_models:
+        weights = getattr(getattr(additive_model, "model", None), "weights", {})
+        if target in weights:
+            if composition is not None:
+                raise RuntimeError(
+                    f"The metatrain checkpoint has multiple composition models for "
+                    f"target {target!r}."
+                )
+            composition = additive_model
+            continue
+        supported_outputs = getattr(additive_model, "supported_outputs", None)
+        if callable(supported_outputs) and target in supported_outputs():
+            raise RuntimeError(
+                "The metatrain MACE target uses an additive model that cannot be "
+                "folded into a Symmetrix MACE export."
+            )
+        if isinstance(additive_model, torch.jit.RecursiveScriptModule):
+            raise RuntimeError(
+                "The exported metatrain MACE model contains a scripted additive "
+                "model that cannot be folded into a Symmetrix MACE export."
+            )
+
+    atomic_numbers = restored.atomic_numbers.detach().cpu().tolist()
+    if composition is None:
+        atomic_baseline = [0.0] * len(atomic_numbers)
+    else:
+        atomic_baseline = _metatrain_atomic_baseline(
+            composition, target, atomic_numbers
+        )
+
+    energies = restored.atomic_energies_fn.atomic_energies
+    if energies.numel() != len(atomic_baseline):
+        raise RuntimeError(
+            "The selected metatrain MACE head has an incompatible atomic-energy "
+            f"shape {tuple(energies.shape)}."
+        )
+    with torch.no_grad():
+        energies.copy_(
+            torch.as_tensor(
+                atomic_baseline, dtype=energies.dtype, device=energies.device
+            ).reshape(energies.shape)
+        )
+
+    from mace.modules.blocks import ScaleShiftBlock
+
+    restored.scale_shift = ScaleShiftBlock(scale=scale, shift=0.0).to(
+        device=energies.device, dtype=energies.dtype
+    )
+    return restored
+
+
+def _load_metatrain_mace_checkpoint(checkpoint, device):
+    try:
+        from metatrain.utils.io import model_from_checkpoint
+    except ModuleNotFoundError as exc:
+        if exc.name == "metatrain" or exc.name.startswith("metatrain."):
+            raise RuntimeError(
+                "Loading a metatrain MACE checkpoint requires the optional "
+                "metatrain dependencies. Install symmetrix-xl[metatrain]."
+            ) from exc
+        raise
+    model = model_from_checkpoint(checkpoint, context="export")
+    return _restore_metatrain_mace_model(
+        model, device, dataset_info=checkpoint.get("dataset_info")
+    )
+
+
+def _load_metatrain_mace_export(model_path, device):
+    try:
+        from metatomic.torch import load_atomistic_model
+    except ModuleNotFoundError as exc:
+        if exc.name == "metatomic" or exc.name.startswith("metatomic."):
+            raise RuntimeError(
+                "Loading a metatrain exported model requires the optional "
+                "metatrain dependencies. Install symmetrix-xl[metatrain]."
+            ) from exc
+        raise
+    exported = load_atomistic_model(str(model_path))
+    return _restore_metatrain_mace_model(
+        exported.module, device, capabilities=exported.capabilities()
+    )
+
+
 def _load_mace_checkpoint(model_path, device):
     """Load an ordinary checkpoint, with a lazy legacy MACEField fallback."""
+    if _is_metatomic_export(model_path):
+        return _load_metatrain_mace_export(model_path, device)
     try:
         loaded = torch.load(
             model_path,
@@ -387,6 +878,8 @@ def _load_mace_checkpoint(model_path, device):
             return _reconstruct_single_layer_training_checkpoint(
                 loaded, model_path, device
             )
+        if _is_metatrain_mace_checkpoint(loaded):
+            return _load_metatrain_mace_checkpoint(loaded, device)
         return loaded
     except Exception as exc:
         if _missing_les_conversion_dependency(exc):

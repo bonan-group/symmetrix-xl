@@ -57,7 +57,11 @@ Artifact preparation commands are exposed as `symmetrix_prepare_jit_host_artifac
 and `symmetrix_prepare_jit_device_artifact`. The converter is
 `symmetrix_extract_mace --model MODEL [--output PATH]`; it accepts species,
 head, compact/pair-spline format, and device-artifact preparation options and
-requires the optional `symmetrix-xl[mace]` dependencies. Omitting the species
+requires the optional `symmetrix-xl[mace]` dependencies for native MACE files.
+Metatrain MACE training checkpoints (`.ckpt`) and exported metatomic deployment
+models (`.pt`) are also accepted with `symmetrix-xl[metatrain]`; their external
+energy scaler and composition baseline are folded back into the compact MACE
+parameters during conversion. Omitting the species
 options creates the preferred universal compact export. Explicit species
 selection is limited to restricted exports or pair-spline radial data;
 nonlinear models always retain the complete checkpoint domain. Exports use
