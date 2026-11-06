@@ -2000,6 +2000,10 @@ def test_lammps_python_module_request_installs_shared_module(tmp_path):
 
     assert invocation.provenance["python_module"] is True
     assert invocation.provenance["cmake_definitions"]["BUILD_SHARED_LIBS"] == "ON"
+    assert (
+        invocation.provenance["cmake_definitions"]["CMAKE_INSTALL_RPATH"]
+        == "$ORIGIN/../lib"
+    )
     assert invocation.commands[-1] == (
         "/usr/bin/cmake",
         "--build",

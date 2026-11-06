@@ -461,6 +461,12 @@ def lammps_build_invocation(
         packages=packages,
         extra_definitions=extra_definitions,
     )
+    if install_python_module:
+        install_rpath = definitions.get("CMAKE_INSTALL_RPATH", "")
+        prefix_rpath = "$ORIGIN/../lib"
+        definitions["CMAKE_INSTALL_RPATH"] = (
+            prefix_rpath if not install_rpath else f"{prefix_rpath};{install_rpath}"
+        )
     provenance = {
         "target_fingerprint": manifest.fingerprint,
         "symmetrix": symmetrix_source_provenance(root, runner),
