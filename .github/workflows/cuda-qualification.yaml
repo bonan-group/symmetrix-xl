@@ -23,7 +23,6 @@ jobs:
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: 4
       KOKKOS_NUM_THREADS: 1
-      SYMMETRIX_JIT_CACHE: ${{ runner.temp }}/symmetrix-cuda-jit
       SYMMETRIX_JIT_POLICY: required
       TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: "1"
     steps:
@@ -45,6 +44,7 @@ jobs:
           cuda_toolkit_root="$(dirname "$(dirname "$cuda_compiler_path")")"
           echo "CUDA_ROOT=$cuda_toolkit_root" >> "$GITHUB_ENV"
           echo "CXX=$GITHUB_WORKSPACE/libsymmetrix/external/kokkos/bin/nvcc_wrapper" >> "$GITHUB_ENV"
+          echo "SYMMETRIX_JIT_CACHE=$RUNNER_TEMP/symmetrix-cuda-jit" >> "$GITHUB_ENV"
 
       - name: Build CUDA extension
         run: |
