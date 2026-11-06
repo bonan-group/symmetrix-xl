@@ -175,8 +175,8 @@ def test_device_module_publishes_product_free_split_phases():
 
     assert metadata["abi"] == "symmetrix.jit.mh1.cuda-plugin/5"
     assert metadata["abi_version"] == 5
-    assert plan["schema"] == "symmetrix.jit.mh1.cuda-launch-plan/6"
-    assert plan["version"] == 6
+    assert plan["schema"] == "symmetrix.jit.mh1.cuda-launch-plan/7"
+    assert plan["version"] == 7
     assert plan["module_abi"] == "symmetrix.jit.mh1.cuda-module/5"
     assert plan["module_abi_version"] == 5
     assert plan["split_phase_composition"] is True
@@ -202,7 +202,9 @@ def test_device_module_publishes_product_free_split_phases():
             "split_pre_reverse",
             "pre_reverse",
         ):
-            assert all(launch["kernel"] in source for launch in layer[phase])
+            for operation in layer[phase]:
+                fallback = operation.get("fallback", [operation])
+                assert all(launch["kernel"] in source for launch in fallback)
 
 
 def test_device_launch_plans_bind_the_active_module_abis():
@@ -229,6 +231,68 @@ def test_device_launch_plans_bind_the_active_module_abis():
     )
 
 
+def test_cuda_launch_plan_exposes_linear2_as_typed_dense_operations():
+    plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(_contract(), 80)
+
+    assert plan["schema"] == "symmetrix.jit.mh1.cuda-launch-plan/7"
+    assert plan["version"] == 7
+    for layer in plan["nodes"]:
+        forward = [
+            operation
+            for operation in layer["split_pre_forward"]
+            if operation.get("name") == "linear_2"
+        ]
+        reverse = [
+            operation
+            for operation in layer["split_pre_reverse"]
+            if operation.get("name") == "linear_2"
+        ]
+        assert [operation["operation"] for operation in forward] == ["dense_linear"]
+        assert [operation["operation"] for operation in reverse] == ["dense_linear"]
+        assert forward[0]["direction"] == "forward"
+        assert reverse[0]["direction"] == "reverse"
+        assert forward[0]["batch_mode"] == "grouped_components"
+        assert reverse[0]["batch_mode"] == "grouped_components"
+        assert len(forward[0]["blocks"]) == 4
+        assert len(reverse[0]["blocks"]) == 4
+        assert all(
+            f"_l{layer['index']}_forward_linear2_grouped" in launch["kernel"]
+            for launch in forward[0]["fallback"]
+        )
+        assert all(
+            f"_l{layer['index']}_reverse_linear2_grouped" in launch["kernel"]
+            for launch in reverse[0]["fallback"]
+        )
+
+
+def test_dense_linear_grouping_requires_uniform_contiguous_blocks():
+    grouped = (
+        {
+            "input_offset": 0,
+            "output_offset": 0,
+            "input_channels": 4,
+            "output_channels": 4,
+            "components": 1,
+        },
+        {
+            "input_offset": 4,
+            "output_offset": 4,
+            "input_channels": 4,
+            "output_channels": 4,
+            "components": 3,
+        },
+    )
+    assert mh1_codegen._dense_linear_batch_mode(grouped) == "grouped_components"
+
+    nonuniform = tuple(dict(block) for block in grouped)
+    nonuniform[1]["input_channels"] = 5
+    assert mh1_codegen._dense_linear_batch_mode(nonuniform) == "block_strided"
+
+    noncontiguous = tuple(dict(block) for block in grouped)
+    noncontiguous[1]["output_offset"] += 1
+    assert mh1_codegen._dense_linear_batch_mode(noncontiguous) == "block_strided"
+
+
 def _surrounding_shape(layer):
     result = {}
     for phase in (
@@ -238,18 +302,19 @@ def _surrounding_shape(layer):
         "split_pre_reverse",
     ):
         shape = []
-        for launch in layer[phase]:
-            kernel = launch["kernel"].split("symmetrix_execution_mh1_split_", 1)[1]
-            if "_block_" in kernel:
-                kernel = kernel.rsplit("_block_", 1)[0]
-            entry = (
-                kernel,
-                launch["grid"],
-                launch.get("tile_nodes"),
-                launch["threads"],
-            )
-            if not shape or shape[-1] != entry:
-                shape.append(entry)
+        for operation in layer[phase]:
+            for launch in operation.get("fallback", [operation]):
+                kernel = launch["kernel"].split("symmetrix_execution_mh1_split_", 1)[1]
+                if "_block_" in kernel:
+                    kernel = kernel.rsplit("_block_", 1)[0]
+                entry = (
+                    kernel,
+                    launch["grid"],
+                    launch.get("tile_nodes"),
+                    launch["threads"],
+                )
+                if not shape or shape[-1] != entry:
+                    shape.append(entry)
         result[phase] = shape
     return result
 
@@ -443,7 +508,8 @@ def test_generation_19_uses_qualified_external_surrounding_schedule():
         for phase, phase_extents in expected_extents.items():
             tiled = [
                 launch
-                for launch in layer[phase]
+                for operation in layer[phase]
+                for launch in operation.get("fallback", [operation])
                 if launch["grid"] == "node_channel_tiles"
             ]
             assert [
@@ -470,7 +536,12 @@ def test_generation_19_uses_qualified_external_surrounding_schedule():
         in readout_middle
     )
     assert all(
-        sum(launch["grid"] == "node_channel_tiles" for launch in layer[phase]) >= 1
+        sum(
+            launch["grid"] == "node_channel_tiles"
+            for operation in layer[phase]
+            for launch in operation.get("fallback", [operation])
+        )
+        >= 1
         for layer in plan["nodes"]
         for phase in (
             "split_pre_forward",
@@ -530,13 +601,14 @@ def test_generation_19_schedule_names_truthfully_describe_state_replay(
             "split_pre_reverse",
             "pre_reverse",
         ):
-            for launch in layer[phase]:
-                if launch["grid"] != "node_channel_tiles":
-                    continue
-                assert launch["tile_channels"] == 32
-                assert launch["channels"] > 0
-                assert launch["components"] > 0
-                assert launch["tile_nodes"] in (8, 32, 64, 128)
+            for operation in layer[phase]:
+                for launch in operation.get("fallback", [operation]):
+                    if launch["grid"] != "node_channel_tiles":
+                        continue
+                    assert launch["tile_channels"] == 32
+                    assert launch["channels"] > 0
+                    assert launch["components"] > 0
+                    assert launch["tile_nodes"] in (8, 32, 64, 128)
 
 
 @pytest.mark.parametrize("policy", ("reuse-adjoints-v1", "retain-interaction-v1"))
@@ -587,7 +659,7 @@ def test_generation_19_modules_contain_no_private_product_implementation():
     assert all(token not in host for token in retired_tokens)
 
     plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(contract, 80)
-    assert plan["version"] == 6
+    assert plan["version"] == 7
     for node in plan["nodes"]:
         assert node["pre_forward"]
         assert node["split_pre_forward"]

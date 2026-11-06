@@ -9,18 +9,19 @@
 
 // The MACE_Nonlinear (MH-1) execution stage description.
 //
-// The interaction-layer count, the profiling region name of every layer's R and
-// M forward and reverse stage, and the ordered forward and reverse execution
-// schedules are DATA.  A description is built from a layer count and names the
+// The interaction-layer count, the profiling region name of every layer's edge
+// and node forward and reverse stage, and the ordered forward and reverse
+// execution schedules are DATA.  A description is built from a layer count and names the
 // canonical regions for that count, so an evaluator that admits a different
 // topology profiles and dispatches it through the same value instead of a
 // compiled-in two-layer table.  The description is family-owned state, not a
 // shared-layer type: it names this family's regions and this family's contract
 // vocabulary.
 //
-// The region spelling is the established one the ROCm profiler analyzer decodes
-// (`symmetrix/mh1/<R|M><layer>/<forward|reverse>`), so a description built for
-// any count keeps the profile contract readable.
+// MH-1 fuses boundaries that standard MACE exposes separately.  Its edge
+// program therefore uses the composite standard symbol `R<layer>+A<layer>`,
+// while its node program uses `M<layer>+H<layer + 1>`.  This makes H1 visible
+// without claiming that MH-1 launches a separate H1 stage.
 
 namespace symmetrix::mace_nonlinear {
 
@@ -53,6 +54,17 @@ enum class ReversePhase {
     pre_reverse = 1,
 };
 
+//: Diagnostic sub-stages nested inside the composite R+A and M+H regions.
+//: These names describe semantic work, not an ABI or a required kernel split.
+enum class SubstageKind {
+    conditioning,
+    radial,
+    message,
+    node,
+    product,
+    readout,
+};
+
 struct Stage {
     StageKind kind = StageKind::node_program;
     //: The contract's phase name for a node-program entry; empty otherwise.
@@ -75,21 +87,21 @@ public:
     {
         StageDescription description;
         description.layer_count_ = layer_count;
-        description.r_forward_.reserve(layer_count);
-        description.m_forward_.reserve(layer_count);
-        description.r_reverse_.reserve(layer_count);
-        description.m_reverse_.reserve(layer_count);
+        description.edge_forward_.reserve(layer_count);
+        description.node_forward_.reserve(layer_count);
+        description.edge_reverse_.reserve(layer_count);
+        description.node_reverse_.reserve(layer_count);
         description.forward_schedule_.reserve(2 * layer_count + 1);
         description.reverse_schedule_.reserve(2 * layer_count);
         for (std::size_t layer = 0; layer < layer_count; ++layer) {
-            description.r_forward_.push_back(
-                region(RegionOwner::r, layer, "forward"));
-            description.m_forward_.push_back(
-                region(RegionOwner::m, layer, "forward"));
-            description.r_reverse_.push_back(
-                region(RegionOwner::r, layer, "reverse"));
-            description.m_reverse_.push_back(
-                region(RegionOwner::m, layer, "reverse"));
+            description.edge_forward_.push_back(
+                region(RegionOwner::edge, layer, "forward"));
+            description.node_forward_.push_back(
+                region(RegionOwner::node, layer, "forward"));
+            description.edge_reverse_.push_back(
+                region(RegionOwner::edge, layer, "reverse"));
+            description.node_reverse_.push_back(
+                region(RegionOwner::node, layer, "reverse"));
         }
         if (layer_count == 0)
             return description;
@@ -142,21 +154,44 @@ public:
         return layer;
     }
 
-    std::string_view r_forward(const std::size_t layer) const
+    std::string_view edge_forward(const std::size_t layer) const
     {
-        return r_forward_.at(layer_index(layer));
+        return edge_forward_.at(layer_index(layer));
     }
-    std::string_view m_forward(const std::size_t layer) const
+    std::string_view node_forward(const std::size_t layer) const
     {
-        return m_forward_.at(layer_index(layer));
+        return node_forward_.at(layer_index(layer));
     }
-    std::string_view r_reverse(const std::size_t layer) const
+    std::string_view edge_reverse(const std::size_t layer) const
     {
-        return r_reverse_.at(layer_index(layer));
+        return edge_reverse_.at(layer_index(layer));
     }
-    std::string_view m_reverse(const std::size_t layer) const
+    std::string_view node_reverse(const std::size_t layer) const
     {
-        return m_reverse_.at(layer_index(layer));
+        return node_reverse_.at(layer_index(layer));
+    }
+
+    //: Return a stable semantic child region for diagnostic profiling.  The
+    //: caller owns the returned string while the profiling scope is alive.
+    std::string substage(
+        const SubstageKind kind, const std::size_t layer,
+        const std::string_view direction) const
+    {
+        layer_index(layer);
+        const bool edge=kind==SubstageKind::conditioning
+            ||kind==SubstageKind::radial||kind==SubstageKind::message;
+        std::string name=region(
+            edge?RegionOwner::edge:RegionOwner::node,layer,direction);
+        name.push_back('/');
+        switch(kind) {
+        case SubstageKind::conditioning: name+="conditioning"; break;
+        case SubstageKind::radial: name+="radial"; break;
+        case SubstageKind::message: name+="message"; break;
+        case SubstageKind::node: name+="node"; break;
+        case SubstageKind::product: name+="product"; break;
+        case SubstageKind::readout: name+="readout"; break;
+        }
+        return name;
     }
 
     const std::vector<Stage>& forward_schedule() const noexcept
@@ -193,15 +228,20 @@ public:
     }
 
 private:
-    enum class RegionOwner { r, m };
+    enum class RegionOwner { edge, node };
 
     static std::string region(
         const RegionOwner owner, const std::size_t layer,
         const std::string_view direction)
     {
         std::string name = "symmetrix/mh1/";
-        name.push_back(owner == RegionOwner::r ? 'R' : 'M');
-        name += std::to_string(layer);
+        if (owner == RegionOwner::edge) {
+            name += "R" + std::to_string(layer);
+            name += "+A" + std::to_string(layer);
+        } else {
+            name += "M" + std::to_string(layer);
+            name += "+H" + std::to_string(layer + 1);
+        }
         name.push_back('/');
         name += direction;
         return name;
@@ -232,10 +272,10 @@ private:
     }
 
     std::size_t layer_count_ = 0;
-    std::vector<std::string> r_forward_;
-    std::vector<std::string> m_forward_;
-    std::vector<std::string> r_reverse_;
-    std::vector<std::string> m_reverse_;
+    std::vector<std::string> edge_forward_;
+    std::vector<std::string> node_forward_;
+    std::vector<std::string> edge_reverse_;
+    std::vector<std::string> node_reverse_;
     std::vector<Stage> forward_schedule_;
     std::vector<Stage> reverse_schedule_;
 };

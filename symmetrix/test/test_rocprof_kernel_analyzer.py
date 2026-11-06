@@ -146,6 +146,38 @@ def test_classifier_uses_only_semantic_evidence(analyzer, name, category):
             "edge_reverse_harmonic",
         ),
         ("symmetrix_execution_mh1_node_pre_forward_kernel_0", "node_forward"),
+        (
+            "symmetrix_execution_mh1_node_tiled_l1_forward_product_linear",
+            "product_forward",
+        ),
+        (
+            "symmetrix_execution_mh1_node_post_finalize_kernel_1",
+            "readout_forward_fused",
+        ),
+        (
+            "symmetrix_execution_mh1_node_tiled_l1_reverse_product_linear",
+            "product_reverse",
+        ),
+        (
+            "symmetrix_execution_mh1_node_post_readout_kernel_1",
+            "readout_reverse_fused",
+        ),
+        (
+            "symmetrix_execution_mh1_split_node_tiled_l1_forward_product_linear_block_1",
+            "product_forward",
+        ),
+        (
+            "symmetrix_execution_mh1_split_post_finalize_kernel_1",
+            "readout_forward_fused",
+        ),
+        (
+            "symmetrix_execution_mh1_split_node_tiled_l1_reverse_product_linear_block_1",
+            "product_reverse",
+        ),
+        (
+            "symmetrix_execution_mh1_split_post_readout_kernel_0",
+            "readout_reverse_fused",
+        ),
         ("symmetrix_execution_mh1_node_tiled_l1_reverse_gate", "node_reverse"),
         (
             "symmetrix_execution_mh1_node_tiled_l0_reverse_readout",
@@ -160,6 +192,13 @@ def test_mh1_generated_phases_are_distinct(analyzer, name, category):
 @pytest.mark.parametrize(
     ("name", "stage"),
     [
+        ("symmetrix/mh1/R0+A0/forward", "r0_forward"),
+        ("symmetrix/mh1/M0+H1/forward", "m0_forward"),
+        ("symmetrix/mh1/R1+A1/reverse", "r1_reverse"),
+        ("symmetrix/mh1/M1+H2/reverse", "m1_reverse"),
+        ("symmetrix/mh1/R2+A2/forward", "r2_forward"),
+        ("symmetrix/mh1/M2+H3/reverse", "m2_reverse"),
+        # Existing reports retain the original owner-only spelling.
         ("symmetrix/mh1/R0/forward", "r0_forward"),
         ("symmetrix/mh1/M0/forward", "m0_forward"),
         ("symmetrix/mh1/R1/reverse", "r1_reverse"),
@@ -281,7 +320,7 @@ def test_marker_trace_resolves_nested_spline_kernels(analyzer, tmp_path):
         [
             {
                 "Domain": "MARKER_CORE_RANGE_API",
-                "Function": "symmetrix/mh1/R1/forward",
+                "Function": "symmetrix/mh1/R1+A1/forward",
                 "Process_Id": 7,
                 "Thread_Id": 8,
                 "Correlation_Id": 10,
@@ -313,6 +352,8 @@ def test_marker_trace_resolves_nested_spline_kernels(analyzer, tmp_path):
 
     stages = {record["stage"]: record for record in summary["mh1_stages"]["stages"]}
     assert stages["r1_forward"]["duration_ns"] == 300
+    assert stages["r1_forward"]["standard_symbol"] == "R1+A1"
+    assert stages["r1_forward"]["display_name"] == "R1+A1 forward"
     assert summary["mh1_stages"]["unassigned"]["duration_ns"] == 0
     assert summary["kernels"][0]["mh1_stage"] == "r1_forward"
 

@@ -4,7 +4,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#ifdef KOKKOS_ENABLE_CUDA
+#include <dlfcn.h>
+#endif
 #include <exception>
 #include <fstream>
 #include <limits>
@@ -53,21 +57,103 @@ struct MH1ExecutionSourceScheduleEntryLess {
 namespace {
 using symmetrix::detail::MH1ExecutionSourceScheduleEntry;
 using symmetrix::detail::MH1ExecutionSourceScheduleEntryLess;
+using symmetrix::mace_nonlinear::SubstageKind;
 
 class ScopedKokkosProfileRegion {
 public:
     explicit ScopedKokkosProfileRegion(const char* name)
     {
         Kokkos::Profiling::pushRegion(name);
+#ifdef KOKKOS_ENABLE_CUDA
+        if(nvtx_enabled())
+            nvtx_range_active=nvtx_available();
+        if(nvtx_range_active)
+            nvtx_push(name);
+#endif
     }
 
     ~ScopedKokkosProfileRegion()
     {
+#ifdef KOKKOS_ENABLE_CUDA
+        if(nvtx_range_active)
+            nvtx_pop();
+#endif
         Kokkos::Profiling::popRegion();
     }
 
     ScopedKokkosProfileRegion(const ScopedKokkosProfileRegion&) = delete;
     ScopedKokkosProfileRegion& operator=(const ScopedKokkosProfileRegion&) = delete;
+
+private:
+#ifdef KOKKOS_ENABLE_CUDA
+    using NvtxPushFunction=int (*)(const char*);
+    using NvtxPopFunction=int (*)();
+
+    struct NvtxApi {
+        void* handle=nullptr;
+        NvtxPushFunction push=nullptr;
+        NvtxPopFunction pop=nullptr;
+    };
+
+    static NvtxApi& nvtx_api()
+    {
+        static NvtxApi api=[] {
+            NvtxApi result;
+            const char* requested=std::getenv("SYMMETRIX_NVTX_LIBRARY");
+            const char* candidates[]={
+                requested,
+                "libnvtx3interop.so.1",
+                nullptr,
+            };
+            for(const char* candidate:candidates) {
+                if(candidate==nullptr || candidate[0]=='\0')
+                    continue;
+                result.handle=dlopen(candidate,RTLD_LAZY|RTLD_LOCAL);
+                if(result.handle==nullptr)
+                    continue;
+                result.push=reinterpret_cast<NvtxPushFunction>(
+                    dlsym(result.handle,"nvtxRangePushA"));
+                result.pop=reinterpret_cast<NvtxPopFunction>(
+                    dlsym(result.handle,"nvtxRangePop"));
+                if(result.push!=nullptr && result.pop!=nullptr)
+                    return result;
+                dlclose(result.handle);
+                result={};
+            }
+            return result;
+        }();
+        return api;
+    }
+
+    static bool nvtx_enabled()
+    {
+        static const bool enabled=[] {
+            const char* value=std::getenv("SYMMETRIX_MH1_NVTX");
+            return value!=nullptr && value[0]!='\0' && value[0]!='0';
+        }();
+        return enabled;
+    }
+
+    static int nvtx_push(const char* name)
+    {
+        const NvtxApi& api=nvtx_api();
+        return api.push==nullptr ? -1 : api.push(name);
+    }
+
+    static bool nvtx_available()
+    {
+        const NvtxApi& api=nvtx_api();
+        return api.push!=nullptr && api.pop!=nullptr;
+    }
+
+    static int nvtx_pop()
+    {
+        const NvtxApi& api=nvtx_api();
+        return api.pop==nullptr ? -1 : api.pop();
+    }
+
+    bool nvtx_range_active=false;
+#endif
 };
 
 template<typename Value>
@@ -247,7 +333,16 @@ int execution_mh1_persistent_blocks()
 
 int execution_mh1_spline_reverse_persistent_blocks()
 {
-    constexpr int blocks_per_compute_unit=8;
+    constexpr int default_blocks_per_compute_unit=8;
+    int blocks_per_compute_unit=default_blocks_per_compute_unit;
+    const char* raw=std::getenv(
+        "SYMMETRIX_MH1_SPLINE_REVERSE_BLOCKS_PER_SM");
+    if(raw!=nullptr&&*raw!='\0') {
+        char* end=nullptr;
+        const long requested=std::strtol(raw,&end,10);
+        if(end!=raw&&*end=='\0'&&requested>0&&requested<=32)
+            blocks_per_compute_unit=static_cast<int>(requested);
+    }
     return std::max(
         1,blocks_per_compute_unit
             *execution_device_execution_environment().compute_unit_count);
@@ -5304,6 +5399,10 @@ void MaceBackboneKokkosT<Precision>::prepare_execution_mh1_node_runtime_paramete
             layer==0?"Execution MH-1 node linear parameters 0"
                 :"Execution MH-1 node linear parameters 1",
             linear_parameters);
+        runtime.vendor_dense_parameters=toKokkosView(
+            layer==0?"Execution MH-1 vendor dense parameters 0"
+                :"Execution MH-1 vendor dense parameters 1",
+            interaction.linear_2.runtime_effective_weights());
         runtime.product_parameters=toKokkosView(
             layer==0?"Execution MH-1 node product parameters 0"
                 :"Execution MH-1 node product parameters 1",
@@ -6477,7 +6576,7 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
         bool packed_spline_messages=false;
         {
         ScopedKokkosProfileRegion profile(
-            stage_description.r_forward(stage).data());
+            stage_description.edge_forward(stage).data());
         if(generated_node_program) {
             ensure_view(state.execution_input_ir_mul,
                 state.execution_input_ir_mul_storage,num_nodes,up_width);
@@ -6602,6 +6701,9 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
         auto densities=state.densities;
         const bool stream_layer=streams_layer(layer);
         if(stream_layer) {
+            const auto profile_name=stage_description.substage(
+                SubstageKind::message,stage,"forward");
+            ScopedKokkosProfileRegion profile(profile_name.c_str());
             ordered_kokkos_deep_copy(messages,Precision(0));
             ordered_kokkos_deep_copy(densities,Precision(0));
             const int convolution_width=
@@ -6700,9 +6802,16 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                 ordered_kokkos_deep_copy(
                     state.execution_output_ir_mul,Precision(0));
             }
-            if(generated_conditioning)
+            if(generated_conditioning) {
+                const auto profile_name=stage_description.substage(
+                    SubstageKind::conditioning,stage,"forward");
+                ScopedKokkosProfileRegion profile(profile_name.c_str());
                 launch_generated_conditioning_forward(layer,interaction,state);
+            }
             if(generated_spline_forward) {
+                const auto profile_name=stage_description.substage(
+                    SubstageKind::radial,stage,"forward");
+                ScopedKokkosProfileRegion profile(profile_name.c_str());
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
                 if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>) {
                     throw std::logic_error(
@@ -6792,6 +6901,9 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                 }
             }
             if(generated_device_spline_forward) {
+                const auto profile_name=stage_description.substage(
+                    SubstageKind::radial,stage,"forward");
+                ScopedKokkosProfileRegion profile(profile_name.c_str());
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
                 if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>) {
                     ordered_kokkos_deep_copy(
@@ -7509,7 +7621,7 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                 });
         }
         ScopedKokkosProfileRegion profile(
-            stage_description.m_forward(stage).data());
+            stage_description.node_forward(stage).data());
         auto densities=state.densities;
         if(!generated_node_program) {
             ensure_view(state.residual,state.residual_storage,num_nodes,res_width);
@@ -7607,6 +7719,10 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                         retained_pre_gate,retained_interaction_output,
                         sizeof(Precision));
                     if(shared_device_product_program) {
+                        const auto product_profile_name=stage_description.substage(
+                            SubstageKind::product,stage,"forward");
+                        ScopedKokkosProfileRegion product_profile(
+                            product_profile_name.c_str());
                         auto& product_artifact=
                             execution_mh1_product_artifacts.at(layer);
                         const auto weights=
@@ -7623,7 +7739,8 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                         check_execution_mh1_cuda_status(
                             jit_mh1_cuda_plugin_v4
                                 ->launch_split_forward(
-                                    &external_args,stream,persistent_blocks),
+                                    &external_args,stream,persistent_blocks,
+                                    runtime.vendor_dense_parameters.data()),
                             "Launching Execution MH-1 device product pre-forward");
                         SymmetrixJitM0ArgsV2 product_args{{
                             sizeof(SymmetrixJitM0ArgsV1),0u,rows,
@@ -7658,13 +7775,24 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                             product_artifact.persistent_blocks);
                         ++product_artifact.forward_launch_count;
                         external_args.phase=1u;
-                        check_execution_mh1_cuda_status(
-                            jit_mh1_cuda_plugin_v4
-                                ->launch_split_forward(
-                                    &external_args,stream,persistent_blocks),
-                            "Launching Execution MH-1 device product post-forward");
+                        {
+                            const auto readout_profile_name=stage_description.substage(
+                                SubstageKind::readout,stage,"forward");
+                            ScopedKokkosProfileRegion readout_profile(
+                                readout_profile_name.c_str());
+                            check_execution_mh1_cuda_status(
+                                jit_mh1_cuda_plugin_v4
+                                    ->launch_split_forward(
+                                        &external_args,stream,persistent_blocks,
+                                        runtime.vendor_dense_parameters.data()),
+                                "Launching Execution MH-1 device product post-forward");
+                        }
                         continue;
                     }
+                    const auto readout_profile_name=stage_description.substage(
+                        SubstageKind::readout,stage,"forward");
+                    ScopedKokkosProfileRegion readout_profile(
+                        readout_profile_name.c_str());
                     check_execution_mh1_cuda_status(
                         jit_mh1_cuda_plugin_v4->launch_node_forward(
                             &args,execution_mh1_device_stream(execution_space),
@@ -7722,15 +7850,25 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                         runtime.contraction_output.data(),
                         nullptr,nullptr};
                     const auto product_owner=product_descriptor.forward_owner;
-                    Kokkos::parallel_for(
-                        "ExecutionMH1SharedProduct::host_forward",
-                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
-                            Kokkos::IndexType<std::int64_t>>(
-                            0,static_cast<std::int64_t>(rows)*channel_tiles),
-                        [=](std::int64_t owner) {
-                            product_owner(&product_args,owner);
-                        });
+                    {
+                        const auto product_profile_name=stage_description.substage(
+                            SubstageKind::product,stage,"forward");
+                        ScopedKokkosProfileRegion product_profile(
+                            product_profile_name.c_str());
+                        Kokkos::parallel_for(
+                            "ExecutionMH1SharedProduct::host_forward",
+                            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                                Kokkos::IndexType<std::int64_t>>(
+                                0,static_cast<std::int64_t>(rows)*channel_tiles),
+                            [=](std::int64_t owner) {
+                                product_owner(&product_args,owner);
+                            });
+                    }
                     ++product_artifact.forward_launch_count;
+                    const auto readout_profile_name=stage_description.substage(
+                        SubstageKind::readout,stage,"forward");
+                    ScopedKokkosProfileRegion readout_profile(
+                        readout_profile_name.c_str());
                     Kokkos::parallel_for(
                         "ExecutionMH1HostPluginV7::node_post_product_forward",rows,
                         [=](int node) { split.post_forward_owner(&tile_args,node); });
@@ -7753,6 +7891,10 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                         tile_args.layer_output+=static_cast<std::size_t>(first)
                             *layer_output_width;
                         tile_args.readout_contribution+=first;
+                        const auto readout_profile_name=stage_description.substage(
+                            SubstageKind::readout,stage,"forward");
+                        ScopedKokkosProfileRegion readout_profile(
+                            readout_profile_name.c_str());
                         Kokkos::parallel_for(
                             "ExecutionMH1HostPluginV4::node_post_forward",rows,
                             [=](int node) { owner(&tile_args,node); });
@@ -7861,6 +8003,9 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
     for(int layer=0;!generated_node_program
         &&layer<static_cast<int>(readouts.size());++layer) {
         auto& state=states[layer];
+        const auto readout_profile_name=stage_description.substage(
+            SubstageKind::readout,static_cast<std::size_t>(layer),"forward");
+        ScopedKokkosProfileRegion readout_profile(readout_profile_name.c_str());
         const bool portable_final=mh1_portable_final_layer_enabled_
             &&layer+1==static_cast<int>(readouts.size());
         if(portable_final) {
@@ -8008,7 +8153,7 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
 
         {
         ScopedKokkosProfileRegion profile(
-            stage_description.m_reverse(stage).data());
+            stage_description.node_reverse(stage).data());
         if(generated_node_program) {
             // The ABI requires a packed row stride, so wrap each flat shared
             // owner with the current layer's exact width.
@@ -8129,11 +8274,18 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                                 reinterpret_cast<Precision*>(args.node_arena)
                                     +interaction_width);
                         external_args.phase=2u;
-                        check_execution_mh1_cuda_status(
-                            jit_mh1_cuda_plugin_v4
-                                ->launch_split_reverse(
-                                    &external_args,stream,persistent_blocks),
-                            "Launching Execution MH-1 device product post-reverse");
+                        {
+                            const auto readout_profile_name=stage_description.substage(
+                                SubstageKind::readout,stage,"reverse");
+                            ScopedKokkosProfileRegion readout_profile(
+                                readout_profile_name.c_str());
+                            check_execution_mh1_cuda_status(
+                                jit_mh1_cuda_plugin_v4
+                                    ->launch_split_reverse(
+                                        &external_args,stream,persistent_blocks,
+                                        runtime.vendor_dense_parameters.data()),
+                                "Launching Execution MH-1 device product post-reverse");
+                        }
                         SymmetrixJitM0ArgsV2 product_reverse_args{{
                             sizeof(SymmetrixJitM0ArgsV1),0u,rows,
                             product_channels,0,state.agnostic_elements.data()+first,
@@ -8160,22 +8312,33 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                             product_artifact.reverse_required_blocks,
                             static_cast<std::int64_t>(
                                 product_artifact.persistent_blocks));
-                        if(product_artifact.kind=="M0")
-                            product_artifact.device_module->launch_m0_reverse_strided(
+                        {
+                            const auto product_profile_name=stage_description.substage(
+                                SubstageKind::product,stage,"reverse");
+                            ScopedKokkosProfileRegion product_profile(
+                                product_profile_name.c_str());
+                            if(product_artifact.kind=="M0")
+                                product_artifact.device_module->launch_m0_reverse_strided(
+                                    product_reverse_args,stream,
+                                    product_artifact.persistent_blocks);
+                            else product_artifact.device_module->launch_m1_reverse_strided(
                                 product_reverse_args,stream,
                                 product_artifact.persistent_blocks);
-                        else product_artifact.device_module->launch_m1_reverse_strided(
-                            product_reverse_args,stream,
-                            product_artifact.persistent_blocks);
+                        }
                         ++product_artifact.reverse_launch_count;
                         external_args.phase=3u;
                         check_execution_mh1_cuda_status(
                             jit_mh1_cuda_plugin_v4
                                 ->launch_split_reverse(
-                                    &external_args,stream,persistent_blocks),
+                                    &external_args,stream,persistent_blocks,
+                                    runtime.vendor_dense_parameters.data()),
                             "Launching Execution MH-1 device product pre-reverse");
                         continue;
                     }
+                    const auto readout_profile_name=stage_description.substage(
+                        SubstageKind::readout,stage,"reverse");
+                    ScopedKokkosProfileRegion readout_profile(
+                        readout_profile_name.c_str());
                     check_execution_mh1_cuda_status(
                         jit_mh1_cuda_plugin_v4->launch_node_reverse(
                             &args,execution_mh1_device_stream(execution_space),
@@ -8233,14 +8396,20 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                         nullptr,nullptr};
                     const auto product_forward_owner=
                         product_descriptor.forward_owner;
-                    Kokkos::parallel_for(
-                        "ExecutionMH1SharedProduct::host_reverse_recompute",
-                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
-                            Kokkos::IndexType<std::int64_t>>(
-                            0,static_cast<std::int64_t>(rows)*channel_tiles),
-                        [=](std::int64_t owner) {
-                            product_forward_owner(&recompute_product_args,owner);
-                        });
+                    {
+                        const auto product_profile_name=stage_description.substage(
+                            SubstageKind::product,stage,"reverse");
+                        ScopedKokkosProfileRegion product_profile(
+                            product_profile_name.c_str());
+                        Kokkos::parallel_for(
+                            "ExecutionMH1SharedProduct::host_reverse_recompute",
+                            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                                Kokkos::IndexType<std::int64_t>>(
+                                0,static_cast<std::int64_t>(rows)*channel_tiles),
+                            [=](std::int64_t owner) {
+                                product_forward_owner(&recompute_product_args,owner);
+                            });
+                    }
                     ++product_artifact.forward_launch_count;
                     const SymmetrixJitMH1HostNodeReverseArgsV7 tile_args{
                         sizeof(SymmetrixJitMH1HostNodeReverseArgsV7),
@@ -8268,6 +8437,10 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                         layer==0?nullptr:previous_adjoint.data()
                             +static_cast<std::size_t>(first)*input_width,
                         state.density_adj.data()+first};
+                    const auto readout_profile_name=stage_description.substage(
+                        SubstageKind::readout,stage,"reverse");
+                    ScopedKokkosProfileRegion readout_profile(
+                        readout_profile_name.c_str());
                     Kokkos::parallel_for(
                         "ExecutionMH1HostPluginV7::node_post_product_reverse",rows,
                         [=](int node) { split.post_reverse_owner(&tile_args,node); });
@@ -8280,14 +8453,20 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                         runtime.interaction_adjoint.data(),
                         nullptr};
                     const auto product_owner=product_descriptor.reverse_owner;
-                    Kokkos::parallel_for(
-                        "ExecutionMH1SharedProduct::host_reverse",
-                        Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
-                            Kokkos::IndexType<std::int64_t>>(
-                            0,static_cast<std::int64_t>(rows)*channel_tiles),
-                        [=](std::int64_t owner) {
-                            product_owner(&product_args,owner);
-                        });
+                    {
+                        const auto product_profile_name=stage_description.substage(
+                            SubstageKind::product,stage,"reverse");
+                        ScopedKokkosProfileRegion product_profile(
+                            product_profile_name.c_str());
+                        Kokkos::parallel_for(
+                            "ExecutionMH1SharedProduct::host_reverse",
+                            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
+                                Kokkos::IndexType<std::int64_t>>(
+                                0,static_cast<std::int64_t>(rows)*channel_tiles),
+                            [=](std::int64_t owner) {
+                                product_owner(&product_args,owner);
+                            });
+                    }
                     ++product_artifact.reverse_launch_count;
                     auto pre_args=tile_args;
                     pre_args.contraction_output_adjoint=
@@ -8326,6 +8505,10 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                             tile_args.layer_input_adjoint+=
                                 static_cast<std::size_t>(first)*input_width;
                         tile_args.node_density_adjoint+=first;
+                        const auto readout_profile_name=stage_description.substage(
+                            SubstageKind::readout,stage,"reverse");
+                        ScopedKokkosProfileRegion readout_profile(
+                            readout_profile_name.c_str());
                         Kokkos::parallel_for(
                             "ExecutionMH1HostPluginV4::node_post_reverse",rows,
                             [=](int node) { owner(&tile_args,node); });
@@ -8507,9 +8690,12 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
         auto density_adj=state.density_adj;
 
         ScopedKokkosProfileRegion profile(
-            stage_description.r_reverse(stage).data());
+            stage_description.edge_reverse(stage).data());
         const bool stream_layer=streams_layer(layer);
         if(stream_layer) {
+            const auto profile_name=stage_description.substage(
+                SubstageKind::message,stage,"reverse");
+            ScopedKokkosProfileRegion profile(profile_name.c_str());
             const int convolution_width=
                 interaction.convolution_source_contributions.extent(1);
             const int density_width=interaction.density_source_contributions.extent(1);
@@ -8754,6 +8940,9 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                 }
             }
             if(generated_conditioning) {
+                const auto profile_name=stage_description.substage(
+                    SubstageKind::conditioning,stage,"reverse");
+                ScopedKokkosProfileRegion profile(profile_name.c_str());
                 const auto convolution_parameters=interaction.convolution_weights
                     .packed_runtime_parameters();
                 const auto density_parameters=interaction.density
@@ -8867,6 +9056,9 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                     &&generated_device_spline_node_adapter;
 #endif
             if(generated_spline_reverse) {
+                const auto profile_name=stage_description.substage(
+                    SubstageKind::radial,stage,"reverse");
+                ScopedKokkosProfileRegion profile(profile_name.c_str());
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
                 if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>) {
                     throw std::logic_error(
@@ -8961,6 +9153,9 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                 }
             }
             if(generated_device_spline_reverse) {
+                const auto profile_name=stage_description.substage(
+                    SubstageKind::radial,stage,"reverse");
+                ScopedKokkosProfileRegion profile(profile_name.c_str());
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
                 if constexpr(device_execution_space<Kokkos::DefaultExecutionSpace>) {
                     const auto pair_spline=interaction.pair_spline;

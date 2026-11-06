@@ -109,6 +109,17 @@ py::dict stage_description_dict(
     };
     py::dict result;
     result["layer_count"] = description.layer_count();
+    auto regions = py::list();
+    for (std::size_t layer = 0; layer < description.layer_count(); ++layer) {
+        py::dict entry;
+        entry["layer"] = layer;
+        entry["edge_forward"] = std::string(description.edge_forward(layer));
+        entry["node_forward"] = std::string(description.node_forward(layer));
+        entry["node_reverse"] = std::string(description.node_reverse(layer));
+        entry["edge_reverse"] = std::string(description.edge_reverse(layer));
+        regions.append(std::move(entry));
+    }
+    result["profile_regions"] = std::move(regions);
     auto forward = py::list();
     for (const auto& stage : description.forward_schedule())
         forward.append(stage_entry(stage));

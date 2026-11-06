@@ -525,7 +525,7 @@ def test_mh1_device_module_v4_requires_explicit_retention_policy():
 
     assert '!plan.contains("node_state_policy")' in loader
     assert '||!plan.at("node_state_policy").is_string()' in loader
-    assert '"launch-plan v6 requires an explicit node-state policy"' in loader
+    assert '"launch-plan v7 requires an explicit node-state policy"' in loader
     assert 'plan.at("node_state_policy").get<std::string>()' in loader
     assert 'plan.at("module_abi")!="symmetrix.jit.mh1.cuda-module/5"' in loader
     assert 'plan.at("module_abi")!="symmetrix.jit.mh1.hip-module/5"' in loader
@@ -552,6 +552,19 @@ def test_mh1_device_module_admits_only_named_nonstandard_tiles():
     assert "result.tile_nodes==128&&result.tile_channels==32&&threads==256" in loader
     assert "product_tiles" not in loader
     assert "paired_product_reverse_tile" not in loader
+
+
+def test_mh1_device_module_parses_dense_operations_with_generated_fallbacks():
+    loader = (SOURCE / "mace_nonlinear_jit_cuda_plugin.cpp").read_text(encoding="ascii")
+
+    assert 'operation!="dense_linear"' in loader
+    assert 'value.at("fallback")' in loader
+    assert "launch_dense_linear" in loader
+    assert "cublasSgemmBatched" in loader
+    assert "cublasSgemmStridedBatched" in loader
+    assert 'batch_mode=="grouped_components"' in loader
+    assert 'plan.at("version")!=7' in loader
+    assert '"launch-plan v7 requires an explicit node-state policy"' in loader
 
 
 def test_retired_mh1_loaders_reject_and_are_not_routed():

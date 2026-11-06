@@ -110,6 +110,9 @@ _FIXED_WORKSPACE_TILED_PLANS = frozenset(
     ("mh0-single-layer-tiled-v1", "mh0-dual-layer-tiled-v1")
 )
 _NEIGHBOR_BACKENDS = frozenset(("automatic", "host", "kokkos"))
+_MH1_DENSE_POLICIES = frozenset(
+    ("auto", "generated", "vendor_fp32", "vendor_tf32")
+)
 _AUTOMATIC_KOKKOS_NEIGHBOR_MIN_ATOMS = 512
 _AUTOMATIC_KOKKOS_NEIGHBOR_EXECUTION_SPACES = frozenset(("Cuda", "HIP"))
 
@@ -120,6 +123,16 @@ def _neighbor_backend_request():
         choices = ", ".join(sorted(_NEIGHBOR_BACKENDS))
         raise ValueError(
             f"SYMMETRIX_NEIGHBOR_BACKEND must be one of {choices}; got {request!r}."
+        )
+    return request
+
+
+def _mh1_dense_policy_request():
+    request = os.environ.get("SYMMETRIX_MH1_DENSE_POLICY", "auto").strip().lower()
+    if request not in _MH1_DENSE_POLICIES:
+        choices = ", ".join(sorted(_MH1_DENSE_POLICIES))
+        raise ValueError(
+            f"SYMMETRIX_MH1_DENSE_POLICY must be one of {choices}; got {request!r}."
         )
     return request
 
@@ -730,6 +743,9 @@ class Symmetrix(Calculator):
     jit_forward_policy, jit_source_policy : dict or None
         Canonical generated MH-1 CUDA partition plans. These remain ``None``
         unless the corresponding plugin compiled and loaded successfully.
+    jit_dense_policy : str or None
+        Active MH-1 CUDA dense-operation policy. This remains ``None`` unless
+        an MH-1 CUDA module compiled and loaded successfully.
     jit_node_state_policy : str or None
         Active generated MH-1 node-state policy. This remains ``None`` unless
         an MH-1 CUDA or HIP module compiled and loaded successfully.
@@ -1148,6 +1164,7 @@ class Symmetrix(Calculator):
         self.jit_forward_policy = None
         self.jit_source_policy = None
         self.jit_edge_policy = None
+        self.jit_dense_policy = None
         self.jit_node_state_policy = None
         self.jit_variant_id = None
         self.jit_operator_modules = {}
@@ -2311,6 +2328,7 @@ class Symmetrix(Calculator):
         selected_forward_policy = None
         selected_source_policy = None
         selected_edge_policy = None
+        selected_dense_policy = None
         selected_node_state_policy = None
         selected_variant_id = None
         mh1_v3_contract = None
@@ -2699,6 +2717,7 @@ class Symmetrix(Calculator):
                     edge_policy = edge_policy_function(
                         mh1_v3_contract, compute_capability, "auto"
                     )
+                    dense_policy = _mh1_dense_policy_request()
                     metadata = metadata_function(
                         contract,
                         compute_capability,
@@ -2724,10 +2743,12 @@ class Symmetrix(Calculator):
                         edge_policy=edge_policy,
                         node_state_policy=self.execution_mh1_node_state_policy,
                         precision=dtype,
+                        dense_policy=dense_policy,
                     )
                     selected_forward_policy = forward_policy
                     selected_source_policy = source_policy
                     selected_edge_policy = edge_policy
+                    selected_dense_policy = dense_policy
                     selected_node_state_policy = metadata["node_state_policy"]
                     selected_variant_id = (
                         f"{metadata['artifact_id']}-fwd-"
@@ -2737,6 +2758,7 @@ class Symmetrix(Calculator):
                         "-edge-"
                         f"{edge_policy['policy_id'].removeprefix('sha256:')[:12]}"
                         f"-node-{metadata['node_state_policy']}"
+                        f"-dense-{dense_policy}"
                     )
                     generator = "symmetrix.jit.mh1-cuda-module-v1"
                     artifact_name = "execution_mh1_cuda_module"
@@ -3163,6 +3185,7 @@ class Symmetrix(Calculator):
             self.jit_forward_policy = selected_forward_policy
             self.jit_source_policy = selected_source_policy
             self.jit_edge_policy = selected_edge_policy
+            self.jit_dense_policy = selected_dense_policy
             self.jit_node_state_policy = selected_node_state_policy
             self.jit_variant_id = selected_variant_id
             if specialization == "mh1" and product_requests is not None:

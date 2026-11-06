@@ -501,8 +501,8 @@ def _configure_mh1_product_route(calculator, route):
         isinstance(abi, dict)
         and abi.get("version") == 5
         and generation == 19
-        and original_plan.get("schema") == "symmetrix.jit.mh1.cuda-launch-plan/6"
-        and original_plan.get("version") == 6
+        and original_plan.get("schema") == "symmetrix.jit.mh1.cuda-launch-plan/7"
+        and original_plan.get("version") == 7
         and original_plan.get("split_phase_composition") is True
     ):
         raise RuntimeError(

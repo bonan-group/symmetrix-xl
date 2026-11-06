@@ -695,8 +695,8 @@ private:
     struct ExecutionMH1NodeRuntime {
         static constexpr int capacity_tile_rows=256;
         static constexpr int cuda_throughput_tile_rows=1024;
-        Kokkos::View<Precision*> linear_parameters,product_parameters,
-            readout_parameters;
+        Kokkos::View<Precision*> linear_parameters,vendor_dense_parameters,
+            product_parameters,readout_parameters;
         Kokkos::View<Precision**,Kokkos::LayoutRight> arena,residual,
             linear_1_output,pre_gate,gated,interaction_output,
             interaction_adjoint,contraction_output,contraction_adjoint,
@@ -709,6 +709,7 @@ private:
         bool reuse_message_adjoint=false;
         std::size_t bytes() const {
             return sizeof(Precision)*(linear_parameters.size()
+                +vendor_dense_parameters.size()
                 +product_parameters.size()+readout_parameters.size()
                 +arena.size()+residual.size()+linear_1_output.size()
                 +pre_gate.size()+gated.size()+interaction_output.size()

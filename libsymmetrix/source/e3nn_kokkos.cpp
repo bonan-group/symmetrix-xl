@@ -327,6 +327,34 @@ std::vector<Precision> E3LinearKokkosT<Precision>::runtime_parameters_ir_mul() c
 }
 
 template<typename Precision>
+std::vector<Precision> E3LinearKokkosT<Precision>::runtime_effective_weights() const
+{
+    if(bias.size()!=0)
+        return {};
+    const auto host_weights=Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(),weights);
+    const auto host_mask=Kokkos::create_mirror_view_and_copy(
+        Kokkos::HostSpace(),output_mask);
+    std::vector<Precision> result(host_weights.data(),
+        host_weights.data()+host_weights.size());
+    for(const auto& instruction:instructions) {
+        for(int source=0;source<instruction.input_multiplicity;++source)
+            for(int target=0;target<instruction.output_multiplicity;++target) {
+                const auto weight_index=instruction.weight_offset
+                    +source*instruction.output_multiplicity+target;
+                const auto mask_index=instruction.output_offset
+                    +target*instruction.width;
+                for(int component=1;component<instruction.width;++component)
+                    if(host_mask(mask_index+component)!=host_mask(mask_index))
+                        return {};
+                result.at(weight_index)=instruction.path_weight
+                    *host_weights(weight_index)*host_mask(mask_index);
+            }
+    }
+    return result;
+}
+
+template<typename Precision>
 bool E3LinearKokkosT<Precision>::has_instruction_width(const int width) const
 {
     return std::any_of(

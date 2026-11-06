@@ -310,6 +310,8 @@ def test_the_mh1_stage_description_is_family_owned_data():
     assert "layer_count" in stage
     assert "canonical" in stage
     assert "symmetrix/mh1/" in stage
+    assert 'name += "+A"' in stage
+    assert 'name += "+H"' in stage
     assert not (SOURCE_ROOT / MH1_RETIRED_STAGE_HEADER).exists()
     for name in (*MH1_OWNERS, MH1_IMPL, MH1_STAGE_HEADER):
         assert MH1_RETIRED_STAGE_HEADER not in (SOURCE_ROOT / name).read_text(), name

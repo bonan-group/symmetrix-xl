@@ -57,6 +57,7 @@ public:
         return all_input_blocks_covered_&&active_output_mask_is_identity_;
     }
     std::vector<Precision> runtime_parameters_ir_mul() const;
+    std::vector<Precision> runtime_effective_weights() const;
     bool has_instruction_width(int width) const;
     bool supports_identity_replacement(int width) const;
     bool supports_scalar_dense_plan() const;
