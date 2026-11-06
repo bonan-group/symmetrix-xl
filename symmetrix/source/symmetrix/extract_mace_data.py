@@ -724,12 +724,17 @@ def _validate_metatrain_energy_metadata(
 def _restore_metatrain_mace_model(
     model, device, *, dataset_info=None, capabilities=None
 ):
-    core = getattr(model, "core", None)
+    core = getattr(model, "core", model)
     mace_model = getattr(core, "mace_model", None)
     if not isinstance(mace_model, torch.nn.Module):
         raise RuntimeError(
             "The metatrain model does not contain a supported MACE module."
         )
+
+    if dataset_info is None and capabilities is None:
+        dataset_info = getattr(model, "dataset_info", None)
+        if dataset_info is None:
+            dataset_info = getattr(core, "dataset_info", None)
 
     hypers = getattr(core, "hypers", {})
     target = hypers.get("mace_head_target") if hasattr(hypers, "get") else None

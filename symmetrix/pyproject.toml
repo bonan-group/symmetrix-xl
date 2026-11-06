@@ -84,7 +84,7 @@ neighbors = [
 ]
 metatrain = [
     "torch>=2.5",
-    "metatrain[mace]>=0.1.dev1,<0.2",
+    "metatrain[mace]>=2026.4,<2027",
 ]
 # Deprecated compatibility extra. Native D2/D3 support is included in every
 # installation and has no additional Python dependency.

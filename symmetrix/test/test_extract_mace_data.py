@@ -381,6 +381,83 @@ def test_metatomic_export_uses_metatrain_export_loader(monkeypatch, tmp_path):
     assert _load_mace_checkpoint(model_path, "cpu") is restored
 
 
+def _assert_model_data_close(expected, actual, path="model"):
+    if isinstance(expected, dict):
+        assert actual.keys() == expected.keys(), path
+        for key in expected:
+            _assert_model_data_close(expected[key], actual[key], f"{path}.{key}")
+    elif isinstance(expected, list):
+        assert len(actual) == len(expected), path
+        for index, (expected_item, actual_item) in enumerate(zip(expected, actual)):
+            _assert_model_data_close(expected_item, actual_item, f"{path}[{index}]")
+    elif isinstance(expected, (int, float)) and not isinstance(expected, bool):
+        assert actual == pytest.approx(expected, rel=1e-6, abs=1e-7), path
+    else:
+        assert actual == expected, path
+
+
+def test_metatrain_native_checkpoint_and_export_round_trip(tmp_path, monkeypatch):
+    o3 = pytest.importorskip("e3nn.o3")
+    modules = pytest.importorskip("mace.modules")
+    loader = pytest.importorskip("metatrain.experimental.mace.utils._load_model_file")
+
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        with torch.random.fork_rng():
+            torch.manual_seed(123)
+            native_model = modules.ScaleShiftMACE(
+                r_max=3.5,
+                num_bessel=4,
+                num_polynomial_cutoff=3,
+                max_ell=3,
+                interaction_cls=modules.interaction_classes[
+                    "RealAgnosticResidualInteractionBlock"
+                ],
+                interaction_cls_first=modules.interaction_classes[
+                    "RealAgnosticInteractionBlock"
+                ],
+                num_interactions=2,
+                num_elements=2,
+                hidden_irreps=o3.Irreps("4x0e + 4x1o"),
+                MLP_irreps=o3.Irreps("3x0e"),
+                atomic_energies=np.array([-1.2, -2.3]),
+                avg_num_neighbors=3.0,
+                atomic_numbers=[1, 8],
+                correlation=3,
+                gate=modules.gate_dict["silu"],
+                pair_repulsion=False,
+                distance_transform="None",
+                radial_type="bessel",
+                atomic_inter_scale=1.3,
+                atomic_inter_shift=0.0,
+            ).to(torch.float64)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+    native_model.eval()
+    native_path = tmp_path / "native.model"
+    checkpoint_path = tmp_path / "metatrain.ckpt"
+    export_path = tmp_path / "metatrain.pt"
+    torch.save(native_model, native_path)
+
+    monkeypatch.chdir(tmp_path)
+    metatrain_model = loader.load_mace_model_file(
+        native_path, "energy", torch.device("cpu")
+    )
+    torch.save(metatrain_model.get_checkpoint(), checkpoint_path)
+    metatrain_model.export().save(str(export_path))
+
+    native_data = extract_mace_data(native_path, species=[1, 8], num_spline_points=4)
+    checkpoint_data = extract_mace_data(
+        checkpoint_path, species=[1, 8], num_spline_points=4
+    )
+    export_data = extract_mace_data(export_path, species=[1, 8], num_spline_points=4)
+
+    _assert_model_data_close(native_data, checkpoint_data, "checkpoint")
+    _assert_model_data_close(native_data, export_data, "export")
+
+
 def test_scripted_readout_activation_uses_module_children():
     activation = SimpleNamespace(code="return torch.silu(x)")
     readout = SimpleNamespace(
@@ -580,6 +657,36 @@ def test_restore_metatrain_mace_scale_and_atomic_baseline():
     assert restored.scale_shift.scale.item() == pytest.approx(2.5)
     assert restored.scale_shift.shift.item() == pytest.approx(0.0)
     assert mace_model.atomic_energies_fn.atomic_energies.tolist() == [0.0, 0.0]
+
+
+def test_restore_metatrain_accepts_direct_legacy_model():
+    class AtomicEnergies(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("atomic_energies", torch.zeros(2))
+
+    class MaceModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.atomic_energies_fn = AtomicEnergies()
+            self.atomic_numbers = torch.tensor([1, 8])
+            self.heads = ["default"]
+
+    metatrain_model = SimpleNamespace(
+        mace_model=MaceModel(),
+        mace_head_index=0,
+        hypers={"mace_head_target": "energy"},
+        dataset_info=_metatrain_dataset_info(),
+        scaler=None,
+        additive_models=[],
+    )
+
+    restored = extract_mace_data_module._restore_metatrain_mace_model(
+        metatrain_model, torch.device("cpu")
+    )
+
+    assert restored.atomic_numbers.tolist() == [1, 8]
+    assert restored.scale_shift.scale.item() == pytest.approx(1.0)
 
 
 def test_remove_prediction_head_restores_default_dtype(monkeypatch):
