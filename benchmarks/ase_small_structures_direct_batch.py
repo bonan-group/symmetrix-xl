@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import gc
 import glob
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -66,10 +67,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--timestep-fs", type=float, default=2.0)
     parser.add_argument("--friction-per-fs", type=float, default=0.01)
     parser.add_argument(
+        "--fix-center-of-mass",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Match ASE Langevin's fixcm policy in the qualification dynamics.",
+    )
+    parser.add_argument(
         "--max-displacement",
         type=float,
         default=0.05,
-        help="Per-atom displacement guard in Angstrom for unstable seed frames.",
+        help="Per-atom guard used only by restrained-langevin smoke dynamics.",
     )
     parser.add_argument("--thermal-displacement-rms", type=float, default=0.01)
     parser.add_argument("--position-rms", type=float, default=0.15)
@@ -117,6 +124,14 @@ def _metric(evaluator, name: str) -> int:
     return int(getattr(evaluator, name, 0))
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _load_structures(
     paths: list[Path], pattern: str | None, tasks: int, frame_index: int
 ):
@@ -138,7 +153,7 @@ def _langevin_begin(
     timestep_fs,
     temperature,
     friction_per_fs,
-    max_displacement,
+    fix_center_of_mass,
 ):
     timestep = float(timestep_fs) * units.fs
     friction = float(friction_per_fs) / units.fs
@@ -159,19 +174,21 @@ def _langevin_begin(
         eta = rng.standard_normal(size=atoms.positions.shape)
         random_position = c5 * eta
         random_velocity = c3 * xi - c4 * eta
+        if fix_center_of_mass:
+            atom_count = len(atoms)
+            factor = np.sqrt(atom_count / (atom_count - 1.0))
+            random_position -= random_position.sum(axis=0) / atom_count
+            random_velocity -= (random_velocity * masses).sum(axis=0) / (
+                masses * atom_count
+            )
+            random_position *= factor
+            random_velocity *= factor
         velocities = atoms.get_velocities()
         velocities += c1 * force / masses - c2 * velocities + random_velocity
         displacement = timestep * velocities + random_position
-        displacement_norm = np.linalg.norm(displacement, axis=1)
-        limited = displacement_norm > float(max_displacement)
-        if np.any(limited):
-            displacement[limited] *= (
-                float(max_displacement) / displacement_norm[limited]
-            )[:, None]
-            velocities[limited] = (
-                displacement[limited] - random_position[limited]
-            ) / timestep
+        old_positions = atoms.positions.copy()
         atoms.positions += displacement
+        velocities = (atoms.positions - old_positions - random_position) / timestep
         atoms.set_velocities(velocities)
         states.append((masses, c1, c2, random_velocity))
     return states
@@ -239,7 +256,7 @@ def run(args: argparse.Namespace) -> dict:
     from atombatch.backends.base import SOURCE_KEY, Source
     from atombatch.backends.symmetrix import GraphBatcher
 
-    from symmetrix import Symmetrix
+    from symmetrix import Symmetrix, load_backend
 
     if args.cell_strain_amplitude < 0.0:
         raise SystemExit("--cell-strain-amplitude must be non-negative")
@@ -247,10 +264,20 @@ def run(args: argparse.Namespace) -> dict:
         raise SystemExit("--cell-strain-amplitude requires --stress")
     if args.cell_strain_period <= 0:
         raise SystemExit("--cell-strain-period must be positive")
+    if args.tasks <= 0 or args.steps <= 0 or args.warmup < 0:
+        raise SystemExit(
+            "--tasks and --steps must be positive; --warmup cannot be negative"
+        )
 
     structures = _load_structures(
         args.structures, args.structure_glob, args.tasks, args.frame_index
     )
+    if args.dynamics == "ase-langevin" and any(
+        atoms.constraints for atoms in structures
+    ):
+        raise SystemExit(
+            "ase-langevin qualification does not support constrained structures"
+        )
     sources = [Source() for _ in structures]
     for atoms, source in zip(structures, sources):
         atoms.info[SOURCE_KEY] = source
@@ -336,7 +363,7 @@ def run(args: argparse.Namespace) -> dict:
                 args.timestep_fs,
                 args.temperature,
                 args.friction_per_fs,
-                args.max_displacement,
+                args.fix_center_of_mass,
             )
         else:
             _restrained_langevin_step(
@@ -399,7 +426,7 @@ def run(args: argparse.Namespace) -> dict:
                 args.timestep_fs,
                 args.temperature,
                 args.friction_per_fs,
-                args.max_displacement,
+                args.fix_center_of_mass,
             )
         else:
             _restrained_langevin_step(
@@ -443,8 +470,42 @@ def run(args: argparse.Namespace) -> dict:
         )
     }
     atom_count = sum(len(atoms) for atoms in structures)
+    native = load_backend()
+    extension_path = Path(native.__file__).resolve()
+    backend_build_info = getattr(native, "_backend_build_info", dict)()
+    execution_space = getattr(native, "_kokkos_default_execution_space", lambda: None)()
+    properties_record = list(properties)
+    directed_edges = _metric(evaluator, "factorized_schedule_entries")
+    memory_metrics = {
+        name: _metric(evaluator, name)
+        for name in (
+            "factorized_schedule_bytes",
+            "factorized_workspace_bytes",
+            "factorized_arena_workspace_bytes",
+            "factorized_radial_workspace_bytes",
+            "execution_geometry_workspace_bytes",
+            "edge_workspace_bytes",
+            "conditioned_mlp_workspace_bytes",
+            "linear_workspace_bytes",
+            "tensor_workspace_bytes",
+            "product_workspace_bytes",
+            "node_workspace_bytes",
+            "precision_workspace_bytes",
+        )
+        if hasattr(evaluator, name)
+    }
     result = {
         "model": str(args.model),
+        "model_sha256": _sha256(args.model),
+        "precision": "float32",
+        "backend": backend_build_info.get("backend"),
+        "architecture": backend_build_info.get("architecture"),
+        "execution_space": execution_space,
+        "native_extension": str(extension_path),
+        "native_extension_sha256": _sha256(extension_path),
+        "native_build": backend_build_info,
+        "jit_artifact_path": calculator.jit_artifact_path,
+        "jit_artifact_id": calculator.jit_artifact_id,
         "tasks": len(structures),
         "frame_index": args.frame_index,
         "atoms": [len(atoms) for atoms in structures],
@@ -454,17 +515,24 @@ def run(args: argparse.Namespace) -> dict:
         "temperature": args.temperature,
         "timestep_fs": args.timestep_fs,
         "friction_per_fs": args.friction_per_fs,
+        "fix_center_of_mass": args.fix_center_of_mass,
         "max_displacement": args.max_displacement,
         "thermal_displacement_rms": args.thermal_displacement_rms,
         "position_rms": args.position_rms,
         "neighbor_skin": args.neighbor_skin,
+        "cutoff": calculator.cutoff,
+        "effective_joined_cutoff": calculator.cutoff + calculator.joined_neighbor_skin,
+        "directed_edges": directed_edges,
+        "properties": properties_record,
         "stress": args.stress,
         "cell_strain_amplitude": args.cell_strain_amplitude,
         "cell_strain_period": args.cell_strain_period,
         "joined_neighbor_skin": calculator.joined_neighbor_skin,
         "trajectory_neighbor_caches": len(calculator._trajectory_neighbor_caches),
         "elapsed_s": elapsed,
+        "us_per_atom_step": elapsed * 1.0e6 / (atom_count * args.steps),
         "atom_steps_per_s": atom_count * args.steps / elapsed,
+        "memory_bytes": memory_metrics,
         "counters_before": before,
         "counters_after": after,
         "counter_deltas": {name: after[name] - before[name] for name in after},
@@ -527,6 +595,19 @@ def run(args: argparse.Namespace) -> dict:
                 maximum_stress_error if args.stress else None
             ),
         }
+    if result["steps"] != args.steps or result["tasks"] != args.tasks:
+        raise RuntimeError("benchmark result does not match requested work extents")
+    if (
+        result["cutoff"] != calculator.cutoff
+        or result["neighbor_skin"] != args.neighbor_skin
+    ):
+        raise RuntimeError("benchmark result does not match requested neighbor policy")
+    if result["precision"] != "float32" or result["properties"] != properties_record:
+        raise RuntimeError(
+            "benchmark result does not match requested evaluation policy"
+        )
+    if result["directed_edges"] <= 0:
+        raise RuntimeError("benchmark did not prepare a directed-edge schedule")
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + "\n")
     return result

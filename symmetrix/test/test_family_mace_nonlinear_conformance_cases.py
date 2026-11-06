@@ -22,12 +22,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 from ase import Atoms
-from symmetrix import Symmetrix
-
+from ase.stress import full_3x3_to_voigt_6_stress
 from conformance.contract import (
-    Adapter,
     CXX_RUNNER,
     FLOAT32_RUNNER,
+    Adapter,
     Graph,
     Unqualified,
     native_symmetrix,
@@ -39,6 +38,7 @@ from conformance.registry import (
     register_family,
 )
 from conformance.surface import _assert_interface_surface, _native
+from symmetrix import Symmetrix
 
 # MH-1's device tier needs a device generated module, not merely a device build:
 # the staged host ABI has no device counterpart, so the requirement names NVRTC.
@@ -344,3 +344,110 @@ def test_mh1_evaluator_satisfies_the_family_interface(tmp_path):
         "readout",
         "pair_energy",
     }
+
+
+def test_mh1_joined_segment_geometry_matches_direct_cell_update(tmp_path):
+    """The MH-1 joined path reuses one graph across a cell update."""
+
+    native = _native()
+    if not hasattr(native, "MACENonlinearKokkos"):
+        pytest.skip("MACENonlinearKokkos is unavailable in this extension")
+
+    model_path = _mh1_model_path(tmp_path)
+    calculator = Symmetrix(
+        str(model_path),
+        dtype="float32",
+        streamed_edges="direct",
+        execution_profile="speed",
+        neighbor_skin=0.5,
+    )
+    first = _mh1_structure()
+    second = _mh1_structure()
+    second.positions += np.array(
+        [
+            [0.01, -0.02, 0.015],
+            [0.0, 0.01, -0.01],
+            [-0.01, 0.0, 0.02],
+            [0.02, -0.01, 0.0],
+        ]
+    )
+
+    def evaluate_group():
+        calculator._pending_explicit_segments = []
+        calculator._mace_inputs(
+            first, native_geometry=True, allow_device_neighbor_graph=False
+        )
+        calculator._mace_inputs(
+            second, native_geometry=True, allow_device_neighbor_graph=False
+        )
+        segments = calculator._pending_explicit_segments
+        assert len(segments) == 2
+        node_types = np.concatenate([segment.node_types for segment in segments])
+        distances = np.full(
+            sum(len(segment.shifts) for segment in segments),
+            calculator.cutoff,
+            dtype=float,
+        )
+        generation = calculator._compute_explicit_segment_group(
+            segments,
+            np.ascontiguousarray(node_types, dtype=np.int32),
+            distances,
+            calculator._resolved_family_entry(),
+            calculator.evaluator._prepare_factorized_graph,
+        )
+        energies = np.asarray(calculator.evaluator.node_energies, dtype=float)
+        identities = calculator._explicit_segment_group_cache.edge_identities
+        receivers = np.concatenate([item[:, 0] for item in identities]).astype(np.int32)
+        sources = np.concatenate([item[:, 1] for item in identities]).astype(np.int32)
+        forces = np.asarray(
+            calculator.evaluator._reduce_atom_forces(
+                len(node_types), receivers, sources, generation
+            ),
+            dtype=float,
+        ).reshape(-1, 3)
+        edge_counts = [len(item) for item in identities]
+        edge_offsets = np.concatenate(([0], np.cumsum(edge_counts, dtype=np.int64)))
+        volumes = np.asarray([first.get_volume(), second.get_volume()], dtype=float)
+        stress = np.asarray(
+            calculator.evaluator._reduce_segmented_stress(
+                volumes,
+                edge_offsets,
+                np.zeros(3 * edge_offsets[-1], dtype=float),
+            ),
+            dtype=float,
+        ).reshape(2, 3, 3)
+        stress = np.stack([full_3x3_to_voigt_6_stress(tensor) for tensor in stress])
+        return generation, energies.copy(), forces.copy(), stress
+
+    first_generation, _, _, _ = evaluate_group()
+    first_schedule_builds = calculator.evaluator.factorized_schedule_build_count
+    second.set_cell(second.cell * 1.01, scale_atoms=False)
+    second_generation, energies, forces, stress = evaluate_group()
+
+    assert second_generation == first_generation
+    assert calculator.evaluator.factorized_schedule_build_count == first_schedule_builds
+    expected = []
+    for atoms in (first, second):
+        direct = Symmetrix(
+            str(model_path),
+            dtype="float32",
+            streamed_edges="direct",
+            execution_profile="speed",
+            neighbor_skin=0.5,
+        )
+        candidate = atoms.copy()
+        candidate.calc = direct
+        expected.append(
+            (
+                float(candidate.get_potential_energy()),
+                np.asarray(candidate.get_forces()),
+                np.asarray(candidate.get_stress()),
+            )
+        )
+
+    np.testing.assert_allclose(energies[:4].sum(), expected[0][0], rtol=0.0, atol=3e-5)
+    np.testing.assert_allclose(energies[4:].sum(), expected[1][0], rtol=0.0, atol=3e-5)
+    np.testing.assert_allclose(forces[:4], expected[0][1], rtol=0.0, atol=3e-5)
+    np.testing.assert_allclose(forces[4:], expected[1][1], rtol=0.0, atol=3e-5)
+    np.testing.assert_allclose(stress[0], expected[0][2], rtol=0.0, atol=3e-5)
+    np.testing.assert_allclose(stress[1], expected[1][2], rtol=0.0, atol=3e-5)

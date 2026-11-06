@@ -293,6 +293,14 @@ public:
         std::span<const double> cell,
         std::span<const double> inverse_cell,
         std::span<const int> pbc);
+    void prepare_factorized_segment_geometry(
+        std::uint64_t graph_generation,
+        std::span<const double> reference_positions,
+        std::span<const int> edge_shifts,
+        std::span<const double> cells);
+    void update_factorized_segment_cells(
+        std::uint64_t graph_generation,
+        std::span<const double> cells);
     // Replace an explicit graph and its geometry as one published state.  The
     // predecessor's Kokkos handles remain alive until both candidate stages
     // succeed, so a failed replacement never requires an O(E) host rollback.
@@ -769,6 +777,7 @@ private:
     std::uint64_t factorized_graph_generation_counter=0;
     std::uint64_t factorized_prepared_graph_generation=0;
     std::uint64_t factorized_prepared_geometry_graph_generation=0;
+    bool factorized_prepared_geometry_segmented=false;
     bool factorized_geometry_prepare_failure_armed_=false;
     std::uint64_t factorized_completed_evaluation_graph_generation=0;
     std::size_t factorized_prepared_graphs=0;
@@ -1048,6 +1057,8 @@ private:
         execution_prepared_geometry_invalid;
     Kokkos::View<std::int64_t*> execution_prepared_batch_edge_offsets;
     Kokkos::View<double*> execution_prepared_batch_volumes;
+    Kokkos::View<int*> execution_prepared_batch_edge_shifts;
+    Kokkos::View<double*> execution_prepared_batch_cells;
     Kokkos::View<int*> execution_block_source_segments,
         execution_source_edge_offsets,execution_source_edges,
         execution_block_receivers,execution_graph_source_edge_offsets,

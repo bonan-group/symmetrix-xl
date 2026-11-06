@@ -215,12 +215,14 @@ that built the current cached graph.
 
 Source-keyed joined direct batches, such as atombatch trajectories, keep one
 neighbor cache per source and combine their candidate graphs into one prepared
-segment group. `joined_neighbor_skin=None` uses at least 1 Angstrom of topology
-reserve for this path while leaving ordinary single-structure calculations at
+segment group for standard MACE and nonlinear MH-1 models.
+`joined_neighbor_skin=None` uses at least 1 Angstrom of topology reserve for
+this path while leaving ordinary single-structure calculations at
 `neighbor_skin`; an explicit value must be at least `neighbor_skin`. The wider
 candidate graph does not change the model cutoff. After the group is prepared,
 only positions are streamed and edge geometry is updated on the device. Host
-geometry is materialized on demand for stress or an explicit-geometry fallback.
+geometry is materialized only for an explicit-geometry fallback; segmented
+force and stress reductions remain on the selected native execution space.
 
 Both frontends build their host graph through one neutral builder,
 `symmetrix/source/symmetrix/neighbor_graph.py`, so the matscipy fast path, the

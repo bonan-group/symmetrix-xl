@@ -2829,8 +2829,12 @@ void MACEKokkos<Precision>::prepare_factorized_segment_geometry(
             "Segment geometry requires current graph and batch tokens.");
     const std::size_t num_nodes = execution_prepared_node_types.extent(0);
     const std::size_t num_edges = execution_prepared_neigh_indices.extent(0);
-    const std::size_t graph_count =
-        execution_prepared_batch_edge_offsets.extent(0)-1;
+    const std::size_t batch_offset_count =
+        execution_prepared_batch_edge_offsets.extent(0);
+    if (batch_offset_count < 2)
+        throw std::invalid_argument(
+            "Segment geometry requires prepared batch edge offsets.");
+    const std::size_t graph_count = batch_offset_count-1;
     if (reference_positions.size() != 3*num_nodes
         || edge_shifts.size() != 3*num_edges
         || cells.size() != 9*graph_count)

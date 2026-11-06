@@ -751,6 +751,27 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
             py::arg("graph_generation"),py::arg("reference_positions"),
             py::arg("reference_xyz"),py::arg("cell"),
             py::arg("inverse_cell"),py::arg("pbc"))
+        .def("_prepare_factorized_segment_geometry",
+            [] (Evaluator& self,const std::uint64_t graph_generation,
+                    DoubleArray reference_positions,IntArray edge_shifts,
+                    DoubleArray cells) {
+                self.prepare_factorized_segment_geometry(
+                    graph_generation,
+                    std::span<const double>(
+                        reference_positions.data(),reference_positions.size()),
+                    std::span<const int>(edge_shifts.data(),edge_shifts.size()),
+                    std::span<const double>(cells.data(),cells.size()));
+            },
+            py::arg("graph_generation"),py::arg("reference_positions"),
+            py::arg("edge_shifts"),py::arg("cells"))
+        .def("_update_factorized_segment_cells",
+            [] (Evaluator& self,const std::uint64_t graph_generation,
+                    DoubleArray cells) {
+                self.update_factorized_segment_cells(
+                    graph_generation,
+                    std::span<const double>(cells.data(),cells.size()));
+            },
+            py::arg("graph_generation"),py::arg("cells"))
         .def("_arm_factorized_geometry_prepare_failure",
             &Evaluator::arm_factorized_geometry_prepare_failure_for_testing,
             "Inject one failure after staged geometry initialization but "
