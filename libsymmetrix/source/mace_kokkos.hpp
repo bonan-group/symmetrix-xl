@@ -554,6 +554,18 @@ void prepare_factorized_geometry(
     std::span<const double> cell,
     std::span<const double> inverse_cell,
     std::span<const int> pbc);
+void update_factorized_reference_geometry(
+    std::uint64_t graph_generation,
+    std::span<const double> reference_positions,
+    std::span<const double> reference_xyz);
+void prepare_factorized_segment_geometry(
+    std::uint64_t graph_generation,
+    std::span<const double> reference_positions,
+    std::span<const int> edge_shifts,
+    std::span<const double> cells);
+void update_factorized_segment_cells(
+    std::uint64_t graph_generation,
+    std::span<const double> cells);
 void prepare_factorized_shift_geometry(
     std::uint64_t graph_generation,
     std::span<const double> reference_positions,
@@ -841,6 +853,12 @@ void reduce_prepared_node_forces(std::uint64_t graph_generation);
 void reduce_prepared_all_interactions_node_forces(std::uint64_t graph_generation);
 void reduce_stress(double volume, Kokkos::View<const double*> xyz);
 void reduce_prepared_stress(double volume, std::uint64_t graph_generation);
+void prepare_factorized_batch(
+    std::uint64_t graph_generation,
+    std::span<const std::int64_t> edge_offsets);
+void reduce_prepared_batched_stress(
+    std::span<const double> volumes,
+    std::uint64_t graph_generation);
 void reduce_prepared_all_interactions_stress(
     double volume,
     std::uint64_t graph_generation);
@@ -1431,6 +1449,10 @@ Kokkos::View<double*,Kokkos::HostSpace> execution_prepared_inverse_cell_host;
 Kokkos::View<int*> execution_prepared_pbc;
 Kokkos::View<int*> execution_prepared_geometry_invalid;
 Kokkos::View<double*> execution_prepared_electric_field;
+Kokkos::View<std::int64_t*> execution_prepared_batch_edge_offsets;
+Kokkos::View<double*> execution_prepared_batch_volumes;
+Kokkos::View<int*> execution_prepared_batch_edge_shifts;
+Kokkos::View<double*> execution_prepared_batch_cells;
 int execution_geometry_capacity_edges = 0;
 int execution_geometry_planned_capacity_edges = 0;
 std::string execution_geometry_growth_reason = "geometric growth";
@@ -1493,6 +1515,7 @@ bool low_memory_device_memory_info_override = false;
 EdgeGeometryPolicy edge_geometry_policy = EdgeGeometryPolicy::cartesian_f64;
 bool compact_edge_geometry_active = false;
 bool factorized_prepared_geometry_uses_shifts = false;
+bool factorized_prepared_geometry_segmented = false;
 bool use_compact_edge_geometry() const;
 bool use_y_only_direct_harmonics() const;
 std::string y_only_direct_harmonics_admission_reason() const;
@@ -1530,6 +1553,7 @@ std::vector<int> execution_prepared_feature_types_host;
 std::vector<int> execution_prepared_num_neigh_host;
 std::vector<int> execution_prepared_neigh_indices_host;
 std::vector<int> execution_prepared_neigh_types_host;
+std::vector<std::int64_t> execution_prepared_batch_edge_offsets_host;
 std::vector<int> execution_receiver_offsets_host;
 std::vector<int> execution_chunk_edge_offsets_host;
 int execution_schedule_num_nodes = 0;
@@ -1556,6 +1580,7 @@ bool factorized_schedule_dirty = true;
 std::uint64_t factorized_graph_generation_counter = 0;
 std::uint64_t factorized_prepared_graph_generation = 0;
 std::uint64_t factorized_prepared_geometry_graph_generation = 0;
+std::uint64_t factorized_prepared_batch_graph_generation = 0;
 std::size_t factorized_prepared_graph_count = 0;
 std::size_t factorized_graph_device_replacement_count = 0;
 std::size_t factorized_graph_device_update_count = 0;

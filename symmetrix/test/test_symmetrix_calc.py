@@ -489,6 +489,130 @@ def test_explicit_segment_group_rebuilds_only_when_ignored_edge_activates(
     assert evaluator.position_calls == 4
 
 
+def test_explicit_segment_group_rebinds_cell_geometry_for_stress(monkeypatch):
+    class Evaluator:
+        factorized_graph_generation = 0
+
+        def __init__(self):
+            self.prepare_calls = 0
+            self.geometry_calls = []
+            self.geometry_update_calls = []
+            self.segment_geometry_calls = []
+            self.segment_cell_calls = []
+            self.position_calls = 0
+            self.batch_calls = []
+
+        def prepare_graph(self, *_args):
+            self.prepare_calls += 1
+            self.factorized_graph_generation += 1
+            return self.factorized_graph_generation
+
+        def prepare_geometry(self, generation, _positions, xyz, *_args):
+            self.geometry_calls.append((generation, np.array(xyz, copy=True)))
+
+        def _update_factorized_reference_geometry(self, generation, _positions, xyz):
+            self.geometry_update_calls.append((generation, np.array(xyz, copy=True)))
+
+        def _prepare_factorized_segment_geometry(
+            self, generation, positions, shifts, cells
+        ):
+            self.segment_geometry_calls.append(
+                (
+                    generation,
+                    np.array(positions, copy=True),
+                    np.array(shifts, copy=True),
+                    np.array(cells, copy=True),
+                )
+            )
+
+        def _update_factorized_segment_cells(self, generation, cells):
+            self.segment_cell_calls.append((generation, np.array(cells, copy=True)))
+
+        def compute_positions(self, *_args):
+            self.position_calls += 1
+
+        def _prepare_factorized_batch(self, generation, edge_offsets):
+            self.batch_calls.append((generation, np.array(edge_offsets, copy=True)))
+
+        def _reduce_segmented_stress(self, *_args):
+            raise AssertionError("the evaluator reduction is not called here")
+
+    evaluator = Evaluator()
+
+    def require_surface(_family, _evaluator, surface):
+        return {
+            "prepared_geometry": (evaluator.prepare_geometry,),
+            "prepared_positions": (evaluator.compute_positions,),
+        }[surface]
+
+    monkeypatch.setattr(
+        calculator_module.family_registry, "require_surface", require_surface
+    )
+    calculator = object.__new__(Symmetrix)
+    calculator.evaluator = evaluator
+    calculator.cutoff = 3.0
+    calculator._explicit_segment_group_cache = None
+    calculator._last_kernel_launch_properties = ("energy", "forces", "stress")
+    segment_type = calculator_module._PendingExplicitSegment
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+    def make_segments(first_cell_length):
+        cells = (
+            np.diag([first_cell_length, 4.0, 4.0]),
+            np.diag([5.0, 5.0, 5.0]),
+        )
+        return [
+            segment_type(
+                positions=positions,
+                cell=cell,
+                node_types=np.array([0, 0], dtype=np.int32),
+                receivers=np.array([0], dtype=np.int32),
+                sources=np.array([1], dtype=np.int32),
+                shifts=np.array([[-1, 0, 0]], dtype=np.int32),
+                cache_generation=1,
+                source_key=("source", index),
+            )
+            for index, cell in enumerate(cells)
+        ]
+
+    node_types = np.zeros(4, dtype=np.int32)
+    family = object()
+    first = calculator._compute_explicit_segment_group(
+        make_segments(4.0),
+        node_types,
+        np.array([3.0, 4.0]),
+        family,
+        evaluator.prepare_graph,
+    )
+    second = calculator._compute_explicit_segment_group(
+        make_segments(4.2),
+        node_types,
+        np.array([3.2, 4.0]),
+        family,
+        evaluator.prepare_graph,
+    )
+
+    assert first == second == 1
+    assert evaluator.prepare_calls == 1
+    assert evaluator.position_calls == 2
+    assert evaluator.geometry_calls == []
+    assert evaluator.geometry_update_calls == []
+    assert len(evaluator.segment_geometry_calls) == 1
+    assert len(evaluator.segment_cell_calls) == 1
+    assert len(evaluator.batch_calls) == 1
+    assert evaluator.batch_calls[0][0] == 1
+    np.testing.assert_array_equal(
+        evaluator.batch_calls[0][1], np.array([0, 1, 2], dtype=np.int64)
+    )
+    np.testing.assert_array_equal(
+        evaluator.segment_geometry_calls[0][2],
+        np.array([-1, 0, 0, -1, 0, 0], dtype=np.int32),
+    )
+    prepared_cells = evaluator.segment_geometry_calls[0][3].reshape(2, 3, 3)
+    updated_cells = evaluator.segment_cell_calls[0][1].reshape(2, 3, 3)
+    np.testing.assert_allclose(updated_cells[0, 0, 0] - prepared_cells[0, 0, 0], 0.2)
+
+
 def test_joined_neighbor_caches_are_keyed_by_source_and_defer_geometry():
     class Source:
         pass

@@ -10,6 +10,10 @@ Langevin at 300 K is the qualification workload. The restrained process is
 retained only as a bounded-motion smoke test and must not be used for reported
 throughput results.
 
+``--stress --cell-strain-amplitude`` adds a bounded affine cell oscillation
+that exercises the changing-cell and segmented-stress path used by NPT
+integrators. It is a performance and parity probe, not a pressure barostat.
+
 The v0.2 calculator exports the compatibility hooks required by atombatch
 0.1.x, so no runtime shims are needed. ``atombatch`` is an optional benchmark
 dependency.
@@ -70,6 +74,26 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--thermal-displacement-rms", type=float, default=0.01)
     parser.add_argument("--position-rms", type=float, default=0.15)
     parser.add_argument("--neighbor-skin", type=float, default=0.5)
+    parser.add_argument(
+        "--stress",
+        action="store_true",
+        help="Request per-structure stress from the joined prepared graph.",
+    )
+    parser.add_argument(
+        "--cell-strain-amplitude",
+        type=float,
+        default=0.0,
+        help=(
+            "Peak bounded isotropic strain applied during the run; requires "
+            "--stress and qualifies the changing-cell NPT execution path."
+        ),
+    )
+    parser.add_argument(
+        "--cell-strain-period",
+        type=int,
+        default=200,
+        help="Cell-strain oscillation period in MD steps.",
+    )
     parser.add_argument("--seed", type=int, default=20261105)
     parser.add_argument(
         "--check-parity",
@@ -202,11 +226,27 @@ def _restrained_langevin_step(
         atoms.positions += displacement
 
 
+def _apply_cell_strain(structures, reference_cells, step, amplitude, period):
+    if amplitude == 0.0:
+        return
+    phase = 2.0 * np.pi * float(step) / float(period)
+    scale = float(np.exp(float(amplitude) * np.sin(phase)))
+    for atoms, reference_cell in zip(structures, reference_cells):
+        atoms.set_cell(reference_cell * scale, scale_atoms=True)
+
+
 def run(args: argparse.Namespace) -> dict:
     from atombatch.backends.base import SOURCE_KEY, Source
     from atombatch.backends.symmetrix import GraphBatcher
 
     from symmetrix import Symmetrix
+
+    if args.cell_strain_amplitude < 0.0:
+        raise SystemExit("--cell-strain-amplitude must be non-negative")
+    if args.cell_strain_amplitude > 0.0 and not args.stress:
+        raise SystemExit("--cell-strain-amplitude requires --stress")
+    if args.cell_strain_period <= 0:
+        raise SystemExit("--cell-strain-period must be positive")
 
     structures = _load_structures(
         args.structures, args.structure_glob, args.tasks, args.frame_index
@@ -270,14 +310,24 @@ def run(args: argparse.Namespace) -> dict:
             layer_seconds["compute_mace"] += time.perf_counter() - start
 
     calculator._compute_mace = timed_compute_mace
-    properties = ("energy", "forces")
+    properties = (
+        ("energy", "forces", "stress")
+        if args.stress
+        else (
+            "energy",
+            "forces",
+        )
+    )
     rng = np.random.default_rng(args.seed)
     references = [atoms.positions.copy() for atoms in structures]
+    reference_cells = [
+        np.asarray(atoms.cell, dtype=float).copy() for atoms in structures
+    ]
     if args.dynamics == "ase-langevin":
         _initialize_velocities(structures, args.temperature, rng)
     results = batcher.evaluate(structures, properties)
 
-    for _ in range(args.warmup):
+    for warmup_step in range(1, args.warmup + 1):
         if args.dynamics == "ase-langevin":
             states = _langevin_begin(
                 structures,
@@ -299,6 +349,13 @@ def run(args: argparse.Namespace) -> dict:
                 args.position_rms,
                 args.max_displacement,
             )
+        _apply_cell_strain(
+            structures,
+            reference_cells,
+            warmup_step,
+            args.cell_strain_amplitude,
+            args.cell_strain_period,
+        )
         results = batcher.evaluate(structures, properties)
         if args.dynamics == "ase-langevin":
             _langevin_end(
@@ -332,7 +389,7 @@ def run(args: argparse.Namespace) -> dict:
     evaluation_seconds = 0.0
     md_end_seconds = 0.0
     start = time.perf_counter()
-    for _ in range(args.steps):
+    for timed_step in range(1, args.steps + 1):
         phase_start = time.perf_counter()
         if args.dynamics == "ase-langevin":
             states = _langevin_begin(
@@ -355,6 +412,13 @@ def run(args: argparse.Namespace) -> dict:
                 args.position_rms,
                 args.max_displacement,
             )
+        _apply_cell_strain(
+            structures,
+            reference_cells,
+            args.warmup + timed_step,
+            args.cell_strain_amplitude,
+            args.cell_strain_period,
+        )
         md_begin_seconds += time.perf_counter() - phase_start
         phase_start = time.perf_counter()
         results = batcher.evaluate(structures, properties)
@@ -394,6 +458,9 @@ def run(args: argparse.Namespace) -> dict:
         "thermal_displacement_rms": args.thermal_displacement_rms,
         "position_rms": args.position_rms,
         "neighbor_skin": args.neighbor_skin,
+        "stress": args.stress,
+        "cell_strain_amplitude": args.cell_strain_amplitude,
+        "cell_strain_period": args.cell_strain_period,
         "joined_neighbor_skin": calculator.joined_neighbor_skin,
         "trajectory_neighbor_caches": len(calculator._trajectory_neighbor_caches),
         "elapsed_s": elapsed,
@@ -430,12 +497,14 @@ def run(args: argparse.Namespace) -> dict:
         )
         maximum_energy_error = 0.0
         maximum_force_error = 0.0
+        maximum_stress_error = 0.0
         for atoms, joined in zip(structures, results):
             reference_atoms = atoms.copy()
             reference_atoms.info.pop(SOURCE_KEY, None)
             reference_atoms.calc = reference_calculator
             reference_energy = reference_atoms.get_potential_energy()
             reference_forces = reference_atoms.get_forces()
+            reference_stress = reference_atoms.get_stress() if args.stress else None
             maximum_energy_error = max(
                 maximum_energy_error,
                 abs(float(joined["energy"]) - float(reference_energy)),
@@ -444,9 +513,19 @@ def run(args: argparse.Namespace) -> dict:
                 maximum_force_error,
                 float(np.max(np.abs(np.asarray(joined["forces"]) - reference_forces))),
             )
+            if args.stress:
+                maximum_stress_error = max(
+                    maximum_stress_error,
+                    float(
+                        np.max(np.abs(np.asarray(joined["stress"]) - reference_stress))
+                    ),
+                )
         result["parity"] = {
             "maximum_energy_absolute_error_ev": maximum_energy_error,
             "maximum_force_absolute_error_ev_per_angstrom": maximum_force_error,
+            "maximum_stress_absolute_error_ev_per_angstrom3": (
+                maximum_stress_error if args.stress else None
+            ),
         }
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + "\n")

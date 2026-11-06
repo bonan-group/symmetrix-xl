@@ -834,6 +834,33 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
                 return view2vector(self.stress_tensor);
             },
             py::arg("volumes"),py::arg("graph_generation"))
+        .def("_reduce_segmented_stress",
+            [] (Evaluator& self,DoubleArray volumes,
+                    Int64Array edge_offsets,DoubleArray xyz) {
+                if(edge_offsets.size()!=volumes.size()+1
+                    ||edge_offsets.size()<2||edge_offsets.data()[0]!=0)
+                    throw py::value_error(
+                        "Segmented stress edge offsets are inconsistent.");
+                for(py::ssize_t graph=0;graph+1<edge_offsets.size();++graph)
+                    if(edge_offsets.data()[graph]<0
+                        ||edge_offsets.data()[graph]
+                            >edge_offsets.data()[graph+1])
+                        throw py::value_error(
+                            "Segmented stress edge offsets must be monotonic.");
+                const auto current_edges=
+                    edge_offsets.data()[edge_offsets.size()-1];
+                if(current_edges<0||xyz.size()!=3*current_edges)
+                    throw py::value_error(
+                        "Segmented stress geometry is inconsistent.");
+                self.reduce_prepared_batched_stress(
+                    std::span<const double>(volumes.data(),volumes.size()),
+                    self.factorized_graph_generation());
+                if(self.stress_tensor.size()!=9*volumes.size())
+                    throw py::value_error(
+                        "Segmented stress tensor extent is inconsistent.");
+                return view2vector(self.stress_tensor);
+            },
+            py::arg("volumes"),py::arg("edge_offsets"),py::arg("xyz"))
         .def("compute_node_energies_forces",
             [](Evaluator& self,int num_nodes,IntArray node_types,
                     IntArray num_neigh,IntArray neigh_indices,

@@ -4761,8 +4761,28 @@ class Symmetrix(Calculator):
     ):
         """Evaluate a joined direct batch from one prepared segment group."""
 
-        if len(segments) < 2 or "stress" in getattr(
+        if len(segments) < 2:
+            return None
+        stress_requested = "stress" in getattr(
             self, "_last_kernel_launch_properties", ()
+        )
+        prepare_batch = getattr(self.evaluator, "_prepare_factorized_batch", None)
+        reduce_segmented_stress = getattr(
+            self.evaluator, "_reduce_segmented_stress", None
+        )
+        prepare_segment_geometry = getattr(
+            self.evaluator, "_prepare_factorized_segment_geometry", None
+        )
+        update_segment_cells = getattr(
+            self.evaluator, "_update_factorized_segment_cells", None
+        )
+        native_segment_geometry = (
+            callable(prepare_batch)
+            and callable(prepare_segment_geometry)
+            and callable(update_segment_cells)
+        )
+        if stress_requested and not (
+            callable(prepare_batch) and callable(reduce_segmented_stress)
         ):
             return None
         atom_counts = tuple(len(segment.positions) for segment in segments)
@@ -4792,6 +4812,7 @@ class Symmetrix(Calculator):
             and np.array_equal(cached.node_types, node_types)
         )
         rebuild = not compatible
+        geometry_rebind = rebuild
         if compatible:
             for index, segment in enumerate(segments):
                 cell_changed = not np.array_equal(cached.cells[index], segment.cell)
@@ -4846,8 +4867,9 @@ class Symmetrix(Calculator):
                         cached.edge_identities[index][order]
                     )
                     rebuild = True
+                    geometry_rebind = True
                 if cell_changed:
-                    rebuild = True
+                    geometry_rebind = True
                 cached.segment_generations[index] = segment.cache_generation
                 cached.cells[index] = np.array(segment.cell, copy=True)
         else:
@@ -4874,25 +4896,15 @@ class Symmetrix(Calculator):
         if rebuild:
             receivers = []
             sources = []
-            reference_xyz = []
             node_offset = 0
             for segment, identities in zip(segments, cached.edge_identities):
                 local_receivers = identities[:, 0]
                 local_sources = identities[:, 1]
-                shifts = identities[:, 2:]
                 receivers.append(local_receivers + node_offset)
                 sources.append(local_sources + node_offset)
-                reference_xyz.append(
-                    segment.positions[local_sources]
-                    - segment.positions[local_receivers]
-                    + shifts @ segment.cell
-                )
                 node_offset += len(segment.positions)
             receivers = np.ascontiguousarray(np.concatenate(receivers), dtype=np.int32)
             sources = np.ascontiguousarray(np.concatenate(sources), dtype=np.int32)
-            reference_xyz = np.ascontiguousarray(
-                np.concatenate(reference_xyz), dtype=float
-            )
             num_neigh = np.bincount(receivers, minlength=num_nodes).astype(np.int32)
             cached.generation = prepare_graph(
                 num_nodes,
@@ -4902,19 +4914,81 @@ class Symmetrix(Calculator):
                 np.ascontiguousarray(node_types[sources], dtype=np.int32),
             )
             self._sync_low_memory_policy_state()
+            if callable(prepare_batch):
+                edge_offsets = np.concatenate(
+                    (
+                        np.zeros(1, dtype=np.int64),
+                        np.cumsum(
+                            [len(values) for values in cached.edge_identities],
+                            dtype=np.int64,
+                        ),
+                    )
+                )
+                prepare_batch(cached.generation, edge_offsets)
+            if native_segment_geometry:
+                edge_shifts = np.ascontiguousarray(
+                    np.concatenate(
+                        [values[:, 2:] for values in cached.edge_identities]
+                    ),
+                    dtype=np.int32,
+                )
+                cells = np.ascontiguousarray(
+                    np.concatenate([segment.cell.reshape(-1) for segment in segments]),
+                    dtype=float,
+                )
+                prepare_segment_geometry(
+                    cached.generation,
+                    positions,
+                    edge_shifts.reshape(-1),
+                    cells,
+                )
+                geometry_rebind = False
+            self._explicit_segment_group_cache = cached
+
+        if geometry_rebind and native_segment_geometry:
+            cells = np.ascontiguousarray(
+                np.concatenate([segment.cell.reshape(-1) for segment in segments]),
+                dtype=float,
+            )
+            update_segment_cells(cached.generation, cells)
+            geometry_rebind = False
+
+        if geometry_rebind:
+            reference_xyz = []
+            for segment, identities in zip(segments, cached.edge_identities):
+                local_receivers = identities[:, 0]
+                local_sources = identities[:, 1]
+                shifts = identities[:, 2:]
+                reference_xyz.append(
+                    segment.positions[local_sources]
+                    - segment.positions[local_receivers]
+                    + shifts @ segment.cell
+                )
+            reference_xyz = np.ascontiguousarray(
+                np.concatenate(reference_xyz), dtype=float
+            )
             (prepare_geometry,) = family_registry.require_surface(
                 family, self.evaluator, "prepared_geometry"
             )
-            identity_cell = np.eye(3, dtype=float).reshape(-1)
-            prepare_geometry(
-                cached.generation,
-                positions,
-                reference_xyz.reshape(-1),
-                identity_cell,
-                identity_cell,
-                np.zeros(3, dtype=np.int32),
+            update_reference_geometry = getattr(
+                self.evaluator, "_update_factorized_reference_geometry", None
             )
-            self._explicit_segment_group_cache = cached
+            if not rebuild and callable(update_reference_geometry):
+                update_reference_geometry(
+                    cached.generation,
+                    positions,
+                    reference_xyz.reshape(-1),
+                )
+            else:
+                identity_cell = np.eye(3, dtype=float).reshape(-1)
+                prepare_geometry(
+                    cached.generation,
+                    positions,
+                    reference_xyz.reshape(-1),
+                    identity_cell,
+                    identity_cell,
+                    np.zeros(3, dtype=np.int32),
+                )
 
         (compute_positions,) = family_registry.require_surface(
             family, self.evaluator, "prepared_positions"
@@ -5000,11 +5074,6 @@ class Symmetrix(Calculator):
                 deferred_geometry = any(
                     segment.geometry_deferred for segment in pending_segments
                 )
-                stress_requested = "stress" in getattr(
-                    self, "_last_kernel_launch_properties", ()
-                )
-                if deferred_geometry and stress_requested:
-                    _materialize_segment_geometry(pending_segments, xyz, r, self.cutoff)
                 segment_generation = self._compute_explicit_segment_group(
                     pending_segments,
                     node_types,
@@ -5015,7 +5084,7 @@ class Symmetrix(Calculator):
                 if segment_generation is not None:
                     self._explicit_factorized_graph_cache = None
                     return segment_generation
-                if deferred_geometry and not stress_requested:
+                if deferred_geometry:
                     _materialize_segment_geometry(pending_segments, xyz, r, self.cutoff)
                 self._joined_group_fast_geometry_ready = False
             if native_geometry:
