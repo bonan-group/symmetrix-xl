@@ -50,6 +50,8 @@ from benchmarks.oam_release_qualification import (
 from symmetrix.oam_cuda_artifact import OAMCudaArtifactResult
 from symmetrix.oam_jit_artifact import OAMHostArtifactResult
 
+ROOT = Path(__file__).resolve().parents[2]
+
 
 def test_release_and_equivalence_drivers_share_authoritative_tolerances():
     assert oam_release_qualification.CORRECTNESS_TOLERANCES is OAM_RELEASE_TOLERANCES
@@ -201,7 +203,7 @@ def _manifest(tmp_path: Path) -> dict:
         ],
         "direct_baselines_us_per_atom": {},
         "provenance": {
-            "source_root": str(Path.cwd()),
+            "source_root": str(ROOT),
             "native_paths": {
                 "host": str(host_native),
                 "cuda": str(cuda_native),

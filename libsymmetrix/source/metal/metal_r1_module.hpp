@@ -11,7 +11,7 @@
 #include <string>
 #include <string_view>
 
-#include "jit_host_plugin_abi.h"
+#include "mace_jit_host_plugin_abi.h"
 
 namespace symmetrix::execution::metal {
 
