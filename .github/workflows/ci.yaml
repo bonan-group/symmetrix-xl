@@ -109,9 +109,12 @@ jobs:
           --blas openblas \
           --particle-mesh off \
           --mpi on \
+          --install-python-module \
+          --lammps-cmake-define CMAKE_CXX_COMPILER_LAUNCHER=ccache \
           --jobs 4
         test -x "$RUNNER_TEMP/lammps-install/bin/lmp"
         "$RUNNER_TEMP/lammps-install/bin/lmp" -help | grep -F 'symmetrix/mace/kk'
+        python -c "from lammps import lammps; instance = lammps(cmdargs=['-screen', 'none']); instance.close()"
         echo "SYMMETRIX_LAMMPS_EXECUTABLE=$RUNNER_TEMP/lammps-install/bin/lmp" >> "$GITHUB_ENV"
         deactivate
 
@@ -122,6 +125,14 @@ jobs:
         SYMMETRIX_REQUIRE_LAMMPS_TESTS=1 \
           pytest -q pair_symmetrix/test/test_pair_symmetrix_factorized_mpi.py \
             -k test_manual_schedules_match_whole_model_for_residual_first_models
+        deactivate
+
+    - name: Run pair style test suite
+      run: |
+        source .venv/bin/activate
+        cd pair_symmetrix/test
+        TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+          pytest -q -k 'not test_manual_schedules_match_whole_model_for_residual_first_models'
         deactivate
 
   extract-mace-model:

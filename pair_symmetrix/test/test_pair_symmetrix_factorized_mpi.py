@@ -1,4 +1,5 @@
 import functools
+import importlib
 import itertools
 import json
 import os
@@ -11,17 +12,33 @@ import numpy as np
 import pytest
 
 
+def _skip_or_fail(message):
+    if os.environ.get("SYMMETRIX_REQUIRE_LAMMPS_TESTS"):
+        pytest.fail(message, pytrace=False)
+    pytest.skip(message)
+
+
+def _import_or_skip(module_name):
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:
+        _skip_or_fail(f"Required Python module {module_name} is unavailable: {exc}")
+
+
+def test_required_lammps_mode_turns_prerequisite_skip_into_failure(monkeypatch):
+    monkeypatch.setenv("SYMMETRIX_REQUIRE_LAMMPS_TESTS", "1")
+
+    with pytest.raises(pytest.fail.Exception, match="required prerequisite"):
+        _skip_or_fail("missing required prerequisite")
+
+
 def _required_path(environment_name, description):
     value = os.environ.get(environment_name)
     if not value:
-        if os.environ.get("SYMMETRIX_REQUIRE_LAMMPS_TESTS"):
-            pytest.fail(f"Set {environment_name} for {description}.")
-        pytest.skip(f"Set {environment_name} for {description}.")
+        _skip_or_fail(f"Set {environment_name} for {description}.")
     path = Path(value).resolve()
     if not path.is_file():
-        if os.environ.get("SYMMETRIX_REQUIRE_LAMMPS_TESTS"):
-            pytest.fail(f"{description.capitalize()} is unavailable: {path}")
-        pytest.skip(f"{description.capitalize()} is unavailable: {path}")
+        _skip_or_fail(f"{description.capitalize()} is unavailable: {path}")
     return path
 
 
@@ -454,7 +471,7 @@ print           "MIGRATED mode={mode} pe=$(pe:%.16g) pxx=$(pxx:%.16g) pyy=$(pyy:
     )
     mpiexec = os.environ.get("MPIEXEC_EXECUTABLE") or shutil.which("mpiexec")
     if not mpiexec:
-        pytest.skip("mpiexec is unavailable")
+        _skip_or_fail("mpiexec is unavailable")
     environment = os.environ.copy()
     environment.update(
         {
@@ -589,7 +606,7 @@ print           "SYMMETRIX_TIMING {timing_record}"
 
     mpiexec = os.environ.get("MPIEXEC_EXECUTABLE") or shutil.which("mpiexec")
     if not mpiexec:
-        pytest.skip("mpiexec is unavailable")
+        _skip_or_fail("mpiexec is unavailable")
     environment = os.environ.copy()
     environment.update(
         {
@@ -724,7 +741,7 @@ print           "RESULT mode=direct pe=$(pe:%.16g) pxx=$(pxx:%.16g) pyy=$(pyy:%.
     )
     mpiexec = os.environ.get("MPIEXEC_EXECUTABLE") or shutil.which("mpiexec")
     if not mpiexec:
-        pytest.skip("mpiexec is unavailable")
+        _skip_or_fail("mpiexec is unavailable")
     environment = os.environ.copy()
     environment.update(
         {
@@ -2046,21 +2063,19 @@ def test_direct_low_memory_macefield_four_rank_matches_single_rank(tmp_path):
 
 @pytest.fixture(scope="module")
 def residual_first_model(tmp_path_factory):
-    torch = pytest.importorskip("torch")
-    o3 = pytest.importorskip("e3nn.o3")
-    modules = pytest.importorskip("mace.modules")
-    blocks = pytest.importorskip("mace.modules.blocks")
-    extract_mace_data = pytest.importorskip(
-        "symmetrix.extract_mace_data"
-    ).extract_mace_data
+    torch = _import_or_skip("torch")
+    o3 = _import_or_skip("e3nn.o3")
+    modules = _import_or_skip("mace.modules")
+    blocks = _import_or_skip("mace.modules.blocks")
+    extract_mace_data = _import_or_skip("symmetrix.extract_mace_data").extract_mace_data
     artifact_dir = tmp_path_factory.mktemp("residual-first-models")
 
     @functools.cache
     def build(family):
         if family == "macefield":
-            extensions = pytest.importorskip("mace.modules.extensions")
+            extensions = _import_or_skip("mace.modules.extensions")
             if not hasattr(extensions, "MACEField"):
-                pytest.skip("This mace-torch does not provide MACEField.")
+                _skip_or_fail("This mace-torch does not provide MACEField.")
             model_class = extensions.MACEField
         else:
             model_class = modules.ScaleShiftMACE

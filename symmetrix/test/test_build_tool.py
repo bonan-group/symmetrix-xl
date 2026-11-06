@@ -1564,7 +1564,8 @@ def test_wheel_content_audit_uses_canonical_operator_catalog_validation(
         audit_wheel(wheel)
 
 
-def test_wheel_content_audit_does_not_trust_fake_shared_library(tmp_path, monkeypatch):
+@pytest.mark.skipif(shutil.which("readelf") is None, reason="requires readelf")
+def test_wheel_content_audit_does_not_trust_fake_shared_library(tmp_path):
     binary = b"not an ELF shared library"
     wheel = tmp_path / "fake-shared-library.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -1574,12 +1575,6 @@ def test_wheel_content_audit_does_not_trust_fake_shared_library(tmp_path, monkey
         )
         archive.writestr("symmetrix/_operator_artifacts/r0/operator.so", binary)
 
-    def reject_fake_operator(_path):
-        raise BuildError("cannot inspect CPU operator dependencies")
-
-    monkeypatch.setattr(
-        build_wheel_audit, "audit_cpu_operator_dependencies", reject_fake_operator
-    )
     with pytest.raises(BuildError, match="dependencies"):
         audit_wheel(wheel)
 
@@ -1618,16 +1613,42 @@ def test_cpu_operator_set_rejects_mixed_vendored_openmp_owners():
         )
 
 
-def test_cpu_operator_dependency_audit_rejects_unapproved_library(
-    tmp_path, monkeypatch
-):
-    monkeypatch.setattr(
-        build_wheel_audit,
-        "_dynamic_dependencies",
-        lambda _path: ("libunapproved.so",),
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("readelf") is None,
+    reason="requires a Linux ELF toolchain and readelf",
+)
+def test_cpu_operator_dependency_audit_rejects_unapproved_library(tmp_path):
+    compiler = shutil.which("cc")
+    if compiler is None:
+        pytest.skip("a C compiler is required")
+    dependency_source = tmp_path / "dependency.c"
+    operator_source = tmp_path / "operator.c"
+    dependency = tmp_path / "libunapproved.so"
+    operator = tmp_path / "operator.so"
+    dependency_source.write_text("int unapproved(void) { return 7; }\n")
+    operator_source.write_text(
+        "extern int unapproved(void); int operator_value(void) { return unapproved(); }\n"
     )
+    subprocess.run(
+        [compiler, "-shared", "-fPIC", dependency_source, "-o", dependency],
+        check=True,
+    )
+    subprocess.run(
+        [
+            compiler,
+            "-shared",
+            "-fPIC",
+            operator_source,
+            f"-L{tmp_path}",
+            "-lunapproved",
+            "-o",
+            operator,
+        ],
+        check=True,
+    )
+
     with pytest.raises(BuildError, match="libunapproved"):
-        build_wheel_audit.audit_cpu_operator_dependencies(tmp_path / "operator.so")
+        build_wheel_audit.audit_cpu_operator_dependencies(operator)
 
 
 def test_cuda12_wheel_declares_split_nvidia_dependencies(tmp_path):
@@ -1957,6 +1978,35 @@ def test_lammps_packages_and_extra_definitions_are_normalized_and_fingerprinted(
     assert definitions["PKG_KSPACE"] == "ON"
     assert definitions["FFT"] == "KISS"
     assert definitions["BUILD_SHARED_LIBS"] == "ON"
+    assert invocation.build_fingerprint != baseline.build_fingerprint
+
+
+def test_lammps_python_module_request_installs_shared_module(tmp_path):
+    arguments = {
+        "repo_root": REPOSITORY_ROOT,
+        "source": _lammps_source(tmp_path / "lammps"),
+        "prefix": tmp_path / "prefix",
+        "mpi": "off",
+        "mpi_cxx": "",
+        "jobs": 1,
+        "runner": FakeRunner({}, {}),
+        "build_root": tmp_path / "build",
+    }
+
+    invocation = lammps_build_invocation(
+        _manifest(), **arguments, install_python_module=True
+    )
+    baseline = lammps_build_invocation(_manifest(), **arguments)
+
+    assert invocation.provenance["python_module"] is True
+    assert invocation.provenance["cmake_definitions"]["BUILD_SHARED_LIBS"] == "ON"
+    assert invocation.commands[-1] == (
+        "/usr/bin/cmake",
+        "--build",
+        str(invocation.build_directory),
+        "--target",
+        "install-python",
+    )
     assert invocation.build_fingerprint != baseline.build_fingerprint
 
 

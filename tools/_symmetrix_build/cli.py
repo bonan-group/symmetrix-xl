@@ -513,6 +513,11 @@ def _parser() -> argparse.ArgumentParser:
             "implies --mpi on."
         ),
     )
+    lammps.add_argument(
+        "--install-python-module",
+        action="store_true",
+        help="Build shared LAMMPS libraries and install the Python module.",
+    )
     return parser
 
 
@@ -666,6 +671,7 @@ def main(argv: list[str] | None = None) -> int:
                 "mpi": args.mpi,
                 "mpi_cxx": os.fspath(args.mpi_cxx) if args.mpi_cxx else "",
                 "require_gpu_aware_mpi": args.require_gpu_aware_mpi,
+                "install_python_module": args.install_python_module,
                 "lammps_packages": tuple(args.lammps_package),
                 "extra_cmake_definitions": tuple(args.lammps_cmake_define),
                 "jobs": args.jobs if args.jobs is not None else (os.cpu_count() or 1),
