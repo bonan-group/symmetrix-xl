@@ -74,7 +74,7 @@ FROZEN_ELECTROSTATICS = "direct_reciprocal"
 # The fixture set the runner declares: sizes x precisions x geometries x
 # channels.  POLAR-1-L is a follow-up record (its 3 interactions are admitted,
 # but the reference set covers the two sizes the plan gates first).
-SIZES = ("S", "M")
+SIZES = ("S", "M", "L")
 PRECISIONS = ("float64", "float32")
 GEOMETRIES = {
     "mol_h2o": ("molecule", 3),

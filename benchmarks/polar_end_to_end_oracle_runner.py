@@ -65,7 +65,7 @@ ORACLE_MACE_REF = "v0.3.16-2-g22f08097"
 ORACLE_GRAPH_ELECTROSTATICS_SHA = "e0eb8945c21e203656f4e0bbece5d1da488b6753"
 ORACLE_GRAPH_LONGRANGE_VERSION = "0.4.4"
 
-MODEL_SIZES = ("S", "M")
+MODEL_SIZES = ("S", "M", "L")
 PRECISIONS = ("float64", "float32")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

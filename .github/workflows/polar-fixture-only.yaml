@@ -8,6 +8,9 @@ on:
       - "symmetrix/test/test_polar_oracle_fixtures.py"
       - "symmetrix/test/test_polar_end_to_end_fixtures.py"
       - "symmetrix/test/test_mace_les_reference.py"
+      - "symmetrix/test/data/polar/**"
+      - "symmetrix/test/reference/fixtures/mace_les_monopole_cases.json"
+      - "symmetrix/test/test_hip_workflow_contract.py"
       - ".github/workflows/polar-fixture-only.yaml"
 
 permissions:
@@ -23,6 +26,8 @@ jobs:
       - uses: astral-sh/setup-uv@v8.3.2
         with:
           python-version: "3.12"
+      - name: Install CPU build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential libopenblas-dev libfftw3-dev
       - name: Build CPU frontend and run immutable fixture lane
         run: |
           uv venv --clear
