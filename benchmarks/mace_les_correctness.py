@@ -25,12 +25,34 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def _file_identity(path):
+def _file_identity(path, *, materialization="local"):
+    if materialization == "recorded":
+        if not isinstance(path, dict):
+            raise ValueError("recorded identity must be an object")
+        result = dict(path)
+        result["materialization"] = "recorded"
+        if not isinstance(result.get("path"), str) or not result["path"]:
+            raise ValueError("recorded identity path is required")
+        digest = result.get("sha256")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("recorded identity must contain a lowercase SHA-256")
+        if (
+            isinstance(result.get("size_bytes"), bool)
+            or not isinstance(result.get("size_bytes"), int)
+            or result["size_bytes"] <= 0
+        ):
+            raise ValueError("recorded identity size_bytes is required")
+        return result
     path = Path(path).resolve()
     return {
         "path": str(path),
         "sha256": _sha256(path),
         "size_bytes": path.stat().st_size,
+        "materialization": "local",
     }
 
 
@@ -75,6 +97,7 @@ def build_result_document(
     frame,
     atom_count,
     results,
+    checkpoint_identity=None,
 ):
     return {
         "schema": SCHEMA,
@@ -83,7 +106,11 @@ def build_result_document(
         "precision": precision,
         "backend": backend,
         "mode": mode,
-        "checkpoint": _file_identity(checkpoint),
+        "checkpoint": (
+            _file_identity(checkpoint_identity, materialization="recorded")
+            if checkpoint_identity is not None
+            else _file_identity(checkpoint)
+        ),
         "converted_model": _file_identity(converted_model),
         "structure": {
             **_file_identity(structure),
@@ -133,6 +160,43 @@ def _evaluate_symmetrix(atoms, converted_model, precision, mode):
 
 
 def run(args):
+    reference_identity = None
+    if args.reference_record is not None and args.checkpoint_identity is not None:
+        raise ValueError("choose one portable identity source")
+    if args.reference_record is not None:
+        record = json.loads(args.reference_record.read_text())
+        reference_identity = (
+            record.get("checkpoint") if isinstance(record, dict) else None
+        )
+        if not isinstance(reference_identity, dict):
+            raise ValueError("reference record must contain a checkpoint identity")
+    if args.implementation == "upstream" and (
+        args.reference_record is not None or args.checkpoint_identity is not None
+    ):
+        raise ValueError("upstream evaluation does not accept portable identities")
+    if args.implementation == "upstream" and args.checkpoint is None:
+        raise ValueError("upstream evaluation requires --checkpoint")
+    if (
+        args.implementation == "symmetrix"
+        and args.checkpoint is None
+        and reference_identity is None
+        and args.checkpoint_identity is None
+    ):
+        raise ValueError(
+            "symmetrix evaluation requires --checkpoint or portable identity"
+        )
+    if (
+        args.implementation == "symmetrix"
+        and args.checkpoint is not None
+        and (reference_identity is not None or args.checkpoint_identity is not None)
+    ):
+        raise ValueError("choose --checkpoint or one portable identity source")
+    if args.checkpoint_identity is not None:
+        identity = json.loads(args.checkpoint_identity.read_text())
+        if isinstance(identity, dict) and isinstance(identity.get("checkpoint"), dict):
+            identity = identity["checkpoint"]
+        args.checkpoint_identity = identity
+
     from ase.io import read
 
     atoms = read(args.structure, index=args.frame)
@@ -162,6 +226,11 @@ def run(args):
         frame=args.frame,
         atom_count=len(atoms),
         results=results,
+        checkpoint_identity=(
+            (reference_identity or args.checkpoint_identity)
+            if (args.checkpoint_identity is not None or reference_identity is not None)
+            else None
+        ),
     )
 
 
@@ -170,7 +239,13 @@ def _parser():
     parser.add_argument(
         "--implementation", choices=("upstream", "symmetrix"), required=True
     )
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument(
+        "--checkpoint-identity",
+        type=Path,
+        help="JSON identity from an immutable upstream record (portable mode)",
+    )
+    parser.add_argument("--reference-record", type=Path)
     parser.add_argument("--converted-model", type=Path, required=True)
     parser.add_argument("--structure", type=Path, required=True)
     parser.add_argument("--frame", type=int, default=0)
