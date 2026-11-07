@@ -3,6 +3,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SPHERICART_SOURCE = _ROOT / "libsymmetrix/external/sphericart"
+_GPULITE_COMMIT = "2cd4213705efd5078874b761feb58e7ff263bef3"
 
 
 def test_pinned_sphericart_uses_wide_edge_offsets():
@@ -59,3 +60,9 @@ def test_pinned_sphericart_carries_async_lifecycle_and_hip():
     int32_max = 2**31 - 1
     assert n46_edges * gradient_stride - 1 <= int32_max
     assert n47_edges * gradient_stride - 1 > int32_max
+
+
+def test_pinned_sphericart_uses_cuda_header_compatible_gpulite():
+    cmake = (_SPHERICART_SOURCE / "sphericart/CMakeLists.txt").read_text()
+    assert "https://github.com/bonan-group/gpu-lite.git" in cmake
+    assert f"GIT_TAG {_GPULITE_COMMIT}" in cmake
