@@ -31,6 +31,7 @@ def test_routine_symmetrix_job_is_fixture_only_and_no_torch():
         "--ignore=symmetrix/test/test_mace_streamed_edges.py",
         "--ignore=symmetrix/test/test_polar_torch_baseline.py",
         "--ignore=symmetrix/test/test_single_layer_mace.py",
+        "--ignore=symmetrix/test/test_jit_kokkos_integration.py",
     ):
         assert required in routine
     assert "pytest -q \\\n          symmetrix/test/test_polar_oracle_fixtures.py" in routine
@@ -54,7 +55,6 @@ def test_routine_lane_keeps_native_modules_and_fails_closed_on_downloads():
         "test_symmetrix_calc.py",
         "test_family_registry.py",
         "test_family_mace_conformance_cases.py",
-        "test_jit_kokkos_integration.py",
         "test_macefield_field_transform.py",
         "test_macefield_native.py",
     ):

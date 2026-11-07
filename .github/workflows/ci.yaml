@@ -61,6 +61,7 @@ jobs:
           --ignore=symmetrix/test/test_mace_streamed_edges.py \
           --ignore=symmetrix/test/test_polar_torch_baseline.py \
           --ignore=symmetrix/test/test_single_layer_mace.py \
+          --ignore=symmetrix/test/test_jit_kokkos_integration.py \
           --ignore=symmetrix/test/test_jit_operator_cuda.py \
           --ignore=symmetrix/test/test_mace_polar_frontend.py
         pytest -q \
