@@ -198,6 +198,14 @@ public:
     }
     int execution_mh1_node_arena_tile_rows() const;
     void set_execution_mh1_node_arena_tile_rows_for_testing(int rows);
+    std::size_t execution_mh1_node_arena_bytes_for_testing(
+        int num_nodes,int tile_rows) const {
+        return execution_mh1_node_arena_bytes_for_rows(num_nodes,tile_rows);
+    }
+    int select_execution_mh1_capacity_node_arena_tile_rows_for_testing(
+        int num_nodes) const {
+        return select_execution_mh1_capacity_node_arena_tile_rows(num_nodes);
+    }
     std::size_t factorized_forward_evaluation_count() const {
         return factorized_forward_evaluations;
     }
@@ -436,7 +444,7 @@ public:
     std::size_t execution_mh1_conditioning_recomputation_count() const {
         return execution_mh1_conditioning_recomputations;
     }
-    std::array<int,2> execution_mh1_retained_interaction_output_dimensions() const {
+    std::vector<int> execution_mh1_retained_interaction_output_dimensions() const {
         // These dimensions belong to the prepared node runtime, which only the
         // direct route's host and device arena preparation builds.  An
         // unprepared route answers with the field's own default of 0: that is
@@ -445,11 +453,11 @@ public:
         // caller cannot mistake an unprepared route for a retained width.  The
         // size guard replaces an unchecked index that read past the empty
         // vector and aborted the process on every non-direct route.
-        const std::size_t layers=execution_mh1_node_runtime.size();
-        return {
-            layers>0?execution_mh1_node_runtime[0].retained_interaction_output_dimension:0,
-            layers>1?execution_mh1_node_runtime[1].retained_interaction_output_dimension:0,
-        };
+        std::vector<int> dimensions(interactions.size(),0);
+        for(std::size_t layer=0;layer<execution_mh1_node_runtime.size();++layer)
+            dimensions.at(layer)=execution_mh1_node_runtime.at(layer)
+                .retained_interaction_output_dimension;
+        return dimensions;
     }
     std::size_t execution_mh1_retained_interaction_output_bytes() const {
         std::size_t bytes=0;
@@ -542,7 +550,9 @@ public:
         Kokkos::View<const double*> distances,
         std::uint64_t execution_graph_generation=0);
     void compute_Y(
-        Kokkos::View<const double*> xyz,bool evaluator_stream=false);
+        Kokkos::View<const double*> xyz,
+        Kokkos::View<const double*> distances,
+        bool evaluator_stream=false,bool retain_unit_directions=false);
 
 private:
     struct SphericalHarmonicsState;
@@ -701,8 +711,11 @@ private:
         Kokkos::View<int*> agnostic_elements_storage;
     };
     struct ExecutionMH1NodeRuntime {
-        static constexpr int capacity_tile_rows=256;
+        static constexpr int minimum_capacity_tile_rows=256;
+        static constexpr int default_capacity_tile_rows=512;
         static constexpr int cuda_throughput_tile_rows=1024;
+        static constexpr std::array<int,5> capacity_tile_row_candidates={
+            1024,768,512,384,256};
         Kokkos::View<Precision*> linear_parameters,vendor_dense_parameters,
             product_parameters,readout_parameters;
         Kokkos::View<Precision**,Kokkos::LayoutRight> arena,residual,
@@ -711,10 +724,18 @@ private:
             gated_adjoint,pre_gate_adjoint,
             linear_1_adjoint;
         int arena_dimension=0;
-        int tile_rows=capacity_tile_rows;
+        int tile_rows=default_capacity_tile_rows;
         int retained_pre_gate_dimension=0;
         int retained_interaction_output_dimension=0;
         bool reuse_message_adjoint=false;
+        std::size_t arena_bytes() const {
+            return sizeof(Precision)*(arena.size()+residual.size()
+                +linear_1_output.size()+pre_gate.size()+gated.size()
+                +interaction_output.size()+interaction_adjoint.size()
+                +contraction_output.size()+contraction_adjoint.size()
+                +gated_adjoint.size()+pre_gate_adjoint.size()
+                +linear_1_adjoint.size());
+        }
         std::size_t bytes() const {
             return sizeof(Precision)*(linear_parameters.size()
                 +vendor_dense_parameters.size()
@@ -753,7 +774,12 @@ private:
     std::string mh1_edge_executor_="mlp_reference";
     std::string execution_mh1_node_arena_policy_="throughput-v1";
     int execution_mh1_node_arena_tile_rows_override_=0;
+    int execution_mh1_node_arena_tile_rows_selected_=
+        ExecutionMH1NodeRuntime::cuda_throughput_tile_rows;
     int selected_execution_mh1_node_arena_tile_rows() const;
+    int select_execution_mh1_capacity_node_arena_tile_rows(int num_nodes) const;
+    std::size_t execution_mh1_node_arena_bytes_for_rows(
+        int num_nodes,int tile_rows) const;
     void apply_execution_mh1_node_arena_tile_rows();
     bool uses_packed_node_linears() const;
     bool direct_node_tensor_reverse_enabled=true;
@@ -952,7 +978,18 @@ public:
         std::vector<int> retained_from_native_signs;
         Kokkos::View<int*> portable_source_indices;
         Kokkos::View<int*> generated_source_indices;
+        Kokkos::View<int*> portable_secondary_source_indices;
+        Kokkos::View<int*> generated_secondary_source_indices;
         Kokkos::View<Precision*> retained_signs;
+        Kokkos::View<Precision*> retained_secondary_coefficients;
+        Kokkos::View<int*> portable_retained_indices;
+        Kokkos::View<int*> generated_retained_indices;
+        Kokkos::View<int*> portable_secondary_retained_indices;
+        Kokkos::View<int*> generated_secondary_retained_indices;
+        Kokkos::View<Precision*> portable_native_coefficients;
+        Kokkos::View<Precision*> generated_native_coefficients;
+        Kokkos::View<Precision*> portable_native_secondary_coefficients;
+        Kokkos::View<Precision*> generated_native_secondary_coefficients;
     };
     // Retain (or stop retaining) the per-layer node features.  Retaining
     // copies each layer's product output, so it is the caller's decision; the

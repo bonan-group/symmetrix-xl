@@ -2,6 +2,7 @@ import ctypes
 import inspect
 import json
 import math
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,14 +13,14 @@ import pytest
 import symmetrix.mace_nonlinear_jit_codegen as mh1_codegen
 from symmetrix.mace_nonlinear_execution_contract import make_execution_mh1_contract
 from symmetrix.mace_nonlinear_jit_codegen import (
+    execution_mh1_conditioner_layout_metadata,
+    jit_mh1_cuda_plugin_metadata,
     render_execution_mh1_conditioner_cpp_helpers,
     render_jit_mh1_cuda_plugin,
     render_jit_mh1_host_plugin,
     resolve_execution_mh1_cuda_edge_policy,
     resolve_execution_mh1_cuda_forward_policy,
     resolve_execution_mh1_cuda_source_policy,
-    execution_mh1_conditioner_layout_metadata,
-    jit_mh1_cuda_plugin_metadata,
 )
 
 
@@ -1028,7 +1029,7 @@ def test_cuda_forward_and_source_reverse_are_partitioned_by_irrep_block(
     )
     assert (
         source.count(
-            "args->source_owner_count * 2\n" "            * source_channel_tiles * 32"
+            "args->source_owner_count * 2\n            * source_channel_tiles * 32"
         )
         == 2
     )
@@ -1596,8 +1597,13 @@ def test_mh1_node_arena_policy_decouples_throughput_from_retained_state():
     )
     loader = source[loader_start:loader_end]
 
-    assert "static constexpr int capacity_tile_rows=256;" in header
+    assert "static constexpr int minimum_capacity_tile_rows=256;" in header
+    assert "static constexpr int default_capacity_tile_rows=512;" in header
     assert "static constexpr int cuda_throughput_tile_rows=1024;" in header
+    assert (
+        "staticconstexprstd::array<int,5>capacity_tile_row_candidates={"
+        "1024,768,512,384,256};"
+    ) in re.sub(r"\s+", "", header)
     assert 'execution_mh1_node_arena_policy_="throughput-v1";' in header
     selector_start = source.index(
         "int MaceBackboneKokkosT<Precision>::"
@@ -1606,11 +1612,28 @@ def test_mh1_node_arena_policy_decouples_throughput_from_retained_state():
     selector_end = source.index("\n}\n", selector_start)
     selector = source[selector_start:selector_end]
     assert 'execution_mh1_node_arena_policy_=="capacity-v1"' in selector
-    assert "ExecutionMH1NodeRuntime::capacity_tile_rows" in selector
+    assert "execution_mh1_node_arena_tile_rows_selected_" in selector
     assert "ExecutionMH1NodeRuntime::cuda_throughput_tile_rows" in selector
     assert "retained_pre_gate_dimension" not in selector
     assert "runtime.tile_rows=selected_execution_mh1_node_arena_tile_rows();" in loader
     assert "runtime.retained_pre_gate_dimension>0" not in loader
+
+    reserve_start = source.index(
+        "void MaceBackboneKokkosT<Precision>::reserve_execution_mh1_node_arena("
+    )
+    reserve_end = source.index("\n}\n", reserve_start)
+    reserve = source[reserve_start:reserve_end]
+    assert "select_execution_mh1_capacity_node_arena_tile_rows(num_nodes)" in reserve
+
+    capacity_selector_start = source.index(
+        "int MaceBackboneKokkosT<Precision>::\n    "
+        "select_execution_mh1_capacity_node_arena_tile_rows("
+    )
+    capacity_selector_end = source.index("\n}\n", capacity_selector_start)
+    capacity_selector = source[capacity_selector_start:capacity_selector_end]
+    assert "capacity_tile_row_candidates" in capacity_selector
+    assert "default_capacity_tile_rows" in capacity_selector
+    assert "candidate_bytes<=available_bytes" in re.sub(r"\s+", "", capacity_selector)
 
 
 @pytest.mark.parametrize(

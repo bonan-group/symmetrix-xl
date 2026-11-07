@@ -125,7 +125,7 @@ def _cuda_module_node_reverse_schedule(node_state_policy: str) -> str:
     if node_state_policy == MH1_NODE_STATE_RECOMPUTE:
         return "composed-v5-full-replay-v1"
     if node_state_policy == MH1_NODE_STATE_RETAIN_INTERACTION:
-        return "composed-v5-pre-gate-replay-v1"
+        return "composed-v5-grouped-pre-gate-replay-v2"
     return "tuned-external-surrounding-retained-v1"
 
 
@@ -332,6 +332,7 @@ class MH1DenseLinearLaunch:
     fallback: tuple[MH1KernelLaunch, ...]
     batch_mode: Literal["block_strided", "grouped_components"] = "block_strided"
     compute_policy: Literal["strict_fp32", "tf32"] = "strict_fp32"
+    accumulate: bool = False
 
     def as_plan_entry(self) -> dict[str, Any]:
         return {
@@ -355,6 +356,7 @@ class MH1DenseLinearLaunch:
             "blocks": [dict(block) for block in self.blocks],
             "batch_mode": self.batch_mode,
             "compute_policy": self.compute_policy,
+            "accumulate": self.accumulate,
             "fallback": [launch.as_plan_entry() for launch in self.fallback],
         }
 
@@ -1432,6 +1434,22 @@ def _dense_linear_blocks(descriptor: dict[str, Any]) -> tuple[dict[str, int], ..
             }
         )
     return tuple(blocks)
+
+
+def _dense_linear_weight_count(descriptor: dict[str, Any]) -> int:
+    return int(
+        next(
+            segment["count"]
+            for segment in descriptor["runtime_parameters"]["segments"]
+            if segment["name"] == "weight"
+        )
+    )
+
+
+def _dense_message_workspace_fits(
+    residual_dimension: int, message_dimension: int, arena_dimension: int
+) -> bool:
+    return residual_dimension + message_dimension <= arena_dimension
 
 
 def _dense_linear_batch_mode(
@@ -7291,7 +7309,7 @@ def jit_mh1_cuda_plugin_v4_metadata(
         _MH1_NODE_REVERSE_SCHEDULE,
         "tuned-external-surrounding-retained-v1",
         "composed-v5-full-replay-v1",
-        "composed-v5-pre-gate-replay-v1",
+        "composed-v5-grouped-pre-gate-replay-v2",
     ):
         raise ValueError(
             "generation-19 MH-1 modules expose only the composed node schedule"
@@ -8736,6 +8754,7 @@ def _render_cuda_node_program(
     node_reverse_schedule: str = _MH1_NODE_REVERSE_SCHEDULE,
     scalar_gate_division: bool = False,
     vendor_dense_linear2: bool = False,
+    vendor_dense_message: bool = False,
     dense_compute_policy: Literal["strict_fp32", "tf32"] = "strict_fp32",
 ) -> str | MH1NodeCudaProgram:
     """Render only the MH-1 phases surrounding canonical common products."""
@@ -8744,7 +8763,7 @@ def _render_cuda_node_program(
         _MH1_NODE_REVERSE_SCHEDULE,
         "tuned-external-surrounding-retained-v1",
         "composed-v5-full-replay-v1",
-        "composed-v5-pre-gate-replay-v1",
+        "composed-v5-grouped-pre-gate-replay-v2",
     ):
         raise ValueError("MH1 external surrounding schedule is unsupported")
     index = int(layer["index"])
@@ -9114,6 +9133,18 @@ float* interaction = arena;
                 ),
             )
         )
+    elif retain_interaction_output:
+        gate_reverse = "\n".join(
+            (
+                f"float* pre_gate_adjoint = arena + {gated_dimension};",
+                _cuda_block_gate_reverse_inplace(
+                    layer["gate"],
+                    input_and_adjoint_pointer="pre_gate_adjoint",
+                    output_adjoint_pointer="arena",
+                    stem=f"l{index}_gate_reverse",
+                ),
+            )
+        )
     else:
         gate_reverse = "\n".join(
             (
@@ -9281,6 +9312,56 @@ float* interaction = arena;
         f"1.0f / (args.linear_parameters[{normalization_offset}]"
         f" + args.linear_parameters[{normalization_offset + 1}]"
         " * args.node_density[node])"
+    )
+    message_scale_forward_body = f"""float* scaled_messages = args.node_arena
+    + node * {arena_dimension} + {residual_dimension};
+const float inverse_normalization = {inverse_normalization};
+for (int column = threadIdx.x; column < {message_dimension}; column += blockDim.x)
+    scaled_messages[column] = args.messages[node * {message_dimension} + column]
+        * inverse_normalization;
+__syncthreads();"""
+    message_scale_replay_body = f"""float* scaled_messages = const_cast<float*>(
+    args.messages) + node * {message_dimension};
+const float inverse_normalization = {inverse_normalization};
+for (int column = threadIdx.x; column < {message_dimension}; column += blockDim.x)
+    scaled_messages[column] *= inverse_normalization;
+__syncthreads();"""
+    message_restore_replay_body = f"""float* scaled_messages = const_cast<float*>(
+    args.messages) + node * {message_dimension};
+const float normalization = args.linear_parameters[{normalization_offset}]
+    + args.linear_parameters[{normalization_offset + 1}] * args.node_density[node];
+for (int column = threadIdx.x; column < {message_dimension}; column += blockDim.x)
+    scaled_messages[column] *= normalization;
+__syncthreads();"""
+    if not retain_pre_gate and retain_interaction_output:
+        pre_gate_replay_residual_launches = grouped_forward(
+            layer["linears"]["linear_res"],
+            input_pointer="args.up",
+            input_stride=up_dimension,
+            parameter_pointer=linear_parameter("linear_res"),
+            output_pointer=f"args.node_arena + {gated_dimension}",
+            output_stride=arena_dimension,
+            stem=f"node_grouped_l{index}_reverse_replay_residual",
+            tile_nodes=_CUDA_NODE_LINEAR2_TILE_NODES,
+            args_type=reverse_args,
+        )
+        pre_gate_replay_message_launches = grouped_forward(
+            layer["linears"]["linear_1"],
+            input_pointer="args.messages",
+            input_stride=message_dimension,
+            parameter_pointer=linear_parameter("linear_1"),
+            output_pointer=f"args.node_arena + {gated_dimension}",
+            output_stride=arena_dimension,
+            stem=f"node_grouped_l{index}_reverse_replay_message",
+            add_scale=inverse_normalization,
+            tile_nodes=_CUDA_NODE_LINEAR2_TILE_NODES,
+            args_type=reverse_args,
+        )
+    else:
+        pre_gate_replay_residual_launches = ()
+        pre_gate_replay_message_launches = ()
+    pre_gate_replay_launches = (
+        pre_gate_replay_residual_launches + pre_gate_replay_message_launches
     )
     pre_residual_launches = grouped_forward(
         layer["linears"]["linear_res"],
@@ -9639,12 +9720,17 @@ float* layer_output_adjoint = args.layer_output_adjoint + node * {output_dimensi
 {readout_reverse}
 {skip_reverse_body}
 {interaction_recompute}"""
-    pre_gate_reverse_body = f"""float* arena = args.node_arena + node * {arena_dimension};
-const float* up = args.up + node * {up_dimension};
+    replay_inputs = (
+        f"""const float* up = args.up + node * {up_dimension};
 const float* messages = args.messages + node * {message_dimension};
 const float normalization = args.linear_parameters[{normalization_offset}]
     + args.linear_parameters[{normalization_offset + 1}] * args.node_density[node];
-const float inverse_normalization = 1.0f / normalization;
+const float inverse_normalization = 1.0f / normalization;"""
+        if not retain_pre_gate and not retain_interaction_output
+        else ""
+    )
+    pre_gate_reverse_body = f"""float* arena = args.node_arena + node * {arena_dimension};
+{replay_inputs}
 {gate_reverse}"""
     pre_scale_body = f"""float* pre_gate_adjoint = args.node_arena
     + node * {arena_dimension} + {gated_dimension};
@@ -9736,6 +9822,13 @@ __syncthreads();"""
             "initial_forward_launches",
         ),
         ("pre_gate", forward_args, 0, pre_gate_body, "pre_gate_launches"),
+        (
+            "message_scale_forward",
+            forward_args,
+            0,
+            message_scale_forward_body,
+            "message_scale_forward_launches",
+        ),
         ("pre_retain", forward_args, 0, pre_retain_body, "pre_retain_launches"),
         (
             "post_finalize",
@@ -9759,6 +9852,20 @@ __syncthreads();"""
             3,
             pre_gate_reverse_body,
             "pre_gate_reverse_launches",
+        ),
+        (
+            "message_scale_replay",
+            reverse_args,
+            3,
+            message_scale_replay_body,
+            "message_scale_replay_launches",
+        ),
+        (
+            "message_restore_replay",
+            reverse_args,
+            3,
+            message_restore_replay_body,
+            "message_restore_replay_launches",
         ),
         ("pre_scale", reverse_args, 3, pre_scale_body, "pre_scale_launches"),
         ("pre_density", reverse_args, 3, pre_density_body, "pre_density_launches"),
@@ -9825,6 +9932,7 @@ __syncthreads();"""
     ) + post_product_linear_reverse_launches
     pre_reverse_launches = (
         pre_linear_2_reverse_launches
+        + pre_gate_replay_launches
         + (persistent(f"{symbol_prefix}pre_gate_reverse_kernel_{index}"),)
         + pre_residual_reverse_launches
         + (persistent(f"{symbol_prefix}pre_scale_kernel_{index}"),)
@@ -9837,6 +9945,11 @@ __syncthreads();"""
         dense_blocks = ()
     if dense_blocks:
         dense_batch_mode = _dense_linear_batch_mode(dense_blocks)
+        dense_parameter_offset = (
+            _dense_linear_weight_count(layer["linears"]["linear_1"])
+            if vendor_dense_message
+            else 0
+        )
         pre_forward_launches = (
             pre_residual_launches
             + pre_message_launches
@@ -9851,7 +9964,7 @@ __syncthreads();"""
                     output_field="node_arena",
                     output_offset=0,
                     output_stride=arena_dimension,
-                    parameter_offset=0,
+                    parameter_offset=dense_parameter_offset,
                     blocks=dense_blocks,
                     fallback=pre_linear_2_launches,
                     batch_mode=dense_batch_mode,
@@ -9872,19 +9985,136 @@ __syncthreads();"""
                     output_field="node_arena",
                     output_offset=0,
                     output_stride=arena_dimension,
-                    parameter_offset=0,
+                    parameter_offset=dense_parameter_offset,
                     blocks=dense_blocks,
                     fallback=pre_linear_2_reverse_launches,
                     batch_mode=dense_batch_mode,
                     compute_policy=dense_compute_policy,
                 ),
             )
+            + pre_gate_replay_launches
             + (persistent(f"{symbol_prefix}pre_gate_reverse_kernel_{index}"),)
             + pre_residual_reverse_launches
             + (persistent(f"{symbol_prefix}pre_scale_kernel_{index}"),)
             + pre_message_reverse_launches
             + (persistent(f"{symbol_prefix}pre_density_kernel_{index}"),)
         )
+    # The forward GEMM needs a per-node normalized-message temporary after the
+    # residual output. Biased linears are also ineligible because the packed
+    # vendor parameter buffer contains weights only.
+    if vendor_dense_message and _dense_message_workspace_fits(
+        residual_dimension, message_dimension, arena_dimension
+    ):
+        message_dense_blocks = _dense_linear_blocks(layer["linears"]["linear_1"])
+    else:
+        message_dense_blocks = ()
+    if message_dense_blocks:
+        message_batch_mode = _dense_linear_batch_mode(message_dense_blocks)
+        message_parameter_offset = 0
+        message_forward = MH1DenseLinearLaunch(
+            name="linear_1",
+            direction="forward",
+            input_field="node_arena",
+            input_offset=residual_dimension,
+            input_stride=arena_dimension,
+            output_field="node_arena",
+            output_offset=0,
+            output_stride=arena_dimension,
+            parameter_offset=message_parameter_offset,
+            blocks=message_dense_blocks,
+            fallback=pre_message_launches,
+            batch_mode=message_batch_mode,
+            compute_policy=dense_compute_policy,
+            accumulate=True,
+        )
+        pre_forward_launches = tuple(
+            operation
+            for operation in pre_forward_launches
+            if operation not in pre_message_launches
+        )
+        residual_end = pre_forward_launches.index(pre_residual_launches[-1]) + 1
+        pre_forward_launches = (
+            pre_forward_launches[:residual_end]
+            + (
+                persistent(f"{symbol_prefix}message_scale_forward_kernel_{index}"),
+                message_forward,
+            )
+            + pre_forward_launches[residual_end:]
+        )
+
+        if pre_gate_replay_launches:
+            replay_message = MH1DenseLinearLaunch(
+                name="linear_1_replay",
+                direction="forward",
+                input_field="messages",
+                input_offset=0,
+                input_stride=message_dimension,
+                output_field="node_arena",
+                output_offset=gated_dimension,
+                output_stride=arena_dimension,
+                parameter_offset=message_parameter_offset,
+                blocks=message_dense_blocks,
+                fallback=pre_gate_replay_message_launches,
+                batch_mode=message_batch_mode,
+                compute_policy=dense_compute_policy,
+                accumulate=True,
+            )
+            pre_reverse_launches = tuple(
+                operation
+                for operation in pre_reverse_launches
+                if operation not in pre_gate_replay_message_launches
+            )
+            replay_residual_position = max(
+                pre_reverse_launches.index(operation)
+                for operation in pre_gate_replay_residual_launches
+            )
+            insertion = replay_residual_position + 1
+            pre_reverse_launches = (
+                pre_reverse_launches[:insertion]
+                + (
+                    persistent(f"{symbol_prefix}message_scale_replay_kernel_{index}"),
+                    replay_message,
+                    persistent(f"{symbol_prefix}message_restore_replay_kernel_{index}"),
+                )
+                + pre_reverse_launches[insertion:]
+            )
+        if not reuse_message_adjoint:
+            message_positions = [
+                position
+                for position, operation in enumerate(pre_reverse_launches)
+                if operation in pre_message_reverse_launches
+            ]
+            if not message_positions:
+                raise ValueError("MH1 message reverse launch is missing")
+            message_reverse = MH1DenseLinearLaunch(
+                name="linear_1",
+                direction="reverse",
+                input_field="node_arena",
+                input_offset=gated_dimension,
+                input_stride=arena_dimension,
+                output_field="message_adjoint",
+                output_offset=0,
+                output_stride=message_dimension,
+                parameter_offset=message_parameter_offset,
+                blocks=message_dense_blocks,
+                fallback=pre_message_reverse_launches,
+                batch_mode=message_batch_mode,
+                compute_policy=dense_compute_policy,
+            )
+            pre_reverse_launches = tuple(
+                operation
+                for operation in pre_reverse_launches
+                if operation not in pre_message_reverse_launches
+            )
+            message_position = min(message_positions)
+            message_position -= sum(
+                position < message_position for position in message_positions
+            )
+            pre_reverse_launches = (
+                pre_reverse_launches[:message_position]
+                + (message_reverse,)
+                + pre_reverse_launches[message_position:]
+            )
     program = MH1NodeCudaProgram(
         device_source=device_source,
         plugin_source=device_source + "\n\n" + "\n\n".join(launchers),
@@ -9924,7 +10154,7 @@ def execution_mh1_cuda_module_v4_launch_plan(
     normalized = normalize_execution_mh1_v4_contract(contract)
     if dense_policy not in ("auto", "generated", "vendor_fp32", "vendor_tf32"):
         raise ValueError("MH1 CUDA dense policy is unsupported")
-    vendor_dense_linear2 = precision == "float32" and dense_policy != "generated"
+    vendor_dense_linears = precision == "float32" and dense_policy != "generated"
     dense_compute_policy = "tf32" if dense_policy == "vendor_tf32" else "strict_fp32"
     node_state_policy = _resolve_node_state_policy(node_state_policy)
     if _node_reverse_schedule is None:
@@ -9932,7 +10162,7 @@ def execution_mh1_cuda_module_v4_launch_plan(
     if _node_reverse_schedule not in (
         "tuned-external-surrounding-retained-v1",
         "composed-v5-full-replay-v1",
-        "composed-v5-pre-gate-replay-v1",
+        "composed-v5-grouped-pre-gate-replay-v2",
     ):
         raise ValueError(
             "generation-19 MH-1 modules expose only the composed node schedule"
@@ -9970,7 +10200,8 @@ def execution_mh1_cuda_module_v4_launch_plan(
             return_program=True,
             symbol_prefix="symmetrix_execution_mh1_split_",
             node_reverse_schedule=_node_reverse_schedule,
-            vendor_dense_linear2=vendor_dense_linear2,
+            vendor_dense_linear2=vendor_dense_linears,
+            vendor_dense_message=vendor_dense_linears,
             dense_compute_policy=dense_compute_policy,
         )
         for layer, layer_metadata in zip(node_layers, metadata["layers"], strict=True)

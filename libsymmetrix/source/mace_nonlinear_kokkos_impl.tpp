@@ -1623,12 +1623,105 @@ int MaceBackboneKokkosT<Precision>::selected_execution_mh1_node_arena_tile_rows(
     if(execution_mh1_node_arena_tile_rows_override_>0)
         return execution_mh1_node_arena_tile_rows_override_;
     if(execution_mh1_node_arena_policy_=="capacity-v1")
-        return ExecutionMH1NodeRuntime::capacity_tile_rows;
+        return execution_mh1_node_arena_tile_rows_selected_;
 #ifdef KOKKOS_ENABLE_CUDA
     if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>)
         return ExecutionMH1NodeRuntime::cuda_throughput_tile_rows;
 #endif
-    return ExecutionMH1NodeRuntime::capacity_tile_rows;
+    return ExecutionMH1NodeRuntime::minimum_capacity_tile_rows;
+}
+
+template<typename Precision>
+std::size_t MaceBackboneKokkosT<Precision>::execution_mh1_node_arena_bytes_for_rows(
+    const int num_nodes,const int tile_rows) const
+{
+    if(num_nodes<0||tile_rows<=0)
+        throw std::invalid_argument(
+            "Execution MH-1 node arena sizing requires non-negative nodes and "
+            "positive tile rows.");
+    std::size_t elements=0;
+    for(int layer=0;layer<static_cast<int>(execution_mh1_node_runtime.size());
+        ++layer) {
+        const auto& runtime=execution_mh1_node_runtime.at(layer);
+        if(runtime.arena_dimension<=0)
+            throw std::logic_error(
+                "Execution MH-1 node arena layout has not been admitted.");
+        const auto& interaction=interactions.at(layer);
+        const std::size_t residual=static_cast<std::size_t>(
+            interaction.linear_res.output_dimension());
+        const std::size_t gated=static_cast<std::size_t>(
+            interaction.gate.output_size);
+        const std::size_t interaction_output=static_cast<std::size_t>(
+            interaction.linear_2.output_dimension());
+        const std::size_t contraction_output=static_cast<std::size_t>(
+            products.at(layer).output_linear().input_dimension());
+        const std::size_t columns=static_cast<std::size_t>(runtime.arena_dimension)
+            +5*residual+2*gated+2*interaction_output+2*contraction_output;
+        const std::size_t rows=static_cast<std::size_t>(
+            std::min(num_nodes,tile_rows));
+        if(columns!=0&&rows>std::numeric_limits<std::size_t>::max()/columns)
+            throw std::overflow_error(
+                "Execution MH-1 node arena element count exceeds size_t.");
+        const std::size_t layer_elements=rows*columns;
+        if(layer_elements>std::numeric_limits<std::size_t>::max()-elements)
+            throw std::overflow_error(
+                "Execution MH-1 node arena element count exceeds size_t.");
+        elements+=layer_elements;
+    }
+    if(elements>std::numeric_limits<std::size_t>::max()/sizeof(Precision))
+        throw std::overflow_error(
+            "Execution MH-1 node arena byte count exceeds size_t.");
+    return elements*sizeof(Precision);
+}
+
+template<typename Precision>
+int MaceBackboneKokkosT<Precision>::
+    select_execution_mh1_capacity_node_arena_tile_rows(const int num_nodes) const
+{
+    std::size_t free_bytes=execution_geometry_device_free_;
+    std::size_t total_bytes=execution_geometry_device_total_;
+    bool memory_info_available=execution_geometry_memory_info_override_;
+#ifdef KOKKOS_ENABLE_CUDA
+    if(!memory_info_available) {
+        ExecutionMH1CudaDeviceGuard device_guard(
+            execution_mh1_device_ordinal(factorized_execution_space));
+        memory_info_available=
+            cudaMemGetInfo(&free_bytes,&total_bytes)==cudaSuccess;
+    }
+#endif
+    if(!memory_info_available)
+        return ExecutionMH1NodeRuntime::default_capacity_tile_rows;
+
+    constexpr std::size_t minimum_reserve=std::size_t(512)*1024*1024;
+    const std::size_t reserve=std::max(minimum_reserve,total_bytes/20);
+    std::size_t current_bytes=0;
+    for(const auto& runtime:execution_mh1_node_runtime) {
+        const std::size_t bytes=runtime.arena_bytes();
+        if(bytes>std::numeric_limits<std::size_t>::max()-current_bytes)
+            throw std::overflow_error(
+                "Execution MH-1 current node arena byte count exceeds size_t.");
+        current_bytes+=bytes;
+    }
+    const std::size_t allocated=total_bytes-free_bytes;
+    const std::size_t reclaimable=current_bytes>allocated
+        ?total_bytes:free_bytes+current_bytes;
+    const std::size_t available_bytes=reclaimable>reserve
+        ?reclaimable-reserve:0;
+    for(const int candidate:
+        ExecutionMH1NodeRuntime::capacity_tile_row_candidates) {
+        const std::size_t candidate_bytes=
+            execution_mh1_node_arena_bytes_for_rows(num_nodes,candidate);
+        if(candidate_bytes<=available_bytes)return candidate;
+    }
+    const std::size_t minimum_bytes=execution_mh1_node_arena_bytes_for_rows(
+        num_nodes,ExecutionMH1NodeRuntime::minimum_capacity_tile_rows);
+    throw std::runtime_error(
+        "MH-1 capacity node arena requires at least "+
+        std::to_string(minimum_bytes)+" bytes for "+std::to_string(num_nodes)+
+        " nodes, but only "+std::to_string(available_bytes)+
+        " bytes are available after the "+std::to_string(reserve)+
+        "-byte device reserve (free="+std::to_string(free_bytes)+
+        ", total="+std::to_string(total_bytes)+").");
 }
 
 template<typename Precision>
@@ -1661,6 +1754,16 @@ void MaceBackboneKokkosT<Precision>::set_execution_mh1_node_arena_policy(
     factorized_execution_space.fence("Set Execution MH-1 node arena policy");
     execution_mh1_node_arena_policy_=std::move(policy);
     execution_mh1_node_arena_tile_rows_override_=0;
+    execution_mh1_node_arena_tile_rows_selected_=
+        execution_mh1_node_arena_policy_=="capacity-v1"
+        ?ExecutionMH1NodeRuntime::minimum_capacity_tile_rows
+        :ExecutionMH1NodeRuntime::cuda_throughput_tile_rows;
+#ifdef KOKKOS_ENABLE_CUDA
+    if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>)
+        if(execution_mh1_node_arena_policy_=="capacity-v1")
+            execution_mh1_node_arena_tile_rows_selected_=
+                ExecutionMH1NodeRuntime::default_capacity_tile_rows;
+#endif
     apply_execution_mh1_node_arena_tile_rows();
 }
 
@@ -2477,6 +2580,8 @@ void MaceBackboneKokkosT<Precision>::load_jit_mh1_cuda_plugin_v5(
         const auto device=execution_device_execution_environment();
         symmetrix::execution::MH1CudaPluginV4Expectation expectation;
         expectation.interaction_count=interactions.size();
+        expectation.interactions.resize(interactions.size());
+        expectation.node_programs.resize(interactions.size());
         expectation.artifact_id=artifact_id;
         expectation.generation_fingerprint=
             execution_mh1_model_generation_fingerprint_v4;
@@ -4296,25 +4401,28 @@ MaceBackboneKokkosT<Precision>::make_layer_retained_feature_layout(
     LayerRetainedFeatureLayout layout;
     layout.channels=mh1_family.node_channels;
     int offset=0;
-    for(const auto& block:descriptor.product_output_blocks) {
+    for(std::size_t block_index=0;
+        block_index<descriptor.product_output_blocks.size();++block_index) {
+        const auto& block=descriptor.product_output_blocks[block_index];
         if(block.multiplicity!=layout.channels)
             throw std::runtime_error(
                 "MH-1 retained-feature blocks must use the family node "
                 "channel count.");
-        if(block.l==0&&block.parity==1&&layout.scalar_offset<0&&offset==0) {
+        if(block.l!=static_cast<int>(block_index)
+            ||block.parity!=(block.l%2==0?1:-1)||block.l>2)
+            throw std::runtime_error(
+                "MH-1 retained features require canonical bands through l=2.");
+        if(block.l==0&&layout.scalar_offset<0&&offset==0) {
             layout.scalar_offset=offset;
             layout.scalar_multiplicity=block.multiplicity;
-        } else if(block.l==1&&block.parity==-1
-            &&layout.scalar_offset==0&&layout.vector_offset<0) {
+        } else if(block.l==1&&layout.scalar_offset==0
+            &&layout.vector_offset<0) {
             layout.vector_offset=offset;
             layout.vector_multiplicity=block.multiplicity;
             layout.vector_components=3;
             layout.retained_from_native_components={1,2,0};
             layout.retained_from_native_signs={-1,-1,-1};
-        } else
-            throw std::runtime_error(
-                "MH-1 retained features support one scalar and one optional "
-                "vector block in canonical order.");
+        }
         offset+=block.multiplicity*(2*block.l+1);
     }
     layout.width=offset;
@@ -4325,32 +4433,111 @@ MaceBackboneKokkosT<Precision>::make_layer_retained_feature_layout(
 
     std::vector<int> portable_indices(layout.width,-1);
     std::vector<int> generated_indices(layout.width,-1);
-    std::vector<Precision> signs(layout.width,Precision(1));
-    for(int channel=0;channel<layout.scalar_multiplicity;++channel) {
-        const int index=layout.scalar_offset+channel;
-        portable_indices[index]=index;
-        generated_indices[index]=index;
-    }
-    if(layout.vector_offset>=0)
-        for(int channel=0;channel<layout.vector_multiplicity;++channel)
+    std::vector<int> portable_secondary_indices(layout.width,-1);
+    std::vector<int> generated_secondary_indices(layout.width,-1);
+    std::vector<Precision> signs(layout.width,Precision(0));
+    std::vector<Precision> secondary_coefficients(layout.width,Precision(0));
+    std::vector<int> portable_retained_indices(layout.width,-1);
+    std::vector<int> generated_retained_indices(layout.width,-1);
+    std::vector<int> portable_secondary_retained_indices(layout.width,-1);
+    std::vector<int> generated_secondary_retained_indices(layout.width,-1);
+    std::vector<Precision> portable_native_coefficients(
+        layout.width,Precision(0));
+    std::vector<Precision> generated_native_coefficients(
+        layout.width,Precision(0));
+    std::vector<Precision> portable_native_secondary_coefficients(
+        layout.width,Precision(0));
+    std::vector<Precision> generated_native_secondary_coefficients(
+        layout.width,Precision(0));
+    const auto set_reverse=[&](const int portable_native,
+                               const int generated_native,
+                               const int retained,
+                               const Precision coefficient) {
+        auto assign=[&](std::vector<int>& primary,
+                        std::vector<int>& secondary,
+                        std::vector<Precision>& primary_coefficient,
+                        std::vector<Precision>& secondary_coefficient,
+                        const int native) {
+            if(primary[native]<0) {
+                primary[native]=retained;
+                primary_coefficient[native]=coefficient;
+            } else if(secondary[native]<0) {
+                secondary[native]=retained;
+                secondary_coefficient[native]=coefficient;
+            } else
+                throw std::runtime_error(
+                    "MH-1 retained-feature transform has too many terms.");
+        };
+        assign(portable_retained_indices,
+            portable_secondary_retained_indices,
+            portable_native_coefficients,
+            portable_native_secondary_coefficients,portable_native);
+        assign(generated_retained_indices,
+            generated_secondary_retained_indices,
+            generated_native_coefficients,
+            generated_native_secondary_coefficients,generated_native);
+    };
+    int block_offset=0;
+    for(const auto& block:descriptor.product_output_blocks) {
+        const int components=2*block.l+1;
+        for(int channel=0;channel<block.multiplicity;++channel)
             for(int retained_component=0;
-                retained_component<layout.vector_components;
-                ++retained_component) {
-                const int retained=layout.vector_offset
-                    +channel*layout.vector_components+retained_component;
-                const int source_component=
-                    layout.retained_from_native_components[retained_component];
-                portable_indices[retained]=layout.vector_offset
-                    +channel*layout.vector_components+source_component;
-                generated_indices[retained]=layout.vector_offset
-                    +source_component*layout.vector_multiplicity+channel;
-                signs[retained]=Precision(
-                    layout.retained_from_native_signs[retained_component]);
+                retained_component<components;++retained_component) {
+                int sources[2]={retained_component,-1};
+                Precision coefficients[2]={Precision(1),Precision(0)};
+                if(block.l==1) {
+                    constexpr int source[3]={1,2,0};
+                    sources[0]=source[retained_component];
+                    coefficients[0]=Precision(-1);
+                } else if(block.l==2) {
+                    constexpr int primary[5]={1,3,2,0,2};
+                    constexpr int secondary[5]={-1,-1,4,-1,4};
+                    constexpr double root_three_over_two=0.86602540378443864676;
+                    constexpr double primary_coefficient[5]={1,1,-0.5,1,
+                        -root_three_over_two};
+                    constexpr double secondary_coefficient[5]={0,0,
+                        root_three_over_two,0,-0.5};
+                    sources[0]=primary[retained_component];
+                    sources[1]=secondary[retained_component];
+                    coefficients[0]=Precision(
+                        primary_coefficient[retained_component]);
+                    coefficients[1]=Precision(
+                        secondary_coefficient[retained_component]);
+                }
+                const int retained=block_offset+channel*components
+                    +retained_component;
+                for(int term=0;term<2&&sources[term]>=0;++term) {
+                    const int portable_native=block_offset+channel*components
+                        +sources[term];
+                    const int generated_native=block_offset
+                        +sources[term]*block.multiplicity+channel;
+                    if(term==0) {
+                        portable_indices[retained]=portable_native;
+                        generated_indices[retained]=generated_native;
+                        signs[retained]=coefficients[term];
+                    } else {
+                        portable_secondary_indices[retained]=portable_native;
+                        generated_secondary_indices[retained]=generated_native;
+                        secondary_coefficients[retained]=coefficients[term];
+                    }
+                    set_reverse(portable_native,generated_native,retained,
+                        coefficients[term]);
+                }
             }
+        block_offset+=block.multiplicity*components;
+    }
     if(std::any_of(portable_indices.begin(),portable_indices.end(),
             [](const int index) { return index<0; })
         ||std::any_of(generated_indices.begin(),generated_indices.end(),
-            [](const int index) { return index<0; }))
+            [](const int index) { return index<0; })
+        ||std::any_of(portable_retained_indices.begin(),
+            portable_retained_indices.end(),[](const int index) {
+                return index<0;
+            })
+        ||std::any_of(generated_retained_indices.begin(),
+            generated_retained_indices.end(),[](const int index) {
+                return index<0;
+            }))
         throw std::runtime_error(
             "MH-1 retained-feature layout leaves an output component unmapped.");
     const auto suffix=std::to_string(layer);
@@ -4361,8 +4548,36 @@ MaceBackboneKokkosT<Precision>::make_layer_retained_feature_layout(
         portable_label.c_str(),portable_indices);
     layout.generated_source_indices=toKokkosView(
         generated_label.c_str(),generated_indices);
+    layout.portable_secondary_source_indices=toKokkosView(
+        (portable_label+" secondary").c_str(),portable_secondary_indices);
+    layout.generated_secondary_source_indices=toKokkosView(
+        (generated_label+" secondary").c_str(),generated_secondary_indices);
     layout.retained_signs=toKokkosView(
         signs_label.c_str(),signs);
+    layout.retained_secondary_coefficients=toKokkosView(
+        (signs_label+" secondary").c_str(),secondary_coefficients);
+    layout.portable_retained_indices=toKokkosView(
+        (portable_label+" reverse").c_str(),portable_retained_indices);
+    layout.generated_retained_indices=toKokkosView(
+        (generated_label+" reverse").c_str(),generated_retained_indices);
+    layout.portable_secondary_retained_indices=toKokkosView(
+        (portable_label+" reverse secondary").c_str(),
+        portable_secondary_retained_indices);
+    layout.generated_secondary_retained_indices=toKokkosView(
+        (generated_label+" reverse secondary").c_str(),
+        generated_secondary_retained_indices);
+    layout.portable_native_coefficients=toKokkosView(
+        (signs_label+" portable reverse").c_str(),
+        portable_native_coefficients);
+    layout.generated_native_coefficients=toKokkosView(
+        (signs_label+" generated reverse").c_str(),
+        generated_native_coefficients);
+    layout.portable_native_secondary_coefficients=toKokkosView(
+        (signs_label+" portable reverse secondary").c_str(),
+        portable_native_secondary_coefficients);
+    layout.generated_native_secondary_coefficients=toKokkosView(
+        (signs_label+" generated reverse secondary").c_str(),
+        generated_native_secondary_coefficients);
     return layout;
 }
 
@@ -4388,9 +4603,9 @@ int MaceBackboneKokkosT<Precision>::layer_feature_components(
     if(found==layer_retained_feature_layouts.end())
         throw std::runtime_error(
             "MH-1 layer node features do not match a retained layout; "
-            "model-convention conversion supports l<=1 only "
-            "(l<=2 and higher bases are unsupported).");
-    return (found->scalar_multiplicity>0?1:0)+found->vector_components;
+            "model-convention conversion supports canonical bands through "
+            "l=2 only (higher bases are unsupported).");
+    return found->channels>0?found->width/found->channels:0;
 }
 
 template<typename Precision>
@@ -4421,13 +4636,21 @@ void MaceBackboneKokkosT<Precision>::retain_layer_output(
     auto source=output;
     const auto source_indices=generated_layout
         ?layout.generated_source_indices:layout.portable_source_indices;
+    const auto secondary_source_indices=generated_layout
+        ?layout.generated_secondary_source_indices
+        :layout.portable_secondary_source_indices;
     const auto signs=layout.retained_signs;
+    const auto secondary_coefficients=layout.retained_secondary_coefficients;
     Kokkos::parallel_for("mh1 retain layer features",
         Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
             {0,0},{num_nodes,width}),
         KOKKOS_LAMBDA(const int node,const int retained) {
-            destination(node,retained)=signs(retained)
+            Precision value=signs(retained)
                 *source(node,source_indices(retained));
+            const int secondary=secondary_source_indices(retained);
+            if(secondary>=0)
+                value+=secondary_coefficients(retained)*source(node,secondary);
+            destination(node,retained)=value;
         });
 }
 
@@ -4544,16 +4767,28 @@ void MaceBackboneKokkosT<Precision>::add_layer_product_seed(
         static_cast<std::size_t>(layer));
     auto local_seed=seed;
     auto local_adjoint=adjoint;
-    const auto source_indices=generated_layout
-        ?layout.generated_source_indices:layout.portable_source_indices;
-    const auto signs=layout.retained_signs;
+    const auto retained_indices=generated_layout
+        ?layout.generated_retained_indices:layout.portable_retained_indices;
+    const auto secondary_retained_indices=generated_layout
+        ?layout.generated_secondary_retained_indices
+        :layout.portable_secondary_retained_indices;
+    const auto signs=generated_layout
+        ?layout.generated_native_coefficients
+        :layout.portable_native_coefficients;
+    const auto secondary_coefficients=generated_layout
+        ?layout.generated_native_secondary_coefficients
+        :layout.portable_native_secondary_coefficients;
     const int width=layout.width;
     Kokkos::parallel_for("mh1 add layer product seed",
         Kokkos::MDRangePolicy<Kokkos::Rank<2>>(
             {0,0},{num_nodes,width}),
-        KOKKOS_LAMBDA(const int node,const int retained) {
-            local_adjoint(node,source_indices(retained))+=signs(retained)
-                *local_seed(node,retained);
+        KOKKOS_LAMBDA(const int node,const int native) {
+            Precision value=signs(native)
+                *local_seed(node,retained_indices(native));
+            const int secondary=secondary_retained_indices(native);
+            if(secondary>=0)
+                value+=secondary_coefficients(native)*local_seed(node,secondary);
+            local_adjoint(node,native)+=value;
         });
 }
 
@@ -5628,10 +5863,25 @@ void MaceBackboneKokkosT<Precision>::prepare_execution_mh1_node_runtime_paramete
             layer==0?"Execution MH-1 node linear parameters 0"
                 :"Execution MH-1 node linear parameters 1",
             linear_parameters);
+        const auto message_dense=interaction.linear_1.runtime_effective_weights();
+        const auto interaction_dense=
+            interaction.linear_2.runtime_effective_weights();
+        std::vector<Precision> vendor_dense_parameters;
+        if(message_dense.size()==interaction.linear_1.runtime_weights().size()
+            &&interaction_dense.size()
+                ==interaction.linear_2.runtime_weights().size()) {
+            vendor_dense_parameters.reserve(
+                message_dense.size()+interaction_dense.size());
+            vendor_dense_parameters.insert(
+                vendor_dense_parameters.end(),
+                message_dense.begin(),message_dense.end());
+            vendor_dense_parameters.insert(vendor_dense_parameters.end(),
+                interaction_dense.begin(),interaction_dense.end());
+        }
         runtime.vendor_dense_parameters=toKokkosView(
             layer==0?"Execution MH-1 vendor dense parameters 0"
                 :"Execution MH-1 vendor dense parameters 1",
-            interaction.linear_2.runtime_effective_weights());
+            vendor_dense_parameters);
         runtime.product_parameters=toKokkosView(
             layer==0?"Execution MH-1 node product parameters 0"
                 :"Execution MH-1 node product parameters 1",
@@ -5648,6 +5898,21 @@ void MaceBackboneKokkosT<Precision>::reserve_execution_mh1_node_arena(int num_no
 {
     if(num_nodes<0)
         throw std::invalid_argument("Execution MH-1 node count must not be negative.");
+#ifdef KOKKOS_ENABLE_CUDA
+    if constexpr(std::is_same_v<Kokkos::DefaultExecutionSpace,Kokkos::Cuda>) {
+        if(execution_mh1_node_arena_policy_=="capacity-v1"
+            &&execution_mh1_node_arena_tile_rows_override_==0) {
+            const int selected=
+                select_execution_mh1_capacity_node_arena_tile_rows(num_nodes);
+            if(selected!=execution_mh1_node_arena_tile_rows_selected_) {
+                factorized_execution_space.fence(
+                    "Resize Execution MH-1 capacity node arena");
+                execution_mh1_node_arena_tile_rows_selected_=selected;
+                apply_execution_mh1_node_arena_tile_rows();
+            }
+        }
+    }
+#endif
     for(int layer=0;layer<static_cast<int>(execution_mh1_node_runtime.size());
         ++layer) {
         auto& runtime=execution_mh1_node_runtime.at(layer);
@@ -6161,7 +6426,8 @@ MaceBackboneKokkosT<Precision>::family_binding_report() const
 
 template<typename Precision>
 void MaceBackboneKokkosT<Precision>::compute_Y(
-    Kokkos::View<const double*> xyz,const bool evaluator_stream)
+    Kokkos::View<const double*> xyz,Kokkos::View<const double*> distances,
+    const bool evaluator_stream,const bool retain_unit_directions)
 {
     if(xyz.extent(0)%3!=0)
         throw std::invalid_argument(
@@ -6170,6 +6436,10 @@ void MaceBackboneKokkosT<Precision>::compute_Y(
         throw std::overflow_error(
             "Spherical-harmonic edge count exceeds the 32-bit graph ABI.");
     const int edges=static_cast<int>(xyz.extent(0)/3);
+    if(retain_unit_directions
+        &&distances.extent(0)!=static_cast<std::size_t>(edges))
+        throw std::invalid_argument(
+            "Unit-direction preparation requires one distance per edge.");
     const std::size_t harmonic_values=static_cast<std::size_t>(edges)*num_lm;
     ensure_view(Y,Y_storage,harmonic_values);
     ensure_view(Y_grad,Y_grad_storage,3*harmonic_values);
@@ -6298,6 +6568,15 @@ void MaceBackboneKokkosT<Precision>::compute_Y(
                 grad((3*edge+2)*nlm+lm)=factor
                     *raw_grad((3*edge+0)*nlm+lm);
             }
+            if(retain_unit_directions) {
+                const double inverse_distance=1.0/distances(edge);
+                shuffled(3*edge+0)=static_cast<Precision>(
+                    xyz(3*edge+0)*inverse_distance);
+                shuffled(3*edge+1)=static_cast<Precision>(
+                    xyz(3*edge+1)*inverse_distance);
+                shuffled(3*edge+2)=static_cast<Precision>(
+                    xyz(3*edge+2)*inverse_distance);
+            }
         });
     if(!evaluator_stream)
         execution_space.fence("Complete CUDA MH-1 spherical harmonics");
@@ -6369,7 +6648,17 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
             spline_type_count=mh1_spline_type_count_;
         }
     }
-    compute_Y(xyz,uses_prepared_graph());
+    bool retain_unit_directions=false;
+#if defined(KOKKOS_ENABLE_CUDA)
+    if constexpr(std::is_same_v<Precision,float>
+        &&device_execution_space<Kokkos::DefaultExecutionSpace>)
+        retain_unit_directions=use_pair_spline
+            &&uses_direct_execution(streamed_edges)
+            &&jit_mh1_cuda_plugin_v5_ready()
+            &&jit_mh1_cuda_plugin_v4->has_spline_r_program();
+#endif
+    compute_Y(
+        xyz,distances,uses_prepared_graph(),retain_unit_directions);
 
     if(execution_graph_generation!=0) {
         offsets=execution_prepared_offsets;
@@ -9419,8 +9708,16 @@ void MaceBackboneKokkosT<Precision>::compute_node_energies_forces(int num_nodes,
                         output_mask.data(),density_adj.data(),local_up_adj.data()};
                     const SymmetrixJitMH1CudaSplineREdgeArgsV5 edge_args{
                         sizeof(SymmetrixJitMH1CudaSplineREdgeArgsV5),
-                        static_cast<std::uint32_t>(layer),sizeof(double),0u,
-                        num_nodes,edges,xyz.data(),distances.data(),radial_packet,
+                        static_cast<std::uint32_t>(layer),
+                        retain_unit_directions
+                            ?static_cast<std::uint32_t>(sizeof(Precision))
+                            :static_cast<std::uint32_t>(sizeof(double)),
+                        retain_unit_directions?1u:0u,
+                        num_nodes,edges,
+                        retain_unit_directions
+                            ?static_cast<const void*>(xyz_shuffled.data())
+                            :static_cast<const void*>(xyz.data()),
+                        distances.data(),radial_packet,
                         edge_harmonics.data(),Y_grad.data(),up.data(),
                         local_message_adj.data(),node_forces.data()};
                     Kokkos::DefaultExecutionSpace execution_space;

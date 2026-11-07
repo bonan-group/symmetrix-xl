@@ -235,6 +235,50 @@ def test_generated_metadata_selects_the_dedicated_wide_final_schedule():
         assert not scalar[1]["uses_wide_final_schedule"]
 
 
+def test_polar_cuda_plan_uses_shared_vendor_dense_operations():
+    """The Polar-M wide backbone must receive the shared MH-1 dense plan."""
+
+    from symmetrix.mace_nonlinear_jit_codegen import (
+        execution_mh1_cuda_module_v4_launch_plan,
+    )
+    from symmetrix.mace_polar_execution_contract import (
+        make_execution_polar_mh1_v4_contract,
+    )
+
+    contract = make_execution_polar_mh1_v4_contract(_build_topology()[0])
+    vendor = execution_mh1_cuda_module_v4_launch_plan(
+        contract, 120, dense_policy="vendor_fp32"
+    )
+    generated = execution_mh1_cuda_module_v4_launch_plan(
+        contract, 120, dense_policy="generated"
+    )
+
+    assert vendor["dense_policy"] == "vendor_fp32"
+    assert generated["dense_policy"] == "generated"
+    assert len(vendor["nodes"]) == len(generated["nodes"]) == 2
+    for vendor_layer, generated_layer in zip(
+        vendor["nodes"], generated["nodes"], strict=True
+    ):
+        vendor_dense = [
+            operation
+            for phase in ("split_pre_forward", "split_pre_reverse")
+            for operation in vendor_layer[phase]
+            if operation.get("operation") == "dense_linear"
+        ]
+        generated_dense = [
+            operation
+            for phase in ("split_pre_forward", "split_pre_reverse")
+            for operation in generated_layer[phase]
+            if operation.get("operation") == "dense_linear"
+        ]
+        assert {operation["name"] for operation in vendor_dense} >= {
+            "linear_1",
+            "linear_2",
+        }
+        assert all(operation["fallback"] for operation in vendor_dense)
+        assert generated_dense == []
+
+
 def test_cuda_wide_final_reverse_keeps_product_seed_outside_the_node_abi():
     """Native composition owns retained outputs and external product seeds."""
 
@@ -321,6 +365,41 @@ def test_native_mh1_admission_accepts_polar_keep_last_output():
         "final_output_policy": "keep_last",
     }
     assert len(descriptor["layers"]) == 2
+
+
+def test_native_mh1_admission_accepts_coherent_retained_l2_output():
+    topology = copy.deepcopy(_build_topology()[0])
+    hidden = "512x0e+512x1o+512x2e"
+    for index, (interaction, product, readout) in enumerate(
+        zip(topology["interactions"], topology["products"], topology["readouts"])
+    ):
+        interaction["hidden_irreps"] = hidden
+        interaction["skip_tp"]["irreps_out"] = hidden
+        if index:
+            interaction["node_feats_irreps"] = hidden
+            interaction["skip_tp"]["irreps_in"] = hidden
+            interaction["edge_irreps"] = "128x0e+128x1o+128x2e"
+        symmetric = product["symmetric_contractions"]
+        symmetric["irreps_out"] = hidden
+        symmetric["contractions"].append(copy.deepcopy(symmetric["contractions"][-1]))
+        product["node_feats_irreps"] = hidden
+        product["target_irreps"] = hidden
+        product["linear"]["irreps_in"] = hidden
+        product["linear"]["irreps_out"] = hidden
+        linear = (
+            readout["linear"]
+            if readout["class"] == "LinearReadoutBlock"
+            else readout["linear_1"]
+        )
+        linear["irreps_in"] = hidden
+
+    from symmetrix import symmetrix as native
+
+    descriptor = native._analyze_mh1_family_architecture(json.dumps(topology))
+    assert descriptor["compatible"], descriptor["rejection_reason"]
+    assert [
+        block["l"] for block in descriptor["layers"][-1]["product_output_blocks"]
+    ] == [0, 1, 2]
 
 
 @pytest.mark.parametrize(

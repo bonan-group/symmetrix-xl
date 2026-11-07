@@ -761,6 +761,11 @@ def test_generalized_mh1_three_interaction_topology_matches_its_reference(
     assert evaluator.jit_mh1_host_plugin_v7_ready
     assert not evaluator.jit_mh1_host_plugin_v5_ready
     assert not evaluator.jit_mh1_host_plugin_v6_ready
+    assert len(evaluator.execution_mh1_retained_interaction_output_dimensions) == 3
+    assert all(
+        dimension > 0
+        for dimension in evaluator.execution_mh1_retained_interaction_output_dimensions
+    )
 
     metrics = {
         name: _effective_decimal_digits(
@@ -1620,6 +1625,7 @@ def test_mh1_shared_cuda_product_policies_cover_full_properties(
             "stress": 1.1e-5,
         },
     }
+    policy_atol = 1e-7 if dtype == "float32" else 0.0
     for name in properties:
         retained = direct_results["full-retention-v1"][name]
         assert np.all(np.isfinite(expected[name]))
@@ -1627,12 +1633,16 @@ def test_mh1_shared_cuda_product_policies_cover_full_properties(
         assert np.max(np.abs(retained - expected[name])) <= generic_bounds[dtype][name]
         for node_state_policy, result in direct_results.items():
             assert np.all(np.isfinite(result[name]))
-            np.testing.assert_array_equal(
+            # Vendor GEMMs can change the final FP32 reduction order by a few
+            # ulps across otherwise equivalent node-state schedules.
+            np.testing.assert_allclose(
                 retained,
                 result[name],
+                rtol=0.0,
+                atol=policy_atol,
                 err_msg=(
                     f"{dtype} full-retention and {node_state_policy} {name} "
-                    "must be bitwise equal"
+                    "must agree within the policy tolerance"
                 ),
             )
 
@@ -2039,6 +2049,58 @@ def test_mh1_generated_host_multiblock_matches_generic(
     )
     assert generated.evaluator.conditioned_mlp_workspace_bytes == 0
     assert generated.evaluator.factorized_schedule_build_count == 1
+
+
+def test_mh1_capacity_node_arena_selects_largest_fitting_tile(
+    mh1_si_artifact, monkeypatch, tmp_path
+):
+    if not hasattr(native_symmetrix, "MACENonlinearKokkosFloat"):
+        pytest.skip("Symmetrix was built without Kokkos Float32 support")
+    if native_symmetrix._kokkos_default_execution_space() != "Cuda":
+        pytest.skip("adaptive MH-1 node arenas require Kokkos CUDA")
+
+    _, model_path = mh1_si_artifact
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
+    monkeypatch.setenv("SYMMETRIX_JIT_POLICY", "required")
+    calculator = Symmetrix(
+        model_path,
+        dtype="float32",
+        streamed_edges="direct",
+        execution_profile="speed",
+        execution_mh1_node_arena_policy="capacity-v1",
+    )
+    evaluator = calculator.evaluator
+    assert evaluator.jit_mh1_cuda_plugin_v5_ready
+
+    num_nodes = 5000
+    total_bytes = 32 * 1024**3
+    reserve_bytes = total_bytes // 20
+    candidate_bytes = {
+        rows: evaluator._execution_mh1_node_arena_bytes_for_testing(num_nodes, rows)
+        for rows in (1024, 768, 512, 384, 256)
+    }
+    assert list(candidate_bytes.values()) == sorted(
+        candidate_bytes.values(), reverse=True
+    )
+
+    for rows in (1024, 768, 512, 384, 256):
+        evaluator._set_execution_geometry_device_memory_info_for_testing(
+            reserve_bytes + candidate_bytes[rows], total_bytes
+        )
+        assert (
+            evaluator._select_execution_mh1_capacity_node_arena_tile_rows_for_testing(
+                num_nodes
+            )
+            == rows
+        )
+
+    evaluator._set_execution_geometry_device_memory_info_for_testing(
+        reserve_bytes + candidate_bytes[256] - 1, total_bytes
+    )
+    with pytest.raises(RuntimeError, match="capacity node arena requires at least"):
+        evaluator._select_execution_mh1_capacity_node_arena_tile_rows_for_testing(
+            num_nodes
+        )
 
 
 def test_mh1_generated_host_loader_rejects_fingerprint_mismatch(

@@ -540,18 +540,32 @@ def test_mh1_device_module_admits_only_named_nonstandard_tiles():
     assert "retired private-product launch is forbidden" in loader
     assert "result.tile_nodes==1&&result.tile_channels==128&&threads==128" not in loader
     assert "(result.tile_nodes==2||result.tile_nodes==4)" not in loader
-    assert 'kernel.ends_with("_l1_reverse_message_grouped")' in loader
-    assert 'kernel.ends_with("_l1_reverse_linear2_grouped")' in loader
-    assert 'kernel.ends_with("_l0_reverse_linear2_grouped")' in loader
-    assert '||kernel.ends_with("_l1_reverse_linear2_grouped")' in loader
-    assert '||kernel.ends_with("_l0_forward_linear2_grouped")' in loader
-    assert '||kernel.ends_with("_l1_forward_linear2_grouped")' in loader
-    assert 'kernel.ends_with("_l0_forward_linear2_grouped")' in loader
-    assert 'kernel.ends_with("_l1_forward_linear2_grouped")' in loader
+    assert 'kernel.ends_with("_reverse_message_grouped")' in loader
+    assert 'kernel.ends_with("_reverse_linear2_grouped")' in loader
+    assert 'kernel.ends_with("_forward_linear2_grouped")' in loader
+    assert "_l0_reverse_linear2_grouped" not in loader
+    assert "_l1_reverse_linear2_grouped" not in loader
     assert "result.tile_nodes==64&&result.tile_channels==32&&threads==256" in loader
     assert "result.tile_nodes==128&&result.tile_channels==32&&threads==256" in loader
     assert "product_tiles" not in loader
     assert "paired_product_reverse_tile" not in loader
+
+
+def test_mh1_device_module_state_scales_with_interaction_count():
+    header = (SOURCE / "mace_nonlinear_jit_cuda_plugin.hpp").read_text(encoding="ascii")
+    loader = (SOURCE / "mace_nonlinear_jit_cuda_plugin.cpp").read_text(encoding="ascii")
+    runtime = (SOURCE / "mace_nonlinear_kokkos_impl.tpp").read_text(encoding="ascii")
+
+    assert "std::vector<MH1CudaInteractionExpectation> interactions" in header
+    assert "std::vector<MH1CudaNodeProgramExpectation> node_programs" in header
+    assert "std::vector<MH1CudaModuleInteraction> interactions" in loader
+    assert "std::vector<MH1CudaModuleNode> nodes" in loader
+    assert "std::vector<SymmetrixJitMH1CudaNodeProgramV5> node_descriptors" in loader
+    assert "state->interactions.resize(interaction_count)" in loader
+    assert "state->nodes.resize(interaction_count)" in loader
+    assert "state->node_descriptors.resize(interaction_count)" in loader
+    assert "expectation.interactions.resize(interactions.size())" in runtime
+    assert "expectation.node_programs.resize(interactions.size())" in runtime
 
 
 def test_mh1_device_module_parses_dense_operations_with_generated_fallbacks():
@@ -562,6 +576,10 @@ def test_mh1_device_module_parses_dense_operations_with_generated_fallbacks():
     assert "launch_dense_linear" in loader
     assert "cublasSgemmBatched" in loader
     assert "cublasSgemmStridedBatched" in loader
+    assert 'value.value("accumulate",false)' in loader
+    assert 'value=="messages"' in loader
+    assert 'value=="message_adjoint"' in loader
+    assert "operation.accumulate?1.0f:0.0f" in loader
     assert 'batch_mode=="grouped_components"' in loader
     assert 'plan.at("version")!=7' in loader
     assert '"launch-plan v7 requires an explicit node-state policy"' in loader

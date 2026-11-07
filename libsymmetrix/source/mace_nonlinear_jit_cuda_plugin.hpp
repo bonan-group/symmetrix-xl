@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace symmetrix::execution {
 
@@ -63,10 +64,12 @@ struct MH1CudaPluginV4Expectation {
     std::string_view semantic_fingerprint;
     std::string_view structure_fingerprint;
     std::string_view runtime_layout_fingerprint;
-    std::array<MH1CudaInteractionExpectation,
-        SYMMETRIX_JIT_MH1_CUDA_PLUGIN_INTERACTIONS> interactions;
-    std::array<MH1CudaNodeProgramExpectation,
-        SYMMETRIX_JIT_MH1_CUDA_PLUGIN_INTERACTIONS> node_programs;
+    std::vector<MH1CudaInteractionExpectation> interactions=
+        std::vector<MH1CudaInteractionExpectation>(
+            SYMMETRIX_JIT_MH1_CUDA_PLUGIN_INTERACTIONS);
+    std::vector<MH1CudaNodeProgramExpectation> node_programs=
+        std::vector<MH1CudaNodeProgramExpectation>(
+            SYMMETRIX_JIT_MH1_CUDA_PLUGIN_INTERACTIONS);
     std::size_t interaction_count = SYMMETRIX_JIT_MH1_CUDA_PLUGIN_INTERACTIONS;
     std::string_view target_backend = "cuda";
     std::string_view target_architecture;

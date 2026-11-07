@@ -97,6 +97,7 @@ struct MH1CudaModuleLaunch {
     std::int32_t parameter_offset = 0;
     std::int32_t dense_batch_mode = 0;
     bool tf32 = false;
+    bool accumulate = false;
     std::vector<DenseBlock> dense_blocks;
     std::vector<MH1CudaModuleLaunch> fallback;
 };
@@ -151,8 +152,8 @@ struct MH1CudaModuleState {
     void* module = nullptr;
     void* context = nullptr;
     int device = -1;
-    std::array<MH1CudaModuleInteraction,2> interactions;
-    std::array<MH1CudaModuleNode,2> nodes;
+    std::vector<MH1CudaModuleInteraction> interactions;
+    std::vector<MH1CudaModuleNode> nodes;
     std::size_t interaction_count=0;
     std::string abi_tag;
     std::string artifact_id;
@@ -162,7 +163,7 @@ struct MH1CudaModuleState {
     std::string runtime_layout_fingerprint;
     std::string target_backend;
     std::string target_architecture;
-    std::array<SymmetrixJitMH1CudaNodeProgramV5,2> node_descriptors{};
+    std::vector<SymmetrixJitMH1CudaNodeProgramV5> node_descriptors;
     SymmetrixJitMH1CudaPluginV5 descriptor{};
     bool split_phase=false;
 #if defined(KOKKOS_ENABLE_CUDA) \
@@ -417,17 +418,13 @@ MH1CudaModuleLaunch parse_module_launch(
             ||result.tile_nodes==16||result.tile_nodes==32)
             &&result.tile_channels==32&&threads==256;
         const bool wide_grouped_tile=
-            (kernel.ends_with("_l1_reverse_message_grouped")
-                ||kernel.ends_with("_l1_reverse_linear2_grouped")
-                ||kernel.ends_with("_l0_reverse_linear2_grouped")
-                ||kernel.ends_with("_l0_forward_linear2_grouped")
-                ||kernel.ends_with("_l1_forward_linear2_grouped"))
+            (kernel.ends_with("_reverse_message_grouped")
+                ||kernel.ends_with("_reverse_linear2_grouped")
+                ||kernel.ends_with("_forward_linear2_grouped"))
             &&result.tile_nodes==64&&result.tile_channels==32&&threads==256;
         const bool xwide_grouped_tile=
-            (kernel.ends_with("_l0_reverse_linear2_grouped")
-                ||kernel.ends_with("_l1_reverse_linear2_grouped")
-                ||kernel.ends_with("_l0_forward_linear2_grouped")
-                ||kernel.ends_with("_l1_forward_linear2_grouped"))
+            (kernel.ends_with("_reverse_linear2_grouped")
+                ||kernel.ends_with("_forward_linear2_grouped"))
             &&result.tile_nodes==128&&result.tile_channels==32&&threads==256;
         if(result.channels<=0||result.components<=0
             ||(!standard_tiles&&!wide_grouped_tile&&!xwide_grouped_tile))
@@ -443,6 +440,8 @@ std::int32_t parse_dense_field(
 {
     if(value=="node_arena") return 1;
     if(input&&value=="contraction_output_adjoint") return 2;
+    if(!input&&value=="message_adjoint") return 2;
+    if(input&&value=="messages") return 4;
     throw plugin_error(path,"dense linear packet field is unsupported");
 }
 
@@ -477,6 +476,7 @@ MH1CudaModuleLaunch parse_module_operation(
     if(compute_policy=="strict_fp32") result.tf32=false;
     else if(compute_policy=="tf32") result.tf32=true;
     else throw plugin_error(path,"dense linear compute policy is invalid");
+    result.accumulate=value.value("accumulate",false);
     const auto batch_mode=value.at("batch_mode").get<std::string>();
     if(batch_mode=="block_strided") result.dense_batch_mode=0;
     else if(batch_mode=="grouped_components") result.dense_batch_mode=1;
@@ -651,6 +651,8 @@ const float* dense_input_pointer(
 {
     if(operation.input_field==1)
         return reinterpret_cast<const float*>(packet.node_arena);
+    if(operation.input_field==4)
+        return reinterpret_cast<const float*>(packet.messages);
     if constexpr(std::is_same_v<Packet,SymmetrixJitMH1CudaNodeReverseArgsV5>) {
         if(operation.input_field==2)
             return reinterpret_cast<const float*>(
@@ -665,6 +667,10 @@ float* dense_output_pointer(
 {
     if(operation.output_field==1)
         return reinterpret_cast<float*>(packet.node_arena);
+    if constexpr(std::is_same_v<Packet,SymmetrixJitMH1CudaNodeReverseArgsV5>) {
+        if(operation.output_field==2)
+            return reinterpret_cast<float*>(packet.message_adjoint);
+    }
     throw std::invalid_argument("Execution MH1 dense output field is invalid");
 }
 
@@ -680,9 +686,6 @@ void launch_dense_linear(
         if(operation.direction!=0)
             throw std::invalid_argument(
                 "Execution MH1 reverse dense operation received a forward packet");
-    } else if(operation.direction!=1) {
-        throw std::invalid_argument(
-            "Execution MH1 forward dense operation received a reverse packet");
     }
     ensure_dense_handle(state,stream);
     check_cublas(
@@ -695,7 +698,7 @@ void launch_dense_linear(
     const auto* input=dense_input_pointer(packet,operation)+operation.input_offset;
     auto* output=dense_output_pointer(packet,operation)+operation.output_offset;
     const float alpha=1.0f;
-    const float beta=0.0f;
+    const float beta=operation.accumulate?1.0f:0.0f;
     if(operation.dense_batch_mode==1) {
         const auto& block=operation.dense_blocks.front();
         auto& batch=prepare_dense_pointer_batch(
@@ -975,7 +978,7 @@ void validate_expectation(const MH1CudaPluginV4Expectation& expectation)
         if(node.requires_tp_source_state_adjoint!=(interaction!=0))
             throw std::invalid_argument(
                 "Execution MH-1 CUDA ABI-v4 expectation must omit the layer-0 "
-                "TP source-state adjoint and require it for layer 1.");
+                "TP source-state adjoint and require it for later layers.");
     }
     if(expectation.required_capabilities!=known_capabilities_v5)
         throw std::invalid_argument(
@@ -1664,6 +1667,9 @@ MH1CudaPluginV4 MH1CudaPluginV4::load_module(
 
         auto state=std::make_unique<MH1CudaModuleState>();
         state->interaction_count=interaction_count;
+        state->interactions.resize(interaction_count);
+        state->nodes.resize(interaction_count);
+        state->node_descriptors.resize(interaction_count);
         state->module=reinterpret_cast<void*>(module);
 #if defined(KOKKOS_ENABLE_CUDA)
         state->context=reinterpret_cast<void*>(context);
