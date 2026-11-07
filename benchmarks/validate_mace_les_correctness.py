@@ -49,16 +49,24 @@ def _identity(document, name):
     value = document.get(name)
     if not isinstance(value, dict) or not value.get("path") or not value.get("sha256"):
         raise CorrectnessError(f"{name} identity is incomplete")
+    _digest(value["sha256"], f"{name}.sha256")
+    materialization = value.get("materialization", "local")
+    if materialization not in {"local", "recorded"}:
+        raise CorrectnessError(f"{name} materialization is invalid")
     path = Path(value["path"])
-    if not path.is_file() or _sha256(path) != value["sha256"]:
-        raise CorrectnessError(f"{name} SHA-256 does not match the recorded file")
+    if materialization == "local":
+        if not path.is_file() or _sha256(path) != value["sha256"]:
+            raise CorrectnessError(f"{name} SHA-256 does not match the recorded file")
     size = value.get("size_bytes")
     if (
         isinstance(size, bool)
         or not isinstance(size, int)
-        or size != path.stat().st_size
+        or size <= 0
+        or (materialization == "local" and size != path.stat().st_size)
     ):
         raise CorrectnessError(f"{name} size does not match the recorded file")
+    if materialization == "recorded" and name != "checkpoint":
+        raise CorrectnessError(f"{name} cannot use recorded-only identity")
     return value
 
 
@@ -84,9 +92,15 @@ def _runtime_provenance(document, label):
     ):
         if not isinstance(value.get(name), str) or not value[name]:
             raise CorrectnessError(f"{label} runtime provenance {name} is invalid")
-    if not Path(value["interpreter_path"]).is_file():
+    mode = value.get("materialization", "local")
+    if mode not in {"local", "recorded"}:
+        raise CorrectnessError(f"{label} runtime provenance materialization is invalid")
+    if mode == "recorded":
+        if label != "reference" or document.get("implementation") != "upstream":
+            raise CorrectnessError(f"{label} recorded runtime provenance is invalid")
+    elif not Path(value["interpreter_path"]).is_file():
         raise CorrectnessError(f"{label} interpreter path does not exist")
-    if not Path(value["package_path"]).is_file():
+    if mode == "local" and not Path(value["package_path"]).is_file():
         raise CorrectnessError(f"{label} package path does not exist")
     return value
 
@@ -151,6 +165,12 @@ def validate_documents(reference, candidate):
         key = "sha256"
         if ref[index][key] != cand[index][key]:
             raise CorrectnessError(f"{name} provenance does not match")
+        if ref[index].get("size_bytes") != cand[index].get("size_bytes"):
+            raise CorrectnessError(f"{name} size provenance does not match")
+        if ref[index].get("materialization", "local") != cand[index].get(
+            "materialization", "local"
+        ):
+            raise CorrectnessError(f"{name} identity mode does not match")
     if ref[2].get("frame") != cand[2].get("frame") or ref[2].get("atoms") != cand[
         2
     ].get("atoms"):

@@ -1,9 +1,11 @@
 import importlib.util
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 PATH = ROOT / "benchmarks" / "mace_les_correctness.py"
@@ -17,8 +19,27 @@ def _module():
     return module
 
 
-def test_result_document_preserves_full_arrays_and_provenance(tmp_path):
+def test_result_document_preserves_full_arrays_and_provenance(tmp_path, monkeypatch):
     driver = _module()
+    monkeypatch.setattr(
+        driver,
+        "_model_identity",
+        lambda _: {
+            "model_type": "MACELES",
+            "mace_les_parameters_sha256": "a" * 64,
+            "mace_les_evaluator_fingerprint": "b" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "_runtime_provenance",
+        lambda _: {
+            "interpreter_path": sys.executable,
+            "python_version": "3.12",
+            "package_path": __file__,
+            "package_version": "test",
+        },
+    )
     checkpoint = tmp_path / "checkpoint.pt"
     converted = tmp_path / "converted.json"
     structure = tmp_path / "structure.xyz"
@@ -82,3 +103,61 @@ def test_result_document_preserves_full_arrays_and_provenance(tmp_path):
     assert document["runtime_provenance"]["python_version"]
     assert Path(document["runtime_provenance"]["package_path"]).is_file()
     assert document["runtime_provenance"]["package_version"]
+
+
+def test_portable_checkpoint_identity_and_cli_rules(tmp_path):
+    driver = _module()
+    identity = {"path": "/oracle/checkpoint.pt", "sha256": "a" * 64, "size_bytes": 12}
+    with np.testing.assert_raises(ValueError):
+        driver._file_identity({**identity, "size_bytes": 0}, materialization="recorded")
+    parser = driver._parser()
+    args = parser.parse_args(
+        [
+            "--implementation",
+            "symmetrix",
+            "--converted-model",
+            "m",
+            "--structure",
+            "s",
+            "--precision",
+            "float32",
+            "--checkpoint-identity",
+            "identity.json",
+        ]
+    )
+    assert args.checkpoint is None
+
+
+def test_run_enforces_identity_sources_before_evaluation(tmp_path):
+    driver = _module()
+    record = tmp_path / "reference.json"
+    record.write_text(
+        json.dumps(
+            {"checkpoint": {"path": "/oracle/x", "sha256": "a" * 64, "size_bytes": 1}}
+        )
+    )
+
+    def namespace(**overrides):
+        values = dict(
+            implementation="symmetrix",
+            checkpoint=None,
+            checkpoint_identity=None,
+            reference_record=None,
+            structure=tmp_path / "missing.xyz",
+            converted_model=tmp_path / "missing.json",
+            frame=0,
+            precision="float32",
+            mode="reference",
+            device="cpu",
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    with pytest.raises(ValueError, match="requires"):
+        driver.run(namespace())
+    with pytest.raises(ValueError, match="portable identit"):
+        driver.run(namespace(implementation="upstream", checkpoint_identity=record))
+    with pytest.raises(ValueError, match="choose one"):
+        driver.run(namespace(reference_record=record, checkpoint_identity=record))
+    with pytest.raises(ValueError, match="choose --checkpoint"):
+        driver.run(namespace(checkpoint=tmp_path / "x", reference_record=record))

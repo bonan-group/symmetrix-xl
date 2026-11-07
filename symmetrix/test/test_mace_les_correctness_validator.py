@@ -192,3 +192,71 @@ def test_validator_rejects_mislabeled_pair_and_shape(validator, tmp_path, mutati
         candidate["stress"] = [[0.0] * 3 for _ in range(3)]
     with pytest.raises(validator.CorrectnessError):
         validator.validate_documents(reference, candidate)
+
+
+def test_portable_reference_checkpoint_and_recorded_runtime(validator, tmp_path):
+    checkpoint = tmp_path / "model.pt"
+    converted = tmp_path / "model.json"
+    structure = tmp_path / "fixture.xyz"
+    checkpoint.write_bytes(b"checkpoint")
+    converted.write_text("{}")
+    structure.write_text("fixture")
+    reference = _result("upstream", checkpoint, converted, structure)
+    candidate = _result("symmetrix", converted, converted, structure)
+    recorded = {
+        "path": "/oracle/model.pt",
+        "sha256": _sha(checkpoint),
+        "size_bytes": checkpoint.stat().st_size,
+        "materialization": "recorded",
+    }
+    reference["checkpoint"] = recorded
+    candidate["checkpoint"] = dict(recorded)
+    reference["runtime_provenance"]["materialization"] = "recorded"
+    assert validator.validate_documents(reference, candidate)["passed"]
+    for bad in ({"size_bytes": 0}, {"sha256": "e" * 64}, {"materialization": "local"}):
+        broken = dict(recorded)
+        broken.update(bad)
+        with pytest.raises(validator.CorrectnessError):
+            validator.validate_documents(reference, {**candidate, "checkpoint": broken})
+
+
+def test_recorded_converted_model_is_rejected_and_missing_local_file_fails(
+    validator, tmp_path
+):
+    checkpoint = tmp_path / "model.pt"
+    converted = tmp_path / "model.json"
+    structure = tmp_path / "fixture.xyz"
+    checkpoint.write_bytes(b"checkpoint")
+    converted.write_text("{}")
+    structure.write_text("fixture")
+    reference = _result("upstream", checkpoint, converted, structure)
+    candidate = _result("symmetrix", checkpoint, converted, structure)
+    candidate["converted_model"]["materialization"] = "recorded"
+    with pytest.raises(validator.CorrectnessError):
+        validator.validate_documents(reference, candidate)
+    missing = _result("symmetrix", checkpoint, converted, structure)
+    converted.unlink()
+    with pytest.raises(validator.CorrectnessError):
+        validator.validate_documents(reference, missing)
+
+
+def test_fixture_validation_does_not_import_torch_or_mace(
+    validator, tmp_path, monkeypatch
+):
+    checkpoint = tmp_path / "model.pt"
+    converted = tmp_path / "model.json"
+    structure = tmp_path / "fixture.xyz"
+    checkpoint.write_bytes(b"checkpoint")
+    converted.write_text("{}")
+    structure.write_text("fixture")
+    reference = _result("upstream", checkpoint, converted, structure)
+    candidate = _result("symmetrix", checkpoint, converted, structure)
+    original = __import__("builtins").__import__
+
+    def blocked(name, *args, **kwargs):
+        if name.startswith(("torch", "mace")):
+            raise AssertionError(name)
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(__import__("builtins"), "__import__", blocked)
+    assert validator.validate_documents(reference, candidate)["passed"]
