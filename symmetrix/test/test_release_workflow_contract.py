@@ -78,9 +78,7 @@ def _cuda_wheel(tmp_path, *, descriptor=None, native=True, catalog=True, oam=Tru
         "backend": "cuda",
         "target": "sm120",
         "artifact_count": len(artifacts),
-        "catalog_sha256": hashlib.sha256(
-            json.dumps(payload).encode()
-        ).hexdigest(),
+        "catalog_sha256": hashlib.sha256(json.dumps(payload).encode()).hexdigest(),
     }
     wheel = tmp_path / "wheel.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -133,7 +131,9 @@ def test_cuda_audit_rejects_descriptor_or_provenance_mismatch(tmp_path, mutator)
         )
 
 
-@pytest.mark.parametrize("kwargs", ({"native": False}, {"catalog": False}, {"oam": False}))
+@pytest.mark.parametrize(
+    "kwargs", ({"native": False}, {"catalog": False}, {"oam": False})
+)
 def test_cuda_audit_rejects_missing_release_payload(tmp_path, kwargs):
     with pytest.raises(Exception):
         audit_cuda_release_wheel.audit_cuda_wheel(

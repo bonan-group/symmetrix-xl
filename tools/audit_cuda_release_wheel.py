@@ -25,7 +25,9 @@ def audit_cuda_wheel(wheel: Path, *, cuda_major: str, target: str) -> dict[str, 
     with zipfile.ZipFile(wheel) as archive:
         names = {info.filename for info in archive.infolist() if not info.is_dir()}
         if descriptor_name not in names:
-            raise BuildError(f"CUDA wheel is missing backend descriptor {descriptor_name}")
+            raise BuildError(
+                f"CUDA wheel is missing backend descriptor {descriptor_name}"
+            )
         descriptor = json.loads(archive.read(descriptor_name))
         expected = {
             "distribution": distribution,
@@ -45,7 +47,9 @@ def audit_cuda_wheel(wheel: Path, *, cuda_major: str, target: str) -> dict[str, 
             if name.startswith(native_prefix) and name.endswith(".so")
         ]
         if len(native) != 1:
-            raise BuildError(f"CUDA wheel must contain one native extension, found {native}")
+            raise BuildError(
+                f"CUDA wheel must contain one native extension, found {native}"
+            )
         if any(
             name == "symmetrix/__init__.py" or name.startswith("symmetrix/")
             for name in names
@@ -53,7 +57,9 @@ def audit_cuda_wheel(wheel: Path, *, cuda_major: str, target: str) -> dict[str, 
             raise BuildError("CUDA add-on wheel must not contain the frontend package")
         catalog_name = f"{package}/_operator_artifacts/catalog.json"
         if catalog_name not in names:
-            raise BuildError(f"CUDA wheel is missing prebuilt operator catalog {catalog_name}")
+            raise BuildError(
+                f"CUDA wheel is missing prebuilt operator catalog {catalog_name}"
+            )
         catalog = json.loads(archive.read(catalog_name))
         artifacts = catalog.get("artifacts")
         prebuilt = descriptor.get("prebuilt_operator_artifacts")
