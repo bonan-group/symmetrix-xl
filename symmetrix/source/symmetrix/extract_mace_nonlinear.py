@@ -10,13 +10,13 @@ from __future__ import annotations
 
 from typing import Any
 
-torch = None
-o3 = None
-
 from .mace_nonlinear_execution_contract import (
     MH1_CONTRACT_KEY,
     maybe_make_execution_mh1_contract,
 )
+
+torch = None
+o3 = None
 
 
 def _load_torch_dependencies() -> None:

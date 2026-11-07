@@ -4,7 +4,8 @@ The records under ``symmetrix/test/data/polar/e2e_*`` are the frozen torch
 oracle's end-to-end values for the family's parity gate (Task 13 of
 ``plans/2026-10-14-mace-polar-1-support-v1.md``): energy, forces, stress,
 dipole, and the chain's intermediate surfaces, on a molecular, a slab, and a
-periodic fixture, in three channel settings, in fp32 and fp64, for POLAR-1-S, POLAR-1-M, and POLAR-1-L. They are captured out of tree by
+periodic fixture, in three channel settings, in fp32 and fp64, for
+POLAR-1-S, POLAR-1-M, and POLAR-1-L. They are captured out of tree by
 ``benchmarks/polar_end_to_end_oracle_runner.py``; this module validates them
 without importing torch.
 
