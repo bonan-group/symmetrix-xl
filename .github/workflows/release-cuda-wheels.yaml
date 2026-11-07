@@ -81,12 +81,62 @@ jobs:
           ls -lh wheelhouse/release
           test "$(find wheelhouse/release -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 5
 
-      - name: Upload repaired wheel
+      - name: Audit repaired CUDA wheels and platform policy
+        env:
+          CUDA_MAJOR: ${{ matrix.cuda_major }}
+          CUDA_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check auditwheel
+          for wheel in wheelhouse/release/*.whl; do
+            python tools/audit_cuda_release_wheel.py "$wheel" \
+              --cuda-major "$CUDA_MAJOR" --target "$CUDA_TARGET"
+            auditwheel show "$wheel" | tee "${wheel%.whl}.auditwheel.txt"
+            grep -q 'manylinux_2_28' "${wheel%.whl}.auditwheel.txt"
+          done
+
+      - name: Install each CUDA wheel without dependencies
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/cuda-wheelcheck"
+          "$RUNNER_TEMP/cuda-wheelcheck/bin/pip" install --no-deps wheelhouse/release/*.whl
+          "$RUNNER_TEMP/cuda-wheelcheck/bin/python" - <<'PY'
+          import importlib.metadata as metadata
+          import json
+          import os
+          from pathlib import Path
+
+          dist_name = f"symmetrix-xl-cuda{os.environ['CUDA_MAJOR']}-{os.environ['CUDA_TARGET']}"
+          dist = metadata.distribution(dist_name)
+          selector = f"cuda{os.environ['CUDA_MAJOR']}-{os.environ['CUDA_TARGET']}"
+          points = [p for p in dist.entry_points if p.group == "symmetrix.backends"]
+          assert [(p.name, p.value) for p in points] == [
+              (selector, f"symmetrix_backend_{selector.replace('-', '_')}"),
+          ], points
+          package = Path(dist.locate_file(f"symmetrix_backend_{selector.replace('-', '_')}"))
+          descriptor = json.loads((package / "backend.json").read_text())
+          assert descriptor["selector"] == selector, descriptor
+          assert (package / f"_native_{selector.replace('-', '_')}.so").exists()
+          assert (package / "_operator_artifacts/catalog.json").exists()
+          print("CUDA wheel metadata/import contract OK", dist_name)
+          PY
+
+      - name: Compute wheel SHA256 manifest
+        run: |
+          mkdir -p release-manifest
+          (cd wheelhouse/release && sha256sum *.whl) > release-manifest/SHA256SUMS
+          cat release-manifest/SHA256SUMS
+
+      - name: Upload wheel and audit manifest artifacts
         uses: actions/upload-artifact@v4
         with:
           name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}
-          path: wheelhouse/release/*.whl
+          path: |
+            wheelhouse/release/*.whl
+            wheelhouse/release/*.auditwheel.txt
+            release-manifest/SHA256SUMS
           if-no-files-found: error
+
 
   publish-testpypi:
     name: Publish CUDA ${{ matrix.cuda_major }} ${{ matrix.target }} to TestPyPI
@@ -112,6 +162,16 @@ jobs:
         with:
           name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}
           path: wheelhouse
+
+      - name: Verify wheel SHA256 manifest
+        run: |
+          manifest="$(find wheelhouse -name SHA256SUMS -print -quit)"
+          test -n "$manifest"
+          while read -r checksum name; do
+            wheel="$(find wheelhouse -name "$name" -type f -print -quit)"
+            test -n "$wheel"
+            printf '%s  %s\n' "$checksum" "$wheel" | sha256sum -c -
+          done < "$manifest"
 
       - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
@@ -146,17 +206,15 @@ jobs:
           name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}
           path: wheelhouse
 
-      - name: Compute release manifest
+      - name: Verify wheel SHA256 manifest
         run: |
-          mkdir release-manifest
-          sha256sum wheelhouse/*.whl > release-manifest/SHA256SUMS
-          cat release-manifest/SHA256SUMS
-
-      - name: Upload release manifest artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-manifest-cuda${{ matrix.cuda_major }}-${{ matrix.target }}
-          path: release-manifest/SHA256SUMS
+          manifest="$(find wheelhouse -name SHA256SUMS -print -quit)"
+          test -n "$manifest"
+          while read -r checksum name; do
+            wheel="$(find wheelhouse -name "$name" -type f -print -quit)"
+            test -n "$wheel"
+            printf '%s  %s\n' "$checksum" "$wheel" | sha256sum -c -
+          done < "$manifest"
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

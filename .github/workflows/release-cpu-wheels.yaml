@@ -202,6 +202,8 @@ jobs:
     name: Run full CPU wheel suite
     needs: build
     runs-on: ubuntu-24.04
+    env:
+      SYMMETRIX_TEST_MODEL_DOWNLOADS: "0"
     steps:
       - name: Clone repository tests
         uses: actions/checkout@v6
@@ -219,7 +221,7 @@ jobs:
           path: wheelhouse
 
       - name: Install wheel and full test dependencies
-        run: pip install wheelhouse/*.whl pytest torch mace-torch
+        run: pip install wheelhouse/*.whl pytest 'torch==2.5.*' 'mace-torch==0.3.16'
 
       - name: Run full applicable test suite
         env:
