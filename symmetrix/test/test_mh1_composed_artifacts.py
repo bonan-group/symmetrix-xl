@@ -213,7 +213,7 @@ def test_mh1_split_phase_abi_versions_retire_all_previous_generations():
         "symmetrix.jit.mh1.hip-module/5",
         5,
     )
-    assert MH1_LAUNCH_PLAN_VERSION == 6
+    assert MH1_LAUNCH_PLAN_VERSION == 7
 
 
 def test_split_phase_headers_do_not_give_plugins_product_coefficients():

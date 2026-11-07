@@ -79,6 +79,25 @@ def test_python_graph_cardinality_guard_rejects_unrepresentable_topology():
         validate_graph_cardinality(-1, 0)
 
 
+def test_atombatch_neighbor_compatibility_surface_uses_shared_helpers():
+    assert calculator_module.neighbor_list is neighbor_graph_module.neighbor_list
+    assert (
+        calculator_module._receiver_major_neighbor_arrays
+        is neighbor_graph_module.receiver_major_neighbor_arrays
+    )
+    positions = np.array([[0.1, 0.0, 0.0], [1.2, 0.0, 0.0]])
+    reference = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+    actual = Symmetrix._minimum_image_displacements(
+        positions,
+        reference,
+        np.diag([4.0, 4.0, 4.0]),
+        np.array([True, True, True]),
+    )
+
+    np.testing.assert_allclose(actual, [[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]])
+
+
 def test_mace_inputs_runs_native_model_cardinality_guard(monkeypatch):
     atoms = Atoms(
         "H2",
@@ -213,6 +232,457 @@ def test_compute_mace_reports_the_missing_prepared_method_by_name():
         calculator._compute_mace(_prepared_inputs())
 
     assert calculator.evaluator.reduced == []
+
+
+def test_compute_mace_reuses_joined_direct_batch_topology():
+    class BatchEvaluator:
+        streamed_edges_mode = "direct"
+
+        def __init__(self):
+            self.factorized_graph_generation = 0
+            self.prepare_calls = []
+            self.compute_calls = []
+
+        def _prepare_factorized_graph(self, *topology):
+            self.factorized_graph_generation += 1
+            self.prepare_calls.append(topology)
+            return self.factorized_graph_generation
+
+        def _compute_prepared_factorized(self, generation, xyz, distances):
+            self.compute_calls.append((generation, xyz.copy(), distances.copy()))
+
+    calculator = object.__new__(Symmetrix)
+    calculator._alchemical = None
+    calculator.evaluator = BatchEvaluator()
+    calculator.cutoff = 3.0
+    inputs = list(_prepared_inputs())
+
+    calculator._compute_mace(tuple(inputs))
+    inputs[5] = inputs[5] + 0.01
+    inputs[6] = inputs[6] + 0.01
+    calculator._compute_mace(tuple(inputs))
+
+    assert len(calculator.evaluator.prepare_calls) == 1
+    assert [call[0] for call in calculator.evaluator.compute_calls] == [1, 1]
+
+
+def test_compute_mace_keeps_missing_joined_edge_in_prepared_superset():
+    class BatchEvaluator:
+        streamed_edges_mode = "direct"
+
+        def __init__(self):
+            self.factorized_graph_generation = 0
+            self.prepare_calls = []
+            self.compute_calls = []
+
+        def _prepare_factorized_graph(self, *topology):
+            self.factorized_graph_generation += 1
+            self.prepare_calls.append(topology)
+            return self.factorized_graph_generation
+
+        def _compute_prepared_factorized(self, generation, xyz, distances):
+            self.compute_calls.append((generation, xyz.copy(), distances.copy()))
+
+    calculator = object.__new__(Symmetrix)
+    calculator._alchemical = None
+    calculator.evaluator = BatchEvaluator()
+    calculator.cutoff = 3.0
+
+    calculator._compute_mace(_prepared_inputs())
+    subset = (
+        2,
+        [0, 0],
+        np.array([1, 0], dtype=np.int32),
+        np.array([1], dtype=np.int32),
+        [0],
+        np.array([[1.01, 0.0, 0.0]]),
+        np.array([1.01]),
+        np.array([0], dtype=np.int32),
+    )
+    calculator._compute_mace(subset)
+    calculator._compute_mace(_prepared_inputs())
+
+    assert len(calculator.evaluator.prepare_calls) == 1
+    assert [call[0] for call in calculator.evaluator.compute_calls] == [1, 1, 1]
+    np.testing.assert_allclose(
+        calculator.evaluator.compute_calls[1][2], [1.01, calculator.cutoff]
+    )
+    np.testing.assert_allclose(
+        calculator.evaluator.compute_calls[1][1].reshape((-1, 3))[1],
+        [-calculator.cutoff, 0.0, 0.0],
+    )
+
+
+def test_compute_mace_ignores_new_inactive_skin_edge():
+    class BatchEvaluator:
+        streamed_edges_mode = "direct"
+
+        def __init__(self):
+            self.factorized_graph_generation = 0
+            self.prepare_calls = 0
+            self.compute_calls = []
+
+        def _prepare_factorized_graph(self, *_topology):
+            self.factorized_graph_generation += 1
+            self.prepare_calls += 1
+            return self.factorized_graph_generation
+
+        def _compute_prepared_factorized(self, generation, xyz, distances):
+            self.compute_calls.append((generation, xyz.copy(), distances.copy()))
+
+    calculator = object.__new__(Symmetrix)
+    calculator._alchemical = None
+    calculator.evaluator = BatchEvaluator()
+    calculator.cutoff = 3.0
+
+    calculator._compute_mace(_prepared_inputs())
+    with_skin_candidate = (
+        2,
+        [0, 0],
+        np.array([2, 1], dtype=np.int32),
+        np.array([1, 0, 0], dtype=np.int32),
+        [0, 0, 0],
+        np.array([[1.0, 0.0, 0.0], [0.0, 3.0, 0.0], [-1.0, 0.0, 0.0]]),
+        np.array([1.0, 3.0, 1.0]),
+        np.array([0, 0, 1], dtype=np.int32),
+    )
+    calculator._compute_mace(with_skin_candidate)
+    with_skin_candidate = list(with_skin_candidate)
+    with_skin_candidate[5] = with_skin_candidate[5] + np.array(
+        [[0.01, 0.0, 0.0], [0.0, 0.0, 0.0], [-0.01, 0.0, 0.0]]
+    )
+    with_skin_candidate[6] = np.linalg.norm(with_skin_candidate[5], axis=1)
+    calculator._compute_mace(tuple(with_skin_candidate))
+
+    assert calculator.evaluator.prepare_calls == 1
+    assert len(calculator.evaluator.compute_calls[1][2]) == 2
+    assert len(calculator.evaluator.compute_calls[2][2]) == 2
+    np.testing.assert_allclose(calculator.evaluator.compute_calls[2][2], [1.01, 1.01])
+
+
+def test_compute_mace_rebuilds_joined_direct_batch_after_topology_change():
+    class BatchEvaluator:
+        streamed_edges_mode = "direct"
+
+        def __init__(self):
+            self.factorized_graph_generation = 0
+            self.prepare_calls = 0
+
+        def _prepare_factorized_graph(self, *topology):
+            self.factorized_graph_generation += 1
+            self.prepare_calls += 1
+            return self.factorized_graph_generation
+
+        def _compute_prepared_factorized(self, *_args):
+            return None
+
+    calculator = object.__new__(Symmetrix)
+    calculator._alchemical = None
+    calculator.evaluator = BatchEvaluator()
+    calculator.cutoff = 3.0
+    inputs = list(_prepared_inputs())
+
+    calculator._compute_mace(tuple(inputs))
+    inputs[2] = np.array([2, 1], dtype=np.int32)
+    inputs[3] = np.array([1, 0, 1], dtype=np.int32)
+    inputs[4] = [0, 0, 0]
+    inputs[5] = np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    inputs[6] = np.array([1.0, 1.0, 1.0])
+    calculator._compute_mace(tuple(inputs))
+
+    assert calculator.evaluator.prepare_calls == 2
+
+
+def test_explicit_segment_group_rebuilds_only_when_ignored_edge_activates(
+    monkeypatch,
+):
+    class Evaluator:
+        factorized_graph_generation = 0
+
+        def __init__(self):
+            self.prepare_calls = 0
+            self.geometry_calls = 0
+            self.position_calls = 0
+
+        def prepare_graph(self, *_args):
+            self.prepare_calls += 1
+            self.factorized_graph_generation += 1
+            return self.factorized_graph_generation
+
+        def prepare_geometry(self, *_args):
+            self.geometry_calls += 1
+
+        def compute_positions(self, *_args):
+            self.position_calls += 1
+
+    evaluator = Evaluator()
+
+    def require_surface(_family, _evaluator, surface):
+        return {
+            "prepared_geometry": (evaluator.prepare_geometry,),
+            "prepared_positions": (evaluator.compute_positions,),
+        }[surface]
+
+    monkeypatch.setattr(
+        calculator_module.family_registry, "require_surface", require_surface
+    )
+    calculator = object.__new__(Symmetrix)
+    calculator.evaluator = evaluator
+    calculator.cutoff = 3.0
+    calculator._explicit_segment_group_cache = None
+    calculator._last_kernel_launch_properties = ("energy", "forces")
+    segment = calculator_module._PendingExplicitSegment
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    common = {
+        "positions": positions,
+        "cell": np.diag([4.0, 4.0, 4.0]),
+        "node_types": np.array([0, 0], dtype=np.int32),
+    }
+
+    def segments(generation, extra=False, source_x=1.0):
+        segment_positions = np.array([[0.0, 0.0, 0.0], [source_x, 0.0, 0.0]])
+        first_receivers = [0, 0] if extra else [0]
+        first_sources = [1, 1] if extra else [1]
+        first_shifts = [[0, 0, 0], [-1, 0, 0]] if extra else [[0, 0, 0]]
+        return [
+            segment(
+                **{**common, "positions": segment_positions},
+                receivers=np.array(first_receivers, dtype=np.int32),
+                sources=np.array(first_sources, dtype=np.int32),
+                shifts=np.array(first_shifts, dtype=np.int32),
+                cache_generation=generation,
+            ),
+            segment(
+                **{**common, "positions": segment_positions},
+                receivers=np.array([0], dtype=np.int32),
+                sources=np.array([1], dtype=np.int32),
+                shifts=np.array([[0, 0, 0]], dtype=np.int32),
+                cache_generation=1,
+            ),
+        ]
+
+    node_types = np.zeros(4, dtype=np.int32)
+    family = object()
+    calculator._compute_explicit_segment_group(
+        segments(1), node_types, np.array([1.0, 1.0]), family, evaluator.prepare_graph
+    )
+    calculator._compute_explicit_segment_group(
+        segments(1), node_types, np.array([1.0, 1.0]), family, evaluator.prepare_graph
+    )
+    calculator._compute_explicit_segment_group(
+        segments(2, extra=True),
+        node_types,
+        np.array([3.0, 3.0, 3.0]),
+        family,
+        evaluator.prepare_graph,
+    )
+    calculator._compute_explicit_segment_group(
+        segments(2, extra=True, source_x=1.1),
+        node_types,
+        np.array([3.0, 3.0, 3.0]),
+        family,
+        evaluator.prepare_graph,
+    )
+
+    assert evaluator.prepare_calls == 2
+    assert evaluator.geometry_calls == 2
+    assert evaluator.position_calls == 4
+
+
+def test_explicit_segment_group_rebinds_cell_geometry_for_stress(monkeypatch):
+    class Evaluator:
+        factorized_graph_generation = 0
+
+        def __init__(self):
+            self.prepare_calls = 0
+            self.geometry_calls = []
+            self.geometry_update_calls = []
+            self.segment_geometry_calls = []
+            self.segment_cell_calls = []
+            self.position_calls = 0
+            self.batch_calls = []
+
+        def prepare_graph(self, *_args):
+            self.prepare_calls += 1
+            self.factorized_graph_generation += 1
+            return self.factorized_graph_generation
+
+        def prepare_geometry(self, generation, _positions, xyz, *_args):
+            self.geometry_calls.append((generation, np.array(xyz, copy=True)))
+
+        def _update_factorized_reference_geometry(self, generation, _positions, xyz):
+            self.geometry_update_calls.append((generation, np.array(xyz, copy=True)))
+
+        def _prepare_factorized_segment_geometry(
+            self, generation, positions, shifts, cells
+        ):
+            self.segment_geometry_calls.append(
+                (
+                    generation,
+                    np.array(positions, copy=True),
+                    np.array(shifts, copy=True),
+                    np.array(cells, copy=True),
+                )
+            )
+
+        def _update_factorized_segment_cells(self, generation, cells):
+            self.segment_cell_calls.append((generation, np.array(cells, copy=True)))
+
+        def compute_positions(self, *_args):
+            self.position_calls += 1
+
+        def _prepare_factorized_batch(self, generation, edge_offsets):
+            self.batch_calls.append((generation, np.array(edge_offsets, copy=True)))
+
+        def _reduce_segmented_stress(self, *_args):
+            raise AssertionError("the evaluator reduction is not called here")
+
+    evaluator = Evaluator()
+
+    def require_surface(_family, _evaluator, surface):
+        return {
+            "prepared_geometry": (evaluator.prepare_geometry,),
+            "prepared_positions": (evaluator.compute_positions,),
+        }[surface]
+
+    monkeypatch.setattr(
+        calculator_module.family_registry, "require_surface", require_surface
+    )
+    calculator = object.__new__(Symmetrix)
+    calculator.evaluator = evaluator
+    calculator.cutoff = 3.0
+    calculator._explicit_segment_group_cache = None
+    calculator._last_kernel_launch_properties = ("energy", "forces", "stress")
+    segment_type = calculator_module._PendingExplicitSegment
+    positions = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+    def make_segments(first_cell_length):
+        cells = (
+            np.diag([first_cell_length, 4.0, 4.0]),
+            np.diag([5.0, 5.0, 5.0]),
+        )
+        return [
+            segment_type(
+                positions=positions,
+                cell=cell,
+                node_types=np.array([0, 0], dtype=np.int32),
+                receivers=np.array([0], dtype=np.int32),
+                sources=np.array([1], dtype=np.int32),
+                shifts=np.array([[-1, 0, 0]], dtype=np.int32),
+                cache_generation=1,
+                source_key=("source", index),
+            )
+            for index, cell in enumerate(cells)
+        ]
+
+    node_types = np.zeros(4, dtype=np.int32)
+    family = object()
+    first = calculator._compute_explicit_segment_group(
+        make_segments(4.0),
+        node_types,
+        np.array([3.0, 4.0]),
+        family,
+        evaluator.prepare_graph,
+    )
+    second = calculator._compute_explicit_segment_group(
+        make_segments(4.2),
+        node_types,
+        np.array([3.2, 4.0]),
+        family,
+        evaluator.prepare_graph,
+    )
+
+    assert first == second == 1
+    assert evaluator.prepare_calls == 1
+    assert evaluator.position_calls == 2
+    assert evaluator.geometry_calls == []
+    assert evaluator.geometry_update_calls == []
+    assert len(evaluator.segment_geometry_calls) == 1
+    assert len(evaluator.segment_cell_calls) == 1
+    assert len(evaluator.batch_calls) == 1
+    assert evaluator.batch_calls[0][0] == 1
+    np.testing.assert_array_equal(
+        evaluator.batch_calls[0][1], np.array([0, 1, 2], dtype=np.int64)
+    )
+    np.testing.assert_array_equal(
+        evaluator.segment_geometry_calls[0][2],
+        np.array([-1, 0, 0, -1, 0, 0], dtype=np.int32),
+    )
+    prepared_cells = evaluator.segment_geometry_calls[0][3].reshape(2, 3, 3)
+    updated_cells = evaluator.segment_cell_calls[0][1].reshape(2, 3, 3)
+    np.testing.assert_allclose(updated_cells[0, 0, 0] - prepared_cells[0, 0, 0], 0.2)
+
+
+def test_joined_neighbor_caches_are_keyed_by_source_and_defer_geometry():
+    class Source:
+        pass
+
+    atoms_a = Atoms(
+        "H2",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        cell=[8.0, 8.0, 8.0],
+        pbc=True,
+    )
+    atoms_b = atoms_a.copy()
+    source_a = Source()
+    source_b = Source()
+    atoms_a.info["atombatch_source"] = source_a
+    atoms_b.info["atombatch_source"] = source_b
+    calculator = _bare_neighbor_cache_calculator(cutoff=2.0, skin=0.4)
+    calculator.joined_neighbor_skin = 1.0
+    calculator.evaluator.streamed_edges_mode = "direct"
+    calculator._joined_group_fast_geometry_ready = False
+
+    calculator._cached_neighbor_geometry(
+        atoms_a, native_geometry=True, allow_device_neighbor_graph=False
+    )
+    cache_a = calculator._neighbor_cache
+    calculator._cached_neighbor_geometry(
+        atoms_b, native_geometry=True, allow_device_neighbor_graph=False
+    )
+    cache_b = calculator._neighbor_cache
+    atoms_a.positions[1, 0] += 0.05
+    calculator._cached_neighbor_geometry(
+        atoms_a, native_geometry=True, allow_device_neighbor_graph=False
+    )
+
+    assert cache_a is not cache_b
+    assert calculator._neighbor_cache is cache_a
+    assert calculator.neighbor_cache_build_count == 2
+    assert calculator.neighbor_cache_reuse_count == 1
+    assert len(calculator._trajectory_neighbor_caches) == 2
+
+    calculator._joined_group_fast_geometry_ready = True
+    _, _, distances, xyz = calculator._cached_neighbor_geometry(
+        atoms_b, native_geometry=True, allow_device_neighbor_graph=False
+    )
+    np.testing.assert_array_equal(distances, calculator.cutoff)
+    np.testing.assert_array_equal(xyz[:, 0], calculator.cutoff)
+    np.testing.assert_array_equal(xyz[:, 1:], 0.0)
+    assert calculator.neighbor_cache_host_geometry_materialization_count == 0
+    assert calculator._pending_explicit_segments[-1].geometry_deferred
+
+
+def test_deferred_segment_geometry_materializes_exact_cutoff_clamping():
+    segment = calculator_module._PendingExplicitSegment(
+        positions=np.array([[0.0, 0.0, 0.0], [3.5, 0.0, 0.0]]),
+        cell=np.diag([8.0, 8.0, 8.0]),
+        node_types=np.array([0, 0], dtype=np.int32),
+        receivers=np.array([0, 1], dtype=np.int32),
+        sources=np.array([1, 0], dtype=np.int32),
+        shifts=np.zeros((2, 3), dtype=np.int32),
+        cache_generation=1,
+        geometry_deferred=True,
+    )
+    xyz = np.zeros((2, 3))
+    distances = np.zeros(2)
+
+    calculator_module._materialize_segment_geometry(
+        [segment], xyz, distances, cutoff=3.0
+    )
+
+    np.testing.assert_allclose(distances, 3.0)
+    np.testing.assert_allclose(xyz, [[3.0, 0.0, 0.0], [-3.0, 0.0, 0.0]])
 
 
 def test_compute_mace_reports_an_unready_declared_tier():

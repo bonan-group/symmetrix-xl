@@ -232,8 +232,8 @@ def test_product_route_uses_common_module(monkeypatch, tmp_path):
     artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
     launch_plan = {
         "split_phase_composition": True,
-        "schema": "symmetrix.jit.mh1.cuda-launch-plan/6",
-        "version": 6,
+        "schema": "symmetrix.jit.mh1.cuda-launch-plan/7",
+        "version": 7,
         "node_state_policy": "full-retention-v1",
         "module_identity": "sha256:module",
         "nodes": [{}, {}],
@@ -276,7 +276,7 @@ def test_product_route_uses_common_module(monkeypatch, tmp_path):
 
     assert record["external_product"] is True
     assert record["split_phase_composition"] is True
-    assert record["plan_schema"] == "symmetrix.jit.mh1.cuda-launch-plan/6"
+    assert record["plan_schema"] == "symmetrix.jit.mh1.cuda-launch-plan/7"
     assert record["device_module_abi"]["version"] == 5
     assert record["jit_generation_version"] == 19
     assert record["node_state_policy"] == "full-retention-v1"
@@ -446,8 +446,8 @@ def test_product_evidence_keeps_full_plugin_origin_independent(monkeypatch, tmp_
                     "build": {
                         "request": {
                             "launch_plan": {
-                                "schema": "symmetrix.jit.mh1.cuda-launch-plan/6",
-                                "version": 6,
+                                "schema": "symmetrix.jit.mh1.cuda-launch-plan/7",
+                                "version": 7,
                                 "split_phase_composition": True,
                                 "module_identity": "sha256:plugin",
                             }
@@ -813,8 +813,8 @@ def test_product_evidence_rejects_invalid_coefficient_count(monkeypatch, tmp_pat
                         "request": {
                             "launch_plan": {
                                 "module_identity": "sha256:plugin",
-                                "schema": "symmetrix.jit.mh1.cuda-launch-plan/6",
-                                "version": 6,
+                                "schema": "symmetrix.jit.mh1.cuda-launch-plan/7",
+                                "version": 7,
                                 "split_phase_composition": True,
                             }
                         }

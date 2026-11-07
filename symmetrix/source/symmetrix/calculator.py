@@ -11,6 +11,7 @@ import operator
 import os
 import sys
 import warnings
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -110,8 +111,17 @@ _FIXED_WORKSPACE_TILED_PLANS = frozenset(
     ("mh0-single-layer-tiled-v1", "mh0-dual-layer-tiled-v1")
 )
 _NEIGHBOR_BACKENDS = frozenset(("automatic", "host", "kokkos"))
+_MH1_DENSE_POLICIES = frozenset(("auto", "generated", "vendor_fp32", "vendor_tf32"))
 _AUTOMATIC_KOKKOS_NEIGHBOR_MIN_ATOMS = 512
 _AUTOMATIC_KOKKOS_NEIGHBOR_EXECUTION_SPACES = frozenset(("Cuda", "HIP"))
+_ATOMBATCH_SOURCE_KEY = "atombatch_source"
+
+# Compatibility surface used by atombatch 0.1.x.  The implementation lives in
+# neighbor_graph so the calculator and external joined-graph callers share the
+# same provider and receiver-major ordering policy.
+neighbor_list = neighbor_graph.neighbor_list
+_matscipy_neighbor_list = neighbor_graph._fast_neighbor_list
+_receiver_major_neighbor_arrays = neighbor_graph.receiver_major_neighbor_arrays
 
 
 def _neighbor_backend_request():
@@ -120,6 +130,16 @@ def _neighbor_backend_request():
         choices = ", ".join(sorted(_NEIGHBOR_BACKENDS))
         raise ValueError(
             f"SYMMETRIX_NEIGHBOR_BACKEND must be one of {choices}; got {request!r}."
+        )
+    return request
+
+
+def _mh1_dense_policy_request():
+    request = os.environ.get("SYMMETRIX_MH1_DENSE_POLICY", "auto").strip().lower()
+    if request not in _MH1_DENSE_POLICIES:
+        choices = ", ".join(sorted(_MH1_DENSE_POLICIES))
+        raise ValueError(
+            f"SYMMETRIX_MH1_DENSE_POLICY must be one of {choices}; got {request!r}."
         )
     return request
 
@@ -192,6 +212,297 @@ class _NeighborCache:
     device_graph_generation: int = 0
     device_geometry_generation: int = 0
     num_edges: int = 0
+    source_key: tuple[str, int] | None = None
+    deferred_distances: np.ndarray | None = None
+    deferred_xyz: np.ndarray | None = None
+
+
+@dataclass
+class _ExplicitFactorizedGraphCache:
+    generation: int
+    num_nodes: int
+    node_types: np.ndarray
+    num_neigh: np.ndarray
+    receivers: np.ndarray
+    sources: np.ndarray
+    reference_xyz: np.ndarray
+    xyz: np.ndarray
+    distances: np.ndarray
+    sorted_edge_keys: np.ndarray
+    sorted_edge_indices: np.ndarray
+    edge_keys_unique: bool
+    input_num_neigh: np.ndarray
+    input_sources: np.ndarray
+    input_to_prepared: np.ndarray
+    prepared_to_input: np.ndarray
+    prepared_missing: np.ndarray
+    inactive_xyz: np.ndarray
+    input_mapping_identity: bool
+
+
+@dataclass
+class _PendingExplicitSegment:
+    positions: np.ndarray
+    cell: np.ndarray
+    node_types: np.ndarray
+    receivers: np.ndarray
+    sources: np.ndarray
+    shifts: np.ndarray
+    cache_generation: int
+    source_key: tuple[str, int] | None = None
+    geometry_deferred: bool = False
+
+
+@dataclass
+class _ExplicitSegmentGroupCache:
+    generation: int
+    num_nodes: int
+    node_types: np.ndarray
+    atom_counts: tuple[int, ...]
+    segment_keys: tuple[tuple[str, int] | None, ...]
+    edge_identities: list[np.ndarray]
+    ignored_edge_identities: list[np.ndarray]
+    segment_generations: list[int]
+    cells: list[np.ndarray]
+
+
+def _segment_edge_identities(segment):
+    return np.ascontiguousarray(
+        np.column_stack(
+            (
+                segment.receivers,
+                segment.sources,
+                segment.shifts,
+            )
+        ),
+        dtype=np.int32,
+    )
+
+
+def _row_keys(rows):
+    rows = np.ascontiguousarray(rows)
+    return rows.view(np.dtype((np.void, rows.dtype.itemsize * rows.shape[1]))).ravel()
+
+
+def _segment_identity_distances(segment, identities):
+    if len(identities) == 0:
+        return np.empty(0, dtype=float)
+    receivers = identities[:, 0]
+    sources = identities[:, 1]
+    xyz = (
+        segment.positions[sources]
+        - segment.positions[receivers]
+        + identities[:, 2:] @ segment.cell
+    )
+    return np.linalg.norm(xyz, axis=1)
+
+
+def _materialize_segment_geometry(segments, xyz, distances, cutoff):
+    xyz = np.asarray(xyz).reshape((-1, 3))
+    distances = np.asarray(distances).reshape(-1)
+    edge_offset = 0
+    for segment in segments:
+        edge_count = len(segment.receivers)
+        edge_slice = slice(edge_offset, edge_offset + edge_count)
+        vectors = (
+            segment.positions[segment.sources]
+            - segment.positions[segment.receivers]
+            + segment.shifts @ segment.cell
+        )
+        radii = np.linalg.norm(vectors, axis=1)
+        inactive = radii >= float(cutoff)
+        if np.any(inactive):
+            vectors = np.array(vectors, copy=True)
+            vectors[inactive] *= (float(cutoff) / radii[inactive])[:, None]
+            radii = np.array(radii, copy=True)
+            radii[inactive] = float(cutoff)
+        xyz[edge_slice] = vectors
+        distances[edge_slice] = radii
+        edge_offset += edge_count
+    if edge_offset != len(distances):
+        raise ValueError("Joined segment geometry extents are inconsistent.")
+
+
+def _explicit_factorized_union(
+    cached,
+    num_nodes,
+    node_types,
+    num_neigh,
+    sources,
+    xyz,
+    distances,
+    cutoff,
+):
+    """Merge a fluctuating explicit edge list into a prepared superset.
+
+    Exact-cutoff neighbor lists can lose and regain boundary edges on adjacent
+    MD steps.  Direct execution keeps every edge it has prepared; an absent
+    cached edge is placed at the radial cutoff, where its contribution is zero.
+    New edges extend the receiver-major topology and require one new schedule.
+    """
+
+    node_types = np.ascontiguousarray(node_types, dtype=np.int32)
+    num_neigh = np.ascontiguousarray(num_neigh, dtype=np.int32)
+    sources = np.ascontiguousarray(sources, dtype=np.int32)
+    xyz = np.ascontiguousarray(xyz, dtype=float).reshape((-1, 3))
+    distances = np.ascontiguousarray(distances, dtype=float).reshape(-1)
+    if int(np.sum(num_neigh, dtype=np.int64)) != len(sources) or len(sources) != len(
+        xyz
+    ):
+        raise ValueError("MACE graph topology and geometry extents are inconsistent.")
+
+    compatible = (
+        cached is not None
+        and cached.num_nodes == num_nodes
+        and np.array_equal(cached.node_types, node_types)
+    )
+    if (
+        compatible
+        and np.array_equal(cached.input_num_neigh, num_neigh)
+        and np.array_equal(cached.input_sources, sources)
+    ):
+        ignored = cached.input_to_prepared < 0
+        if not np.any(ignored & (distances < float(cutoff))):
+            if cached.input_mapping_identity:
+                return (
+                    cached.receivers,
+                    cached.sources,
+                    xyz,
+                    distances,
+                    False,
+                    cached.input_to_prepared,
+                    cached.reference_xyz,
+                )
+            np.take(
+                xyz,
+                cached.prepared_to_input,
+                axis=0,
+                out=cached.xyz,
+            )
+            np.take(
+                distances,
+                cached.prepared_to_input,
+                out=cached.distances,
+            )
+            cached.xyz[cached.prepared_missing] = cached.inactive_xyz
+            cached.distances[cached.prepared_missing] = float(cutoff)
+            return (
+                cached.receivers,
+                cached.sources,
+                cached.xyz,
+                cached.distances,
+                False,
+                cached.input_to_prepared,
+                cached.reference_xyz,
+            )
+
+    receivers = np.repeat(
+        np.arange(num_nodes, dtype=np.int32), num_neigh.astype(np.int64)
+    )
+    if not compatible:
+        return (
+            receivers,
+            sources,
+            xyz,
+            distances,
+            True,
+            np.arange(len(sources), dtype=np.int64),
+            xyz,
+        )
+
+    matched_cached = np.full(len(sources), -1, dtype=np.int64)
+    # Distinct periodic images of the same atom pair differ by a lattice
+    # vector.  This tolerance follows one image through ordinary MD motion but
+    # does not alias a newly encountered image onto an old one.
+    match_tolerance_sq = max(1.0e-12, (0.25 * float(cutoff)) ** 2)
+    current_keys = receivers.astype(np.int64) * int(num_nodes) + sources
+    starts = np.searchsorted(cached.sorted_edge_keys, current_keys, side="left")
+    ends = np.searchsorted(cached.sorted_edge_keys, current_keys, side="right")
+    multiplicities = ends - starts
+    best_squared = np.full(len(current_keys), np.inf, dtype=float)
+
+    max_multiplicity = int(multiplicities.max(initial=0))
+    for offset in range(max_multiplicity):
+        eligible = np.flatnonzero(multiplicities > offset)
+        sorted_positions = starts[eligible] + offset
+        previous = cached.sorted_edge_indices[sorted_positions]
+        delta = cached.reference_xyz[previous] - xyz[eligible]
+        squared = np.einsum("ij,ij->i", delta, delta)
+        better = squared < best_squared[eligible]
+        selected = eligible[better]
+        matched_cached[selected] = previous[better]
+        best_squared[selected] = squared[better]
+    matched_cached[best_squared > match_tolerance_sq] = -1
+
+    # Nearest-image selection is normally one-to-one.  If a disappearing image
+    # makes two current edges choose the same cached edge, retain the closer
+    # match and treat the other as a genuinely new candidate.
+    matched = np.flatnonzero(matched_cached >= 0)
+    if len(matched) > 1:
+        order = np.lexsort((best_squared[matched], matched_cached[matched]))
+        ordered = matched[order]
+        duplicate = np.zeros(len(ordered), dtype=bool)
+        duplicate[1:] = matched_cached[ordered[1:]] == matched_cached[ordered[:-1]]
+        matched_cached[ordered[duplicate]] = -1
+
+    # A rebuilt cutoff-plus-skin list discovers pairs before they contribute to
+    # the model.  atombatch clamps those candidates to exactly ``cutoff``;
+    # leave them out of the prepared union until they become active instead of
+    # rebuilding a schedule for a zero edge.
+    new_edges = np.flatnonzero((matched_cached < 0) & (distances < float(cutoff)))
+    current_by_cached = np.full(len(cached.sources), -1, dtype=np.int64)
+    for current, previous in enumerate(matched_cached):
+        if previous >= 0:
+            current_by_cached[previous] = current
+
+    norms = np.linalg.norm(cached.reference_xyz, axis=1)
+    if not np.isfinite(norms).all() or not (norms > 0.0).all():
+        raise ValueError("Cached MACE edge has an invalid displacement vector.")
+    output_receivers = np.array(cached.receivers, copy=True)
+    output_sources = np.array(cached.sources, copy=True)
+    output_xyz = cached.reference_xyz * (float(cutoff) / norms)[:, None]
+    output_distances = np.full(len(cached.sources), float(cutoff), dtype=float)
+    output_reference_xyz = np.array(cached.reference_xyz, copy=True)
+    present = np.flatnonzero(current_by_cached >= 0)
+    output_xyz[present] = xyz[current_by_cached[present]]
+    output_distances[present] = distances[current_by_cached[present]]
+    output_reference_xyz[present] = xyz[current_by_cached[present]]
+    if len(new_edges):
+        current_to_output = np.array(matched_cached, copy=True)
+        current_to_output[new_edges] = len(cached.sources) + np.arange(
+            len(new_edges), dtype=np.int64
+        )
+        output_receivers = np.concatenate((output_receivers, receivers[new_edges]))
+        output_sources = np.concatenate((output_sources, sources[new_edges]))
+        output_xyz = np.concatenate((output_xyz, xyz[new_edges]), axis=0)
+        output_reference_xyz = np.concatenate(
+            (output_reference_xyz, xyz[new_edges]), axis=0
+        )
+        output_distances = np.concatenate(
+            (output_distances, distances[new_edges]), axis=0
+        )
+        receiver_order = np.argsort(output_receivers, kind="stable")
+        inverse_order = np.empty(len(receiver_order), dtype=np.int64)
+        inverse_order[receiver_order] = np.arange(len(receiver_order), dtype=np.int64)
+        mapped = current_to_output >= 0
+        current_to_output[mapped] = inverse_order[current_to_output[mapped]]
+        output_receivers = output_receivers[receiver_order]
+        output_sources = output_sources[receiver_order]
+        output_xyz = output_xyz[receiver_order]
+        output_distances = output_distances[receiver_order]
+        output_reference_xyz = output_reference_xyz[receiver_order]
+    else:
+        current_to_output = matched_cached
+
+    return (
+        np.ascontiguousarray(output_receivers, dtype=np.int32),
+        np.ascontiguousarray(output_sources, dtype=np.int32),
+        np.ascontiguousarray(output_xyz, dtype=float),
+        np.ascontiguousarray(output_distances, dtype=float),
+        bool(len(new_edges)),
+        np.ascontiguousarray(current_to_output, dtype=np.int64),
+        np.ascontiguousarray(output_reference_xyz, dtype=float),
+    )
 
 
 def _to_voigt_stress(stress):
@@ -678,6 +989,12 @@ class Symmetrix(Calculator):
         the exact compact-radial cutoff, where their radial contribution is
         zero, so the prepared schedule remains stable. Set to zero to rebuild
         the exact neighbor list every call.
+    joined_neighbor_skin : float or None, default=None
+        Candidate-list skin for source-keyed joined direct batches. ``None``
+        uses at least 1 Angstrom while leaving ``neighbor_skin`` unchanged for
+        ordinary single-structure calculations. A wider joined skin amortizes
+        topology specialization across many independently moving structures;
+        it does not change the model cutoff or physical interactions.
     polar_electrostatics : {"auto", "realspace", "periodic", "direct_reciprocal", "pme"}, default="auto"
         Runtime POLAR electrostatics policy. Fully non-periodic input resolves
         ``auto`` to real space; any periodic axis resolves it to the Delivery 1
@@ -730,6 +1047,9 @@ class Symmetrix(Calculator):
     jit_forward_policy, jit_source_policy : dict or None
         Canonical generated MH-1 CUDA partition plans. These remain ``None``
         unless the corresponding plugin compiled and loaded successfully.
+    jit_dense_policy : str or None
+        Active MH-1 CUDA dense-operation policy. This remains ``None`` unless
+        an MH-1 CUDA module compiled and loaded successfully.
     jit_node_state_policy : str or None
         Active generated MH-1 node-state policy. This remains ``None`` unless
         an MH-1 CUDA or HIP module compiled and loaded successfully.
@@ -770,6 +1090,10 @@ class Symmetrix(Calculator):
     imported nor required.
     """
 
+    # atombatch 0.1.x calls this hook while maintaining one Symmetrix neighbor
+    # cache per trajectory.  Keep it as a static alias of the shared helper.
+    _minimum_image_displacements = staticmethod(minimum_image_displacements)
+
     implemented_properties = list(_FIELD_ADDITIVE_PROPERTIES)
     #: Compatibility tombstone for callers checking that the retired Python
     #: scientific-program branch is not configured in production.
@@ -799,6 +1123,7 @@ class Symmetrix(Calculator):
         execution_mh0_state_policy="full-retention-v1",
         edge_geometry_policy="cartesian-f64-v1",
         neighbor_skin=0.5,
+        joined_neighbor_skin=None,
         polar_electrostatics=_POLAR_OPTION_UNSET,
         polar_pme_mesh=_POLAR_OPTION_UNSET,
         polar_pme_order=_POLAR_OPTION_UNSET,
@@ -1101,7 +1426,21 @@ class Symmetrix(Calculator):
         ):
             raise ValueError("neighbor_skin must be a finite non-negative number.")
         self.neighbor_skin = float(neighbor_skin)
+        if joined_neighbor_skin is None:
+            joined_neighbor_skin = max(self.neighbor_skin, 1.0)
+        if (
+            isinstance(joined_neighbor_skin, bool)
+            or not np.isscalar(joined_neighbor_skin)
+            or not np.isfinite(joined_neighbor_skin)
+            or joined_neighbor_skin < self.neighbor_skin
+        ):
+            raise ValueError(
+                "joined_neighbor_skin must be finite and at least neighbor_skin."
+            )
+        self.joined_neighbor_skin = float(joined_neighbor_skin)
         self._neighbor_cache = None
+        self._trajectory_neighbor_caches = {}
+        self._trajectory_neighbor_cache_watched = set()
         self.neighbor_cache_build_count = 0
         self.neighbor_cache_reuse_count = 0
         self.neighbor_cache_geometry_update_count = 0
@@ -1112,6 +1451,13 @@ class Symmetrix(Calculator):
         self._all_interactions_native_geometry_identity = None
         self._all_interactions_graph_identity = None
         self._all_interactions_graph_generation = 0
+        # Joined direct batches submit explicit edge geometry with ``atoms``
+        # unset.  Keep their topology-specialized schedule alive across steps;
+        # the edge coordinates are still streamed on every call.
+        self._explicit_factorized_graph_cache = None
+        self._explicit_segment_group_cache = None
+        self._pending_explicit_segments = []
+        self._joined_group_fast_geometry_ready = False
         self._deprecate_jit_argument(jit)
         self.streamed_edges_requested = requested_streamed_edges
         self.streamed_edges_alias = (
@@ -1148,6 +1494,7 @@ class Symmetrix(Calculator):
         self.jit_forward_policy = None
         self.jit_source_policy = None
         self.jit_edge_policy = None
+        self.jit_dense_policy = None
         self.jit_node_state_policy = None
         self.jit_variant_id = None
         self.jit_operator_modules = {}
@@ -1858,6 +2205,7 @@ class Symmetrix(Calculator):
         )
 
     def _apply_kernel_launch_tuning(self, num_nodes, num_edges, properties):
+        self._last_kernel_launch_properties = tuple(properties)
         if self.kernel_launch_policy == "static":
             self.kernel_launch_tuning_status = "static"
             return False
@@ -2311,6 +2659,7 @@ class Symmetrix(Calculator):
         selected_forward_policy = None
         selected_source_policy = None
         selected_edge_policy = None
+        selected_dense_policy = None
         selected_node_state_policy = None
         selected_variant_id = None
         mh1_v3_contract = None
@@ -2699,6 +3048,7 @@ class Symmetrix(Calculator):
                     edge_policy = edge_policy_function(
                         mh1_v3_contract, compute_capability, "auto"
                     )
+                    dense_policy = _mh1_dense_policy_request()
                     metadata = metadata_function(
                         contract,
                         compute_capability,
@@ -2724,10 +3074,12 @@ class Symmetrix(Calculator):
                         edge_policy=edge_policy,
                         node_state_policy=self.execution_mh1_node_state_policy,
                         precision=dtype,
+                        dense_policy=dense_policy,
                     )
                     selected_forward_policy = forward_policy
                     selected_source_policy = source_policy
                     selected_edge_policy = edge_policy
+                    selected_dense_policy = dense_policy
                     selected_node_state_policy = metadata["node_state_policy"]
                     selected_variant_id = (
                         f"{metadata['artifact_id']}-fwd-"
@@ -2737,6 +3089,7 @@ class Symmetrix(Calculator):
                         "-edge-"
                         f"{edge_policy['policy_id'].removeprefix('sha256:')[:12]}"
                         f"-node-{metadata['node_state_policy']}"
+                        f"-dense-{dense_policy}"
                     )
                     generator = "symmetrix.jit.mh1-cuda-module-v1"
                     artifact_name = "execution_mh1_cuda_module"
@@ -3163,6 +3516,7 @@ class Symmetrix(Calculator):
             self.jit_forward_policy = selected_forward_policy
             self.jit_source_policy = selected_source_policy
             self.jit_edge_policy = selected_edge_policy
+            self.jit_dense_policy = selected_dense_policy
             self.jit_node_state_policy = selected_node_state_policy
             self.jit_variant_id = selected_variant_id
             if specialization == "mh1" and product_requests is not None:
@@ -3948,6 +4302,36 @@ class Symmetrix(Calculator):
             self.neighbor_cache_host_geometry_materialization_count += 1
         return cache
 
+    def _joined_neighbor_source_key(self, atoms):
+        source = atoms.info.get(_ATOMBATCH_SOURCE_KEY)
+        if source is None:
+            return None
+        key = ("source", id(source))
+        watched = getattr(self, "_trajectory_neighbor_cache_watched", None)
+        if watched is None:
+            watched = set()
+            self._trajectory_neighbor_cache_watched = watched
+        if key in watched:
+            return key
+
+        owner = weakref.ref(self)
+
+        def release():
+            calculator = owner()
+            if calculator is None:
+                return
+            getattr(calculator, "_trajectory_neighbor_caches", {}).pop(key, None)
+            getattr(calculator, "_trajectory_neighbor_cache_watched", set()).discard(
+                key
+            )
+
+        try:
+            weakref.finalize(source, release)
+        except TypeError:
+            return None
+        watched.add(key)
+        return key
+
     def _cached_neighbor_geometry(
         self, atoms, native_geometry=False, allow_device_neighbor_graph=True
     ):
@@ -3955,7 +4339,33 @@ class Symmetrix(Calculator):
         pbc = np.asarray(atoms.pbc, dtype=bool)
         cell = np.asarray(atoms.cell, dtype=float)
         positions = np.asarray(atoms.positions, dtype=float)
-        cache = self._neighbor_cache
+        source_key = None
+        if (
+            native_geometry
+            and not allow_device_neighbor_graph
+            and getattr(self.evaluator, "streamed_edges_mode", None)
+            in _PREPARED_EXECUTION_MODES
+        ):
+            source_key = self._joined_neighbor_source_key(atoms)
+        topology_skin = (
+            getattr(self, "joined_neighbor_skin", self.neighbor_skin)
+            if source_key is not None
+            else self.neighbor_skin
+        )
+        if source_key is None:
+            cache = self._neighbor_cache
+        else:
+            trajectory_caches = getattr(self, "_trajectory_neighbor_caches", None)
+            if trajectory_caches is None:
+                trajectory_caches = {}
+                self._trajectory_neighbor_caches = trajectory_caches
+            cache = trajectory_caches.get(source_key)
+            if (
+                cache is None
+                and getattr(self._neighbor_cache, "source_key", None) == source_key
+            ):
+                cache = self._neighbor_cache
+            self._neighbor_cache = cache
         displacements = None
         cell_changed = False
         geometry_reference_positions = None
@@ -3978,7 +4388,7 @@ class Symmetrix(Calculator):
                 cell=cell,
                 pbc=pbc,
                 cutoff=self.cutoff,
-                skin=self.neighbor_skin,
+                skin=topology_skin,
             )
             cell_changed = reuse.cell_changed
             geometry_reference_positions = reuse.geometry_reference_positions
@@ -4051,7 +4461,7 @@ class Symmetrix(Calculator):
                     np.ascontiguousarray(positions, dtype=float).reshape(-1),
                     np.ascontiguousarray(cell, dtype=float).reshape(-1),
                     np.ascontiguousarray(inverse_cell, dtype=float).reshape(-1),
-                    self.cutoff + self.neighbor_skin,
+                    self.cutoff + topology_skin,
                 )
                 self._sync_low_memory_policy_state()
                 num_edges = int(device_graph["num_edges"])
@@ -4065,9 +4475,7 @@ class Symmetrix(Calculator):
                 topology_fractional_xyz = np.empty((0, 3), dtype=float)
                 self.neighbor_graph_backend = "kokkos"
             else:
-                graph = build_host_neighbor_graph(
-                    atoms, self.cutoff + self.neighbor_skin
-                )
+                graph = build_host_neighbor_graph(atoms, self.cutoff + topology_skin)
                 receivers = graph.receivers
                 sources = graph.sources
                 shifts = graph.shifts
@@ -4114,6 +4522,7 @@ class Symmetrix(Calculator):
                     else 0
                 ),
                 num_edges=num_edges,
+                source_key=source_key,
             )
             self._neighbor_cache = cache
             self.neighbor_cache_build_count += 1
@@ -4143,7 +4552,55 @@ class Symmetrix(Calculator):
             cache.geometry_generation = self.neighbor_cache_geometry_update_count
             displacements = np.zeros_like(positions)
 
+        if source_key is not None:
+            self._trajectory_neighbor_caches[source_key] = cache
+
         if native_geometry and cache.native_geometry_eligible:
+            if (
+                not allow_device_neighbor_graph
+                and getattr(self.evaluator, "streamed_edges_mode", None)
+                in _PREPARED_EXECUTION_MODES
+                and cache.device_graph_generation == 0
+            ):
+                pending_segments = getattr(self, "_pending_explicit_segments", None)
+                if pending_segments is None:
+                    pending_segments = []
+                    self._pending_explicit_segments = pending_segments
+                geometry_deferred = bool(
+                    source_key is not None
+                    and getattr(self, "_joined_group_fast_geometry_ready", False)
+                )
+                pending_segments.append(
+                    _PendingExplicitSegment(
+                        positions=np.array(positions, dtype=float, copy=True),
+                        cell=np.array(cell, dtype=float, copy=True),
+                        node_types=np.array(
+                            cache.node_types, dtype=np.int32, copy=True
+                        ),
+                        receivers=np.array(cache.receivers, dtype=np.int32, copy=True),
+                        sources=np.array(cache.sources, dtype=np.int32, copy=True),
+                        shifts=np.array(cache.shifts, dtype=np.int32, copy=True),
+                        cache_generation=int(cache.generation),
+                        source_key=source_key,
+                        geometry_deferred=geometry_deferred,
+                    )
+                )
+                if geometry_deferred:
+                    if (
+                        cache.deferred_distances is None
+                        or len(cache.deferred_distances) != cache.num_edges
+                    ):
+                        cache.deferred_distances = np.full(
+                            cache.num_edges, self.cutoff, dtype=float
+                        )
+                        cache.deferred_xyz = np.zeros((cache.num_edges, 3), dtype=float)
+                        cache.deferred_xyz[:, 0] = self.cutoff
+                    return (
+                        np.ascontiguousarray(cache.receivers),
+                        np.ascontiguousarray(cache.sources),
+                        cache.deferred_distances,
+                        cache.deferred_xyz,
+                    )
             return (
                 np.ascontiguousarray(cache.receivers),
                 np.ascontiguousarray(cache.sources),
@@ -4292,8 +4749,266 @@ class Symmetrix(Calculator):
         neigh_types = [type_by_atomic_number[ase_atomic_numbers[j]] for j in j_list]
         return num_nodes, node_types, num_neigh, j_list, neigh_types, xyz, r, i_list
 
+    def _compute_explicit_segment_group(
+        self,
+        segments,
+        node_types,
+        distances,
+        family,
+        prepare_graph,
+    ):
+        """Evaluate a joined direct batch from one prepared segment group."""
+
+        if len(segments) < 2:
+            return None
+        stress_requested = "stress" in getattr(
+            self, "_last_kernel_launch_properties", ()
+        )
+        prepare_batch = getattr(self.evaluator, "_prepare_factorized_batch", None)
+        reduce_segmented_stress = getattr(
+            self.evaluator, "_reduce_segmented_stress", None
+        )
+        prepare_segment_geometry = getattr(
+            self.evaluator, "_prepare_factorized_segment_geometry", None
+        )
+        update_segment_cells = getattr(
+            self.evaluator, "_update_factorized_segment_cells", None
+        )
+        native_segment_geometry = (
+            callable(prepare_batch)
+            and callable(prepare_segment_geometry)
+            and callable(update_segment_cells)
+        )
+        if stress_requested and not (
+            callable(prepare_batch) and callable(reduce_segmented_stress)
+        ):
+            return None
+        atom_counts = tuple(len(segment.positions) for segment in segments)
+        num_nodes = sum(atom_counts)
+        node_types = np.ascontiguousarray(node_types, dtype=np.int32)
+        segment_types = np.concatenate(
+            [segment.node_types for segment in segments]
+        ).astype(np.int32, copy=False)
+        edge_counts = [len(segment.receivers) for segment in segments]
+        if (
+            num_nodes != len(node_types)
+            or not np.array_equal(segment_types, node_types)
+            or sum(edge_counts) != len(distances)
+        ):
+            return None
+
+        cached = getattr(self, "_explicit_segment_group_cache", None)
+        evaluator_generation = getattr(
+            self.evaluator, "factorized_graph_generation", None
+        )
+        compatible = (
+            cached is not None
+            and cached.generation in (evaluator_generation, None)
+            and cached.num_nodes == num_nodes
+            and cached.atom_counts == atom_counts
+            and cached.segment_keys == tuple(segment.source_key for segment in segments)
+            and np.array_equal(cached.node_types, node_types)
+        )
+        rebuild = not compatible
+        geometry_rebind = rebuild
+        if compatible:
+            for index, segment in enumerate(segments):
+                cell_changed = not np.array_equal(cached.cells[index], segment.cell)
+                generation_changed = (
+                    cached.segment_generations[index] != segment.cache_generation
+                )
+                identities = _segment_edge_identities(segment)
+                previous_ignored = cached.ignored_edge_identities[index]
+                ignored = previous_ignored
+                activated = np.empty((0, 5), dtype=np.int32)
+                if len(ignored):
+                    active_ignored = _segment_identity_distances(
+                        segment, ignored
+                    ) < float(self.cutoff)
+                    activated = ignored[active_ignored]
+                    ignored = ignored[~active_ignored]
+                if generation_changed:
+                    current_keys = _row_keys(identities)
+                    prepared_keys = _row_keys(cached.edge_identities[index])
+                    known_keys = prepared_keys
+                    if len(previous_ignored):
+                        known_keys = np.concatenate(
+                            (known_keys, _row_keys(previous_ignored))
+                        )
+                    new_edge = ~np.isin(current_keys, known_keys, assume_unique=True)
+                    new_identities = identities[new_edge]
+                    if len(new_identities):
+                        active_new = _segment_identity_distances(
+                            segment, new_identities
+                        ) < float(self.cutoff)
+                        activated = np.concatenate(
+                            (activated, new_identities[active_new]), axis=0
+                        )
+                        ignored = np.concatenate(
+                            (ignored, new_identities[~active_new]), axis=0
+                        )
+                cached.ignored_edge_identities[index] = np.ascontiguousarray(
+                    ignored, dtype=np.int32
+                )
+                if len(activated):
+                    cached.edge_identities[index] = np.concatenate(
+                        (cached.edge_identities[index], activated),
+                        axis=0,
+                    )
+                    order = np.lexsort(
+                        tuple(
+                            cached.edge_identities[index][:, column]
+                            for column in range(4, -1, -1)
+                        )
+                    )
+                    cached.edge_identities[index] = np.ascontiguousarray(
+                        cached.edge_identities[index][order]
+                    )
+                    rebuild = True
+                    geometry_rebind = True
+                if cell_changed:
+                    geometry_rebind = True
+                cached.segment_generations[index] = segment.cache_generation
+                cached.cells[index] = np.array(segment.cell, copy=True)
+        else:
+            cached = _ExplicitSegmentGroupCache(
+                generation=0,
+                num_nodes=num_nodes,
+                node_types=np.array(node_types, copy=True),
+                atom_counts=atom_counts,
+                segment_keys=tuple(segment.source_key for segment in segments),
+                edge_identities=[
+                    _segment_edge_identities(segment) for segment in segments
+                ],
+                ignored_edge_identities=[
+                    np.empty((0, 5), dtype=np.int32) for _ in segments
+                ],
+                segment_generations=[segment.cache_generation for segment in segments],
+                cells=[np.array(segment.cell, copy=True) for segment in segments],
+            )
+
+        positions = np.ascontiguousarray(
+            np.concatenate([segment.positions for segment in segments]),
+            dtype=float,
+        ).reshape(-1)
+        if rebuild:
+            receivers = []
+            sources = []
+            node_offset = 0
+            for segment, identities in zip(segments, cached.edge_identities):
+                local_receivers = identities[:, 0]
+                local_sources = identities[:, 1]
+                receivers.append(local_receivers + node_offset)
+                sources.append(local_sources + node_offset)
+                node_offset += len(segment.positions)
+            receivers = np.ascontiguousarray(np.concatenate(receivers), dtype=np.int32)
+            sources = np.ascontiguousarray(np.concatenate(sources), dtype=np.int32)
+            num_neigh = np.bincount(receivers, minlength=num_nodes).astype(np.int32)
+            cached.generation = prepare_graph(
+                num_nodes,
+                node_types,
+                num_neigh,
+                sources,
+                np.ascontiguousarray(node_types[sources], dtype=np.int32),
+            )
+            self._sync_low_memory_policy_state()
+            if callable(prepare_batch):
+                edge_offsets = np.concatenate(
+                    (
+                        np.zeros(1, dtype=np.int64),
+                        np.cumsum(
+                            [len(values) for values in cached.edge_identities],
+                            dtype=np.int64,
+                        ),
+                    )
+                )
+                prepare_batch(cached.generation, edge_offsets)
+            if native_segment_geometry:
+                edge_shifts = np.ascontiguousarray(
+                    np.concatenate(
+                        [values[:, 2:] for values in cached.edge_identities]
+                    ),
+                    dtype=np.int32,
+                )
+                cells = np.ascontiguousarray(
+                    np.concatenate([segment.cell.reshape(-1) for segment in segments]),
+                    dtype=float,
+                )
+                prepare_segment_geometry(
+                    cached.generation,
+                    positions,
+                    edge_shifts.reshape(-1),
+                    cells,
+                )
+                geometry_rebind = False
+            self._explicit_segment_group_cache = cached
+
+        if geometry_rebind and native_segment_geometry:
+            cells = np.ascontiguousarray(
+                np.concatenate([segment.cell.reshape(-1) for segment in segments]),
+                dtype=float,
+            )
+            update_segment_cells(cached.generation, cells)
+            geometry_rebind = False
+
+        if geometry_rebind:
+            reference_xyz = []
+            for segment, identities in zip(segments, cached.edge_identities):
+                local_receivers = identities[:, 0]
+                local_sources = identities[:, 1]
+                shifts = identities[:, 2:]
+                reference_xyz.append(
+                    segment.positions[local_sources]
+                    - segment.positions[local_receivers]
+                    + shifts @ segment.cell
+                )
+            reference_xyz = np.ascontiguousarray(
+                np.concatenate(reference_xyz), dtype=float
+            )
+            (prepare_geometry,) = family_registry.require_surface(
+                family, self.evaluator, "prepared_geometry"
+            )
+            update_reference_geometry = getattr(
+                self.evaluator, "_update_factorized_reference_geometry", None
+            )
+            if not rebuild and callable(update_reference_geometry):
+                update_reference_geometry(
+                    cached.generation,
+                    positions,
+                    reference_xyz.reshape(-1),
+                )
+            else:
+                identity_cell = np.eye(3, dtype=float).reshape(-1)
+                prepare_geometry(
+                    cached.generation,
+                    positions,
+                    reference_xyz.reshape(-1),
+                    identity_cell,
+                    identity_cell,
+                    np.zeros(3, dtype=np.int32),
+                )
+
+        (compute_positions,) = family_registry.require_surface(
+            family, self.evaluator, "prepared_positions"
+        )
+        compute_positions(
+            cached.generation,
+            positions,
+        )
+        self._joined_group_fast_geometry_ready = True
+        return cached.generation
+
     def _compute_mace(self, mace_inputs, atoms=None):
         num_nodes, node_types, num_neigh, j_list, neigh_types, xyz, r, _ = mace_inputs
+        pending_segments = getattr(self, "_pending_explicit_segments", [])
+        self._pending_explicit_segments = []
+        if atoms is not None:
+            # A regular calculator evaluation owns the evaluator's prepared
+            # graph lifecycle.  Do not let a later joined batch reuse a token
+            # that an intervening native-geometry call may have replaced.
+            self._explicit_factorized_graph_cache = None
+            self._explicit_segment_group_cache = None
+            self._joined_group_fast_geometry_ready = False
         family = self._resolved_family_entry()
         # The family's graph-level scalar channel is input to whatever routing
         # follows, so it enters here, before the graph is prepared: the same
@@ -4353,6 +5068,23 @@ class Symmetrix(Calculator):
             native_geometry = xyz is None and r is None
             if (xyz is None) != (r is None):
                 raise ValueError("MACE geometry must provide both xyz and distances.")
+            if atoms is None and not native_geometry and pending_segments:
+                deferred_geometry = any(
+                    segment.geometry_deferred for segment in pending_segments
+                )
+                segment_generation = self._compute_explicit_segment_group(
+                    pending_segments,
+                    node_types,
+                    np.ascontiguousarray(r, dtype=float).reshape(-1),
+                    family,
+                    prepare_graph,
+                )
+                if segment_generation is not None:
+                    self._explicit_factorized_graph_cache = None
+                    return segment_generation
+                if deferred_geometry:
+                    _materialize_segment_geometry(pending_segments, xyz, r, self.cutoff)
+                self._joined_group_fast_geometry_ready = False
             if native_geometry:
                 (compute_positions,) = family_registry.require_surface(
                     family, self.evaluator, "prepared_positions"
@@ -4468,19 +5200,148 @@ class Symmetrix(Calculator):
                 )
                 return graph_generation
 
-            xyz_flat = np.ascontiguousarray(xyz, dtype=float).reshape(-1)
+            xyz_array = np.ascontiguousarray(xyz, dtype=float).reshape((-1, 3))
             distances = np.ascontiguousarray(r, dtype=float)
             if (
-                not np.isfinite(xyz_flat).all()
+                not np.isfinite(xyz_array).all()
                 or not np.isfinite(distances).all()
                 or not (distances > 0.0).all()
             ):
                 raise ValueError(
                     "MACE graph has an invalid distance or displacement vector."
                 )
-            graph_generation = prepare_graph(
-                num_nodes, node_types, num_neigh, j_list, neigh_types
+            node_types_array = np.ascontiguousarray(node_types, dtype=np.int32)
+            cached = getattr(self, "_explicit_factorized_graph_cache", None)
+            cached_generation = (
+                getattr(self.evaluator, "factorized_graph_generation", None)
+                if cached is not None
+                else None
             )
+            if cached is not None and cached_generation not in (
+                None,
+                cached.generation,
+            ):
+                cached = None
+            cache_explicit = (
+                atoms is None and self.alchemical is None and hasattr(self, "cutoff")
+            )
+            if cache_explicit:
+                (
+                    receivers,
+                    sources,
+                    xyz_array,
+                    distances,
+                    topology_changed,
+                    input_to_prepared,
+                    reference_xyz,
+                ) = _explicit_factorized_union(
+                    cached,
+                    num_nodes,
+                    node_types_array,
+                    num_neigh,
+                    j_list,
+                    xyz_array,
+                    distances,
+                    self.cutoff,
+                )
+                num_neigh_array = np.bincount(receivers, minlength=num_nodes).astype(
+                    np.int32
+                )
+                neigh_types_array = np.ascontiguousarray(
+                    node_types_array[sources], dtype=np.int32
+                )
+            else:
+                sources = np.ascontiguousarray(j_list, dtype=np.int32)
+                receivers = np.repeat(
+                    np.arange(num_nodes, dtype=np.int32),
+                    np.asarray(num_neigh, dtype=np.int64),
+                )
+                num_neigh_array = np.ascontiguousarray(num_neigh, dtype=np.int32)
+                neigh_types_array = np.ascontiguousarray(neigh_types, dtype=np.int32)
+                topology_changed = True
+            reuse = cached is not None and not topology_changed
+            if reuse:
+                graph_generation = cached.generation
+            else:
+                graph_generation = prepare_graph(
+                    num_nodes,
+                    node_types_array,
+                    num_neigh_array,
+                    sources,
+                    neigh_types_array,
+                )
+            if cache_explicit:
+                input_present = np.flatnonzero(input_to_prepared >= 0)
+                prepared_present = input_to_prepared[input_present]
+                prepared_to_input = np.zeros(len(sources), dtype=np.int64)
+                prepared_to_input[prepared_present] = input_present
+                prepared_missing = np.flatnonzero(
+                    np.bincount(prepared_present, minlength=len(sources)) == 0
+                )
+                inactive_xyz = np.array(
+                    xyz_array[prepared_missing], dtype=float, copy=True
+                )
+                input_mapping_identity = len(input_to_prepared) == len(
+                    sources
+                ) and np.array_equal(
+                    input_to_prepared,
+                    np.arange(len(sources), dtype=np.int64),
+                )
+                if reuse:
+                    if not input_mapping_identity:
+                        cached.xyz = xyz_array
+                        cached.distances = distances
+                    cached.reference_xyz = reference_xyz
+                    cached.input_num_neigh = np.array(num_neigh, copy=True)
+                    cached.input_sources = np.array(j_list, dtype=np.int32, copy=True)
+                    cached.input_to_prepared = np.array(
+                        input_to_prepared, dtype=np.int64, copy=True
+                    )
+                    cached.prepared_to_input = prepared_to_input
+                    cached.prepared_missing = prepared_missing
+                    cached.inactive_xyz = inactive_xyz
+                    cached.input_mapping_identity = input_mapping_identity
+                    self._explicit_factorized_graph_cache = cached
+                else:
+                    edge_keys = receivers.astype(np.int64) * int(num_nodes) + sources
+                    edge_order = np.argsort(edge_keys, kind="stable")
+                    sorted_edge_keys = np.ascontiguousarray(edge_keys[edge_order])
+                    self._explicit_factorized_graph_cache = (
+                        _ExplicitFactorizedGraphCache(
+                            generation=graph_generation,
+                            num_nodes=num_nodes,
+                            node_types=np.array(node_types_array, copy=True),
+                            num_neigh=np.array(num_neigh_array, copy=True),
+                            receivers=np.array(receivers, copy=True),
+                            sources=np.array(sources, copy=True),
+                            reference_xyz=np.array(reference_xyz, copy=True),
+                            xyz=np.array(xyz_array, copy=True),
+                            distances=np.array(distances, copy=True),
+                            sorted_edge_keys=sorted_edge_keys,
+                            sorted_edge_indices=np.ascontiguousarray(
+                                edge_order, dtype=np.int64
+                            ),
+                            edge_keys_unique=(
+                                len(sorted_edge_keys) < 2
+                                or bool(
+                                    np.all(
+                                        sorted_edge_keys[1:] != sorted_edge_keys[:-1]
+                                    )
+                                )
+                            ),
+                            input_num_neigh=np.array(
+                                num_neigh, dtype=np.int32, copy=True
+                            ),
+                            input_sources=np.array(j_list, dtype=np.int32, copy=True),
+                            input_to_prepared=np.array(
+                                input_to_prepared, dtype=np.int64, copy=True
+                            ),
+                            prepared_to_input=prepared_to_input,
+                            prepared_missing=prepared_missing,
+                            inactive_xyz=inactive_xyz,
+                            input_mapping_identity=input_mapping_identity,
+                        )
+                    )
             if self.alchemical is not None:
                 weight_identity = (graph_generation, self.alchemical.version)
                 if weight_identity != self._alchemical_native_weight_identity:
@@ -4499,7 +5360,7 @@ class Symmetrix(Calculator):
                 return graph_generation
             compute_prepared(
                 graph_generation,
-                xyz_flat,
+                np.ascontiguousarray(xyz_array, dtype=float).reshape(-1),
                 distances,
             )
             return graph_generation

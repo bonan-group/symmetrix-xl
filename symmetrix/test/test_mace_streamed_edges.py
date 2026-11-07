@@ -1519,6 +1519,59 @@ def test_factorized_compact_mace_reduces_stress_on_device(
     np.testing.assert_allclose(reduced, expected, rtol=0.0, atol=atol)
 
 
+def test_direct_prepared_batch_reduces_segmented_stress_on_device(
+    scalar_standard_model_path,
+):
+    standard_path = scalar_standard_model_path
+    atoms = _small_structure()
+    atoms.set_pbc(True)
+    calculator = Symmetrix(
+        standard_path,
+        dtype="float32",
+        streamed_edges="direct",
+        execution_profile="speed",
+    )
+    evaluator = calculator.evaluator
+    _load_direct_artifact(evaluator, standard_path, dtype="float32")
+    inputs = calculator._mace_inputs(atoms)
+    num_nodes, node_types, num_neigh, sources, neigh_types, xyz, distances, _ = inputs
+    edge_count = len(sources)
+    token = evaluator._prepare_factorized_graph(
+        2 * num_nodes,
+        np.tile(node_types, 2),
+        np.tile(num_neigh, 2),
+        np.concatenate((sources, np.asarray(sources) + num_nodes)),
+        np.tile(neigh_types, 2),
+    )
+    prepared_offsets = np.asarray([0, edge_count, 2 * edge_count], dtype=np.int64)
+    evaluator._prepare_factorized_batch(token, prepared_offsets)
+    evaluator._compute_prepared_factorized(
+        token,
+        np.tile(np.asarray(xyz).reshape(-1), 2),
+        np.tile(distances, 2),
+    )
+
+    pair_forces = np.asarray(evaluator.node_forces, dtype=float).reshape(-1, 3)
+    expected = np.stack(
+        (
+            -(pair_forces[:edge_count].T @ xyz),
+            -(pair_forces[edge_count : 2 * edge_count].T @ xyz),
+        )
+    )
+    current_offsets = np.asarray(
+        [0, edge_count - 1, 2 * edge_count - 2], dtype=np.int64
+    )
+    current_xyz = np.tile(np.asarray(xyz)[:-1].reshape(-1), 2)
+    reduced = np.asarray(
+        evaluator._reduce_segmented_stress(
+            np.ones(2, dtype=float), current_offsets, current_xyz
+        ),
+        dtype=float,
+    ).reshape(2, 3, 3)
+
+    np.testing.assert_allclose(reduced, expected, rtol=0.0, atol=3e-5)
+
+
 def test_factorized_compact_edge_geometry_reduces_stress_on_device(
     streamed_model_paths,
 ):

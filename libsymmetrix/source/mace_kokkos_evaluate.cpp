@@ -313,6 +313,141 @@ void MACEKokkos<Precision>::reduce_prepared_stress(
 }
 
 template <typename Precision>
+void MACEKokkos<Precision>::prepare_factorized_batch(
+    const std::uint64_t graph_generation,
+    const std::span<const std::int64_t> edge_offsets)
+{
+    if (graph_generation == 0
+        || graph_generation != factorized_prepared_graph_generation)
+        throw std::invalid_argument(
+            "Batched stress requires the current prepared Execution R1 graph.");
+    const std::size_t num_edges = execution_prepared_neigh_indices.extent(0);
+    if (edge_offsets.size() < 2 || edge_offsets.front() != 0
+        || edge_offsets.back() != static_cast<std::int64_t>(num_edges))
+        throw std::invalid_argument(
+            "Batched stress edge offsets do not cover the prepared graph.");
+    for (std::size_t graph=0; graph+1<edge_offsets.size(); ++graph)
+        if (edge_offsets[graph] < 0
+            || edge_offsets[graph] > edge_offsets[graph+1])
+            throw std::invalid_argument(
+                "Batched stress edge offsets must be monotonic.");
+
+    if (graph_generation == factorized_prepared_batch_graph_generation
+        && edge_offsets.size()
+            == execution_prepared_batch_edge_offsets_host.size()
+        && std::equal(
+            edge_offsets.begin(), edge_offsets.end(),
+            execution_prepared_batch_edge_offsets_host.begin()))
+        return;
+    execution_prepared_batch_edge_offsets_host.assign(
+        edge_offsets.begin(), edge_offsets.end());
+    const auto host = Kokkos::View<
+        const std::int64_t*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(
+            edge_offsets.data(), edge_offsets.size());
+    execution_prepared_batch_edge_offsets = Kokkos::View<std::int64_t*>(
+        Kokkos::view_alloc(
+            "MACE prepared batch edge offsets", Kokkos::WithoutInitializing),
+        edge_offsets.size());
+    Kokkos::deep_copy(
+        factorized_execution_space,
+        execution_prepared_batch_edge_offsets,
+        host);
+    factorized_prepared_batch_graph_generation = graph_generation;
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::reduce_prepared_batched_stress(
+    const std::span<const double> volumes,
+    const std::uint64_t graph_generation)
+{
+    if (graph_generation == 0
+        || graph_generation != factorized_prepared_graph_generation
+        || graph_generation != factorized_prepared_batch_graph_generation
+        || graph_generation != factorized_completed_evaluation_graph_generation)
+        throw std::invalid_argument(
+            "Batched stress requires the current completed batch graph.");
+    if (single_layer_tiled_plan_active || dual_layer_tiled_plan_active)
+        throw std::logic_error(
+            "Batched stress is unavailable for a fixed-workspace tiled plan.");
+    const std::size_t graph_count =
+        execution_prepared_batch_edge_offsets.extent(0)-1;
+    if (volumes.size() != graph_count
+        || !std::all_of(volumes.begin(), volumes.end(), [](const double volume) {
+            return std::isfinite(volume) && volume > 0.0;
+        }))
+        throw std::invalid_argument(
+            "Batched stress volumes are inconsistent.");
+
+    const std::size_t num_edges = execution_prepared_neigh_indices.extent(0);
+    if (node_forces.extent(0) < 3*num_edges)
+        throw std::invalid_argument(
+            "Batched stress reduction exceeds the evaluated edge extent.");
+    const bool compact =
+        edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64;
+    if (compact
+        && (execution_prepared_unit_direction.extent(0) < 3*num_edges
+            || execution_prepared_r.extent(0) < num_edges))
+        throw std::invalid_argument(
+            "Compact batched stress geometry is inconsistent.");
+    if (!compact && execution_prepared_xyz.extent(0) < 3*num_edges)
+        throw std::invalid_argument(
+            "Batched stress geometry is inconsistent.");
+
+    if (execution_prepared_batch_volumes.extent(0) != graph_count)
+        execution_prepared_batch_volumes = Kokkos::View<double*>(
+            Kokkos::view_alloc(
+                "MACE prepared batch volumes", Kokkos::WithoutInitializing),
+            graph_count);
+    const auto volumes_host = Kokkos::View<
+        const double*, Kokkos::HostSpace, Kokkos::MemoryUnmanaged>(
+            volumes.data(), volumes.size());
+    Kokkos::deep_copy(
+        factorized_execution_space,
+        execution_prepared_batch_volumes,
+        volumes_host);
+    if (stress_tensor.extent(0) != 9*graph_count)
+        Kokkos::realloc(stress_tensor, 9*graph_count);
+
+    const auto reduced_stress = stress_tensor;
+    const auto directed_forces = node_forces;
+    const auto xyz = execution_prepared_xyz;
+    const auto unit_direction = execution_prepared_unit_direction;
+    const auto radius = execution_prepared_r;
+    const auto offsets = execution_prepared_batch_edge_offsets;
+    const auto device_volumes = execution_prepared_batch_volumes;
+    using team_policy = Kokkos::TeamPolicy<
+        decltype(factorized_execution_space)>;
+    Kokkos::parallel_for(
+        "MACEKokkos::reduce_batched_stress",
+        team_policy(
+            factorized_execution_space, 9*graph_count, Kokkos::AUTO),
+        KOKKOS_LAMBDA (const typename team_policy::member_type& team) {
+            const std::size_t owner = team.league_rank();
+            const std::size_t graph = owner/9;
+            const int component = owner%9;
+            const int force_component = component/3;
+            const int vector_component = component%3;
+            const std::int64_t edge_begin = offsets(graph);
+            const std::int64_t edge_end = offsets(graph+1);
+            double value = 0.0;
+            Kokkos::parallel_reduce(
+                Kokkos::TeamThreadRange(team, edge_begin, edge_end),
+                [&] (const std::int64_t edge, double& update) {
+                    const std::size_t index = static_cast<std::size_t>(edge);
+                    const double vector = compact
+                        ? radius(index)*static_cast<double>(
+                            unit_direction(3*index+vector_component))
+                        : xyz(3*index+vector_component);
+                    update += directed_forces(3*index+force_component)*vector;
+                },
+                value);
+            Kokkos::single(Kokkos::PerTeam(team), [&] () {
+                reduced_stress(owner) = -value/device_volumes(graph);
+            });
+        });
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::reduce_prepared_all_interactions_stress(
     const double volume,
     const std::uint64_t graph_generation)

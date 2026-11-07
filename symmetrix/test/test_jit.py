@@ -589,6 +589,94 @@ def test_cache_root_precedence(jit, monkeypatch, tmp_path):
     assert jit.jit_cache_root() == xdg / "symmetrix" / "execution-jit"
 
 
+def test_host_cxx_environment_ignores_ambient_include_paths(jit, monkeypatch):
+    for variable in jit._HOST_CXX_AMBIENT_INCLUDE_VARIABLES:
+        monkeypatch.setenv(variable, f"/site/{variable.lower()}")
+    diagnostics = []
+
+    environment = jit._sanitized_host_cxx_environment(diagnostics)
+
+    assert all(
+        variable not in environment
+        for variable in jit._HOST_CXX_AMBIENT_INCLUDE_VARIABLES
+    )
+    assert all(
+        variable in os.environ for variable in jit._HOST_CXX_AMBIENT_INCLUDE_VARIABLES
+    )
+    assert diagnostics == [
+        f"ignored ambient {variable} for deterministic host C++ compilation"
+        for variable in jit._HOST_CXX_AMBIENT_INCLUDE_VARIABLES
+    ]
+
+
+def test_host_flag_probe_uses_sanitized_environment(jit, monkeypatch):
+    for variable in jit._HOST_CXX_AMBIENT_INCLUDE_VARIABLES:
+        monkeypatch.setenv(variable, "/site/legacy-cxx")
+    captured = {}
+
+    def run(*args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args[0], 0, "", "")
+
+    monkeypatch.setattr(jit.subprocess, "run", run)
+
+    assert jit._probe_host_compiler_flags(("c++",), ("-march=native",)) == (
+        True,
+        "",
+    )
+    assert all(
+        variable not in captured["env"]
+        for variable in jit._HOST_CXX_AMBIENT_INCLUDE_VARIABLES
+    )
+
+
+def test_host_compile_uses_sanitized_environment(jit, monkeypatch, tmp_path):
+    for variable in jit._HOST_CXX_AMBIENT_INCLUDE_VARIABLES:
+        monkeypatch.setenv(variable, "/site/legacy-cxx")
+    captured = {}
+    compiler = tmp_path / "synthetic-cxx"
+    compiler.write_text("synthetic compiler", encoding="utf-8")
+    monkeypatch.setattr(
+        jit,
+        "probe_compiler_identity",
+        lambda cxx: (
+            (str(compiler),),
+            {
+                "command": [str(compiler)],
+                "resolved_executable": str(compiler),
+                "version": "synthetic CXX 1",
+                "size": compiler.stat().st_size,
+                "mtime_ns": compiler.stat().st_mtime_ns,
+            },
+        ),
+    )
+
+    def run(command, **kwargs):
+        captured.update(kwargs)
+        Path(command[command.index("-o") + 1]).write_bytes(b"synthetic host plugin")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(jit.subprocess, "run", run)
+    result = jit.prepare_jit_artifact(
+        _source(),
+        abi="host-environment-test",
+        build="host-environment-test",
+        cpu="test-cpu",
+        cache_root=tmp_path / "cache",
+        cxx=compiler,
+    )
+
+    assert result.status == "built"
+    assert all(
+        variable not in captured["env"]
+        for variable in jit._HOST_CXX_AMBIENT_INCLUDE_VARIABLES
+    )
+    assert all(
+        any(variable in diagnostic for diagnostic in result.diagnostics)
+        for variable in jit._HOST_CXX_AMBIENT_INCLUDE_VARIABLES
+    )
+
+
 def test_host_jit_default_policy_prefers_accepted_native_target(jit, monkeypatch):
     probes = []
 
@@ -1920,9 +2008,24 @@ def test_compile_failure_returns_diagnostics_and_cleans_staging(jit, tmp_path, c
     assert failed.artifact_path is None
     assert "compilation exited" in failed.reason
     assert any("compiler stderr" in item for item in failed.diagnostics)
+    assert "error" in failed.diagnostics[0].lower()
     assert failed.command
     staging = tmp_path / "cache" / ".staging"
     assert list(staging.iterdir()) == []
+
+
+def test_compiler_error_lines_are_prepended_to_diagnostics(jit):
+    diagnostics = ["compiler command: synthetic-cxx"]
+
+    jit._prepend_compiler_error_lines(
+        diagnostics,
+        "warning: legacy header selected\nplugin.cpp:7: error: atomic_ref is missing\n",
+    )
+
+    assert diagnostics == [
+        "compiler error lines:\nplugin.cpp:7: error: atomic_ref is missing",
+        "compiler command: synthetic-cxx",
+    ]
 
 
 def test_compile_progress_is_flushed_only_for_cache_miss(jit, tmp_path, cxx, capsys):
@@ -2141,29 +2244,62 @@ def test_clean_build_validates_quarantine_options(jit, tmp_path, kwargs, reason)
     assert compile_calls == 0
 
 
-def test_unsupported_no_replace_uses_mkdir_locked_publication(
-    jit, monkeypatch, tmp_path
-):
-    def unsupported(source, destination):
-        raise jit.JitPublicationUnsupported("synthetic unsupported filesystem")
+def test_unsupported_no_replace_is_fail_closed_by_default(jit, monkeypatch, tmp_path):
+    def unsupported(library, source, destination):
+        ctypes.set_errno(errno.EINVAL)
+        return -1
 
-    def unexpected_lock(*args, **kwargs):
-        raise AssertionError("publication fallback must not rely on flock")
-
-    monkeypatch.setattr(jit, "_publish_directory_no_replace", unsupported)
-    monkeypatch.setattr(jit, "_cache_key_lock", unexpected_lock)
+    monkeypatch.setattr(jit.sys, "platform", "linux")
+    monkeypatch.setattr(jit, "_linux_renameat2", unsupported)
     result = _prepare_nvrtc(
         jit,
         tmp_path,
-        lambda source, options: (b"mkdir-locked cubin", ""),
+        lambda source, options: (b"unpublished cubin", ""),
+    )
+
+    assert result.status == "fallback"
+    assert not result.available
+    assert jit.JIT_PUBLISH_ENVIRONMENT_VARIABLE in result.reason
+    assert list((tmp_path / "nvrtc-cache" / ".staging").iterdir()) == []
+
+
+def test_unsupported_no_replace_uses_opt_in_lock_fallback(jit, monkeypatch, tmp_path):
+    def unsupported(library, source, destination):
+        ctypes.set_errno(errno.EINVAL)
+        return -1
+
+    monkeypatch.setenv(jit.JIT_PUBLISH_ENVIRONMENT_VARIABLE, "lock-fallback")
+    monkeypatch.setattr(jit.sys, "platform", "linux")
+    monkeypatch.setattr(jit, "_linux_renameat2", unsupported)
+    result = _prepare_nvrtc(
+        jit,
+        tmp_path,
+        lambda source, options: (b"lock-fallback cubin", ""),
     )
 
     assert result.status == "built"
     assert result.available
-    assert any("using mkdir-locked publication" in item for item in result.diagnostics)
-    assert result.artifact_path.read_bytes() == b"mkdir-locked cubin"
+    assert any(
+        "non-atomic publication (lock-fallback)" in item for item in result.diagnostics
+    )
+    assert result.artifact_path.read_bytes() == b"lock-fallback cubin"
     assert list((tmp_path / "nvrtc-cache" / ".staging").iterdir()) == []
-    assert not list((tmp_path / "nvrtc-cache" / "locks").glob("*.lock.d"))
+    assert not list((tmp_path / "nvrtc-cache" / "artifacts").glob(".*.publish.lock"))
+
+
+def test_jit_publication_mode_rejects_unknown_value(jit, monkeypatch, tmp_path):
+    monkeypatch.setenv(jit.JIT_PUBLISH_ENVIRONMENT_VARIABLE, "unsafe")
+
+    result = _prepare_nvrtc(
+        jit,
+        tmp_path,
+        lambda source, options: (b"unexpected cubin", ""),
+    )
+
+    assert result.status == "fallback"
+    assert result.reason == (
+        f"{jit.JIT_PUBLISH_ENVIRONMENT_VARIABLE} must be 'atomic' or 'lock-fallback'"
+    )
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux renameat2 coverage")
@@ -2176,6 +2312,8 @@ def test_fresh_processes_converge_on_one_publication(
     gate = tmp_path / "start"
     worker = r"""
 import importlib.util
+import ctypes
+import errno
 import json
 import os
 from pathlib import Path
@@ -2191,9 +2329,11 @@ jit = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = jit
 spec.loader.exec_module(jit)
 if force_locked_fallback:
-    def unsupported(source, destination):
-        raise jit.JitPublicationUnsupported("synthetic unsupported filesystem")
-    jit._publish_directory_no_replace = unsupported
+    os.environ[jit.JIT_PUBLISH_ENVIRONMENT_VARIABLE] = "lock-fallback"
+    def unsupported(library, source, destination):
+        ctypes.set_errno(errno.EINVAL)
+        return -1
+    jit._linux_renameat2 = unsupported
 while not gate.exists():
     time.sleep(0.005)
 
@@ -2258,7 +2398,7 @@ print(json.dumps({
     entries = list((cache_root / "artifacts").iterdir())
     assert len(entries) == 1
     jit.validate_jit_manifest(entries[0])
-    assert not list((cache_root / "locks").glob("*.lock.d"))
+    assert not list((cache_root / "artifacts").glob(".*.publish.lock"))
 
 
 def test_missing_compiler_returns_fallback_with_reason(jit, tmp_path):

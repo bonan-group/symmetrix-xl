@@ -59,6 +59,9 @@ HOST_FP_MODE_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_HOST_FP_MODE"
 JIT_POLICY_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_POLICY"
 JIT_REQUIRED_POLICY = "required"
 JIT_DISABLED_POLICY = "none"
+JIT_PUBLISH_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_PUBLISH"
+JIT_ATOMIC_PUBLICATION = "atomic"
+JIT_LOCK_FALLBACK_PUBLICATION = "lock-fallback"
 CUDA_COMPILER_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_NVCC"
 CUDA_JIT_BACKEND_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_CUDA_JIT_BACKEND"
 CUDA_R1_EDGE_STRATEGY_ENVIRONMENT_VARIABLE = "SYMMETRIX_JIT_CUDA_R1_EDGE_STRATEGY"
@@ -110,6 +113,11 @@ _HIP_ARCHITECTURE = re.compile(r"^(gfx[0-9a-f]+)(?::(.*))?$", re.IGNORECASE)
 _NVCC_AMBIENT_FLAG_VARIABLES = (
     "NVCC_PREPEND_FLAGS",
     "NVCC_APPEND_FLAGS",
+)
+_HOST_CXX_AMBIENT_INCLUDE_VARIABLES = (
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
 )
 _HOST_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]*$")
 _X86_64_MACHINE_NAMES = frozenset(("x86_64", "amd64"))
@@ -290,6 +298,10 @@ class JitLockTimeout(JitError):
 
 class JitPublicationUnsupported(JitError):
     """Raised when the cache filesystem cannot publish without replacement."""
+
+    def __init__(self, message: str, *, lock_fallback_supported: bool = False):
+        super().__init__(message)
+        self.lock_fallback_supported = lock_fallback_supported
 
 
 @dataclass(frozen=True)
@@ -820,6 +832,7 @@ def _probe_host_compiler_flags(
     *,
     timeout: float = DEFAULT_HOST_PROBE_TIMEOUT,
 ) -> tuple[bool, str]:
+    environment = _sanitized_host_cxx_environment([])
     command = (
         *compiler_command,
         "-std=c++20",
@@ -838,6 +851,7 @@ def _probe_host_compiler_flags(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=environment,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise JitError(f"could not probe host JIT compiler flags: {exc}") from exc
@@ -1355,6 +1369,16 @@ def _sanitized_nvcc_environment(diagnostics: list[str]) -> dict[str, str]:
         if environment.pop(variable, None) is not None:
             diagnostics.append(
                 f"ignored ambient {variable} for deterministic CUDA compilation"
+            )
+    return environment
+
+
+def _sanitized_host_cxx_environment(diagnostics: list[str]) -> dict[str, str]:
+    environment = dict(os.environ)
+    for variable in _HOST_CXX_AMBIENT_INCLUDE_VARIABLES:
+        if environment.pop(variable, None) is not None:
+            diagnostics.append(
+                f"ignored ambient {variable} for deterministic host C++ compilation"
             )
     return environment
 
@@ -2393,28 +2417,104 @@ def _publish_directory_no_replace(source: Path, destination: Path) -> bool:
             unsupported_errors.add(value)
     if error in unsupported_errors:
         raise JitPublicationUnsupported(
-            "the JIT cache filesystem does not support atomic no-replace rename"
+            "the JIT cache filesystem does not support atomic no-replace rename",
+            lock_fallback_supported=True,
         )
     raise OSError(error, os.strerror(error), destination)
 
 
-def _publish_directory_with_mkdir_lock(
+def _jit_publication_mode() -> str:
+    """Resolve cache publication semantics.
+
+    ``lock-fallback`` is an explicit degraded mode for filesystems without
+    atomic no-replace rename. Its lock-file check and ordinary rename leave a
+    small cross-process race window compared with the default atomic mode.
+    """
+
+    selected = os.environ.get(JIT_PUBLISH_ENVIRONMENT_VARIABLE, JIT_ATOMIC_PUBLICATION)
+    if selected not in (JIT_ATOMIC_PUBLICATION, JIT_LOCK_FALLBACK_PUBLICATION):
+        raise ValueError(
+            f"{JIT_PUBLISH_ENVIRONMENT_VARIABLE} must be "
+            f"'{JIT_ATOMIC_PUBLICATION}' or '{JIT_LOCK_FALLBACK_PUBLICATION}'"
+        )
+    return selected
+
+
+def _publish_directory_with_lock_file(
     source: Path,
     destination: Path,
-    lock_path: Path,
     *,
     timeout: float,
     stale_age: float,
     diagnostics: list[str],
 ) -> bool:
-    """Publish a complete directory while holding a portable key lock."""
+    """Publish with a destination-adjacent exclusive lock file."""
 
-    with _directory_key_lock(
-        lock_path,
-        timeout=timeout,
-        stale_age=stale_age,
-        diagnostics=diagnostics,
-    ):
+    lock_path = destination.with_name(f".{destination.name}.publish.lock")
+    token = uuid.uuid4().hex
+    owner = {
+        "pid": os.getpid(),
+        "hostname": socket.gethostname(),
+        "created_at": time.time(),
+        "token": token,
+    }
+    payload = (json.dumps(owner, sort_keys=True) + "\n").encode("utf-8")
+    deadline = time.monotonic() + timeout
+    descriptor: int | None = None
+    while descriptor is None:
+        try:
+            descriptor = os.open(
+                lock_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+        except FileExistsError:
+            if destination.exists() or destination.is_symlink():
+                return False
+            previous = _read_owner(lock_path)
+            try:
+                stale = (
+                    _owner_is_stale(previous, stale_age)
+                    if previous is not None
+                    else time.time() - lock_path.stat().st_mtime >= stale_age
+                )
+            except FileNotFoundError:
+                continue
+            if stale:
+                try:
+                    lock_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    continue
+                diagnostics.append(
+                    "recovered stale JIT publication lock owner: "
+                    + _owner_description(previous)
+                )
+                continue
+            if time.monotonic() >= deadline:
+                raise JitLockTimeout(
+                    "timed out waiting for degraded JIT publication lock "
+                    f"({_owner_description(previous)})"
+                )
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+    try:
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:  # pragma: no cover - defensive short-write guard
+                raise OSError("could not write JIT publication lock owner")
+            written += count
+        os.fsync(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        lock_path.unlink(missing_ok=True)
+        raise
+    else:
+        os.close(descriptor)
+
+    try:
         if destination.exists() or destination.is_symlink():
             return False
         try:
@@ -2424,6 +2524,16 @@ def _publish_directory_with_mkdir_lock(
                 return False
             raise
         return True
+    finally:
+        current = _read_owner(lock_path)
+        if current is not None and current.get("token") == token:
+            lock_path.unlink(missing_ok=True)
+
+
+def _prepend_compiler_error_lines(diagnostics: list[str], stderr: str) -> None:
+    error_lines = [line for line in stderr.splitlines() if "error" in line.casefold()]
+    if error_lines:
+        diagnostics.insert(0, "compiler error lines:\n" + "\n".join(error_lines))
 
 
 def _validated_entry(
@@ -2692,6 +2802,7 @@ def _prepare_compiled_artifact(
             raise ValueError("stale_lock_age must be positive")
         if compile_timeout <= 0:
             raise ValueError("compile_timeout must be positive")
+        publication_mode = _jit_publication_mode()
         configuration: _CompileConfiguration = configure(diagnostics)
         compiler_command = configuration.command
         artifact_filename = _artifact_filename(
@@ -2827,6 +2938,7 @@ def _prepare_compiled_artifact(
                 if completed.stderr:
                     diagnostics.append("compiler stderr:\n" + completed.stderr.rstrip())
                 if completed.returncode != 0:
+                    _prepend_compiler_error_lines(diagnostics, completed.stderr)
                     raise JitError(
                         f"{configuration.compiler_label} compilation exited with "
                         f"status {completed.returncode}"
@@ -2876,14 +2988,25 @@ def _prepare_compiled_artifact(
         try:
             published = _publish_directory_no_replace(temporary_directory, entry)
         except JitPublicationUnsupported as exc:
+            if (
+                publication_mode != JIT_LOCK_FALLBACK_PUBLICATION
+                or not exc.lock_fallback_supported
+            ):
+                if exc.lock_fallback_supported:
+                    raise JitPublicationUnsupported(
+                        f"{exc}; use a node-local cache or set "
+                        f"{JIT_PUBLISH_ENVIRONMENT_VARIABLE}="
+                        f"{JIT_LOCK_FALLBACK_PUBLICATION} to opt into non-atomic "
+                        "publication with a small cross-process race window"
+                    ) from exc
+                raise
             diagnostics.append(
-                f"atomic no-replace JIT publication is unavailable: {exc}; "
-                "using mkdir-locked publication"
+                f"non-atomic publication (lock-fallback): {exc}; ordinary rename "
+                "has a small cross-process race window"
             )
-            published = _publish_directory_with_mkdir_lock(
+            published = _publish_directory_with_lock_file(
                 temporary_directory,
                 entry,
-                lock_path,
                 timeout=lock_timeout,
                 stale_age=stale_lock_age,
                 diagnostics=diagnostics,
@@ -3334,6 +3457,7 @@ def prepare_jit_artifact(
     """
 
     def configure(diagnostics: list[str]) -> _CompileConfiguration:
+        environment = _sanitized_host_cxx_environment(diagnostics)
         compiler_command, compiler = probe_compiler_identity(cxx)
         selected_cpu = detect_cpu_identity() if cpu is None else _json_value(cpu, "cpu")
         selected_build = build
@@ -3382,6 +3506,7 @@ def prepare_jit_artifact(
             options=("-std=c++20", "-O3", "-fPIC", "-shared", *flags),
             source_name="plugin.cpp",
             compiler_label="CXX",
+            environment=environment,
         )
 
     return _prepare_compiled_artifact(

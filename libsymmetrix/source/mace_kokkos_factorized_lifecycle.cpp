@@ -908,8 +908,11 @@ void MACEKokkos<Precision>::invalidate_factorized_prepared_graph()
     }
     factorized_prepared_graph_generation = 0;
     factorized_prepared_geometry_graph_generation = 0;
+    factorized_prepared_batch_graph_generation = 0;
     factorized_prepared_geometry_fractional = false;
     factorized_prepared_geometry_uses_shifts = false;
+    factorized_prepared_geometry_segmented = false;
+    execution_prepared_batch_edge_offsets_host.clear();
     invalidate_factorized_operator_benchmark();
     factorized_completed_evaluation_epoch = 0;
     factorized_completed_evaluation_graph_generation = 0;
@@ -2499,6 +2502,7 @@ MACEKokkos<Precision>::prepare_periodic_factorized_graph(
         factorized_prepared_graph_generation;
     factorized_prepared_geometry_fractional = !fixed_workspace_tiled;
     factorized_prepared_geometry_uses_shifts = fixed_workspace_tiled;
+    factorized_prepared_geometry_segmented = false;
     factorized_prepared_graph_count += 1;
     factorized_fractional_geometry_preparation_count += 1;
     factorized_fractional_geometry_initialization_bytes +=
@@ -2761,6 +2765,181 @@ void MACEKokkos<Precision>::prepare_factorized_geometry(
     factorized_prepared_geometry_graph_generation = graph_generation;
     factorized_prepared_geometry_fractional = false;
     factorized_prepared_geometry_uses_shifts = false;
+    factorized_prepared_geometry_segmented = false;
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::update_factorized_reference_geometry(
+    const std::uint64_t graph_generation,
+    const std::span<const double> reference_positions,
+    const std::span<const double> reference_xyz)
+{
+    if (graph_generation == 0
+        || graph_generation != factorized_prepared_graph_generation
+        || graph_generation != factorized_prepared_geometry_graph_generation
+        || factorized_schedule_dirty
+        || factorized_prepared_geometry_fractional
+        || factorized_prepared_geometry_uses_shifts
+        || factorized_prepared_geometry_segmented)
+        throw std::invalid_argument(
+            "Reference geometry update requires current Cartesian geometry tokens.");
+    if (reference_positions.size()
+            != execution_prepared_reference_positions.extent(0)
+        || reference_xyz.size() != execution_prepared_reference_xyz.extent(0))
+        throw std::invalid_argument(
+            "Reference geometry update extents are inconsistent.");
+    if (!std::all_of(
+            reference_positions.begin(), reference_positions.end(),
+            [] (const double value) { return std::isfinite(value); })
+        || !std::all_of(
+            reference_xyz.begin(), reference_xyz.end(),
+            [] (const double value) { return std::isfinite(value); }))
+        throw std::invalid_argument(
+            "Reference geometry update contains a non-finite value.");
+
+    const auto positions_host = Kokkos::View<
+        const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            reference_positions.data(), reference_positions.size());
+    const auto xyz_host = Kokkos::View<
+        const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            reference_xyz.data(), reference_xyz.size());
+    Kokkos::deep_copy(
+        factorized_execution_space,
+        execution_prepared_reference_positions,
+        positions_host);
+    Kokkos::deep_copy(
+        factorized_execution_space,
+        execution_prepared_reference_xyz,
+        xyz_host);
+    execution_geometry_copy_count += 2;
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::prepare_factorized_segment_geometry(
+    const std::uint64_t graph_generation,
+    const std::span<const double> reference_positions,
+    const std::span<const int> edge_shifts,
+    const std::span<const double> cells)
+{
+    if (graph_generation == 0
+        || graph_generation != factorized_prepared_graph_generation
+        || graph_generation != factorized_prepared_batch_graph_generation
+        || factorized_schedule_dirty)
+        throw std::invalid_argument(
+            "Segment geometry requires current graph and batch tokens.");
+    const std::size_t num_nodes = execution_prepared_node_types.extent(0);
+    const std::size_t num_edges = execution_prepared_neigh_indices.extent(0);
+    const std::size_t batch_offset_count =
+        execution_prepared_batch_edge_offsets.extent(0);
+    if (batch_offset_count < 2)
+        throw std::invalid_argument(
+            "Segment geometry requires prepared batch edge offsets.");
+    const std::size_t graph_count = batch_offset_count-1;
+    if (reference_positions.size() != 3*num_nodes
+        || edge_shifts.size() != 3*num_edges
+        || cells.size() != 9*graph_count)
+        throw std::invalid_argument(
+            "Segment geometry extents are inconsistent.");
+    if (!std::all_of(
+            reference_positions.begin(), reference_positions.end(),
+            [] (const double value) { return std::isfinite(value); })
+        || !std::all_of(cells.begin(), cells.end(), [] (const double value) {
+            return std::isfinite(value);
+        }))
+        throw std::invalid_argument(
+            "Segment geometry contains a non-finite value.");
+    for (std::size_t graph=0; graph<graph_count; ++graph) {
+        const double* cell = cells.data()+9*graph;
+        const double determinant =
+            cell[0]*(cell[4]*cell[8]-cell[5]*cell[7])
+            -cell[1]*(cell[3]*cell[8]-cell[5]*cell[6])
+            +cell[2]*(cell[3]*cell[7]-cell[4]*cell[6]);
+        if (!std::isfinite(determinant) || determinant == 0.0)
+            throw std::invalid_argument(
+                "Segment geometry cells must be invertible.");
+    }
+
+    reserve_prepared_geometry_state_capacity(num_nodes, num_edges);
+    const auto positions_host = Kokkos::View<
+        const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            reference_positions.data(), reference_positions.size());
+    Kokkos::deep_copy(
+        factorized_execution_space,
+        execution_prepared_reference_positions,
+        positions_host);
+    if (execution_prepared_batch_edge_shifts.extent(0) != edge_shifts.size()) {
+        execution_prepared_batch_edge_shifts = Kokkos::View<int*>(
+            Kokkos::view_alloc(
+                "MACE prepared batch edge shifts", Kokkos::WithoutInitializing),
+            edge_shifts.size());
+        factorized_geometry_state_allocation_count += 1;
+    }
+    const auto shifts_host = Kokkos::View<
+        const int*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            edge_shifts.data(), edge_shifts.size());
+    Kokkos::deep_copy(
+        factorized_execution_space,
+        execution_prepared_batch_edge_shifts,
+        shifts_host);
+    if (execution_prepared_batch_cells.extent(0) != cells.size()) {
+        execution_prepared_batch_cells = Kokkos::View<double*>(
+            Kokkos::view_alloc(
+                "MACE prepared batch cells", Kokkos::WithoutInitializing),
+            cells.size());
+        factorized_geometry_state_allocation_count += 1;
+    }
+    const auto cells_host = Kokkos::View<
+        const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            cells.data(), cells.size());
+    Kokkos::deep_copy(
+        factorized_execution_space, execution_prepared_batch_cells, cells_host);
+    if (execution_prepared_geometry_invalid.extent(0) != 1) {
+        execution_prepared_geometry_invalid = Kokkos::View<int*>(
+            "Execution prepared geometry invalid", 1);
+        factorized_geometry_state_allocation_count += 1;
+    }
+    factorized_execution_space.fence("Execution segment geometry preparation");
+    factorized_prepared_geometry_graph_generation = graph_generation;
+    factorized_prepared_geometry_fractional = false;
+    factorized_prepared_geometry_uses_shifts = false;
+    factorized_prepared_geometry_segmented = true;
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::update_factorized_segment_cells(
+    const std::uint64_t graph_generation,
+    const std::span<const double> cells)
+{
+    if (graph_generation == 0
+        || graph_generation != factorized_prepared_graph_generation
+        || graph_generation != factorized_prepared_geometry_graph_generation
+        || factorized_schedule_dirty
+        || !factorized_prepared_geometry_segmented
+        || cells.size() != execution_prepared_batch_cells.extent(0))
+        throw std::invalid_argument(
+            "Segment cell update requires current segment geometry tokens.");
+    if (!std::all_of(cells.begin(), cells.end(), [] (const double value) {
+            return std::isfinite(value);
+        }))
+        throw std::invalid_argument(
+            "Segment cell update contains a non-finite value.");
+    for (std::size_t graph=0; graph<cells.size()/9; ++graph) {
+        const double* cell = cells.data()+9*graph;
+        const double determinant =
+            cell[0]*(cell[4]*cell[8]-cell[5]*cell[7])
+            -cell[1]*(cell[3]*cell[8]-cell[5]*cell[6])
+            +cell[2]*(cell[3]*cell[7]-cell[4]*cell[6]);
+        if (!std::isfinite(determinant) || determinant == 0.0)
+            throw std::invalid_argument(
+                "Segment cell update requires invertible cells.");
+    }
+    const auto cells_host = Kokkos::View<
+        const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
+            cells.data(), cells.size());
+    Kokkos::deep_copy(
+        factorized_execution_space, execution_prepared_batch_cells, cells_host);
+    factorized_cell_update_count += 1;
+    factorized_cell_update_bytes += sizeof(double)*cells.size();
 }
 
 template <typename Precision>
@@ -2890,6 +3069,7 @@ void MACEKokkos<Precision>::prepare_factorized_shift_geometry(
     factorized_prepared_geometry_graph_generation = graph_generation;
     factorized_prepared_geometry_fractional = false;
     factorized_prepared_geometry_uses_shifts = true;
+    factorized_prepared_geometry_segmented = false;
 }
 
 template <typename Precision>
@@ -3020,6 +3200,7 @@ void MACEKokkos<Precision>::compute_prepared_factorized(
         factorized_prepared_geometry_graph_generation = 0;
         factorized_prepared_geometry_fractional = false;
         factorized_prepared_geometry_uses_shifts = false;
+        factorized_prepared_geometry_segmented = false;
         compact_edge_geometry_active =
             edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64;
         try {
@@ -3141,6 +3322,85 @@ void MACEKokkos<Precision>::update_prepared_factorized_positions_geometry(
     const auto positions_host = Kokkos::View<
         const double*,Kokkos::HostSpace,Kokkos::MemoryUnmanaged>(
             positions.data(), positions.size());
+    if (factorized_prepared_geometry_segmented) {
+        Kokkos::deep_copy(
+            factorized_execution_space, execution_prepared_positions,
+            positions_host);
+        execution_geometry_copy_count += 1;
+        Kokkos::deep_copy(
+            factorized_execution_space, execution_prepared_geometry_invalid, 0);
+        const auto current_positions = execution_prepared_positions;
+        const auto edge_receivers = execution_edge_receivers;
+        const auto edge_sources = execution_prepared_neigh_indices;
+        const auto shifts = execution_prepared_batch_edge_shifts;
+        const auto offsets = execution_prepared_batch_edge_offsets;
+        const auto cells = execution_prepared_batch_cells;
+        const bool compact_geometry =
+            edge_geometry_policy == EdgeGeometryPolicy::unit_f32_radius_f64;
+        auto xyz = execution_prepared_xyz;
+        auto direction = execution_prepared_unit_direction;
+        auto r = Kokkos::subview(
+            execution_prepared_r,
+            Kokkos::make_pair(std::size_t(0), std::size_t(num_edges)));
+        auto invalid = execution_prepared_geometry_invalid;
+        const double cutoff = r_cut;
+        const std::size_t graph_count = offsets.extent(0)-1;
+        Kokkos::parallel_for(
+            "MACEKokkos::prepared_segment_edge_geometry",
+            Kokkos::RangePolicy<decltype(factorized_execution_space)>(
+                factorized_execution_space, 0, num_edges),
+            KOKKOS_LAMBDA (const int edge) {
+                std::size_t lower = 0;
+                std::size_t upper = graph_count;
+                while (lower+1 < upper) {
+                    const std::size_t middle = (lower+upper)/2;
+                    if (edge < offsets(middle))
+                        upper = middle;
+                    else
+                        lower = middle;
+                }
+                const int receiver = edge_receivers(edge);
+                const int source = edge_sources(edge);
+                double vector[3];
+                double squared_distance = 0.0;
+                for (int component=0; component<3; ++component) {
+                    double value = current_positions(3*source+component)
+                        -current_positions(3*receiver+component);
+                    for (int lattice=0; lattice<3; ++lattice)
+                        value += shifts(3*edge+lattice)
+                            *cells(9*lower+3*lattice+component);
+                    vector[component] = value;
+                    squared_distance += value*value;
+                }
+                if (!Kokkos::isfinite(squared_distance)
+                    || !(squared_distance > 0.0)) {
+                    Kokkos::atomic_add(&invalid(0), 1);
+                    if (compact_geometry) {
+                        direction(3*edge) = Precision(1);
+                        direction(3*edge+1) = Precision(0);
+                        direction(3*edge+2) = Precision(0);
+                    } else {
+                        xyz(3*edge) = cutoff;
+                        xyz(3*edge+1) = 0.0;
+                        xyz(3*edge+2) = 0.0;
+                    }
+                    r(edge) = cutoff;
+                    return;
+                }
+                const double distance = Kokkos::sqrt(squared_distance);
+                const double scale = distance >= cutoff ? cutoff/distance : 1.0;
+                for (int component=0; component<3; ++component) {
+                    if (compact_geometry)
+                        direction(3*edge+component) = static_cast<Precision>(
+                            vector[component]/distance);
+                    else
+                        xyz(3*edge+component) = scale*vector[component];
+                }
+                r(edge) = distance >= cutoff ? cutoff : distance;
+            });
+        factorized_prepared_geometry_update_count += 1;
+        return;
+    }
     if (factorized_prepared_geometry_uses_shifts)
         Kokkos::deep_copy(
             factorized_execution_space, execution_prepared_displacements,

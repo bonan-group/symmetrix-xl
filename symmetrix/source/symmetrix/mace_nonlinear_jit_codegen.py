@@ -61,9 +61,9 @@ MH1_CUDA_MODULE_ABI = "symmetrix.jit.mh1.cuda-module/5"
 MH1_CUDA_MODULE_ABI_VERSION = 5
 MH1_HIP_MODULE_ABI = "symmetrix.jit.mh1.hip-module/5"
 MH1_HIP_MODULE_ABI_VERSION = 5
-MH1_LAUNCH_PLAN_TAG = "symmetrix.jit.mh1.cuda-launch-plan/6"
-MH1_HIP_LAUNCH_PLAN_TAG = "symmetrix.jit.mh1.hip-launch-plan/6"
-MH1_LAUNCH_PLAN_VERSION = 6
+MH1_LAUNCH_PLAN_TAG = "symmetrix.jit.mh1.cuda-launch-plan/7"
+MH1_HIP_LAUNCH_PLAN_TAG = "symmetrix.jit.mh1.hip-launch-plan/7"
+MH1_LAUNCH_PLAN_VERSION = 7
 MH1_CONDITIONER_LAYOUT_TAG = "symmetrix.execution.mh1.conditioner-layout/1"
 # The identity envelope every non-linear metadata builder publishes: the ABI tag
 # and version above, the codegen artifact id, and the generation/semantic/
@@ -318,15 +318,60 @@ class MH1KernelLaunch:
 
 
 @dataclass(frozen=True)
+class MH1DenseLinearLaunch:
+    name: str
+    direction: Literal["forward", "reverse"]
+    input_field: str
+    input_offset: int
+    input_stride: int
+    output_field: str
+    output_offset: int
+    output_stride: int
+    parameter_offset: int
+    blocks: tuple[dict[str, int], ...]
+    fallback: tuple[MH1KernelLaunch, ...]
+    batch_mode: Literal["block_strided", "grouped_components"] = "block_strided"
+    compute_policy: Literal["strict_fp32", "tf32"] = "strict_fp32"
+
+    def as_plan_entry(self) -> dict[str, Any]:
+        return {
+            "operation": "dense_linear",
+            "name": self.name,
+            "direction": self.direction,
+            "input": {
+                "field": self.input_field,
+                "offset": self.input_offset,
+                "stride": self.input_stride,
+            },
+            "output": {
+                "field": self.output_field,
+                "offset": self.output_offset,
+                "stride": self.output_stride,
+            },
+            "parameters": {
+                "offset": self.parameter_offset,
+                "layout": "effective_source_target",
+            },
+            "blocks": [dict(block) for block in self.blocks],
+            "batch_mode": self.batch_mode,
+            "compute_policy": self.compute_policy,
+            "fallback": [launch.as_plan_entry() for launch in self.fallback],
+        }
+
+
+MH1PlanOperation = MH1KernelLaunch | MH1DenseLinearLaunch
+
+
+@dataclass(frozen=True)
 class MH1NodeProgram:
     device_source: str
     plugin_source: str
-    post_forward_launches: tuple[MH1KernelLaunch, ...]
-    post_reverse_launches: tuple[MH1KernelLaunch, ...]
-    pre_reverse_launches: tuple[MH1KernelLaunch, ...] = ()
-    pre_forward_launches: tuple[MH1KernelLaunch, ...] = ()
-    initial_forward_launches: tuple[MH1KernelLaunch, ...] = ()
-    final_reverse_launches: tuple[MH1KernelLaunch, ...] = ()
+    post_forward_launches: tuple[MH1PlanOperation, ...]
+    post_reverse_launches: tuple[MH1PlanOperation, ...]
+    pre_reverse_launches: tuple[MH1PlanOperation, ...] = ()
+    pre_forward_launches: tuple[MH1PlanOperation, ...] = ()
+    initial_forward_launches: tuple[MH1PlanOperation, ...] = ()
+    final_reverse_launches: tuple[MH1PlanOperation, ...] = ()
 
 
 MH1CudaKernelLaunch = MH1KernelLaunch
@@ -1357,6 +1402,58 @@ def _runtime_pack_segment(
     raise ValueError(
         f"MH1 node runtime pack {pack_name!r} has no {segment_name!r} segment"
     )
+
+
+def _dense_linear_blocks(descriptor: dict[str, Any]) -> tuple[dict[str, int], ...]:
+    segments = {
+        segment["name"]: segment
+        for segment in descriptor["runtime_parameters"]["segments"]
+    }
+    if int(segments["bias"]["count"]) != 0:
+        return ()
+    blocks = []
+    for path in descriptor["instructions"]:
+        input_block = descriptor["blocks"]["input"][int(path["input_block"])]
+        output_block = descriptor["blocks"]["output"][int(path["output_block"])]
+        if (
+            int(input_block["components"]) != int(output_block["components"])
+            or int(input_block["l"]) != int(output_block["l"])
+            or input_block["parity"] != output_block["parity"]
+        ):
+            return ()
+        blocks.append(
+            {
+                "input_offset": int(input_block["offset"]),
+                "output_offset": int(output_block["offset"]),
+                "weight_offset": int(path["weight_offset"]),
+                "input_channels": int(input_block["multiplicity"]),
+                "output_channels": int(output_block["multiplicity"]),
+                "components": int(input_block["components"]),
+            }
+        )
+    return tuple(blocks)
+
+
+def _dense_linear_batch_mode(
+    blocks: tuple[dict[str, int], ...],
+) -> Literal["block_strided", "grouped_components"]:
+    if not blocks:
+        return "block_strided"
+    input_channels = blocks[0]["input_channels"]
+    output_channels = blocks[0]["output_channels"]
+    input_offset = blocks[0]["input_offset"]
+    output_offset = blocks[0]["output_offset"]
+    for block in blocks:
+        if (
+            block["input_channels"] != input_channels
+            or block["output_channels"] != output_channels
+            or block["input_offset"] != input_offset
+            or block["output_offset"] != output_offset
+        ):
+            return "block_strided"
+        input_offset += input_channels * block["components"]
+        output_offset += output_channels * block["components"]
+    return "grouped_components"
 
 
 def _render_linear_forward_adjoint_dot(
@@ -6764,6 +6861,14 @@ def _render_mh1_spline_r_gpu_programs(
         edge_harmonics = extents["input_2_dimension"]
         output_components = extents["output_dimension"] // channels
         density_function = extents["weight_size"]
+        use_output_mask = not _interaction_output_mask_is_identity(interaction)
+        shared_source_features = (
+            dialect.backend == "cuda"
+            and precision == "float32"
+            and channels == 128
+            and source_harmonics == 4
+            and edge_harmonics == 16
+        )
         radial_offsets = tuple(
             int(path["weight_offset"]) for path in interaction["paths"]
         )
@@ -6783,7 +6888,7 @@ def _render_mh1_spline_r_gpu_programs(
             map_type_indices=False,
             density_function=density_function,
             radial_function_offsets=radial_offsets,
-            use_output_mask=True,
+            use_output_mask=use_output_mask,
             filter_inactive_edges=False,
         ).replace("r1_forward_owner", f"spline_r_forward_owner_{index}")
         reverse_kernel = _render_standard_r1_fused_reverse_kernel(
@@ -6803,8 +6908,9 @@ def _render_mh1_spline_r_gpu_programs(
             compact_source_owners=True,
             density_function=density_function,
             radial_function_offsets=radial_offsets,
-            use_output_mask=True,
+            use_output_mask=use_output_mask,
             filter_inactive_edges=False,
+            shared_source_features=shared_source_features,
         )
         spline_helpers = render_gpu_spline_helpers(
             "SymmetrixJitMH1CudaSplineV5",
@@ -8629,6 +8735,8 @@ def _render_cuda_node_program(
     symbol_prefix: str = "",
     node_reverse_schedule: str = _MH1_NODE_REVERSE_SCHEDULE,
     scalar_gate_division: bool = False,
+    vendor_dense_linear2: bool = False,
+    dense_compute_policy: Literal["strict_fp32", "tf32"] = "strict_fp32",
 ) -> str | MH1NodeCudaProgram:
     """Render only the MH-1 phases surrounding canonical common products."""
 
@@ -9723,6 +9831,60 @@ __syncthreads();"""
         + pre_message_reverse_launches
         + (persistent(f"{symbol_prefix}pre_density_kernel_{index}"),)
     )
+    if vendor_dense_linear2:
+        dense_blocks = _dense_linear_blocks(layer["linears"]["linear_2"])
+    else:
+        dense_blocks = ()
+    if dense_blocks:
+        dense_batch_mode = _dense_linear_batch_mode(dense_blocks)
+        pre_forward_launches = (
+            pre_residual_launches
+            + pre_message_launches
+            + (persistent(f"{symbol_prefix}pre_gate_kernel_{index}"),)
+            + (
+                MH1DenseLinearLaunch(
+                    name="linear_2",
+                    direction="forward",
+                    input_field="node_arena",
+                    input_offset=residual_dimension,
+                    input_stride=arena_dimension,
+                    output_field="node_arena",
+                    output_offset=0,
+                    output_stride=arena_dimension,
+                    parameter_offset=0,
+                    blocks=dense_blocks,
+                    fallback=pre_linear_2_launches,
+                    batch_mode=dense_batch_mode,
+                    compute_policy=dense_compute_policy,
+                ),
+            )
+            + (persistent(f"{symbol_prefix}pre_retain_kernel_{index}"),)
+            + post_skip_launches
+        )
+        pre_reverse_launches = (
+            (
+                MH1DenseLinearLaunch(
+                    name="linear_2",
+                    direction="reverse",
+                    input_field="contraction_output_adjoint",
+                    input_offset=contraction_output_dimension,
+                    input_stride=arena_dimension,
+                    output_field="node_arena",
+                    output_offset=0,
+                    output_stride=arena_dimension,
+                    parameter_offset=0,
+                    blocks=dense_blocks,
+                    fallback=pre_linear_2_reverse_launches,
+                    batch_mode=dense_batch_mode,
+                    compute_policy=dense_compute_policy,
+                ),
+            )
+            + (persistent(f"{symbol_prefix}pre_gate_reverse_kernel_{index}"),)
+            + pre_residual_reverse_launches
+            + (persistent(f"{symbol_prefix}pre_scale_kernel_{index}"),)
+            + pre_message_reverse_launches
+            + (persistent(f"{symbol_prefix}pre_density_kernel_{index}"),)
+        )
     program = MH1NodeCudaProgram(
         device_source=device_source,
         plugin_source=device_source + "\n\n" + "\n\n".join(launchers),
@@ -9753,12 +9915,17 @@ def execution_mh1_cuda_module_v4_launch_plan(
     edge_policy: str | dict[str, Any] = "auto",
     node_state_policy: str = MH1_NODE_STATE_FULL_RETENTION,
     precision: str = "float32",
+    dense_policy: Literal["auto", "generated", "vendor_fp32", "vendor_tf32"] = "auto",
     _edge_reverse_schedule: str = _MH1_CUDA_EDGE_REVERSE_SCHEDULE,
     _node_reverse_schedule: str | None = None,
 ) -> dict[str, Any]:
     """Return the closed native launch plan for an MH1 NVRTC module."""
 
     normalized = normalize_execution_mh1_v4_contract(contract)
+    if dense_policy not in ("auto", "generated", "vendor_fp32", "vendor_tf32"):
+        raise ValueError("MH1 CUDA dense policy is unsupported")
+    vendor_dense_linear2 = precision == "float32" and dense_policy != "generated"
+    dense_compute_policy = "tf32" if dense_policy == "vendor_tf32" else "strict_fp32"
     node_state_policy = _resolve_node_state_policy(node_state_policy)
     if _node_reverse_schedule is None:
         _node_reverse_schedule = _cuda_module_node_reverse_schedule(node_state_policy)
@@ -9803,6 +9970,8 @@ def execution_mh1_cuda_module_v4_launch_plan(
             return_program=True,
             symbol_prefix="symmetrix_execution_mh1_split_",
             node_reverse_schedule=_node_reverse_schedule,
+            vendor_dense_linear2=vendor_dense_linear2,
+            dense_compute_policy=dense_compute_policy,
         )
         for layer, layer_metadata in zip(node_layers, metadata["layers"], strict=True)
     ]
@@ -9896,6 +10065,7 @@ def execution_mh1_cuda_module_v4_launch_plan(
         "structure_fingerprint": metadata["structure_fingerprint"],
         "runtime_layout_fingerprint": metadata["runtime_layout_fingerprint"],
         "target_compute_capability": compute_capability,
+        "dense_policy": dense_policy,
         "module_identity": _execution_mh1_cuda_module_identity(metadata, precision),
         "scalar_size": _gpu_scalar_size(precision),
         "node_state_policy": metadata["node_state_policy"],
@@ -9938,6 +10108,7 @@ def execution_mh1_hip_module_v4_launch_plan(
         edge_policy=internal_edge,
         node_state_policy=node_state_policy,
         precision=precision,
+        dense_policy="generated",
         _edge_reverse_schedule=_MH1_HIP_EDGE_REVERSE_SCHEDULE,
         _node_reverse_schedule=metadata["node_reverse_schedule"],
     )

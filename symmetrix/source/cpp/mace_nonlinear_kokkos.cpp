@@ -109,6 +109,17 @@ py::dict stage_description_dict(
     };
     py::dict result;
     result["layer_count"] = description.layer_count();
+    auto regions = py::list();
+    for (std::size_t layer = 0; layer < description.layer_count(); ++layer) {
+        py::dict entry;
+        entry["layer"] = layer;
+        entry["edge_forward"] = std::string(description.edge_forward(layer));
+        entry["node_forward"] = std::string(description.node_forward(layer));
+        entry["node_reverse"] = std::string(description.node_reverse(layer));
+        entry["edge_reverse"] = std::string(description.edge_reverse(layer));
+        regions.append(std::move(entry));
+    }
+    result["profile_regions"] = std::move(regions);
     auto forward = py::list();
     for (const auto& stage : description.forward_schedule())
         forward.append(stage_entry(stage));
@@ -740,6 +751,27 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
             py::arg("graph_generation"),py::arg("reference_positions"),
             py::arg("reference_xyz"),py::arg("cell"),
             py::arg("inverse_cell"),py::arg("pbc"))
+        .def("_prepare_factorized_segment_geometry",
+            [] (Evaluator& self,const std::uint64_t graph_generation,
+                    DoubleArray reference_positions,IntArray edge_shifts,
+                    DoubleArray cells) {
+                self.prepare_factorized_segment_geometry(
+                    graph_generation,
+                    std::span<const double>(
+                        reference_positions.data(),reference_positions.size()),
+                    std::span<const int>(edge_shifts.data(),edge_shifts.size()),
+                    std::span<const double>(cells.data(),cells.size()));
+            },
+            py::arg("graph_generation"),py::arg("reference_positions"),
+            py::arg("edge_shifts"),py::arg("cells"))
+        .def("_update_factorized_segment_cells",
+            [] (Evaluator& self,const std::uint64_t graph_generation,
+                    DoubleArray cells) {
+                self.update_factorized_segment_cells(
+                    graph_generation,
+                    std::span<const double>(cells.data(),cells.size()));
+            },
+            py::arg("graph_generation"),py::arg("cells"))
         .def("_arm_factorized_geometry_prepare_failure",
             &Evaluator::arm_factorized_geometry_prepare_failure_for_testing,
             "Inject one failure after staged geometry initialization but "
@@ -823,6 +855,33 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
                 return view2vector(self.stress_tensor);
             },
             py::arg("volumes"),py::arg("graph_generation"))
+        .def("_reduce_segmented_stress",
+            [] (Evaluator& self,DoubleArray volumes,
+                    Int64Array edge_offsets,DoubleArray xyz) {
+                if(edge_offsets.size()!=volumes.size()+1
+                    ||edge_offsets.size()<2||edge_offsets.data()[0]!=0)
+                    throw py::value_error(
+                        "Segmented stress edge offsets are inconsistent.");
+                for(py::ssize_t graph=0;graph+1<edge_offsets.size();++graph)
+                    if(edge_offsets.data()[graph]<0
+                        ||edge_offsets.data()[graph]
+                            >edge_offsets.data()[graph+1])
+                        throw py::value_error(
+                            "Segmented stress edge offsets must be monotonic.");
+                const auto current_edges=
+                    edge_offsets.data()[edge_offsets.size()-1];
+                if(current_edges<0||xyz.size()!=3*current_edges)
+                    throw py::value_error(
+                        "Segmented stress geometry is inconsistent.");
+                self.reduce_prepared_batched_stress(
+                    std::span<const double>(volumes.data(),volumes.size()),
+                    self.factorized_graph_generation());
+                if(self.stress_tensor.size()!=9*volumes.size())
+                    throw py::value_error(
+                        "Segmented stress tensor extent is inconsistent.");
+                return view2vector(self.stress_tensor);
+            },
+            py::arg("volumes"),py::arg("edge_offsets"),py::arg("xyz"))
         .def("compute_node_energies_forces",
             [](Evaluator& self,int num_nodes,IntArray node_types,
                     IntArray num_neigh,IntArray neigh_indices,

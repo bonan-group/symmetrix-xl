@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
         validate_mh1_product_module_candidate(product, product_expected);
         const std::string plan_schema = mutation.rfind("plan-", 0) == 0
             ? "symmetrix.jit.mh1.cuda-launch-plan/" + mutation.substr(5)
-            : "symmetrix.jit.mh1.cuda-launch-plan/6";
+            : "symmetrix.jit.mh1.cuda-launch-plan/7";
         validate_mh1_launch_plan_schema(plan_schema, "cuda");
         return mutation == "valid" ? 0 : 4;
     } catch (const std::exception&) {

@@ -687,6 +687,16 @@ def test_native_stage_description_matches_the_contract_schedule(layer_count):
     described = native_symmetrix.mace_nonlinear_stage_description(layer_count)
 
     assert described["layer_count"] == layer_count
+    assert [dict(entry) for entry in described["profile_regions"]] == [
+        {
+            "layer": layer,
+            "edge_forward": f"symmetrix/mh1/R{layer}+A{layer}/forward",
+            "node_forward": f"symmetrix/mh1/M{layer}+H{layer + 1}/forward",
+            "node_reverse": f"symmetrix/mh1/M{layer}+H{layer + 1}/reverse",
+            "edge_reverse": f"symmetrix/mh1/R{layer}+A{layer}/reverse",
+        }
+        for layer in range(layer_count)
+    ]
     assert [dict(entry) for entry in described["forward_schedule"]] == (
         expected["forward_schedule"]
     )
@@ -966,6 +976,8 @@ def test_mh1_v4_spline_r_uses_exact_graph_without_r1_cutoff_abi(
     assert "args->cutoff" not in module
     assert "edge_is_active(" not in module
     assert "source_args.source_ids" not in module
+    assert "source_args.output_mask" not in module
+    assert "args->output_mask" not in module
     assert (
         "source_args.neigh_indices[source_args.source_edges[first_scheduled]]" in module
     )
@@ -985,14 +997,22 @@ def test_mh1_generation_19_recompute_plan_splits_external_product_from_nodes(
 
     for node in plan["nodes"]:
         index = node["index"]
-        pre_forward_kernels = {launch["kernel"] for launch in node["split_pre_forward"]}
+
+        def kernels(phase):
+            return {
+                launch["kernel"]
+                for operation in node[phase]
+                for launch in operation.get("fallback", [operation])
+            }
+
+        pre_forward_kernels = kernels("split_pre_forward")
         post_forward_kernels = {
             launch["kernel"] for launch in node["split_post_forward"]
         }
         post_reverse_kernels = {
             launch["kernel"] for launch in node["split_post_reverse"]
         }
-        pre_reverse_kernels = {launch["kernel"] for launch in node["split_pre_reverse"]}
+        pre_reverse_kernels = kernels("split_pre_reverse")
         assert {
             f"symmetrix_execution_mh1_split_node_grouped_l{index}_forward_residual_grouped",
             f"symmetrix_execution_mh1_split_node_grouped_l{index}_forward_message_grouped",
@@ -1152,6 +1172,8 @@ def test_mh1_v4_path_tiled_edge_geometry_is_shared_by_cuda_and_hip(
             for interaction in plan["interactions"]
         )
     for module in (cuda_module, hip_module):
+        assert "source_args.output_mask" in module
+        assert "args->output_mask" in module
         assert "__shared__ float path_weight_adjoint[4][4]" in module
         assert "path_weight_adjoint[3][3][channel]" in module
         assert "static_cast<std::int64_t>(blockIdx.x) * 4" in module
@@ -1476,8 +1498,8 @@ int main() {
     if(!posix_failure([&] { (void)first.launch_conditioning_reverse(&conditioning_reverse,nullptr,1); })) return 11;
     if(!posix_failure([&] { (void)first.launch_node_forward(&node_forward,nullptr,1); })) return 12;
     if(!posix_failure([&] { (void)first.launch_node_reverse(&node_reverse,nullptr,1); })) return 13;
-    if(!posix_failure([&] { (void)first.launch_split_forward(&node_forward,nullptr,1); })) return 14;
-    if(!posix_failure([&] { (void)first.launch_split_reverse(&node_reverse,nullptr,1); })) return 15;
+    if(!posix_failure([&] { (void)first.launch_split_forward(&node_forward,nullptr,1,nullptr); })) return 14;
+    if(!posix_failure([&] { (void)first.launch_split_reverse(&node_reverse,nullptr,1,nullptr); })) return 15;
     if(!posix_failure([&] { (void)first.descriptor(); })) return 16;
     return !first&&first.path().empty()&&!first.has_spline_r_program()
         &&first.edge_launch_count(0)==0&&!first.split_phase_ready()?0:17;

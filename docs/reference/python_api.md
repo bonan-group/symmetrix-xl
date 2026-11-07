@@ -29,7 +29,8 @@ Symmetrix(
     execution_mh1_node_arena_policy="throughput-v1",
     execution_mh0_state_policy="full-retention-v1",
     edge_geometry_policy="cartesian-f64-v1",
-    neighbor_skin=0.5, head=None, alchemical=None,
+    neighbor_skin=0.5, joined_neighbor_skin=None,
+    head=None, alchemical=None,
     polar_electrostatics="auto", total_charge=None, total_spin=None,
     fermi_level=None, electric_field=None,
     corrections=None,
@@ -211,6 +212,17 @@ builder below 512 atoms and Kokkos at 512 atoms or above when native
 construction is eligible. Serial and OpenMP use the host builder by default.
 The calculator attribute `neighbor_graph_backend` reports the implementation
 that built the current cached graph.
+
+Source-keyed joined direct batches, such as atombatch trajectories, keep one
+neighbor cache per source and combine their candidate graphs into one prepared
+segment group for standard MACE and nonlinear MH-1 models.
+`joined_neighbor_skin=None` uses at least 1 Angstrom of topology reserve for
+this path while leaving ordinary single-structure calculations at
+`neighbor_skin`; an explicit value must be at least `neighbor_skin`. The wider
+candidate graph does not change the model cutoff. After the group is prepared,
+only positions are streamed and edge geometry is updated on the device. Host
+geometry is materialized only for an explicit-geometry fallback; segmented
+force and stress reductions remain on the selected native execution space.
 
 Both frontends build their host graph through one neutral builder,
 `symmetrix/source/symmetrix/neighbor_graph.py`, so the matscipy fast path, the

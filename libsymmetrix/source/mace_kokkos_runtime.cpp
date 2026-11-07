@@ -667,12 +667,16 @@ std::size_t MACEKokkos<Precision>::execution_geometry_workspace_bytes() const
         +execution_prepared_reference_xyz_storage.size()
         +execution_prepared_displacements_storage.size()
         +execution_prepared_cell.size()+execution_prepared_inverse_cell.size()
-        +execution_prepared_electric_field.size())
+        +execution_prepared_electric_field.size()
+        +execution_prepared_batch_volumes.size()
+        +execution_prepared_batch_cells.size())
         +sizeof(int)*(execution_prepared_pbc.size()
             +execution_prepared_geometry_invalid.size()
+            +execution_prepared_batch_edge_shifts.size()
             +execution_prepared_edge_shifts_storage.size()
             +single_layer_workspace_neigh_types.size()
             +dual_layer_workspace_neigh_types.size())
+        +sizeof(std::int64_t)*execution_prepared_batch_edge_offsets.size()
         +sizeof(Precision)*(execution_prepared_unit_direction.size()
             +xyz_shuffled.size()+Y.size()+Y_grad.size()
             +(Y_grad_shuffled.data() == Y_grad.data()
@@ -711,6 +715,10 @@ MACEKokkos<Precision>::~MACEKokkos()
         decltype(execution_prepared_geometry_invalid)();
     execution_prepared_electric_field =
         decltype(execution_prepared_electric_field)();
+    execution_prepared_batch_edge_offsets = {};
+    execution_prepared_batch_volumes = {};
+    execution_prepared_batch_edge_shifts = {};
+    execution_prepared_batch_cells = {};
     xyz_shuffled = decltype(xyz_shuffled)();
     Y = decltype(Y)();
     Y_grad = decltype(Y_grad)();

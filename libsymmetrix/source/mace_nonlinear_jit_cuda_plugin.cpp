@@ -11,6 +11,9 @@
 
 #if defined(KOKKOS_ENABLE_CUDA)
 #include <cuda.h>
+#if defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)
+#include <cublas_v2.h>
+#endif
 #elif defined(KOKKOS_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 #endif
@@ -23,6 +26,7 @@
 #endif
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -66,6 +70,16 @@ static_assert(std::is_standard_layout_v<SymmetrixJitMH1CudaPluginV5>);
 namespace symmetrix::execution {
 
 struct MH1CudaModuleLaunch {
+    struct DenseBlock {
+        std::int32_t input_offset = 0;
+        std::int32_t output_offset = 0;
+        std::int32_t weight_offset = 0;
+        std::int32_t input_channels = 0;
+        std::int32_t output_channels = 0;
+        std::int32_t components = 0;
+    };
+
+    std::int32_t operation_kind = 0;
     void* function = nullptr;
     std::int32_t grid_kind = 0;
     std::int32_t channels = 0;
@@ -73,7 +87,32 @@ struct MH1CudaModuleLaunch {
     std::int32_t tile_nodes = 0;
     std::int32_t tile_channels = 0;
     std::int32_t threads = 0;
+    std::int32_t direction = 0;
+    std::int32_t input_field = 0;
+    std::int32_t output_field = 0;
+    std::int32_t input_offset = 0;
+    std::int32_t output_offset = 0;
+    std::int32_t input_stride = 0;
+    std::int32_t output_stride = 0;
+    std::int32_t parameter_offset = 0;
+    std::int32_t dense_batch_mode = 0;
+    bool tf32 = false;
+    std::vector<DenseBlock> dense_blocks;
+    std::vector<MH1CudaModuleLaunch> fallback;
 };
+
+#if defined(KOKKOS_ENABLE_CUDA) \
+    && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)
+struct MH1CudaDensePointerBatch {
+    const float** weights = nullptr;
+    const float** inputs = nullptr;
+    float** outputs = nullptr;
+    const float* parameter_base = nullptr;
+    const float* input_base = nullptr;
+    float* output_base = nullptr;
+    std::size_t count = 0;
+};
+#endif
 
 struct MH1CudaModuleInteraction {
     void* forward = nullptr;
@@ -126,6 +165,13 @@ struct MH1CudaModuleState {
     std::array<SymmetrixJitMH1CudaNodeProgramV5,2> node_descriptors{};
     SymmetrixJitMH1CudaPluginV5 descriptor{};
     bool split_phase=false;
+#if defined(KOKKOS_ENABLE_CUDA) \
+    && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)
+    cublasHandle_t dense_handle=nullptr;
+    cudaStream_t dense_stream=nullptr;
+    std::unordered_map<const MH1CudaModuleLaunch*,MH1CudaDensePointerBatch>
+        dense_pointer_batches;
+#endif
 };
 
 namespace {
@@ -392,13 +438,336 @@ MH1CudaModuleLaunch parse_module_launch(
     return result;
 }
 
+std::int32_t parse_dense_field(
+    const std::string& path,const std::string& value,const bool input)
+{
+    if(value=="node_arena") return 1;
+    if(input&&value=="contraction_output_adjoint") return 2;
+    throw plugin_error(path,"dense linear packet field is unsupported");
+}
+
+MH1CudaModuleLaunch parse_module_operation(
+    const std::string& path,MH1Module module,const nlohmann::json& value,
+    const std::int32_t launch_plan_version)
+{
+    if(!value.contains("operation"))
+        return parse_module_launch(path,module,value,launch_plan_version);
+    const auto operation=value.at("operation").get<std::string>();
+    if(operation!="dense_linear")
+        throw plugin_error(path,"node operation kind is unsupported");
+    MH1CudaModuleLaunch result;
+    result.operation_kind=1;
+    const auto direction=value.at("direction").get<std::string>();
+    if(direction=="forward") result.direction=0;
+    else if(direction=="reverse") result.direction=1;
+    else throw plugin_error(path,"dense linear direction is invalid");
+    const auto& input=value.at("input");
+    const auto& output=value.at("output");
+    result.input_field=parse_dense_field(
+        path,input.at("field").get<std::string>(),true);
+    result.output_field=parse_dense_field(
+        path,output.at("field").get<std::string>(),false);
+    result.input_offset=input.at("offset").get<std::int32_t>();
+    result.output_offset=output.at("offset").get<std::int32_t>();
+    result.input_stride=input.at("stride").get<std::int32_t>();
+    result.output_stride=output.at("stride").get<std::int32_t>();
+    result.parameter_offset=value.at("parameters").at("offset")
+        .get<std::int32_t>();
+    const auto compute_policy=value.at("compute_policy").get<std::string>();
+    if(compute_policy=="strict_fp32") result.tf32=false;
+    else if(compute_policy=="tf32") result.tf32=true;
+    else throw plugin_error(path,"dense linear compute policy is invalid");
+    const auto batch_mode=value.at("batch_mode").get<std::string>();
+    if(batch_mode=="block_strided") result.dense_batch_mode=0;
+    else if(batch_mode=="grouped_components") result.dense_batch_mode=1;
+    else throw plugin_error(path,"dense linear batch mode is invalid");
+    if(result.input_offset<0||result.output_offset<0
+        ||result.input_stride<=0||result.output_stride<=0
+        ||result.parameter_offset<0)
+        throw plugin_error(path,"dense linear layout is invalid");
+    for(const auto& block:value.at("blocks")) {
+        MH1CudaModuleLaunch::DenseBlock parsed;
+        parsed.input_offset=block.at("input_offset").get<std::int32_t>();
+        parsed.output_offset=block.at("output_offset").get<std::int32_t>();
+        parsed.weight_offset=block.at("weight_offset").get<std::int32_t>();
+        parsed.input_channels=block.at("input_channels").get<std::int32_t>();
+        parsed.output_channels=block.at("output_channels").get<std::int32_t>();
+        parsed.components=block.at("components").get<std::int32_t>();
+        if(parsed.input_offset<0||parsed.output_offset<0||parsed.weight_offset<0
+            ||parsed.input_channels<=0||parsed.output_channels<=0
+            ||parsed.components<=0)
+            throw plugin_error(path,"dense linear block is invalid");
+        result.dense_blocks.push_back(parsed);
+    }
+    if(result.dense_blocks.empty())
+        throw plugin_error(path,"dense linear has no blocks");
+    if(result.dense_batch_mode==1) {
+        const auto input_channels=result.dense_blocks.front().input_channels;
+        const auto output_channels=result.dense_blocks.front().output_channels;
+        auto input_offset=result.dense_blocks.front().input_offset;
+        auto output_offset=result.dense_blocks.front().output_offset;
+        for(const auto& block:result.dense_blocks) {
+            if(block.input_channels!=input_channels
+                ||block.output_channels!=output_channels
+                ||block.input_offset!=input_offset
+                ||block.output_offset!=output_offset)
+                throw plugin_error(
+                    path,"grouped dense linear blocks are not contiguous");
+            input_offset+=block.input_channels*block.components;
+            output_offset+=block.output_channels*block.components;
+        }
+    }
+    for(const auto& fallback:value.at("fallback"))
+        result.fallback.push_back(
+            parse_module_launch(path,module,fallback,launch_plan_version));
+    if(result.fallback.empty())
+        throw plugin_error(path,"dense linear has no generated fallback");
+    return result;
+}
+
+#if defined(KOKKOS_ENABLE_CUDA) \
+    && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)
+void check_cublas(const cublasStatus_t status,const char* operation)
+{
+    if(status!=CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error(
+            std::string(operation)+" failed with cuBLAS status "
+            +std::to_string(static_cast<int>(status)));
+}
+
+void check_cuda(const cudaError_t status,const char* operation)
+{
+    if(status!=cudaSuccess)
+        throw std::runtime_error(
+            std::string(operation)+" failed: "+cudaGetErrorString(status));
+}
+
+void ensure_dense_handle(MH1CudaModuleState& state,void* stream)
+{
+    const auto requested=reinterpret_cast<cudaStream_t>(stream);
+    if(state.dense_handle==nullptr) {
+        check_cublas(cublasCreate(&state.dense_handle),"cublasCreate(MH1)");
+        check_cublas(
+            cublasSetStream(state.dense_handle,requested),
+            "cublasSetStream(MH1)");
+        state.dense_stream=requested;
+    } else if(state.dense_stream!=requested) {
+        throw std::runtime_error(
+            "Execution MH1 dense stream changed after cuBLAS preparation");
+    }
+}
+
+void release_dense_pointer_batches(MH1CudaModuleState& state) noexcept
+{
+    for(auto& [operation,batch]:state.dense_pointer_batches) {
+        (void)operation;
+        static_cast<void>(cudaFree(batch.weights));
+        static_cast<void>(cudaFree(batch.inputs));
+        static_cast<void>(cudaFree(batch.outputs));
+    }
+    state.dense_pointer_batches.clear();
+}
+
+MH1CudaDensePointerBatch& prepare_dense_pointer_batch(
+    MH1CudaModuleState& state,const MH1CudaModuleLaunch& operation,
+    const float* parameters,const float* input,float* output)
+{
+    auto& batch=state.dense_pointer_batches[&operation];
+    std::size_t count=0;
+    for(const auto& block:operation.dense_blocks)
+        count+=static_cast<std::size_t>(block.components);
+    if(batch.count==count&&batch.parameter_base==parameters
+        &&batch.input_base==input&&batch.output_base==output)
+        return batch;
+    if(batch.count!=0)
+        check_cuda(
+            cudaStreamSynchronize(state.dense_stream),
+            "cudaStreamSynchronize(MH1 grouped dense metadata)");
+    if(batch.count!=count) {
+        static_cast<void>(cudaFree(batch.weights));
+        static_cast<void>(cudaFree(batch.inputs));
+        static_cast<void>(cudaFree(batch.outputs));
+        batch={};
+        const auto input_bytes=count*sizeof(const float*);
+        const auto output_bytes=count*sizeof(float*);
+        if(cudaMalloc(reinterpret_cast<void**>(&batch.weights),input_bytes)
+                !=cudaSuccess
+            ||cudaMalloc(reinterpret_cast<void**>(&batch.inputs),input_bytes)
+                !=cudaSuccess
+            ||cudaMalloc(reinterpret_cast<void**>(&batch.outputs),output_bytes)
+                !=cudaSuccess) {
+            static_cast<void>(cudaFree(batch.weights));
+            static_cast<void>(cudaFree(batch.inputs));
+            static_cast<void>(cudaFree(batch.outputs));
+            batch={};
+            throw std::runtime_error(
+                "CUDA allocation failed for MH1 grouped dense pointers");
+        }
+        batch.count=count;
+    }
+    std::vector<const float*> weights;
+    std::vector<const float*> inputs;
+    std::vector<float*> outputs;
+    weights.reserve(count);
+    inputs.reserve(count);
+    outputs.reserve(count);
+    for(const auto& block:operation.dense_blocks) {
+        for(int component=0;component<block.components;++component) {
+            weights.push_back(parameters+block.weight_offset);
+            if(operation.direction==0) {
+                inputs.push_back(input+block.input_offset
+                    +component*block.input_channels);
+                outputs.push_back(output+block.output_offset
+                    +component*block.output_channels);
+            } else {
+                inputs.push_back(input+block.output_offset
+                    +component*block.output_channels);
+                outputs.push_back(output+block.input_offset
+                    +component*block.input_channels);
+            }
+        }
+    }
+    check_cuda(
+        cudaMemcpy(batch.weights,weights.data(),count*sizeof(const float*),
+            cudaMemcpyHostToDevice),
+        "cudaMemcpy(MH1 grouped dense weights)");
+    check_cuda(
+        cudaMemcpy(batch.inputs,inputs.data(),count*sizeof(const float*),
+            cudaMemcpyHostToDevice),
+        "cudaMemcpy(MH1 grouped dense inputs)");
+    check_cuda(
+        cudaMemcpy(batch.outputs,outputs.data(),count*sizeof(float*),
+            cudaMemcpyHostToDevice),
+        "cudaMemcpy(MH1 grouped dense outputs)");
+    batch.parameter_base=parameters;
+    batch.input_base=input;
+    batch.output_base=output;
+    return batch;
+}
+
+template<typename Packet>
+const float* dense_input_pointer(
+    const Packet& packet,const MH1CudaModuleLaunch& operation)
+{
+    if(operation.input_field==1)
+        return reinterpret_cast<const float*>(packet.node_arena);
+    if constexpr(std::is_same_v<Packet,SymmetrixJitMH1CudaNodeReverseArgsV5>) {
+        if(operation.input_field==2)
+            return reinterpret_cast<const float*>(
+                packet.contraction_output_adjoint);
+    }
+    throw std::invalid_argument("Execution MH1 dense input field is invalid");
+}
+
+template<typename Packet>
+float* dense_output_pointer(
+    const Packet& packet,const MH1CudaModuleLaunch& operation)
+{
+    if(operation.output_field==1)
+        return reinterpret_cast<float*>(packet.node_arena);
+    throw std::invalid_argument("Execution MH1 dense output field is invalid");
+}
+
+template<typename Packet>
+void launch_dense_linear(
+    MH1CudaModuleState& state,const MH1CudaModuleLaunch& operation,
+    const Packet& packet,void* stream,const void* dense_parameters)
+{
+    if(dense_parameters==nullptr)
+        throw std::invalid_argument(
+            "Execution MH1 dense parameters are unavailable");
+    if constexpr(std::is_same_v<Packet,SymmetrixJitMH1CudaNodeForwardArgsV5>) {
+        if(operation.direction!=0)
+            throw std::invalid_argument(
+                "Execution MH1 reverse dense operation received a forward packet");
+    } else if(operation.direction!=1) {
+        throw std::invalid_argument(
+            "Execution MH1 forward dense operation received a reverse packet");
+    }
+    ensure_dense_handle(state,stream);
+    check_cublas(
+        cublasSetMathMode(
+            state.dense_handle,
+            operation.tf32?CUBLAS_TF32_TENSOR_OP_MATH:CUBLAS_DEFAULT_MATH),
+        "cublasSetMathMode(MH1)");
+    const auto* parameters=static_cast<const float*>(dense_parameters)
+        +operation.parameter_offset;
+    const auto* input=dense_input_pointer(packet,operation)+operation.input_offset;
+    auto* output=dense_output_pointer(packet,operation)+operation.output_offset;
+    const float alpha=1.0f;
+    const float beta=0.0f;
+    if(operation.dense_batch_mode==1) {
+        const auto& block=operation.dense_blocks.front();
+        auto& batch=prepare_dense_pointer_batch(
+            state,operation,parameters,input,output);
+        check_cublas(
+            cublasSgemmBatched(
+                state.dense_handle,
+                operation.direction==0?CUBLAS_OP_N:CUBLAS_OP_T,CUBLAS_OP_N,
+                operation.direction==0
+                    ?block.output_channels:block.input_channels,
+                static_cast<int>(packet.num_nodes),
+                operation.direction==0
+                    ?block.input_channels:block.output_channels,
+                &alpha,batch.weights,block.output_channels,
+                batch.inputs,operation.input_stride,&beta,
+                batch.outputs,operation.output_stride,
+                static_cast<int>(batch.count)),
+            "cublasSgemmBatched(MH1 grouped linear)");
+        return;
+    }
+    for(const auto& block:operation.dense_blocks) {
+        const auto* weights=parameters+block.weight_offset;
+        if(operation.direction==0) {
+            check_cublas(
+                cublasSgemmStridedBatched(
+                    state.dense_handle,CUBLAS_OP_N,CUBLAS_OP_N,
+                    block.output_channels,static_cast<int>(packet.num_nodes),
+                    block.input_channels,&alpha,
+                    weights,block.output_channels,0,
+                    input+block.input_offset,operation.input_stride,
+                    block.input_channels,&beta,
+                    output+block.output_offset,operation.output_stride,
+                    block.output_channels,block.components),
+                "cublasSgemmStridedBatched(MH1 linear forward)");
+        } else {
+            check_cublas(
+                cublasSgemmStridedBatched(
+                    state.dense_handle,CUBLAS_OP_T,CUBLAS_OP_N,
+                    block.input_channels,static_cast<int>(packet.num_nodes),
+                    block.output_channels,&alpha,
+                    weights,block.output_channels,0,
+                    input+block.output_offset,operation.input_stride,
+                    block.output_channels,&beta,
+                    output+block.input_offset,operation.output_stride,
+                    block.input_channels,block.components),
+                "cublasSgemmStridedBatched(MH1 linear reverse)");
+        }
+    }
+}
+#endif
+
 template<typename Packet>
 void launch_node_sequence(
-    const MH1CudaModuleState& state,
+    MH1CudaModuleState& state,
     const std::vector<MH1CudaModuleLaunch>& launches,
-    const Packet& packet, void* stream, std::int32_t persistent_blocks)
+    const Packet& packet, void* stream, std::int32_t persistent_blocks,
+    const void* dense_parameters=nullptr)
 {
     for(const auto& launch:launches) {
+        if(launch.operation_kind==1) {
+#if defined(KOKKOS_ENABLE_CUDA) \
+    && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)
+            if(dense_parameters!=nullptr) {
+                launch_dense_linear(
+                    state,launch,packet,stream,dense_parameters);
+                continue;
+            }
+#endif
+            launch_node_sequence(
+                state,launch.fallback,packet,stream,persistent_blocks,nullptr);
+            continue;
+        }
         unsigned int grid_x=0,grid_y=1,grid_z=1;
         if(launch.grid_kind==0) {
             grid_x=static_cast<unsigned int>(
@@ -1230,12 +1599,12 @@ MH1CudaPluginV4 MH1CudaPluginV4::load_module(
         std::int32_t launch_plan_version=0;
 #if defined(KOKKOS_ENABLE_CUDA)
         validate_mh1_launch_plan_schema(launch_plan_schema,"cuda");
-        launch_plan_version=6;
+        launch_plan_version=7;
 #else
         validate_mh1_launch_plan_schema(launch_plan_schema,"hip");
-        launch_plan_version=6;
+        launch_plan_version=7;
 #endif
-        if(plan.at("version")!=6
+        if(plan.at("version")!=7
             ||plan.at("artifact_id")!=expectation.artifact_id
             ||plan.at("generation_fingerprint")
                 !=expectation.generation_fingerprint
@@ -1272,7 +1641,7 @@ MH1CudaPluginV4 MH1CudaPluginV4::load_module(
         if(!plan.contains("node_state_policy")
             ||!plan.at("node_state_policy").is_string())
             throw plugin_error(
-                path,"launch-plan v6 requires an explicit node-state policy");
+                path,"launch-plan v7 requires an explicit node-state policy");
         const auto node_state_policy=
             plan.at("node_state_policy").get<std::string>();
         if(node_state_policy!="full-retention-v1"
@@ -1415,7 +1784,7 @@ MH1CudaPluginV4 MH1CudaPluginV4::load_module(
             auto parse_sequence=[&](const char* field) {
                 std::vector<MH1CudaModuleLaunch> result;
                 for(const auto& launch:node_value.at(field))
-                    result.push_back(parse_module_launch(
+                    result.push_back(parse_module_operation(
                         path,module,launch,launch_plan_version));
                 return result;
             };
@@ -2020,7 +2389,7 @@ bool MH1CudaPluginV4::split_phase_ready() const noexcept
 
 std::int32_t MH1CudaPluginV4::launch_split_forward(
     const SymmetrixJitMH1CudaNodeForwardArgsV5* args,void* stream,
-    std::int32_t persistent_blocks) const
+    std::int32_t persistent_blocks,const void* dense_parameters) const
 {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     if(!split_phase_ready())
@@ -2042,16 +2411,17 @@ std::int32_t MH1CudaPluginV4::launch_split_forward(
             "Execution MH1 split forward retained pre-gate is missing");
     const auto& launches=args->phase==0
         ?node.split_pre_forward:node.split_post_forward;
-    launch_node_sequence(*module_state_,launches,*args,stream,persistent_blocks);
+    launch_node_sequence(
+        *module_state_,launches,*args,stream,persistent_blocks,dense_parameters);
     return 0;
 #else
-    (void)args;(void)stream;(void)persistent_blocks;return 1;
+    (void)args;(void)stream;(void)persistent_blocks;(void)dense_parameters;return 1;
 #endif
 }
 
 std::int32_t MH1CudaPluginV4::launch_split_reverse(
     const SymmetrixJitMH1CudaNodeReverseArgsV5* args,void* stream,
-    std::int32_t persistent_blocks) const
+    std::int32_t persistent_blocks,const void* dense_parameters) const
 {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
     if(!split_phase_ready())
@@ -2073,10 +2443,11 @@ std::int32_t MH1CudaPluginV4::launch_split_reverse(
             "Execution MH1 split reverse retained pre-gate is missing");
     const auto& launches=args->phase==2
         ?node.split_post_reverse:node.split_pre_reverse;
-    launch_node_sequence(*module_state_,launches,*args,stream,persistent_blocks);
+    launch_node_sequence(
+        *module_state_,launches,*args,stream,persistent_blocks,dense_parameters);
     return 0;
 #else
-    (void)args;(void)stream;(void)persistent_blocks;return 1;
+    (void)args;(void)stream;(void)persistent_blocks;(void)dense_parameters;return 1;
 #endif
 }
 
@@ -2084,6 +2455,15 @@ void MH1CudaPluginV4::reset() noexcept
 {
     descriptor_=nullptr;
     if(module_state_!=nullptr) {
+#if defined(KOKKOS_ENABLE_CUDA) \
+    && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)
+        if(module_state_->dense_handle!=nullptr) {
+            release_dense_pointer_batches(*module_state_);
+            static_cast<void>(cublasDestroy(module_state_->dense_handle));
+            module_state_->dense_handle=nullptr;
+            module_state_->dense_stream=nullptr;
+        }
+#endif
 #if defined(KOKKOS_ENABLE_CUDA)
         if(module_state_->module!=nullptr)
             static_cast<void>(cuModuleUnload(
@@ -2253,11 +2633,13 @@ bool MH1CudaPluginV4::split_phase_ready() const noexcept
 { return false; }
 
 std::int32_t MH1CudaPluginV4::launch_split_forward(
-    const SymmetrixJitMH1CudaNodeForwardArgsV5*,void*,std::int32_t) const
+    const SymmetrixJitMH1CudaNodeForwardArgsV5*,void*,std::int32_t,
+    const void*) const
 { throw std::runtime_error("Execution MH-1 device modules require POSIX and GPU support."); }
 
 std::int32_t MH1CudaPluginV4::launch_split_reverse(
-    const SymmetrixJitMH1CudaNodeReverseArgsV5*,void*,std::int32_t) const
+    const SymmetrixJitMH1CudaNodeReverseArgsV5*,void*,std::int32_t,
+    const void*) const
 { throw std::runtime_error("Execution MH-1 device modules require POSIX and GPU support."); }
 
 const SymmetrixJitMH1CudaPluginV5& MH1CudaPluginV4::descriptor() const

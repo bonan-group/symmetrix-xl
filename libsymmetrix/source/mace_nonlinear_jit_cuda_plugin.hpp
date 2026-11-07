@@ -175,11 +175,13 @@ public:
     std::int32_t launch_split_forward(
         const SymmetrixJitMH1CudaNodeForwardArgsV5* args,
         void* stream,
-        std::int32_t persistent_blocks) const;
+        std::int32_t persistent_blocks,
+        const void* dense_parameters) const;
     std::int32_t launch_split_reverse(
         const SymmetrixJitMH1CudaNodeReverseArgsV5* args,
         void* stream,
-        std::int32_t persistent_blocks) const;
+        std::int32_t persistent_blocks,
+        const void* dense_parameters) const;
 
 private:
     MH1CudaPluginV4(

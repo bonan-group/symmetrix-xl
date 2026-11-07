@@ -58,11 +58,15 @@ CATEGORY_ORDER = (
     "a1_forward",
     "m1_forward",
     "node_forward",
+    "product_forward",
+    "readout_forward_fused",
     "h2_forward",
     "readout_reduction",
     "h2_reverse",
     "m1_reverse",
     "node_reverse",
+    "product_reverse",
+    "readout_reverse_fused",
     "a1_reverse",
     "r1_reverse",
     "source_reverse",
@@ -99,10 +103,14 @@ CATEGORY_DISPLAY_NAMES = {
     "edge_reverse_phi": "R1 reverse: edge phi",
     "edge_reverse_harmonic": "R1 reverse: edge harmonic",
     "node_forward": "M1/node forward",
+    "product_forward": "Product forward",
+    "readout_forward_fused": "Readout forward (fused)",
     "h2_forward": "H2 forward",
     "h2_reverse": "H2 reverse",
     "m1_reverse": "M1 reverse",
     "node_reverse": "M1/node reverse",
+    "product_reverse": "Product reverse",
+    "readout_reverse_fused": "Readout reverse (fused)",
     "a1_reverse": "A1 reverse",
     "h1_reverse": "H1 reverse",
     "m0_reverse": "M0 reverse",
@@ -112,35 +120,56 @@ CATEGORY_DISPLAY_NAMES = {
     "unclassified": "Unclassified",
 }
 
-MH1_STAGE_ORDER = (
-    "r0_forward",
-    "m0_forward",
-    "r1_forward",
-    "m1_forward",
-    "m1_reverse",
-    "r1_reverse",
-    "m0_reverse",
-    "r0_reverse",
+_MH1_STAGE_ID = re.compile(
+    r"^(?P<owner>[rm])(?P<layer>\d+)_(?P<direction>forward|reverse)$"
 )
-MH1_STAGE_DISPLAY_NAMES = {
-    "r0_forward": "R0 forward",
-    "m0_forward": "M0 forward",
-    "r1_forward": "R1 forward",
-    "m1_forward": "M1 forward",
-    "m1_reverse": "M1 reverse",
-    "r1_reverse": "R1 reverse",
-    "m0_reverse": "M0 reverse",
-    "r0_reverse": "R0 reverse",
-}
 
-_MH1_STAGE_REGION = re.compile(
-    r"^symmetrix/mh1/(?P<owner>[RM])(?P<layer>[01])/(?P<direction>forward|reverse)$"
+
+def _mh1_stage_order(layer_count):
+    forward = [
+        f"{owner}{layer}_forward"
+        for layer in range(layer_count)
+        for owner in ("r", "m")
+    ]
+    reverse = [
+        f"{owner}{layer}_reverse"
+        for layer in reversed(range(layer_count))
+        for owner in ("m", "r")
+    ]
+    return tuple(forward + reverse)
+
+
+def _mh1_stage_symbol(stage):
+    match = _MH1_STAGE_ID.fullmatch(stage)
+    if match is None:
+        raise AnalysisError(f"invalid canonical MH-1 stage: {stage}")
+    layer = int(match.group("layer"))
+    if match.group("owner") == "r":
+        return f"R{layer}+A{layer}"
+    return f"M{layer}+H{layer + 1}"
+
+
+def _mh1_stage_display_name(stage):
+    match = _MH1_STAGE_ID.fullmatch(stage)
+    if match is None:
+        raise AnalysisError(f"invalid canonical MH-1 stage: {stage}")
+    return f"{_mh1_stage_symbol(stage)} {match.group('direction')}"
+
+
+_MH1_LEGACY_STAGE_REGION = re.compile(
+    r"^symmetrix/mh1/(?P<owner>[RM])(?P<layer>\d+)/(?P<direction>forward|reverse)$"
+)
+_MH1_EDGE_STAGE_REGION = re.compile(
+    r"^symmetrix/mh1/R(?P<layer>\d+)\+A(?P=layer)/(?P<direction>forward|reverse)$"
+)
+_MH1_NODE_STAGE_REGION = re.compile(
+    r"^symmetrix/mh1/M(?P<layer>\d+)\+H(?P<hidden>\d+)/(?P<direction>forward|reverse)$"
 )
 _MH1_R_STAGE_KERNEL = re.compile(
-    r"^symmetrix_execution_mh1_(?:conditioning_(?P<conditioning_direction>forward|reverse)(?:_[a-z]+)*_kernel_|spline_r_(?P<spline_direction>forward|reverse)_kernel_|(?P<forward>forward_kernel_)|(?P<reverse>(?:source_reverse_kernel_|edge_reverse(?:_[a-z]+)*_kernel_)))(?P<layer>[01])(?:_|$)"
+    r"^symmetrix_execution_mh1_(?:conditioning_(?P<conditioning_direction>forward|reverse)(?:_[a-z]+)*_kernel_|spline_r_(?P<spline_direction>forward|reverse)_kernel_|(?P<forward>forward_kernel_)|(?P<reverse>(?:source_reverse_kernel_|edge_reverse(?:_[a-z]+)*_kernel_)))(?P<layer>\d+)(?:_|$)"
 )
 _MH1_M_STAGE_KERNEL = re.compile(
-    r"^symmetrix_execution_mh1_node_(?:pre_(?P<pre_direction>forward|reverse)_kernel_(?P<pre_layer>[01])|tiled_l(?P<tiled_layer>[01])_(?P<tiled_direction>forward|reverse)(?:_|$))"
+    r"^symmetrix_execution_mh1_(?:split_)?node_(?:pre_(?P<pre_direction>forward|reverse)_kernel_(?P<pre_layer>\d+)|tiled_l(?P<tiled_layer>\d+)_(?P<tiled_direction>forward|reverse)(?:_|$))"
 )
 
 
@@ -274,14 +303,34 @@ CATEGORY_RULES = (
         r"symmetrix_execution_mh1_edge_reverse_harmonic",
     ),
     _rule(
+        "mh1.product_forward",
+        "product_forward",
+        r"symmetrix_execution_mh1_(?:split_)?node_tiled_l\d+_forward_product(?:_linear)?",
+    ),
+    _rule(
+        "mh1.readout_forward_fused",
+        "readout_forward_fused",
+        r"symmetrix_execution_mh1_(?:split_)?(?:node_)?post_finalize_kernel_",
+    ),
+    _rule(
         "mh1.node_forward",
         "node_forward",
-        r"symmetrix_execution_mh1_node_(?:pre_forward|tiled_(?!.*_reverse).*_forward)",
+        r"symmetrix_execution_mh1_(?:split_)?node_(?:pre_forward|tiled_(?!.*_reverse)(?!.*(?:product|readout)).*_forward)",
+    ),
+    _rule(
+        "mh1.product_reverse",
+        "product_reverse",
+        r"symmetrix_execution_mh1_(?:split_)?node_tiled_l\d+_reverse_product(?:_linear)?",
+    ),
+    _rule(
+        "mh1.readout_reverse_fused",
+        "readout_reverse_fused",
+        r"symmetrix_execution_mh1_(?:split_)?(?:node_)?post_readout_kernel_",
     ),
     _rule(
         "mh1.node_reverse",
         "node_reverse",
-        r"symmetrix_execution_mh1_node_(?:pre_reverse|tiled_(?!.*_reverse_readout).*_reverse)",
+        r"symmetrix_execution_mh1_(?:split_)?node_(?:pre_reverse|tiled_(?!.*_reverse_readout)(?!.*(?:product|readout)).*_reverse)",
     ),
     _rule(
         "standard.h2_reverse",
@@ -316,7 +365,7 @@ CATEGORY_RULES = (
     _rule(
         "semantic.readout_reduction",
         "readout_reduction",
-        r"(?:compute_readouts|evaluate_gradient|symmetrix_execution_mh1_node_.*_reverse_readout|(?:^|[.:_])readout(?:$|[.:_<(]))",
+        r"(?:compute_readouts|evaluate_gradient|(?:^|[.:_])(?<!post_)readout(?:$|[.:_<(]))",
     ),
     _rule(
         "library.blas",
@@ -350,10 +399,18 @@ def classify_kernel(name):
 
 def classify_mh1_stage(name):
     """Return the canonical staged-direct MH-1 owner for a kernel name."""
-    match = _MH1_STAGE_REGION.fullmatch(name)
+    match = _MH1_LEGACY_STAGE_REGION.fullmatch(name)
     if match:
         owner = match.group("owner").lower()
         return f"{owner}{match.group('layer')}_{match.group('direction')}"
+
+    match = _MH1_EDGE_STAGE_REGION.fullmatch(name)
+    if match:
+        return f"r{match.group('layer')}_{match.group('direction')}"
+
+    match = _MH1_NODE_STAGE_REGION.fullmatch(name)
+    if match and int(match.group("hidden")) == int(match.group("layer")) + 1:
+        return f"m{match.group('layer')}_{match.group('direction')}"
 
     match = _MH1_R_STAGE_KERNEL.match(name)
     if match:
@@ -581,9 +638,18 @@ def summarize(path, marker_trace=None, evaluation_count=None):
         category: {"calls": 0, "duration_ns": 0, "kernel_count": 0}
         for category in CATEGORY_ORDER
     }
+    observed_mh1_stages = {
+        mh1_stage for _, _, _, mh1_stage in kernels if mh1_stage is not None
+    }
+    observed_layers = [
+        int(match.group("layer"))
+        for stage in observed_mh1_stages
+        if (match := _MH1_STAGE_ID.fullmatch(stage)) is not None
+    ]
+    mh1_stage_order = _mh1_stage_order(max(2, max(observed_layers, default=-1) + 1))
     mh1_stages = {
         stage: {"calls": 0, "duration_ns": 0, "kernel_count": 0}
-        for stage in MH1_STAGE_ORDER
+        for stage in mh1_stage_order
     }
     mh1_unassigned = {"calls": 0, "duration_ns": 0, "kernel_count": 0}
     kernel_records = []
@@ -620,7 +686,8 @@ def summarize(path, marker_trace=None, evaluation_count=None):
     mh1_stage_records = [
         {
             "stage": stage,
-            "display_name": MH1_STAGE_DISPLAY_NAMES[stage],
+            "standard_symbol": _mh1_stage_symbol(stage),
+            "display_name": _mh1_stage_display_name(stage),
             **mh1_stages[stage],
             "duration_percent": (
                 100.0 * mh1_stages[stage]["duration_ns"] / total_duration_ns
@@ -628,7 +695,7 @@ def summarize(path, marker_trace=None, evaluation_count=None):
                 else 0.0
             ),
         }
-        for stage in MH1_STAGE_ORDER
+        for stage in mh1_stage_order
     ]
 
     category_records = []

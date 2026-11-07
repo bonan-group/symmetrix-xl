@@ -1962,6 +1962,7 @@ def test_mh1_cuda_jit_uses_subgroup_generator_provenance(
         "jit_nvrtc_information",
         lambda: {"available": True},
     )
+    monkeypatch.setenv("SYMMETRIX_MH1_DENSE_POLICY", "vendor_tf32")
 
     calculator = Symmetrix(
         model_path,
@@ -1974,9 +1975,10 @@ def test_mh1_cuda_jit_uses_subgroup_generator_provenance(
     assert calculator.jit_forward_policy == _MH1_CUDA_FORWARD_POLICY
     assert calculator.jit_source_policy == _MH1_CUDA_SOURCE_POLICY
     assert calculator.jit_edge_policy == _MH1_CUDA_EDGE_POLICY
+    assert calculator.jit_dense_policy == "vendor_tf32"
     assert calculator.jit_variant_id == (
         "jit-mh1-v4-fixture-fwd-aaaaaaaaaaaa-src-bbbbbbbbbbbb-edge-cccccccccccc"
-        "-node-full-retention-v1"
+        "-node-full-retention-v1-dense-vendor_tf32"
     )
     assert calculator.jit_node_state_policy == "full-retention-v1"
     assert jit_harness["mh1_cuda_policy_requests"] == [(contract, 120, "auto")]
@@ -2005,6 +2007,8 @@ def test_mh1_cuda_jit_uses_subgroup_generator_provenance(
         "node_state_policy": "full-retention-v1",
         "precision": "float32",
     }
+    _, _, launch_policies = jit_harness["mh1_cuda_launch_plan_contracts"][0]
+    assert launch_policies["dense_policy"] == "vendor_tf32"
     source, options = jit_harness["nvrtc_prepare_calls"][0]
     assert source == "generated MH1 CUDA module source"
     assert options["abi"] == {
@@ -2021,6 +2025,12 @@ def test_mh1_cuda_jit_uses_subgroup_generator_provenance(
     event = jit_harness["events"][-1]
     assert event[:2] == ("mh1_cuda_v5_load", str(jit_harness["artifact"]))
     assert json.loads(event[2]) == options["build"]["launch_plan"]
+
+
+def test_mh1_dense_policy_rejects_unknown_environment_value(monkeypatch):
+    monkeypatch.setenv("SYMMETRIX_MH1_DENSE_POLICY", "tensorish")
+    with pytest.raises(ValueError, match="SYMMETRIX_MH1_DENSE_POLICY"):
+        symmetrix_calc._mh1_dense_policy_request()
 
 
 def test_mh1_cuda_explicit_nvrtc_uses_module_and_launch_plan(

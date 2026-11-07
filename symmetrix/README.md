@@ -334,7 +334,12 @@ symmetrix_prepare_jit_host_artifact \
 
 The cache contains executable code and must not be writable by other users.
 Generated artifacts are specific to the model contract, precision, backend,
-compiler/runtime identity, and host or GPU target.
+compiler/runtime identity, and host or GPU target. On Linux, the cache
+filesystem must support `renameat2(..., RENAME_NOREPLACE)` (local ext4 and
+tmpfs do). Some network filesystems, including parastor and Lustre deployments
+on older kernels, do not. Prefer node-local storage such as `/dev/shm`; when
+that is not available, `SYMMETRIX_JIT_PUBLISH=lock-fallback` opts into a weaker
+lock-file publication path with a small cross-process race window.
 
 ## MACEField
 

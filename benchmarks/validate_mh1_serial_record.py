@@ -470,10 +470,10 @@ def validate_record(
     _require(plugin.get("abi", {}).get("version") == 5, "device module ABI is not 5")
     _require(plugin.get("jit_generation_version") == 19, "JIT generation is not 19")
     _require(
-        plugin.get("launch_plan_schema") == "symmetrix.jit.mh1.cuda-launch-plan/6",
-        "launch-plan schema is not /6",
+        plugin.get("launch_plan_schema") == "symmetrix.jit.mh1.cuda-launch-plan/7",
+        "launch-plan schema is not /7",
     )
-    _require(plugin.get("launch_plan_version") == 6, "launch-plan version is not 6")
+    _require(plugin.get("launch_plan_version") == 7, "launch-plan version is not 7")
     _require(
         plugin.get("split_phase_composition") is True,
         "split-phase composition is not enabled",

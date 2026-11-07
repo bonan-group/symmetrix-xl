@@ -44,7 +44,7 @@ header: it is included only by those three owners, so it is listed in no build
 file and carried by no shared layer.
 
 `mace_nonlinear_stage.hpp` is the family's stage description. The interaction
-layer count, every layer's R and M forward and reverse profiling region name,
+layer count, every layer's edge and node forward and reverse profiling region name,
 and the ordered forward and reverse execution schedules are its **data**, built
 from a layer count, so an evaluator that admits a different interaction count
 profiles and dispatches it through the same value instead of a compiled-in
@@ -53,6 +53,22 @@ two-layer table. The region spelling it emits is the one
 count keeps the profile contract readable. The evaluator holds one description
 built from the validated model's layer count and reads its regions and phase
 ordinals from it.
+
+The region symbols align with standard MACE while preserving MH-1 fusion:
+`R<layer>+A<layer>` is the layer's fused radial/edge-aggregation program and
+`M<layer>+H<layer + 1>` is its fused product/node-update program. Thus MH-1 has
+H1 work, but no separate H1 launch boundary. The legacy `R<layer>` and
+`M<layer>` spellings remain accepted by the profile analyzer for existing
+traces.
+
+Diagnostic child ranges refine those composite regions without changing the
+execution ABI: `/conditioning`, `/radial`, `/message`, `/product`, and
+`/readout` are emitted around the corresponding existing launches. A generated
+post-forward or post-reverse kernel that still combines product completion and
+the head is reported as a fused readout range; the code does not pretend that
+this is a separate H1 or readout launch. Nsight Systems can opt into direct
+NVTX emission with `SYMMETRIX_MH1_NVTX=1`; ordinary runs retain only the
+zero-fence Kokkos profiling calls.
 
 ## Private shared contracts
 

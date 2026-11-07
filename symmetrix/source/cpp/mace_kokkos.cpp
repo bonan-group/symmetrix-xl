@@ -19,6 +19,8 @@
 namespace py = pybind11;
 using ContiguousIntArray =
     py::array_t<int, py::array::c_style | py::array::forcecast>;
+using ContiguousInt64Array =
+    py::array_t<std::int64_t, py::array::c_style | py::array::forcecast>;
 using ContiguousDoubleArray =
     py::array_t<double, py::array::c_style | py::array::forcecast>;
 using symmetrix::python::detail::shaped_array;
@@ -1854,6 +1856,46 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             py::arg("execution_graph_generation"),
             py::arg("reference_positions"), py::arg("reference_xyz"),
             py::arg("cell"), py::arg("inverse_cell"), py::arg("pbc"))
+        .def("_update_factorized_reference_geometry",
+            [] (MACEKokkos<Precision>& self,
+                    const std::uint64_t execution_graph_generation,
+                    ContiguousDoubleArray reference_positions,
+                    ContiguousDoubleArray reference_xyz) {
+                self.update_factorized_reference_geometry(
+                    execution_graph_generation,
+                    std::span<const double>(
+                        reference_positions.data(), reference_positions.size()),
+                    std::span<const double>(
+                        reference_xyz.data(), reference_xyz.size()));
+            },
+            py::arg("execution_graph_generation"),
+            py::arg("reference_positions"), py::arg("reference_xyz"))
+        .def("_prepare_factorized_segment_geometry",
+            [] (MACEKokkos<Precision>& self,
+                    const std::uint64_t execution_graph_generation,
+                    ContiguousDoubleArray reference_positions,
+                    ContiguousIntArray edge_shifts,
+                    ContiguousDoubleArray cells) {
+                self.prepare_factorized_segment_geometry(
+                    execution_graph_generation,
+                    std::span<const double>(
+                        reference_positions.data(), reference_positions.size()),
+                    std::span<const int>(
+                        edge_shifts.data(), edge_shifts.size()),
+                    std::span<const double>(cells.data(), cells.size()));
+            },
+            py::arg("execution_graph_generation"),
+            py::arg("reference_positions"), py::arg("edge_shifts"),
+            py::arg("cells"))
+        .def("_update_factorized_segment_cells",
+            [] (MACEKokkos<Precision>& self,
+                    const std::uint64_t execution_graph_generation,
+                    ContiguousDoubleArray cells) {
+                self.update_factorized_segment_cells(
+                    execution_graph_generation,
+                    std::span<const double>(cells.data(), cells.size()));
+            },
+            py::arg("execution_graph_generation"), py::arg("cells"))
         .def("_prepare_factorized_shift_geometry",
             [] (MACEKokkos<Precision>& self,
                     const std::uint64_t execution_graph_generation,
@@ -2377,6 +2419,58 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             },
             py::arg("volume"), py::arg("xyz"),
             py::arg("execution_graph_generation") = 0)
+        .def("_prepare_factorized_batch",
+            [] (MACEKokkos<Precision>& self,
+                    const std::uint64_t graph_generation,
+                    ContiguousInt64Array edge_offsets) {
+                self.prepare_factorized_batch(
+                    graph_generation,
+                    std::span<const std::int64_t>(
+                        edge_offsets.data(), edge_offsets.size()));
+            },
+            py::arg("graph_generation"), py::arg("edge_offsets"))
+        .def("_reduce_batched_stress",
+            [] (MACEKokkos<Precision>& self,
+                    ContiguousDoubleArray volumes,
+                    const std::uint64_t graph_generation) {
+                self.reduce_prepared_batched_stress(
+                    std::span<const double>(volumes.data(), volumes.size()),
+                    graph_generation);
+                return shaped_array(
+                    view_prefix_1d(self.stress_tensor, 9*volumes.size()),
+                    {volumes.size(), 3, 3});
+            },
+            py::arg("volumes"), py::arg("graph_generation"))
+        .def("_reduce_segmented_stress",
+            [] (MACEKokkos<Precision>& self,
+                    ContiguousDoubleArray volumes,
+                    ContiguousInt64Array edge_offsets,
+                    ContiguousDoubleArray xyz) {
+                if (edge_offsets.size() != volumes.size()+1
+                    || edge_offsets.size() < 2
+                    || edge_offsets.data()[0] != 0)
+                    throw py::value_error(
+                        "Segmented stress edge offsets are inconsistent.");
+                for (py::ssize_t graph=0; graph+1<edge_offsets.size(); ++graph)
+                    if (edge_offsets.data()[graph] < 0
+                        || edge_offsets.data()[graph]
+                            > edge_offsets.data()[graph+1])
+                        throw py::value_error(
+                            "Segmented stress edge offsets must be monotonic.");
+                const auto current_edges = edge_offsets.data()[
+                    edge_offsets.size()-1];
+                if (current_edges < 0
+                    || xyz.size() != 3*current_edges)
+                    throw py::value_error(
+                        "Segmented stress geometry is inconsistent.");
+                self.reduce_prepared_batched_stress(
+                    std::span<const double>(volumes.data(), volumes.size()),
+                    self.factorized_completed_evaluation_graph_generation);
+                return shaped_array(
+                    view_prefix_1d(self.stress_tensor, 9*volumes.size()),
+                    {volumes.size(), 3, 3});
+            },
+            py::arg("volumes"), py::arg("edge_offsets"), py::arg("xyz"))
         .def_readonly("has_field_coupling", &MACEKokkos<Precision>::has_field_coupling)
         .def_property_readonly("electric_field_adj",
             [] (MACEKokkos<Precision>& self) {

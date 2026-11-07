@@ -205,7 +205,7 @@ void validate_mh1_launch_plan_schema(
         throw std::invalid_argument(
             "Execution MH-1 launch-plan backend is unsupported.");
     const std::string expected="symmetrix.jit.mh1."+std::string(backend)
-        +"-launch-plan/6";
+        +"-launch-plan/7";
     if(schema!=expected)
         throw std::invalid_argument(
             "Execution MH-1 launch-plan schema is retired or malformed.");
