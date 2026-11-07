@@ -997,6 +997,7 @@ def test_mh1_generation_19_recompute_plan_splits_external_product_from_nodes(
 
     for node in plan["nodes"]:
         index = node["index"]
+
         def kernels(phase):
             return {
                 launch["kernel"]

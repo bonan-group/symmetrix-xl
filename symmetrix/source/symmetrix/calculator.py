@@ -111,9 +111,7 @@ _FIXED_WORKSPACE_TILED_PLANS = frozenset(
     ("mh0-single-layer-tiled-v1", "mh0-dual-layer-tiled-v1")
 )
 _NEIGHBOR_BACKENDS = frozenset(("automatic", "host", "kokkos"))
-_MH1_DENSE_POLICIES = frozenset(
-    ("auto", "generated", "vendor_fp32", "vendor_tf32")
-)
+_MH1_DENSE_POLICIES = frozenset(("auto", "generated", "vendor_fp32", "vendor_tf32"))
 _AUTOMATIC_KOKKOS_NEIGHBOR_MIN_ATOMS = 512
 _AUTOMATIC_KOKKOS_NEIGHBOR_EXECUTION_SPACES = frozenset(("Cuda", "HIP"))
 _ATOMBATCH_SOURCE_KEY = "atombatch_source"
