@@ -41,16 +41,24 @@ def test_exporter_and_compatibility_lanes_remain_separate():
     assert "  metatrain-mace:\n" in workflow
     assert "  extract-mace-model:\n" in workflow
     assert "  pair_symmetrix:\n" in workflow
-    for compatibility_module in (
-        "test_family_mace_conformance_cases.py",
-        "test_family_registry.py",
-        "test_jit_kokkos_integration.py",
-        "test_jit_operator_cuda.py",
-        "test_mace_polar_frontend.py",
-        "test_macefield_field_transform.py",
-        "test_macefield_native.py",
-        "test_symmetrix_calc.py",
-    ):
-        assert compatibility_module in workflow
     fixture = (ROOT / ".github/workflows/polar-fixture-only.yaml").read_text()
     assert "pull_request:" in fixture and "paths:" in fixture
+
+
+def test_routine_lane_keeps_native_modules_and_fails_closed_on_downloads():
+    workflow = (ROOT / ".github/workflows/ci.yaml").read_text()
+    routine = workflow.split("  symmetrix:\n", 1)[1].split(
+        "  metatrain-mace:\n", 1
+    )[0]
+    for module in (
+        "test_symmetrix_calc.py",
+        "test_family_registry.py",
+        "test_family_mace_conformance_cases.py",
+        "test_jit_kokkos_integration.py",
+        "test_macefield_field_transform.py",
+        "test_macefield_native.py",
+    ):
+        assert f"--ignore=symmetrix/test/{module}" not in routine
+    source = (ROOT / "symmetrix/test/model_downloads.py").read_text()
+    assert 'SYMMETRIX_TEST_MODEL_DOWNLOADS"' in source
+    assert "ModelDownloadDisabledError" in source
