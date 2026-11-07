@@ -249,8 +249,10 @@ fix             integrate all nve
 def _pair_style(streamed_edges, host_artifact=None, extra=""):
     style = "symmetrix/mace no_domain_decomposition "
     if streamed_edges == "direct":
+        # The compact model has no R0 execution contract, so the default
+        # profile capacity, which needs a state-free R0, is unavailable.
         style += (
-            f"streamed_edges direct profile capacity jit_host_artifact {host_artifact}"
+            f"streamed_edges direct profile speed jit_host_artifact {host_artifact}"
         )
     else:
         style += f"streamed_edges {streamed_edges}"
