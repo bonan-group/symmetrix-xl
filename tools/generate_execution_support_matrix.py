@@ -299,14 +299,14 @@ FAMILY_CAPABILITIES: Mapping[str, tuple[CapabilityRow, ...]] = {
             "target",
             "build-dependent",
             "the default execution space",
-            "CPU and CUDA are runtime-qualified; HIP remains unqualified",
+            "CPU and CUDA are runtime-qualified; HIP gfx1151 is runtime-qualified from source builds only; other HIP architectures remain unqualified",
         ),
         CapabilityRow("precision", "qualified", "float32 and float64", "none"),
         CapabilityRow(
             "reference",
             "qualified",
             "the artifact-free portable MH-1 backbone and native polar program",
-            "CPU and CUDA runtime-qualified; HIP remains unqualified",
+            "CPU and CUDA runtime-qualified; HIP gfx1151 is runtime-qualified from source builds only; other HIP architectures remain unqualified",
         ),
         CapabilityRow(
             "portable",
@@ -318,13 +318,13 @@ FAMILY_CAPABILITIES: Mapping[str, tuple[CapabilityRow, ...]] = {
             "generated",
             "qualified",
             "the generated MH-1 backbone subprogram with retained outputs and external product seeds",
-            "a prepared artifact and a recognized keep-last schedule are required; CPU and CUDA are runtime-qualified, while HIP remains unqualified",
+            "a prepared artifact and a recognized keep-last schedule are required; CPU and CUDA are runtime-qualified, while HIP gfx1151 is runtime-qualified from source builds only; other HIP architectures remain unqualified",
         ),
         CapabilityRow(
             "stress",
             "qualified",
             "released M FP32/FP64 EFS: exact-zero isolated stress and composed periodic stress",
-            "CPU and CUDA sm120; S/L checkpoints and HIP runtime remain unqualified",
+            "CPU and CUDA sm120; HIP gfx1151 source-build/runtime evidence covers Polar S/M/L FP32/FP64 reference/direct molecule, slab, and bulk energy/forces/stress; HIP wheels, other HIP architectures, multi-GPU/distributed execution, PME publication, and distributed Polar LAMMPS are excluded",
         ),
         CapabilityRow(
             "field",

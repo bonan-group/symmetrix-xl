@@ -161,7 +161,7 @@ itself establish artifact availability, runtime qualification, wheel inclusion,
 or published support. Mixed periodicity, batches, fixed workspace, alchemical
 mixing, Metal, multi-GPU/distributed execution, and LAMMPS remain excluded.
 MACELES is intentionally single-GPU for this release; qualification remains
-pending where the release matrix says so.
+pending the portable qualification packet gate.
 
 ## Reproducible timing
 

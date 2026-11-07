@@ -53,12 +53,12 @@ editing this block.
 | `MACE` (MH-0 compact model) | `parameter_gradients` | qualified | the prepared factorized path | none |
 | `MACE` (MH-0 compact model) | `host_artifact` | qualified | every build | none |
 | `MACE` (MH-0 compact model) | `device_artifact` | build-dependent | device execution spaces | a CUDA-capable build is required |
-| `MACE_Polar` (polar-mace) | `target` | build-dependent | the default execution space | CPU and CUDA are runtime-qualified; HIP remains unqualified |
+| `MACE_Polar` (polar-mace) | `target` | build-dependent | the default execution space | CPU and CUDA are runtime-qualified; HIP gfx1151 is runtime-qualified from source builds only; other HIP architectures remain unqualified |
 | `MACE_Polar` (polar-mace) | `precision` | qualified | float32 and float64 | none |
-| `MACE_Polar` (polar-mace) | `reference` | qualified | the artifact-free portable MH-1 backbone and native polar program | CPU and CUDA runtime-qualified; HIP remains unqualified |
+| `MACE_Polar` (polar-mace) | `reference` | qualified | the artifact-free portable MH-1 backbone and native polar program | CPU and CUDA runtime-qualified; HIP gfx1151 is runtime-qualified from source builds only; other HIP architectures remain unqualified |
 | `MACE_Polar` (polar-mace) | `portable` | qualified | the layer-local MH-1 fast path and the long-range kind group's portable nodes | independent per-layer UVU widths; supported keep-last layouts only |
-| `MACE_Polar` (polar-mace) | `generated` | qualified | the generated MH-1 backbone subprogram with retained outputs and external product seeds | a prepared artifact and a recognized keep-last schedule are required; CPU and CUDA are runtime-qualified, while HIP remains unqualified |
-| `MACE_Polar` (polar-mace) | `stress` | qualified | released M FP32/FP64 EFS: exact-zero isolated stress and composed periodic stress | CPU and CUDA sm120; S/L checkpoints and HIP runtime remain unqualified |
+| `MACE_Polar` (polar-mace) | `generated` | qualified | the generated MH-1 backbone subprogram with retained outputs and external product seeds | a prepared artifact and a recognized keep-last schedule are required; CPU and CUDA are runtime-qualified, while HIP gfx1151 is runtime-qualified from source builds only; other HIP architectures remain unqualified |
+| `MACE_Polar` (polar-mace) | `stress` | qualified | released M FP32/FP64 EFS: exact-zero isolated stress and composed periodic stress | CPU and CUDA sm120; HIP gfx1151 source-build/runtime evidence covers Polar S/M/L FP32/FP64 reference/direct molecule, slab, and bulk energy/forces/stress; HIP wheels, other HIP architectures, multi-GPU/distributed execution, PME publication, and distributed Polar LAMMPS are excluded |
 | `MACE_Polar` (polar-mace) | `field` | qualified | a program property | declared when the model's compiled program carries the external-field projection node |
 | `MACE_Polar` (polar-mace) | `parameter_gradients` | unsupported | - | not implemented for this family |
 | `MACE_Polar` (polar-mace) | `host_artifact` | qualified | every build | none |

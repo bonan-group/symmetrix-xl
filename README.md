@@ -76,17 +76,17 @@ multi-GPU, and LAMMPS/MPI are unsupported; live upstream FP64 parity and
 repaired-wheel inclusion remain open gates. Ordinary MACE HIP does not imply
 OAM or Polar HIP support, and OAM remains single-GPU by decision.
 
-Released Polar-M CPU/CUDA FP32/FP64 is the current evidenced matrix. Polar-S
-focused checks exist while final combined-source qualification is pending.
-Polar-L, HIP, multi-GPU, PME publication support, and distributed Polar
-LAMMPS are unqualified or unsupported for this freeze; HIP and Polar-L are
-planned qualification work.
+Released Polar-M CPU/CUDA FP32/FP64 remains qualified. Polar S/M/L HIP
+`gfx1151` source-build/runtime evidence covers FP32/FP64, `reference` and
+`direct`, single-GPU molecule, slab, and bulk energy/forces/stress. HIP wheels,
+other HIP architectures, multi-GPU/distributed execution, PME publication,
+and distributed Polar LAMMPS remain outside this support contract.
 
 MACELES is implemented for one fully periodic or nonperiodic ASE structure on
 CPU/OpenMP, CUDA, and HIP in FP32/FP64. Mixed periodicity, batches, fixed
 workspace, alchemical mixing, Metal, multi-GPU/distributed execution, and
 LAMMPS are excluded. MACELES remains single-GPU for v0.2.0; qualification
-remains pending where the support matrix says so.
+remains pending the portable qualification packet gate.
 
 ### Demonstrated scale
 

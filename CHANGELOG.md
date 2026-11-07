@@ -90,10 +90,12 @@ All notable changes to Symmetrix-XL are documented in this file.
 - Added specialized Polar-S `direct` execution for the one-interaction,
   retained scalar-only backbone with a linear energy readout, alongside the
   artifact-free `reference` route. Generated forward and seeded reverse use
-  the validated layer contract; unsupported layouts fail explicitly. Focused
-  CPU and CUDA sm120 FP32/FP64 checks passed before final integration; final
-  combined-source release qualification remains pending. HIP and released
-  Polar-L runtime qualification are outside this record.
+  the validated layer contract; unsupported layouts fail explicitly. Polar
+  S/M/L HIP `gfx1151` source-build/runtime evidence covers FP32/FP64,
+  `reference` and `direct`, single-GPU molecule, slab, and bulk
+  energy/forces/stress. HIP wheels, other HIP architectures,
+  multi-GPU/distributed execution, PME publication, and distributed Polar
+  LAMMPS remain outside this release contract.
 - Corrected the generated retained-state bias-readout reverse and Polar-S
   reference retained-feature/skin-graph handling. Strict frozen Polar oracle
   comparisons explicitly use 4096 radial spline points; the public 256-point
@@ -105,6 +107,8 @@ All notable changes to Symmetrix-XL are documented in this file.
   `mace_les_energy`, and `latent_charges`. Fully periodic and nonperiodic
   systems are supported; mixed periodicity, fixed-workspace plans, alchemical
   mixing, distributed evaluation, and LAMMPS are outside the supported boundary.
+  MACELES qualification remains pending the portable qualification packet gate;
+  the v0.2.0 decision keeps it single-GPU.
 - Added frozen-weight alchemical message mixing for standard two-interaction
   compact MACE models, including Agnesi radial functions, A0/A1 density
   conditioning, ZBL, energy, forces, stress, and reusable coefficient updates.
