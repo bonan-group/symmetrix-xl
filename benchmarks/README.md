@@ -7,7 +7,10 @@ files, machine-specific run output, or historical qualification reports.
 ## Maintained drivers
 
 Current Python files directly under this directory are the maintained entry
-points. Names identify the workload or comparison they run. In particular:
+points. Follow the
+[MACE-Torch comparison protocol](mace_torch_comparison_protocol.md) for matched
+MACE-Torch/cuEquivariance and Symmetrix-XL results intended for the project
+README. Names identify the workload or comparison they run. In particular:
 
 - `standard_mace_streamed_benchmark.py` exercises standard MACE streamed-edge
   execution.
@@ -15,7 +18,11 @@ points. Names identify the workload or comparison they run. In particular:
   deterministic cubic SrTiO3 graph for speed, capacity, parity, and profiling
   comparisons.
 - `streamed_edge_release_benchmark.py` runs the milestone current/develop/
-  PyTorch energy, forces, and stress comparison in isolated processes.
+  PyTorch energy, forces, and stress comparison in isolated processes. The
+  paper-aligned README case uses `--structure srtio3-cubic --repeat 10 --seed
+  17`, three warm-up calls, and ten measured complete ASE calls. Each
+  implementation runs in a fresh process, and each JSON record stores the cell,
+  composition, atom count, cutoff/skin, edge counts, outputs, and timings.
 - `ase_omat_md_backend_scale.py` measures OMAT backend scaling through ASE.
 - `srtio3_capacity_probe.py` probes a fresh-process GPU capacity point on a
   periodic cubic SrTiO3 workload and records the selected plan and sampled
