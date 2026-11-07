@@ -229,8 +229,8 @@ Runtime evaluation accepts the OAM v2 JSON contract with
 retains a universal H through Pu element mapping, model cutoff, ordered layers,
 and precision-independent parameters. Runtime evaluation uses the exported
 JSON, ASE, and the native Symmetrix extension; PyTorch, NequIP, and e3nn remain
-exporter/reference dependencies. OAM-S, OAM-M, OAM-L, and OAM-XL are
-Implementation and generated-artifact paths exist for OAM-S/M/L/XL on host and
+exporter/reference dependencies. Implementation and generated-artifact paths
+exist for OAM-S/M/L/XL on host and
 CUDA, but this historical or compile evidence is not current published
 qualification. Fresh runtime qualification remains pending after the
 artifact-contract change. Live upstream FP64 parity and repaired-wheel
