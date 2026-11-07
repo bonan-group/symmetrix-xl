@@ -97,7 +97,9 @@ def test_fixture_only_workflow_forbids_oracle_dependencies_and_downloads():
 
 
 def test_polar_checkpoint_path_is_available_without_oracle_runtime():
-    source = (WORKFLOW.parents[2] / "symmetrix/test/test_polar_end_to_end_fixtures.py").read_text()
+    source = (
+        WORKFLOW.parents[2] / "symmetrix/test/test_polar_end_to_end_fixtures.py"
+    ).read_text()
     checkpoint = source.index("def _checkpoint_path")
     oracle_skip = source.index("if _polar_oracle_import_error is not None", checkpoint)
     path_lookup = source.index("os.environ.get", checkpoint)
