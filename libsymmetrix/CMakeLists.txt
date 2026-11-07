@@ -164,7 +164,6 @@ if(NOT LAPACK_LIBRARIES AND BLAS_LIBRARIES AND BLA_VENDOR MATCHES "Intel")
             FORCE)
     endif()
 endif()
-find_package(Git REQUIRED)
 
 set(_symmetrix_sphericart_cuda_default OFF)
 if(Kokkos_ENABLE_CUDA)
@@ -174,14 +173,35 @@ option(SYMMETRIX_SPHERICART_CUDA "Enable SpheriCart-CUDA."
     ${_symmetrix_sphericart_cuda_default})
 unset(_symmetrix_sphericart_cuda_default)
 option(SYMMETRIX_SPHERICART_SYCL "Enable SpheriCart-SYCL." OFF)
+set(_symmetrix_sphericart_hip_default OFF)
+if(Kokkos_ENABLE_HIP)
+    set(_symmetrix_sphericart_hip_default ON)
+endif()
+option(SYMMETRIX_SPHERICART_HIP "Enable SpheriCart-HIP."
+    ${_symmetrix_sphericart_hip_default})
+unset(_symmetrix_sphericart_hip_default)
 set(SPHERICART_ARCH_NATIVE OFF CACHE BOOL
     "Try to use -march=native when compiling SpheriCart." FORCE)
 if(Kokkos_ENABLE_HIP)
+    # The HIP build uses Kokkos Serial as its host execution space, so the
+    # OpenMP host parallelism of SpheriCart stays off; the spherical
+    # harmonics run through the SpheriCart HIP backend instead.
     set(SYMMETRIX_SPHERICART_CUDA OFF CACHE BOOL "Enable SpheriCart-CUDA." FORCE)
     set(SPHERICART_ENABLE_CUDA OFF CACHE BOOL "Build SpheriCart CUDA backend." FORCE)
     set(SPHERICART_OPENMP OFF CACHE BOOL "Build SpheriCart with OpenMP." FORCE)
     set(SPHERICART_ARCH_NATIVE OFF CACHE BOOL
         "Try to use -march=native when compiling SpheriCart." FORCE)
+    if(SYMMETRIX_SPHERICART_HIP)
+        set(SPHERICART_ENABLE_HIP ON CACHE BOOL
+            "Build SpheriCart HIP backend." FORCE)
+    else()
+        message(WARNING
+            "Kokkos HIP is enabled while SYMMETRIX_SPHERICART_HIP is OFF; "
+            "MACE spherical harmonics fall back to the hardcoded Kokkos "
+            "device kernels, which support l_max values from 0 through 6 "
+            "and reject larger models at runtime. Use this configuration "
+            "only as a diagnostic.")
+    endif()
 endif()
 if(Kokkos_ENABLE_CUDA AND NOT SYMMETRIX_SPHERICART_CUDA)
     message(WARNING
@@ -190,104 +210,24 @@ if(Kokkos_ENABLE_CUDA AND NOT SYMMETRIX_SPHERICART_CUDA)
         "every evaluation. Use this configuration only as a diagnostic.")
 endif()
 
-# Sphericart 1.0.3 synchronizes every CUDA launch and intentionally leaves its
-# lazy device allocation alive. Apply the narrowly scoped lifecycle extension
-# to a build-tree copy so the pinned upstream submodule remains reproducible
-# and clean in source checkouts.
+# The pinned SpheriCart defaults SPHERICART_ENABLE_CUDA to OFF (the gpu-lite
+# backend is opt-in since 2.0.4), so the CUDA calculator selection maps onto
+# it explicitly. Under Kokkos HIP the block above has already forced the CUDA
+# options off.
+if(SYMMETRIX_SPHERICART_CUDA)
+    set(SPHERICART_ENABLE_CUDA ON CACHE BOOL
+        "Build SpheriCart CUDA backend." FORCE)
+endif()
+
+# The pinned SpheriCart already carries the async-lifecycle extensions (64-bit
+# kernel indexing, opt-in asynchronous launches, explicit device release) and
+# the HIP backend, so it is consumed directly without the historical 1.0.3
+# build-tree patch.
 set(SYMMETRIX_SPHERICART_SOURCE_DIR
-    "${CMAKE_CURRENT_BINARY_DIR}/external/sphericart-patched-source")
-set(SYMMETRIX_SPHERICART_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/sphericart-1.0.3-async-lifecycle.patch")
-set(SYMMETRIX_SPHERICART_BASE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/external/sphericart")
-set(SYMMETRIX_SPHERICART_PATCH_STAMP
-    "${SYMMETRIX_SPHERICART_SOURCE_DIR}/.symmetrix-patch-fingerprint")
-file(GLOB_RECURSE SYMMETRIX_SPHERICART_INPUTS
-    LIST_DIRECTORIES FALSE "${SYMMETRIX_SPHERICART_BASE_DIR}/*")
-list(SORT SYMMETRIX_SPHERICART_INPUTS)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    ${SYMMETRIX_SPHERICART_INPUTS} "${SYMMETRIX_SPHERICART_PATCH}")
-set(SYMMETRIX_SPHERICART_FINGERPRINT_INPUT "")
-foreach(SYMMETRIX_SPHERICART_INPUT IN LISTS SYMMETRIX_SPHERICART_INPUTS)
-    file(RELATIVE_PATH SYMMETRIX_SPHERICART_INPUT_RELATIVE
-        "${SYMMETRIX_SPHERICART_BASE_DIR}" "${SYMMETRIX_SPHERICART_INPUT}")
-    if(NOT SYMMETRIX_SPHERICART_INPUT_RELATIVE STREQUAL ".git"
-            AND NOT IS_DIRECTORY "${SYMMETRIX_SPHERICART_INPUT}")
-        file(SHA256 "${SYMMETRIX_SPHERICART_INPUT}"
-            SYMMETRIX_SPHERICART_INPUT_HASH)
-        string(APPEND SYMMETRIX_SPHERICART_FINGERPRINT_INPUT
-            "${SYMMETRIX_SPHERICART_INPUT_RELATIVE}:${SYMMETRIX_SPHERICART_INPUT_HASH}\n")
-    endif()
-endforeach()
-file(SHA256 "${SYMMETRIX_SPHERICART_PATCH}" SYMMETRIX_SPHERICART_PATCH_HASH)
-string(APPEND SYMMETRIX_SPHERICART_FINGERPRINT_INPUT
-    "patch:${SYMMETRIX_SPHERICART_PATCH_HASH}\n")
-string(SHA256 SYMMETRIX_SPHERICART_EXPECTED_FINGERPRINT
-    "${SYMMETRIX_SPHERICART_FINGERPRINT_INPUT}")
-
-set(SYMMETRIX_SPHERICART_REFRESH TRUE)
-if(EXISTS "${SYMMETRIX_SPHERICART_PATCH_STAMP}")
-    file(READ "${SYMMETRIX_SPHERICART_PATCH_STAMP}"
-        SYMMETRIX_SPHERICART_CURRENT_FINGERPRINT)
-    if("${SYMMETRIX_SPHERICART_CURRENT_FINGERPRINT}" STREQUAL
-            "${SYMMETRIX_SPHERICART_EXPECTED_FINGERPRINT}")
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}" -E env
-                    "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}/external"
-                    "${GIT_EXECUTABLE}" apply --reverse --check
-                    "${SYMMETRIX_SPHERICART_PATCH}"
-            WORKING_DIRECTORY "${SYMMETRIX_SPHERICART_SOURCE_DIR}"
-            RESULT_VARIABLE SYMMETRIX_SPHERICART_REUSE_CHECK
-            ERROR_QUIET)
-        if(SYMMETRIX_SPHERICART_REUSE_CHECK EQUAL 0)
-            set(SYMMETRIX_SPHERICART_REFRESH FALSE)
-        endif()
-    endif()
-endif()
-
-if(SYMMETRIX_SPHERICART_REFRESH)
-    file(REMOVE_RECURSE "${SYMMETRIX_SPHERICART_SOURCE_DIR}")
-    file(MAKE_DIRECTORY "${SYMMETRIX_SPHERICART_SOURCE_DIR}")
-    file(COPY "${SYMMETRIX_SPHERICART_BASE_DIR}/"
-        DESTINATION "${SYMMETRIX_SPHERICART_SOURCE_DIR}"
-        PATTERN ".git" EXCLUDE)
-    execute_process(
-        COMMAND "${CMAKE_COMMAND}" -E env
-                "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}/external"
-                "${GIT_EXECUTABLE}" apply --check "${SYMMETRIX_SPHERICART_PATCH}"
-        WORKING_DIRECTORY "${SYMMETRIX_SPHERICART_SOURCE_DIR}"
-        RESULT_VARIABLE SYMMETRIX_SPHERICART_PATCH_CHECK)
-    if(NOT SYMMETRIX_SPHERICART_PATCH_CHECK EQUAL 0)
-        message(FATAL_ERROR
-            "Symmetrix's Sphericart lifecycle patch does not apply to the pinned source.")
-    endif()
-    execute_process(
-        COMMAND "${CMAKE_COMMAND}" -E env
-                "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}/external"
-                "${GIT_EXECUTABLE}" apply --whitespace=nowarn
-                "${SYMMETRIX_SPHERICART_PATCH}"
-        WORKING_DIRECTORY "${SYMMETRIX_SPHERICART_SOURCE_DIR}"
-        RESULT_VARIABLE SYMMETRIX_SPHERICART_PATCH_RESULT)
-    if(NOT SYMMETRIX_SPHERICART_PATCH_RESULT EQUAL 0)
-        message(FATAL_ERROR "Failed to apply Symmetrix's Sphericart lifecycle patch.")
-    endif()
-    execute_process(
-        COMMAND "${CMAKE_COMMAND}" -E env
-                "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}/external"
-                "${GIT_EXECUTABLE}" apply --reverse --check
-                "${SYMMETRIX_SPHERICART_PATCH}"
-        WORKING_DIRECTORY "${SYMMETRIX_SPHERICART_SOURCE_DIR}"
-        RESULT_VARIABLE SYMMETRIX_SPHERICART_PATCH_VERIFY)
-    if(NOT SYMMETRIX_SPHERICART_PATCH_VERIFY EQUAL 0)
-        message(FATAL_ERROR
-            "Symmetrix's Sphericart lifecycle patch did not modify the build-tree copy.")
-    endif()
-    file(WRITE "${SYMMETRIX_SPHERICART_PATCH_STAMP}"
-        "${SYMMETRIX_SPHERICART_EXPECTED_FINGERPRINT}")
-endif()
 add_subdirectory(
     "${SYMMETRIX_SPHERICART_SOURCE_DIR}"
-    "${CMAKE_CURRENT_BINARY_DIR}/external/sphericart-patched-build")
+    "${CMAKE_CURRENT_BINARY_DIR}/external/sphericart-build")
 if(_symmetrix_host_arch_flag
         AND NOT _symmetrix_host_arch_applied_globally
         AND NOT Kokkos_ENABLE_CUDA
@@ -950,6 +890,11 @@ endif()
 if (SYMMETRIX_SPHERICART_SYCL)
     message(STATUS "Symmetrix: Will use SYCL version of sphericart.")
     target_compile_definitions(symmetrix PRIVATE SYMMETRIX_SPHERICART_SYCL)
+endif()
+
+if (SYMMETRIX_SPHERICART_HIP)
+    message(STATUS "Symmetrix: Will use HIP version of sphericart.")
+    target_compile_definitions(symmetrix PRIVATE SYMMETRIX_SPHERICART_HIP)
 endif()
 
 # The source tree gates its accelerator batched-BLAS routes on the KokkosKernels

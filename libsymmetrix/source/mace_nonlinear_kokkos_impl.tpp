@@ -30,7 +30,7 @@
 #include "mace_device_backend.hpp"
 #include "neighbor_graph_kokkos.hpp"
 #include "sphericart.hpp"
-#include "sphericart_cuda.hpp"
+#include "sphericart_device.hpp"
 #include "spherical_harmonic_device.hpp"
 #include "tools_kokkos.hpp"
 
@@ -352,17 +352,17 @@ int execution_mh1_spline_reverse_persistent_blocks()
 
 template<typename Precision>
 struct MaceBackboneKokkosT<Precision>::SphericalHarmonicsState {
-#ifdef SYMMETRIX_SPHERICART_CUDA
+#if defined(SYMMETRIX_SPHERICART_CUDA) || defined(SYMMETRIX_SPHERICART_HIP)
     explicit SphericalHarmonicsState(int l_max) : calculator(l_max) {}
     ~SphericalHarmonicsState() noexcept
     {
         try {
             calculator.release_device_resources();
         } catch (...) {
-            // Evaluator teardown must not propagate CUDA cleanup errors.
+            // Evaluator teardown must not propagate device cleanup errors.
         }
     }
-    sphericart::cuda::SphericalHarmonics<Precision> calculator;
+    symmetrix::DeviceSphericartCalculator<Precision> calculator;
 #else
     explicit SphericalHarmonicsState(int l_max) : calculator(l_max) {}
     sphericart::SphericalHarmonics<Precision> calculator;
@@ -6186,7 +6186,7 @@ void MaceBackboneKokkosT<Precision>::compute_Y(
     const int nlm=num_lm;
     const Precision factor=Precision(2)*Precision(std::sqrt(M_PI));
 
-#if defined(KOKKOS_ENABLE_HIP)
+#if defined(KOKKOS_ENABLE_HIP) && !defined(SYMMETRIX_SPHERICART_HIP)
     const auto execution_space=evaluator_stream
         ?factorized_execution_space:Kokkos::DefaultExecutionSpace();
     Kokkos::parallel_for(
@@ -6221,7 +6221,7 @@ void MaceBackboneKokkosT<Precision>::compute_Y(
                     *raw_grad((3*edge+0)*nlm+lm);
             }
         });
-#elif !defined(SYMMETRIX_SPHERICART_CUDA)
+#elif !defined(SYMMETRIX_SPHERICART_CUDA) && !defined(SYMMETRIX_SPHERICART_HIP)
     static_cast<void>(evaluator_stream);
     Kokkos::parallel_for(
         "nonlinear shuffle xyz",
@@ -6274,11 +6274,11 @@ void MaceBackboneKokkosT<Precision>::compute_Y(
     if(evaluator_stream) {
         spherical_harmonics_state->calculator.compute_with_gradients_async(
             xyz_shuffled.data(),edges,Y.data(),Y_grad_shuffled.data(),
-            reinterpret_cast<void*>(execution_space.cuda_stream()));
+            symmetrix::native_device_stream(execution_space));
         if(edges>0)++execution_sphericart_async_launches;
     } else {
         execution_space.fence(
-            "Prepare CUDA MH-1 spherical-harmonic coordinates");
+            "Prepare device MH-1 spherical-harmonic coordinates");
         spherical_harmonics_state->calculator.compute_with_gradients(
             xyz_shuffled.data(),edges,Y.data(),Y_grad_shuffled.data());
     }

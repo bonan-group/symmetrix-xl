@@ -275,6 +275,8 @@ def lammps_cmake_definitions(
                 "Kokkos_IMPL_AMDGPU_LINK": f"--offload-arch={target}",
                 "SYMMETRIX_HOST_ARCH": "none",
                 "SYMMETRIX_SPHERICART_CUDA": "OFF",
+                "SYMMETRIX_SPHERICART_HIP": "ON",
+                "SPHERICART_ENABLE_HIP": "ON",
                 "SYMMETRIX_HIP_BLAS": "AUTO",
             }
         )

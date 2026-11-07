@@ -1710,6 +1710,11 @@ def test_gpu_install_requires_exact_base_frontend():
 def test_hip_build_embeds_selected_toolkit_runtime_path():
     definitions = cmake_definitions(_manifest("hip", "gfx1151"))
     assert definitions["CMAKE_INSTALL_RPATH"] == "/opt/rocm/core-test/lib"
+    assert definitions["SYMMETRIX_SPHERICART_CUDA"] == "OFF"
+    assert definitions["SYMMETRIX_SPHERICART_HIP"] == "ON"
+    assert definitions["SPHERICART_ENABLE_CUDA"] == "OFF"
+    assert definitions["SPHERICART_ENABLE_HIP"] == "ON"
+    assert definitions["SPHERICART_OPENMP"] == "OFF"
 
 
 def test_python_invocation_uses_fingerprinted_build_directory(tmp_path):
@@ -2445,6 +2450,9 @@ def test_lammps_hip_configuration_matches_python_target(tmp_path):
 
     assert definitions["Kokkos_ARCH_AMD_GFX1100"] == "ON"
     assert definitions["Kokkos_IMPL_AMDGPU_FLAGS"] == "--offload-arch=gfx1151"
+    assert definitions["SYMMETRIX_SPHERICART_CUDA"] == "OFF"
+    assert definitions["SYMMETRIX_SPHERICART_HIP"] == "ON"
+    assert definitions["SPHERICART_ENABLE_HIP"] == "ON"
 
 
 def test_build_frontend_is_not_part_of_installed_project():
