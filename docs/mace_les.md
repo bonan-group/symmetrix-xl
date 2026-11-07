@@ -153,6 +153,16 @@ MACELES does not support fixed-workspace/tiled plans, alchemical coefficients,
 distributed evaluation, Metal execution, mixed periodicity, batches, or the
 LAMMPS pair style. Unsupported requests fail with a MACELES capability error.
 
+### v0.2.0 support boundary
+
+Implementation availability covers one fully periodic or nonperiodic ASE
+structure on CPU/OpenMP, CUDA, and HIP in FP32 and FP64. This does not by
+itself establish artifact availability, runtime qualification, wheel inclusion,
+or published support. Mixed periodicity, batches, fixed workspace, alchemical
+mixing, Metal, multi-GPU/distributed execution, and LAMMPS remain excluded.
+MACELES is intentionally single-GPU for this release; qualification remains
+pending where the release matrix says so.
+
 ## Reproducible timing
 
 The timing driver loads one MACELES file and measures complete warmed model
