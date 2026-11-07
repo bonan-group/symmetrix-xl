@@ -1,0 +1,40 @@
+name: Polar fixture-only validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "symmetrix/source/symmetrix/extract_mace_nonlinear.py"
+      - "symmetrix/test/test_polar_oracle_fixtures.py"
+      - "symmetrix/test/test_polar_end_to_end_fixtures.py"
+      - "symmetrix/test/test_mace_les_reference.py"
+      - ".github/workflows/polar-fixture-only.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  fixture-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          python-version: "3.12"
+      - name: Build CPU frontend and run immutable fixture lane
+        run: |
+          uv venv --clear
+          source .venv/bin/activate
+          uv pip install scikit-build-core pybind11 ninja pytest numpy scipy ase
+          python tools/symmetrix_build.py install --backend cpu --cpu-target native --build-root "$RUNNER_TEMP/symmetrix-cpu-build" --generator 'Unix Makefiles'
+          python - <<'PY'
+          import importlib.util
+          for name in ("torch", "mace", "graph_longrange"):
+              assert importlib.util.find_spec(name) is None, name
+          PY
+          SYMMETRIX_POLAR_ORACLE_RUNTIME=0 pytest -q \
+            symmetrix/test/test_polar_oracle_fixtures.py \
+            symmetrix/test/test_polar_end_to_end_fixtures.py \
+            symmetrix/test/test_mace_les_reference.py

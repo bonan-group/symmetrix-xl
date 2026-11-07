@@ -280,7 +280,6 @@ def extract_mace_nonlinear_data(
     atomic_numbers: list[int] | None = None,
     num_spline_points: int | None = None,
 ) -> dict[str, Any]:
-    _load_torch_dependencies()
     """Return a full-domain versioned schema for nonlinear residual MACE models.
 
     ``atomic_numbers`` is retained as a compatibility argument for direct
@@ -289,6 +288,7 @@ def extract_mace_nonlinear_data(
     given, is written to ``radial_embedding`` and sets the node count of the
     runtime pair-spline table (the runtime default is 256).
     """
+    _load_torch_dependencies()
     from mace.modules.blocks import RealAgnosticResidualNonLinearInteractionBlock
 
     if not model.interactions or not all(
