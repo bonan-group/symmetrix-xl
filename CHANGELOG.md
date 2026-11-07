@@ -2,7 +2,7 @@
 
 All notable changes to Symmetrix-XL are documented in this file.
 
-## 0.2.0 - 2026-10-25
+## 0.2.0 - Unreleased
 
 ### Execution and JIT
 
