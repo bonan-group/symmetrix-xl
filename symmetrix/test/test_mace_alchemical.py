@@ -445,68 +445,20 @@ def test_omat0_oracle_identity_rejects_noncanonical_m1(
 
 @pytest.fixture(scope="module")
 def omat0_alchemical_model_path(tmp_path_factory):
-    """Rebuild the deterministic OMAT-style model used by the frozen oracle."""
+    """Load the frozen OMAT-style model used by the frozen oracle."""
 
+    import gzip
     import json
     from pathlib import Path
-    import torch
-    import torch.nn.functional as F
 
-    o3 = _e3nn_o3()
-    from mace import modules
-    from mace.modules import ScaleShiftMACE
-    from symmetrix.extract_mace_data import _extract_single_head_data
-
-    oracle_path = (
-        Path(__file__).parent / "data" / "alchemical_omat0_oracle.json.fixture"
-    )
+    data_root = Path(__file__).parent / "data"
+    oracle_path = data_root / "alchemical_omat0_oracle.json.fixture"
     oracle = json.loads(oracle_path.read_text())
-    previous_dtype = torch.get_default_dtype()
-    try:
-        torch.set_default_dtype(torch.float64)
-        torch.manual_seed(oracle["seed"])
-        model = ScaleShiftMACE(
-            r_max=5.0,
-            num_bessel=3,
-            num_polynomial_cutoff=5,
-            max_ell=3,
-            interaction_cls=modules.interaction_classes[
-                "RealAgnosticDensityResidualInteractionBlock"
-            ],
-            interaction_cls_first=modules.interaction_classes[
-                "RealAgnosticDensityInteractionBlock"
-            ],
-            num_interactions=2,
-            num_elements=4,
-            hidden_irreps=o3.Irreps("4x0e + 4x1o"),
-            MLP_irreps=o3.Irreps("4x0e"),
-            gate=F.silu,
-            atomic_energies=np.array([-2040.0, -1580.0, -800.0, -750.0]),
-            avg_num_neighbors=8.0,
-            atomic_numbers=oracle["atomic_numbers"],
-            correlation=3,
-            radial_type="bessel",
-            distance_transform="Agnesi",
-            pair_repulsion=True,
-            atomic_inter_shift=0.0,
-            atomic_inter_scale=1.0,
-        )
-        model.eval()
-        data = _extract_single_head_data(
-            model, radial_format="compact", num_spline_points=128
-        )
-    finally:
-        torch.set_default_dtype(previous_dtype)
+    model_path = data_root / "alchemical_omat0_model.json.gz.fixture"
+    with gzip.open(model_path, "rt", encoding="utf-8") as handle:
+        data = json.load(handle)
 
-    try:
-        canonical = _omat0_oracle_model_json(data, oracle["model_sha256"])
-    except AssertionError as exc:
-        if "OMAT-0 frozen model identity mismatch" not in str(exc):
-            raise
-        pytest.skip(
-            "the frozen OMAT-0 oracle requires upstream MACE commit "
-            f"{oracle['upstream_commit']}; generated model identity does not match"
-        )
+    canonical = _omat0_oracle_model_json(data, oracle["model_sha256"])
     path = tmp_path_factory.mktemp("alchemical-omat0-model") / "model.json"
     path.write_text(canonical)
     return path

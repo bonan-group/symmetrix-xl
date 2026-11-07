@@ -8,7 +8,15 @@ from .prepare_jit_device_artifact import main as prepare_jit_device_artifact
 
 def main(argv=None):
     parser = ArgumentParser()
-    parser.add_argument("--model", "-m", required=True, help="Torch model file.")
+    parser.add_argument(
+        "--model",
+        "-m",
+        required=True,
+        help=(
+            "Native MACE model, metatrain MACE checkpoint, or exported "
+            "metatomic model file."
+        ),
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--atomic-numbers",

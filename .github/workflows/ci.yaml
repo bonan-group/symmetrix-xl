@@ -56,6 +56,44 @@ jobs:
         deactivate
         cd ../..
 
+  metatrain-mace:
+    runs-on: ubuntu-latest
+    env:
+      TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: "1"
+    steps:
+    - name: Clone repo
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake git libblas-dev liblapack-dev ninja-build
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v8.3.2
+      with:
+        python-version: '3.12'
+        enable-cache: true
+    - name: Create python venv and install
+      run: |
+        uv venv --clear
+        source .venv/bin/activate
+        uv pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.5.*"
+        uv pip install \
+          "metatrain[mace]==2026.4.1" \
+          pytest
+        source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_source_fingerprint; print(symmetrix_source_fingerprint(Path.cwd()))')
+        uv pip install ./symmetrix \
+          --config-settings=cmake.define.SYMMETRIX_HOST_ARCH=x86-64-v3 \
+          --config-settings="cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint"
+        deactivate
+    - name: Test native MACE import and metatrain export
+      run: |
+        source .venv/bin/activate
+        pytest -q symmetrix/test/test_extract_mace_data.py \
+          -k metatrain_native_checkpoint_and_export_round_trip
+        deactivate
+
   pair_symmetrix:
     runs-on: ubuntu-latest
     steps:
