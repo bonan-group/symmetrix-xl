@@ -160,10 +160,16 @@ uses content-addressed entries and validates permissions, ownership, manifests,
 target identity, file size, and SHA-256 digests before reuse.
 
 Concurrent cache misses compile in private staging directories. Publication
-prefers atomic no-replace rename; on filesystems that do not support it,
-Symmetrix-XL acquires an atomic per-key `mkdir` lock, revalidates any winner,
-and publishes with ordinary atomic rename while holding the lock. Compilation
-remains outside the lock, so shared HPC caches retain concurrent builds.
+requires atomic no-replace rename by default. On Linux, the cache must
+therefore live on a filesystem supporting
+`renameat2(..., RENAME_NOREPLACE)`, such as local ext4 or tmpfs. Some parastor
+and Lustre deployments on older kernels do not.
+Use node-local storage such as `/dev/shm`, or explicitly set
+`SYMMETRIX_JIT_PUBLISH=lock-fallback` to publish under a destination-adjacent
+exclusive lock file with ordinary rename. The fallback has a small
+cross-process race window and is intentionally not the default. Compilation
+remains outside the publication lock, so shared HPC caches retain concurrent
+builds.
 
 Prepare deployable artifacts with:
 

@@ -209,6 +209,15 @@ symmetrix_prepare_jit_host_artifact \
     --model srtio3-mace.json --precision float64
 ```
 
+On Linux, the cache filesystem must support atomic no-replace publication
+through `renameat2(..., RENAME_NOREPLACE)`. Local ext4 and tmpfs support it;
+some network filesystems such as parastor and Lustre on older kernels return
+`EINVAL`, `ENOSYS`, or `ENOTSUP`. Use a node-local cache such as `/dev/shm` on
+those systems. If node-local storage is unavailable,
+`SYMMETRIX_JIT_PUBLISH=lock-fallback` enables destination-adjacent lock-file
+publication followed by ordinary rename. This is an explicit degraded mode
+with a small cross-process race window; atomic publication remains the default.
+
 Production preparation includes the package's complete
 `source_content_sha256` in the cache key, manifest, and `_src<hash>` artifact
 basename. After rebuilding the extension, stop old processes and prepare/load

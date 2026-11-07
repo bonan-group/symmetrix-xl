@@ -116,11 +116,11 @@ def test_nvrtc_cache_publication_remains_optimistic_and_no_replace():
     for expected in (
         "def _create_staging_directory(",
         "def _publish_directory_no_replace(",
-        "def _publish_directory_with_mkdir_lock(",
+        "def _publish_directory_with_lock_file(",
         'renameat2 = getattr(library, "renameat2", None)',
         "published = _publish_directory_no_replace(temporary_directory, entry)",
-        "using mkdir-locked publication",
-        "published = _publish_directory_with_mkdir_lock(",
+        "non-atomic publication (lock-fallback)",
+        "published = _publish_directory_with_lock_file(",
         'diagnostics.append("another process published the JIT artifact first")',
     ):
         assert expected in source

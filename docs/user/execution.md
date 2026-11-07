@@ -76,6 +76,13 @@ symmetrix_prepare_jit_host_artifact \
     --model srtio3-mace.json --precision float32
 ```
 
+On Linux, the cache must be on a filesystem supporting atomic no-replace
+rename. Local ext4 and tmpfs are suitable; some parastor and Lustre
+installations on older kernels are not. Prefer a node-local cache such as
+`/dev/shm`. As an explicit degraded alternative, set
+`SYMMETRIX_JIT_PUBLISH=lock-fallback` to use lock-file publication with a small
+cross-process race window.
+
 For explicit `dtype="float64"` evaluation, prepare the corresponding artifact
 with `--precision float64`.
 
