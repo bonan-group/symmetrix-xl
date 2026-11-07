@@ -133,7 +133,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="+",
         default=list(MODEL_SIZES),
         choices=list(MODEL_SIZES),
-        help="Checkpoint sizes to capture (L parity is a follow-up record).",
+        help="Checkpoint sizes to capture (S, M, and L are supported).",
     )
     parser.add_argument(
         "--precisions",
