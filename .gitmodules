@@ -15,7 +15,7 @@
 	url = https://github.com/kokkos/kokkos-kernels
 [submodule "libsymmetrix/external/sphericart"]
 	path = libsymmetrix/external/sphericart
-	url = https://github.com/lab-cosmo/sphericart
+	url = https://github.com/bonan-group/sphericart
 [submodule "symmetrix/external/pybind11"]
 	path = symmetrix/external/pybind11
 	url = https://github.com/pybind/pybind11

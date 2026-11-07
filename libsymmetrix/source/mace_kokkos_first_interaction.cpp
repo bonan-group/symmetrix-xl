@@ -25,7 +25,7 @@
 #endif
 #include "nlohmann/json.hpp"
 #include "sphericart.hpp"
-#include "sphericart_cuda.hpp"
+#include "sphericart_device.hpp"
 #include "spherical_harmonic_device.hpp"
 
 #include "tools_kokkos.hpp"
@@ -318,7 +318,7 @@ void MACEKokkos<Precision>::compute_Y(
     const auto unit_direction = execution_prepared_unit_direction;
     const double normalization_factor = 2*std::sqrt(M_PI);
 
-#if defined(KOKKOS_ENABLE_HIP)
+#if defined(KOKKOS_ENABLE_HIP) && !defined(SYMMETRIX_SPHERICART_HIP)
     const auto execution_space = evaluator_stream
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
     Kokkos::parallel_for(
@@ -368,7 +368,7 @@ void MACEKokkos<Precision>::compute_Y(
                 Y_grad(3*edge*harmonics+2*harmonics+lm) = gradient_scale*x;
             }
         });
-#elif !defined(SYMMETRIX_SPHERICART_CUDA)
+#elif !defined(SYMMETRIX_SPHERICART_CUDA) && !defined(SYMMETRIX_SPHERICART_HIP)
     static_cast<void>(evaluator_stream);
     Kokkos::parallel_for("shuffle_xyz", num, KOKKOS_LAMBDA (const int i) {
         const std::size_t edge = static_cast<std::size_t>(i);
@@ -449,11 +449,11 @@ void MACEKokkos<Precision>::compute_Y(
     if (evaluator_stream) {
         spherical_harmonics_state->calculator.compute_with_gradients_async(
             xyz_shuffled.data(), num, Y.data(), Y_grad_shuffled.data(),
-            reinterpret_cast<void*>(execution_space.cuda_stream()));
+            symmetrix::native_device_stream(execution_space));
         if (num > 0)
             execution_sphericart_async_launch_count += 1;
     } else {
-        execution_space.fence("Prepare CUDA spherical-harmonic coordinates");
+        execution_space.fence("Prepare device spherical-harmonic coordinates");
         spherical_harmonics_state->calculator.compute_with_gradients(
             xyz_shuffled.data(), num, Y.data(), Y_grad_shuffled.data());
     }
