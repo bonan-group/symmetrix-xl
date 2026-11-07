@@ -6,9 +6,7 @@ ROOT = Path(__file__).parents[2]
 
 def test_routine_symmetrix_job_is_fixture_only_and_no_torch():
     workflow = (ROOT / ".github/workflows/ci.yaml").read_text()
-    routine = workflow.split("  symmetrix:\n", 1)[1].split(
-        "  metatrain-mace:\n", 1
-    )[0]
+    routine = workflow.split("  symmetrix:\n", 1)[1].split("  metatrain-mace:\n", 1)[0]
     for forbidden in (
         "torch==",
         "mace-torch",
@@ -34,7 +32,10 @@ def test_routine_symmetrix_job_is_fixture_only_and_no_torch():
         "--ignore=symmetrix/test/test_jit_kokkos_integration.py",
     ):
         assert required in routine
-    assert "pytest -q \\\n          symmetrix/test/test_polar_oracle_fixtures.py" in routine
+    assert (
+        "pytest -q \\\n          symmetrix/test/test_polar_oracle_fixtures.py"
+        in routine
+    )
 
 
 def test_exporter_and_compatibility_lanes_remain_separate():
@@ -48,9 +49,7 @@ def test_exporter_and_compatibility_lanes_remain_separate():
 
 def test_routine_lane_keeps_native_modules_and_fails_closed_on_downloads():
     workflow = (ROOT / ".github/workflows/ci.yaml").read_text()
-    routine = workflow.split("  symmetrix:\n", 1)[1].split(
-        "  metatrain-mace:\n", 1
-    )[0]
+    routine = workflow.split("  symmetrix:\n", 1)[1].split("  metatrain-mace:\n", 1)[0]
     for module in (
         "test_symmetrix_calc.py",
         "test_family_registry.py",

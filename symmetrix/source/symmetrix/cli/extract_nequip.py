@@ -37,7 +37,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         model = load_nequip_model(args.model)
-        data = extract_nequip_data(model, output_precision=args.precision)
+        data = extract_nequip_data(
+            model, output_precision=args.precision, source_path=args.model
+        )
         metadata = data.get("model_metadata", {})
         print(f"source model: {type(model).__module__}.{type(model).__name__}")
         print(f"NequIP version: {metadata.get('source_version', 'unknown')}")
@@ -53,7 +55,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {item}")
         print(f"certified precision: {args.precision}")
         output = export_nequip_model(
-            model, args.output, force=args.force, precision=args.precision
+            model,
+            args.output,
+            force=args.force,
+            precision=args.precision,
+            data=data,
         )
         print(f"wrote: {output}")
     except (NequIPProbeError, OSError, ValueError, TypeError) as error:
