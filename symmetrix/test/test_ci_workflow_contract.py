@@ -26,8 +26,14 @@ def test_routine_symmetrix_job_is_fixture_only_and_no_torch():
         "symmetrix-cpu-build",
         "SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256",
         '("torch", "mace", "graph_longrange")',
+        "pytest -q -m 'not extended' symmetrix/test",
+        "--ignore=symmetrix/test/test_extract_mace_data.py",
+        "--ignore=symmetrix/test/test_mace_streamed_edges.py",
+        "--ignore=symmetrix/test/test_polar_torch_baseline.py",
+        "--ignore=symmetrix/test/test_single_layer_mace.py",
     ):
         assert required in routine
+    assert "pytest -q \\\n          symmetrix/test/test_polar_oracle_fixtures.py" in routine
 
 
 def test_exporter_and_compatibility_lanes_remain_separate():
@@ -35,5 +41,16 @@ def test_exporter_and_compatibility_lanes_remain_separate():
     assert "  metatrain-mace:\n" in workflow
     assert "  extract-mace-model:\n" in workflow
     assert "  pair_symmetrix:\n" in workflow
+    for compatibility_module in (
+        "test_family_mace_conformance_cases.py",
+        "test_family_registry.py",
+        "test_jit_kokkos_integration.py",
+        "test_jit_operator_cuda.py",
+        "test_mace_polar_frontend.py",
+        "test_macefield_field_transform.py",
+        "test_macefield_native.py",
+        "test_symmetrix_calc.py",
+    ):
+        assert compatibility_module in workflow
     fixture = (ROOT / ".github/workflows/polar-fixture-only.yaml").read_text()
     assert "pull_request:" in fixture and "paths:" in fixture

@@ -54,12 +54,23 @@ jobs:
         for name in ("torch", "mace", "graph_longrange"):
             assert importlib.util.find_spec(name) is None, name
         PY
+        pytest -q -m 'not extended' symmetrix/test \
+          --ignore=symmetrix/test/test_extract_mace_data.py \
+          --ignore=symmetrix/test/test_mace_streamed_edges.py \
+          --ignore=symmetrix/test/test_polar_torch_baseline.py \
+          --ignore=symmetrix/test/test_single_layer_mace.py \
+          --ignore=symmetrix/test/test_family_mace_conformance_cases.py \
+          --ignore=symmetrix/test/test_family_registry.py \
+          --ignore=symmetrix/test/test_jit_kokkos_integration.py \
+          --ignore=symmetrix/test/test_jit_operator_cuda.py \
+          --ignore=symmetrix/test/test_mace_polar_frontend.py \
+          --ignore=symmetrix/test/test_macefield_field_transform.py \
+          --ignore=symmetrix/test/test_macefield_native.py \
+          --ignore=symmetrix/test/test_symmetrix_calc.py
         pytest -q \
           symmetrix/test/test_polar_oracle_fixtures.py \
           symmetrix/test/test_polar_end_to_end_fixtures.py \
-          symmetrix/test/test_mace_les_reference.py \
-          symmetrix/test/test_build_backend.py \
-          symmetrix/test/test_standard_modules.py
+          symmetrix/test/test_mace_les_reference.py
         deactivate
         cd ../..
 
