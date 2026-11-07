@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -436,6 +437,8 @@ _ORACLE_GRAPH_ELECTROSTATICS_CHECKOUT = optional_checkout(
 )
 
 try:  # pragma: no cover - environment-dependent import guard
+    if os.environ.get("SYMMETRIX_POLAR_ORACLE_RUNTIME") != "1":
+        raise ImportError("Polar oracle runtime is opt-in")
     import sys as _sys
 
     if _ORACLE_MACE_CHECKOUT is not None and _ORACLE_MACE_CHECKOUT.is_dir():
@@ -1118,6 +1121,9 @@ def test_the_backbone_half_is_parity_clean_against_the_oracle_reference(tmp_path
     diagnostic surface, then compares the remaining backbone energy against
     the frozen oracle's atomic-reference-plus-interaction record.
     """
+
+    if os.environ.get("SYMMETRIX_POLAR_ORACLE_RUNTIME") != "1":
+        pytest.skip("one-time Polar oracle opening is opt-in")
 
     import json as _json
 
