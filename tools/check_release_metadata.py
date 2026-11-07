@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -44,6 +45,22 @@ def release_metadata(
     date = heading.group(1)
     if require_dated and date == "Unreleased":
         raise ValueError(f"CHANGELOG.md has no dated {version} release heading")
+    if require_dated:
+        current_date = datetime.date.fromisoformat(date)
+        prior_dates = [
+            datetime.date.fromisoformat(match.group(2))
+            for match in re.finditer(
+                r"^## (\d+\.\d+\.\d+) - (\d{4}-\d{2}-\d{2})$",
+                changelog,
+                re.MULTILINE,
+            )
+            if match.group(1) != version
+        ]
+        if prior_dates and current_date < max(prior_dates):
+            raise ValueError(
+                f"CHANGELOG.md release date {date} predates the latest prior release "
+                f"{max(prior_dates).isoformat()}"
+            )
     if require_dated and re.search(
         r"^## \d+\.\d+\.\d+ - Unreleased$", changelog, re.MULTILINE
     ):
