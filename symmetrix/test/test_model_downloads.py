@@ -17,6 +17,7 @@ def test_cached_model_path_uses_external_cache_and_reuses_download(
         return str(destination), None
 
     monkeypatch.setenv("SYMMETRIX_TEST_MODEL_CACHE_DIR", str(cache_dir))
+    monkeypatch.delenv("SYMMETRIX_TEST_MODEL_DOWNLOADS", raising=False)
     monkeypatch.setattr("model_downloads.urlretrieve", fake_urlretrieve)
 
     first = cached_model_path("example.model", "https://example.invalid/example.model")
@@ -64,6 +65,7 @@ def test_cached_model_path_replaces_corrupt_cached_download(monkeypatch, tmp_pat
         return str(path), None
 
     monkeypatch.setenv("SYMMETRIX_TEST_MODEL_CACHE_DIR", str(cache_dir))
+    monkeypatch.delenv("SYMMETRIX_TEST_MODEL_DOWNLOADS", raising=False)
     monkeypatch.setattr("model_downloads.urlretrieve", fake_urlretrieve)
 
     path = cached_model_path(
@@ -74,3 +76,23 @@ def test_cached_model_path_replaces_corrupt_cached_download(monkeypatch, tmp_pat
 
     assert path.read_bytes() == expected
     assert calls == [("https://example.invalid/example.model", destination)]
+
+
+def test_cached_model_path_fails_closed_when_downloads_are_disabled(
+    monkeypatch, tmp_path
+):
+    from model_downloads import ModelDownloadDisabledError, cached_model_path
+
+    calls = []
+    monkeypatch.setenv("SYMMETRIX_TEST_MODEL_DOWNLOADS", "0")
+    monkeypatch.setenv("SYMMETRIX_TEST_MODEL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "model_downloads.urlretrieve",
+        lambda *args: calls.append(args),
+    )
+
+    import pytest
+
+    with pytest.raises(ModelDownloadDisabledError):
+        cached_model_path("example.model", "https://example.invalid/example.model")
+    assert calls == []

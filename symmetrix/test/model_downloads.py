@@ -14,6 +14,10 @@ MACEFIELD_MODEL_SHA256 = (
 )
 
 
+class ModelDownloadDisabledError(RuntimeError):
+    """Raised when routine CI forbids fetching upstream model inputs."""
+
+
 def test_model_cache_dir():
     override = os.environ.get("SYMMETRIX_TEST_MODEL_CACHE_DIR")
     if override:
@@ -54,6 +58,10 @@ def cached_model_path(filename, url, env_var=None, sha256=None):
         destination.unlink()
 
     try:
+        if os.environ.get("SYMMETRIX_TEST_MODEL_DOWNLOADS") == "0":
+            raise ModelDownloadDisabledError(
+                f"model download disabled for routine CI: {filename}"
+            )
         urlretrieve(url, destination)
     except (OSError, URLError) as exc:
         if destination.exists():
