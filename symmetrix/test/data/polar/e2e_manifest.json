@@ -182,6 +182,66 @@
       "energy_abs": 0.000583889675908722,
       "forces_max_abs": 1.0447800834173515e-05,
       "stress_max_abs": 9.109668046216202e-10
+    },
+    "e2e_L_bulk_w4_charged_triplet_float32.json": {
+      "dipole_max_abs": 7.525169891664518e-07,
+      "energy_abs": 0.0009717308585095452,
+      "forces_max_abs": 1.4109334658674033e-05,
+      "stress_max_abs": 1.2756446551623313e-08
+    },
+    "e2e_L_bulk_w4_field_float32.json": {
+      "dipole_max_abs": 5.104542674105872e-07,
+      "energy_abs": 0.0010403721771581331,
+      "forces_max_abs": 1.476404250721347e-05,
+      "stress_max_abs": 1.3341408031146895e-08
+    },
+    "e2e_L_bulk_w4_singlet_float32.json": {
+      "dipole_max_abs": 4.6151029176044744e-07,
+      "energy_abs": 0.0012642929577850737,
+      "forces_max_abs": 1.48437128831818e-05,
+      "stress_max_abs": 1.3334869392904393e-08
+    },
+    "e2e_L_mol_h2o_charged_triplet_float32.json": {
+      "dipole_max_abs": 1.0050999696975538e-06,
+      "energy_abs": 1.4054217899683863e-05,
+      "forces_max_abs": 1.4623327667884212e-05,
+      "stress_max_abs": 6.409001931762068e-11
+    },
+    "e2e_L_mol_h2o_fermi_lane_float32.json": {
+      "dipole_max_abs": 1.419704319660653e-07,
+      "energy_abs": 0.00011865713577208226,
+      "forces_max_abs": 1.5155263789687345e-06,
+      "stress_max_abs": 7.008848403933507e-12
+    },
+    "e2e_L_mol_h2o_field_float32.json": {
+      "dipole_max_abs": 1.3808500276546454e-07,
+      "energy_abs": 0.0001353839220428199,
+      "forces_max_abs": 1.5173784121830236e-06,
+      "stress_max_abs": 6.522551981667164e-12
+    },
+    "e2e_L_mol_h2o_singlet_float32.json": {
+      "dipole_max_abs": 1.419704319660653e-07,
+      "energy_abs": 0.00011865713577208226,
+      "forces_max_abs": 1.5155263789687345e-06,
+      "stress_max_abs": 7.008848403933507e-12
+    },
+    "e2e_L_slab_w2_charged_triplet_float32.json": {
+      "dipole_max_abs": 1.409838985111378e-06,
+      "energy_abs": 0.00018804138471750775,
+      "forces_max_abs": 1.4145486529892892e-05,
+      "stress_max_abs": 9.531742478912242e-10
+    },
+    "e2e_L_slab_w2_field_float32.json": {
+      "dipole_max_abs": 2.9520379168923583e-07,
+      "energy_abs": 0.00045139019675843883,
+      "forces_max_abs": 1.0776343491308848e-05,
+      "stress_max_abs": 8.626677612679585e-10
+    },
+    "e2e_L_slab_w2_singlet_float32.json": {
+      "dipole_max_abs": 2.386758086170282e-07,
+      "energy_abs": 0.00033208732565981336,
+      "forces_max_abs": 1.1138402182354207e-05,
+      "stress_max_abs": 8.839656775793759e-10
     }
   },
   "environment": {
@@ -226,7 +286,7 @@
     "mace_ref": "v0.3.16-2-g22f08097",
     "mace_sha": "22f0809735bd4dd1deba80cf8e16f89913a35ff4"
   },
-  "record_fingerprint": "46a00340ce85c86965ec19d8faae8e7da9136bb9b9ddd7221446a6e940a4c1d4",
+  "record_fingerprint": "b50e041509cce0faf92dc5d480c07ab8387a8d2746c76eefce9e05130ab49c93",
   "records": [
     {
       "channel": "singlet",
@@ -1030,6 +1090,48 @@
       "energy_abs": 0.0,
       "forces_max_abs": 1.1920928955078125e-07,
       "stress_max_abs": 2.546585164964199e-11
+    },
+    "e2e_L_bulk_w4_charged_triplet_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 1.1920928955078125e-07,
+      "stress_max_abs": 2.9103830456733704e-10
+    },
+    "e2e_L_bulk_w4_field_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 2.9802322387695312e-08,
+      "stress_max_abs": 7.548806024715304e-11
+    },
+    "e2e_L_bulk_w4_singlet_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 1.862645149230957e-08,
+      "stress_max_abs": 9.458744898438454e-11
+    },
+    "e2e_L_slab_w2_charged_triplet_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 8.642673492431641e-07,
+      "stress_max_abs": 2.764863893389702e-10
+    },
+    "e2e_L_slab_w2_field_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 1.043081283569336e-07,
+      "stress_max_abs": 3.2741809263825417e-11
+    },
+    "e2e_L_slab_w2_singlet_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 1.4901161193847656e-07,
+      "stress_max_abs": 2.1827872842550278e-11
     }
   },
   "repeat_tolerance": {
