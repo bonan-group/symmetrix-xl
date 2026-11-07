@@ -269,6 +269,13 @@ are claimed. Live upstream FP64 parity remains an open qualification gate.
 HIP, parameter gradients, LAMMPS/MPI, multi-GPU, and fixed-workspace
 OAM execution are unsupported.
 
+The v0.2.0 support contract keeps implementation availability, artifact
+availability, runtime qualification, wheel inclusion, and published support
+separate. OAM S/M/L/XL remain single-GPU host/CUDA only where qualified. Live
+upstream FP64 parity and repaired-wheel inclusion are open gates. Ordinary MACE
+HIP support does not imply OAM or Polar HIP support; OAM remains single-GPU by
+decision.
+
 See {doc}`../reference/execution_support_matrix` for current release gates and
 {doc}`../reference/publications` for the NequIP and OAM publications to cite.
 

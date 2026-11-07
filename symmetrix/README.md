@@ -211,7 +211,7 @@ MACEField checkpoints must be converted before use. Passing an original
 MACEField checkpoint directly to the calculator is rejected rather than
 silently delegating evaluation to PyTorch.
 
-### NequIP OAM (experimental)
+### NequIP OAM
 
 NequIP support uses the OAM v2 versioned JSON contract. Install the optional
 exporter stack in a fresh environment and export an upstream OAM package or
@@ -229,13 +229,14 @@ Runtime evaluation accepts the OAM v2 JSON contract with
 retains a universal H through Pu element mapping, model cutoff, ordered layers,
 and precision-independent parameters. Runtime evaluation uses the exported
 JSON, ASE, and the native Symmetrix extension; PyTorch, NequIP, and e3nn remain
-exporter/reference dependencies. OAM-S, OAM-M, OAM-L, and OAM-XL are
-experimentally supported.
-Retained OAM-v2 qualification covers energy, forces, and stress for host
-S-FP32, M-FP32/FP64, L-FP32, and XL-FP32 and CUDA `sm120` S/M/L/XL FP32/FP64.
-The independent upstream comparison is narrower and does not establish live
-upstream FP64 parity. HIP and multi-GPU execution are unsupported; other CUDA
-targets are artifact-available but runtime-unqualified. The earlier `sm80`
+exporter/reference dependencies. Implementation and generated-artifact paths
+exist for OAM-S/M/L/XL on host and
+CUDA, but this historical or compile evidence is not current published
+qualification. Fresh runtime qualification remains pending after the
+artifact-contract change. Live upstream FP64 parity and repaired-wheel
+inclusion are open gates. HIP, multi-GPU, and LAMMPS/MPI execution are
+unsupported; other CUDA targets may be artifact-available while remaining
+runtime-unqualified. The earlier `sm80`
 package/generated-path record predates ABI v4 and requires a merged-source
 rerun.
 

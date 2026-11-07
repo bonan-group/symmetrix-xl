@@ -67,6 +67,27 @@ DFT-D2/D3 corrections, and reciprocal-space FourierD3. See the
 model, property, and backend boundaries. The [changelog](CHANGELOG.md) records
 implemented changes and pending release qualification.
 
+### v0.2.0 support contract
+
+The public contract separates implementation availability, artifact
+availability, runtime qualification, wheel inclusion, and published support.
+OAM S/M/L/XL are single-GPU host/CUDA contracts only where qualified. HIP,
+multi-GPU, and LAMMPS/MPI are unsupported; live upstream FP64 parity and
+repaired-wheel inclusion remain open gates. Ordinary MACE HIP does not imply
+OAM or Polar HIP support, and OAM remains single-GPU by decision.
+
+Released Polar-M CPU/CUDA FP32/FP64 is the current evidenced matrix. Polar-S
+focused checks exist while final combined-source qualification is pending.
+Polar-L, HIP, multi-GPU, PME publication support, and distributed Polar
+LAMMPS are unqualified or unsupported for this freeze; HIP and Polar-L are
+planned qualification work.
+
+MACELES is implemented for one fully periodic or nonperiodic ASE structure on
+CPU/OpenMP, CUDA, and HIP in FP32/FP64. Mixed periodicity, batches, fixed
+workspace, alchemical mixing, Metal, multi-GPU/distributed execution, and
+LAMMPS are excluded. MACELES remains single-GPU for v0.2.0; qualification
+remains pending where the support matrix says so.
+
 ### Demonstrated scale
 
 The paper's FP32 single-GPU LAMMPS capacity benchmark uses the MACE-OMAT-0

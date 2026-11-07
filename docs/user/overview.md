@@ -41,6 +41,27 @@ Every call evaluates the complete model and publishes `les_energy`,
 and stress results. D2 and D3 remain independently configured additive
 corrections.
 
+### v0.2.0 support contract
+
+The public contract separates implementation availability, artifact availability,
+runtime qualification, wheel inclusion, and published support. OAM S/M/L/XL are
+single-GPU host/CUDA only where qualified. HIP, multi-GPU, and LAMMPS/MPI are
+unsupported; live upstream FP64 parity and repaired-wheel inclusion remain open
+gates. Ordinary MACE HIP does not imply OAM or Polar HIP support, and OAM remains
+single-GPU by decision.
+
+Released Polar-M CPU/CUDA FP32/FP64 is the current evidenced matrix. Polar-S
+focused checks exist while final combined-source qualification is pending.
+Polar-L, HIP, multi-GPU, PME publication support, and distributed Polar LAMMPS
+are unqualified or unsupported for this freeze; HIP and Polar-L are planned
+qualification work.
+
+MACELES is implemented for one fully periodic or nonperiodic ASE structure on
+CPU/OpenMP, CUDA, and HIP in FP32/FP64. Mixed periodicity, batches, fixed
+workspace, alchemical mixing, Metal, multi-GPU/distributed execution, and
+LAMMPS are excluded. The v0.2.0 decision keeps MACELES single-GPU; release
+qualification remains pending where stated in the matrix.
+
 Compatible format-version-2 MACE and MACEField JSON can be used from Python/ASE
 or from the `pair_symmetrix` LAMMPS integration. Two-interaction direct LAMMPS
 runs consume a prepared JIT artifact; LAMMPS does not invoke the runtime
