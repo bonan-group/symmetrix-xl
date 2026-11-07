@@ -13,6 +13,11 @@ from typing import Any
 torch = None
 o3 = None
 
+from .mace_nonlinear_execution_contract import (
+    MH1_CONTRACT_KEY,
+    maybe_make_execution_mh1_contract,
+)
+
 
 def _load_torch_dependencies() -> None:
     global torch, o3
@@ -28,12 +33,6 @@ def _load_torch_dependencies() -> None:
             from e3nn import o3 as o3_module
     torch = torch_module
     o3 = o3_module
-
-
-from .mace_nonlinear_execution_contract import (
-    MH1_CONTRACT_KEY,
-    maybe_make_execution_mh1_contract,
-)
 
 
 def _tensor(value: torch.Tensor) -> dict[str, Any]:
