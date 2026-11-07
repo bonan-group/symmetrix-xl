@@ -182,6 +182,66 @@
       "energy_abs": 0.000583889675908722,
       "forces_max_abs": 1.0447800834173515e-05,
       "stress_max_abs": 9.109668046216202e-10
+    },
+    "e2e_L_bulk_w4_charged_triplet_float32.json": {
+      "dipole_max_abs": 7.525169891664518e-07,
+      "energy_abs": 0.0009717308585095452,
+      "forces_max_abs": 1.4109334658674033e-05,
+      "stress_max_abs": 1.2756446551623313e-08
+    },
+    "e2e_L_bulk_w4_field_float32.json": {
+      "dipole_max_abs": 5.104542674105872e-07,
+      "energy_abs": 0.0010403721771581331,
+      "forces_max_abs": 1.476404250721347e-05,
+      "stress_max_abs": 1.3341408031146895e-08
+    },
+    "e2e_L_bulk_w4_singlet_float32.json": {
+      "dipole_max_abs": 4.6151029176044744e-07,
+      "energy_abs": 0.0012642929577850737,
+      "forces_max_abs": 1.48437128831818e-05,
+      "stress_max_abs": 1.3334869392904393e-08
+    },
+    "e2e_L_mol_h2o_charged_triplet_float32.json": {
+      "dipole_max_abs": 1.0050999696975538e-06,
+      "energy_abs": 1.4054217899683863e-05,
+      "forces_max_abs": 1.4623327667884212e-05,
+      "stress_max_abs": 6.409001931762068e-11
+    },
+    "e2e_L_mol_h2o_fermi_lane_float32.json": {
+      "dipole_max_abs": 1.419704319660653e-07,
+      "energy_abs": 0.00011865713577208226,
+      "forces_max_abs": 1.5155263789687345e-06,
+      "stress_max_abs": 7.008848403933507e-12
+    },
+    "e2e_L_mol_h2o_field_float32.json": {
+      "dipole_max_abs": 1.3808500276546454e-07,
+      "energy_abs": 0.0001353839220428199,
+      "forces_max_abs": 1.5173784121830236e-06,
+      "stress_max_abs": 6.522551981667164e-12
+    },
+    "e2e_L_mol_h2o_singlet_float32.json": {
+      "dipole_max_abs": 1.419704319660653e-07,
+      "energy_abs": 0.00011865713577208226,
+      "forces_max_abs": 1.5155263789687345e-06,
+      "stress_max_abs": 7.008848403933507e-12
+    },
+    "e2e_L_slab_w2_charged_triplet_float32.json": {
+      "dipole_max_abs": 1.409838985111378e-06,
+      "energy_abs": 0.00018804138471750775,
+      "forces_max_abs": 1.4145486529892892e-05,
+      "stress_max_abs": 9.531742478912242e-10
+    },
+    "e2e_L_slab_w2_field_float32.json": {
+      "dipole_max_abs": 2.9520379168923583e-07,
+      "energy_abs": 0.00045139019675843883,
+      "forces_max_abs": 1.0776343491308848e-05,
+      "stress_max_abs": 8.626677612679585e-10
+    },
+    "e2e_L_slab_w2_singlet_float32.json": {
+      "dipole_max_abs": 2.386758086170282e-07,
+      "energy_abs": 0.00033208732565981336,
+      "forces_max_abs": 1.1138402182354207e-05,
+      "stress_max_abs": 8.839656775793759e-10
     }
   },
   "environment": {
@@ -226,7 +286,7 @@
     "mace_ref": "v0.3.16-2-g22f08097",
     "mace_sha": "22f0809735bd4dd1deba80cf8e16f89913a35ff4"
   },
-  "record_fingerprint": "46a00340ce85c86965ec19d8faae8e7da9136bb9b9ddd7221446a6e940a4c1d4",
+  "record_fingerprint": "b50e041509cce0faf92dc5d480c07ab8387a8d2746c76eefce9e05130ab49c93",
   "records": [
     {
       "channel": "singlet",
@@ -747,6 +807,266 @@
       "path": "e2e_M_bulk_w4_field_float32.json",
       "sha256": "8535786ce05c52f57fe3c4d9cba52ab649acdfe76d9bfbf7941b4d45dd7d28c3",
       "size": "M"
+    },
+    {
+      "channel": "singlet",
+      "dtype": "float32",
+      "energy": -2079.865966796875,
+      "geometry": "mol_h2o",
+      "graph_class": "molecule",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 3,
+      "name": "e2e_L_mol_h2o_singlet_float32.json",
+      "path": "e2e_L_mol_h2o_singlet_float32.json",
+      "sha256": "adeff1893e75296544af3a8f70e6412161b2a234877e79d096da728ebae396de",
+      "size": "L"
+    },
+    {
+      "channel": "charged_triplet",
+      "dtype": "float32",
+      "energy": -2065.93896484375,
+      "geometry": "mol_h2o",
+      "graph_class": "molecule",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 3,
+      "name": "e2e_L_mol_h2o_charged_triplet_float32.json",
+      "path": "e2e_L_mol_h2o_charged_triplet_float32.json",
+      "sha256": "c0836a5365fca4346431a95e1dc1c429f52c01b368ff56923e106aaeac627458",
+      "size": "L"
+    },
+    {
+      "channel": "field",
+      "dtype": "float32",
+      "energy": -2079.854736328125,
+      "geometry": "mol_h2o",
+      "graph_class": "molecule",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 3,
+      "name": "e2e_L_mol_h2o_field_float32.json",
+      "path": "e2e_L_mol_h2o_field_float32.json",
+      "sha256": "992e25a58de926825dc7c4c67e09c99f456d3d32895430e254ebf4cc1b48f785",
+      "size": "L"
+    },
+    {
+      "channel": "fermi_lane",
+      "dtype": "float32",
+      "energy": -2079.865966796875,
+      "geometry": "mol_h2o",
+      "graph_class": "molecule",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 3,
+      "name": "e2e_L_mol_h2o_fermi_lane_float32.json",
+      "path": "e2e_L_mol_h2o_fermi_lane_float32.json",
+      "sha256": "5c20640ee9f33d45201431bbe92a80a8ef059c19eef363b3a81033a85ff82673",
+      "size": "L"
+    },
+    {
+      "channel": "singlet",
+      "dtype": "float32",
+      "energy": -4159.46240234375,
+      "geometry": "slab_w2",
+      "graph_class": "slab",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 6,
+      "name": "e2e_L_slab_w2_singlet_float32.json",
+      "path": "e2e_L_slab_w2_singlet_float32.json",
+      "sha256": "d90dde5f56f761738ce07d7a01f35ba9533611c353bb14bd87962a299a356219",
+      "size": "L"
+    },
+    {
+      "channel": "charged_triplet",
+      "dtype": "float32",
+      "energy": -4087.65185546875,
+      "geometry": "slab_w2",
+      "graph_class": "slab",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 6,
+      "name": "e2e_L_slab_w2_charged_triplet_float32.json",
+      "path": "e2e_L_slab_w2_charged_triplet_float32.json",
+      "sha256": "9b2b813b1bdc11cf65c4bffc3514d192455528ee9d2812a365a20dfb57bf483e",
+      "size": "L"
+    },
+    {
+      "channel": "field",
+      "dtype": "float32",
+      "energy": -4159.45166015625,
+      "geometry": "slab_w2",
+      "graph_class": "slab",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 6,
+      "name": "e2e_L_slab_w2_field_float32.json",
+      "path": "e2e_L_slab_w2_field_float32.json",
+      "sha256": "8fbc3e8fd705a070da93116e50186898bb55696c7a166abeeec8f1c8c82097a5",
+      "size": "L"
+    },
+    {
+      "channel": "singlet",
+      "dtype": "float32",
+      "energy": -8319.5146484375,
+      "geometry": "bulk_w4",
+      "graph_class": "bulk",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 12,
+      "name": "e2e_L_bulk_w4_singlet_float32.json",
+      "path": "e2e_L_bulk_w4_singlet_float32.json",
+      "sha256": "30e491375bd8d1b57a30f10c4ff76da51789f02d69fa58efd8f1ff2bc11dc41b",
+      "size": "L"
+    },
+    {
+      "channel": "charged_triplet",
+      "dtype": "float32",
+      "energy": -8306.0810546875,
+      "geometry": "bulk_w4",
+      "graph_class": "bulk",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 12,
+      "name": "e2e_L_bulk_w4_charged_triplet_float32.json",
+      "path": "e2e_L_bulk_w4_charged_triplet_float32.json",
+      "sha256": "1a5a8502617ed8e44cf2ea1d85cfa0341e72672d33c085bb8068656cb201660c",
+      "size": "L"
+    },
+    {
+      "channel": "field",
+      "dtype": "float32",
+      "energy": -8319.564453125,
+      "geometry": "bulk_w4",
+      "graph_class": "bulk",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 12,
+      "name": "e2e_L_bulk_w4_field_float32.json",
+      "path": "e2e_L_bulk_w4_field_float32.json",
+      "sha256": "23c7c20afe59b5a8c56f86741af28b27004ae5cb97559f841befa9b39aa07140",
+      "size": "L"
+    },
+    {
+      "channel": "singlet",
+      "dtype": "float64",
+      "energy": -2079.8658481397392,
+      "geometry": "mol_h2o",
+      "graph_class": "molecule",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 3,
+      "name": "e2e_L_mol_h2o_singlet_float64.json",
+      "path": "e2e_L_mol_h2o_singlet_float64.json",
+      "sha256": "615e97bf8e70eba4d5853b62541740fc4dce8dd630969f5c708835c17c9604aa",
+      "size": "L"
+    },
+    {
+      "channel": "charged_triplet",
+      "dtype": "float64",
+      "energy": -2065.938978897968,
+      "geometry": "mol_h2o",
+      "graph_class": "molecule",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 3,
+      "name": "e2e_L_mol_h2o_charged_triplet_float64.json",
+      "path": "e2e_L_mol_h2o_charged_triplet_float64.json",
+      "sha256": "bb9b6f593298f369965323ef0fe41520339917889293d36b76aab6443420e80e",
+      "size": "L"
+    },
+    {
+      "channel": "field",
+      "dtype": "float64",
+      "energy": -2079.854600944203,
+      "geometry": "mol_h2o",
+      "graph_class": "molecule",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 3,
+      "name": "e2e_L_mol_h2o_field_float64.json",
+      "path": "e2e_L_mol_h2o_field_float64.json",
+      "sha256": "961f10492f7ebd32aa9f9c6aa5e24ae1f5b79cd192b756f8c6785288872a7ce2",
+      "size": "L"
+    },
+    {
+      "channel": "fermi_lane",
+      "dtype": "float64",
+      "energy": -2079.8658481397392,
+      "geometry": "mol_h2o",
+      "graph_class": "molecule",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 3,
+      "name": "e2e_L_mol_h2o_fermi_lane_float64.json",
+      "path": "e2e_L_mol_h2o_fermi_lane_float64.json",
+      "sha256": "9fffd9178823c990bba4b65c412f1c29da7590ab99cf8d46e7916827f1269a78",
+      "size": "L"
+    },
+    {
+      "channel": "singlet",
+      "dtype": "float64",
+      "energy": -4159.462070256424,
+      "geometry": "slab_w2",
+      "graph_class": "slab",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 6,
+      "name": "e2e_L_slab_w2_singlet_float64.json",
+      "path": "e2e_L_slab_w2_singlet_float64.json",
+      "sha256": "2843bde1cf5ead8fd00746497ea3b5d329723ee9e2a1011975f7fddaaa294f8d",
+      "size": "L"
+    },
+    {
+      "channel": "charged_triplet",
+      "dtype": "float64",
+      "energy": -4087.6516674273653,
+      "geometry": "slab_w2",
+      "graph_class": "slab",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 6,
+      "name": "e2e_L_slab_w2_charged_triplet_float64.json",
+      "path": "e2e_L_slab_w2_charged_triplet_float64.json",
+      "sha256": "af9af7f22acd2cb5c069bb687a4d4b74d52a4761686c1f82dbbd069855c21782",
+      "size": "L"
+    },
+    {
+      "channel": "field",
+      "dtype": "float64",
+      "energy": -4159.451208766053,
+      "geometry": "slab_w2",
+      "graph_class": "slab",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 6,
+      "name": "e2e_L_slab_w2_field_float64.json",
+      "path": "e2e_L_slab_w2_field_float64.json",
+      "sha256": "38ed2dada43bd333f571d4a4c48e6359f1687b63df2618f8fef0098b382cdcd2",
+      "size": "L"
+    },
+    {
+      "channel": "singlet",
+      "dtype": "float64",
+      "energy": -8319.513384144542,
+      "geometry": "bulk_w4",
+      "graph_class": "bulk",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 12,
+      "name": "e2e_L_bulk_w4_singlet_float64.json",
+      "path": "e2e_L_bulk_w4_singlet_float64.json",
+      "sha256": "1b1ddfc4edc9c3dc5acd9a99da2cb318ee19bcf8bd6c704ccb12ff8f771e2e30",
+      "size": "L"
+    },
+    {
+      "channel": "charged_triplet",
+      "dtype": "float64",
+      "energy": -8306.080082956641,
+      "geometry": "bulk_w4",
+      "graph_class": "bulk",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 12,
+      "name": "e2e_L_bulk_w4_charged_triplet_float64.json",
+      "path": "e2e_L_bulk_w4_charged_triplet_float64.json",
+      "sha256": "e129eb9f7de9d22001b47f57cd0ed4c88ee932da5d9370a7fafa8adffc20ec1d",
+      "size": "L"
+    },
+    {
+      "channel": "field",
+      "dtype": "float64",
+      "energy": -8319.563412752823,
+      "geometry": "bulk_w4",
+      "graph_class": "bulk",
+      "model_sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+      "n_atoms": 12,
+      "name": "e2e_L_bulk_w4_field_float64.json",
+      "path": "e2e_L_bulk_w4_field_float64.json",
+      "sha256": "17d10a1085e1b167e3284721289451b6b37b72a700f21044aaf2d2cb0e9d751f",
+      "size": "L"
     }
   ],
   "repeat_spread": {
@@ -770,6 +1090,48 @@
       "energy_abs": 0.0,
       "forces_max_abs": 1.1920928955078125e-07,
       "stress_max_abs": 2.546585164964199e-11
+    },
+    "e2e_L_bulk_w4_charged_triplet_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 1.1920928955078125e-07,
+      "stress_max_abs": 2.9103830456733704e-10
+    },
+    "e2e_L_bulk_w4_field_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 2.9802322387695312e-08,
+      "stress_max_abs": 7.548806024715304e-11
+    },
+    "e2e_L_bulk_w4_singlet_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 1.862645149230957e-08,
+      "stress_max_abs": 9.458744898438454e-11
+    },
+    "e2e_L_slab_w2_charged_triplet_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 8.642673492431641e-07,
+      "stress_max_abs": 2.764863893389702e-10
+    },
+    "e2e_L_slab_w2_field_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 1.043081283569336e-07,
+      "stress_max_abs": 3.2741809263825417e-11
+    },
+    "e2e_L_slab_w2_singlet_float32.json": {
+      "density_max_abs": 0.0,
+      "dipole_max_abs": 0.0,
+      "energy_abs": 0.0,
+      "forces_max_abs": 1.4901161193847656e-07,
+      "stress_max_abs": 2.1827872842550278e-11
     }
   },
   "repeat_tolerance": {

@@ -4,8 +4,8 @@ The records under ``symmetrix/test/data/polar/e2e_*`` are the frozen torch
 oracle's end-to-end values for the family's parity gate (Task 13 of
 ``plans/2026-10-14-mace-polar-1-support-v1.md``): energy, forces, stress,
 dipole, and the chain's intermediate surfaces, on a molecular, a slab, and a
-periodic fixture, in three channel settings, in fp32 and fp64, for POLAR-1-S
-and POLAR-1-M.  They are captured out of tree by
+periodic fixture, in three channel settings, in fp32 and fp64, for
+POLAR-1-S, POLAR-1-M, and POLAR-1-L. They are captured out of tree by
 ``benchmarks/polar_end_to_end_oracle_runner.py``; this module validates them
 without importing torch.
 
@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -71,9 +72,8 @@ ORACLE_GRAPH_LONGRANGE_VERSION = "0.4.4"
 FROZEN_ELECTROSTATICS = "direct_reciprocal"
 
 # The fixture set the runner declares: sizes x precisions x geometries x
-# channels.  POLAR-1-L is a follow-up record (its 3 interactions are admitted,
-# but the reference set covers the two sizes the plan gates first).
-SIZES = ("S", "M")
+# channels across the committed POLAR-1-S, POLAR-1-M, and POLAR-1-L records.
+SIZES = ("S", "M", "L")
 PRECISIONS = ("float64", "float32")
 GEOMETRIES = {
     "mol_h2o": ("molecule", 3),
@@ -436,6 +436,8 @@ _ORACLE_GRAPH_ELECTROSTATICS_CHECKOUT = optional_checkout(
 )
 
 try:  # pragma: no cover - environment-dependent import guard
+    if os.environ.get("SYMMETRIX_POLAR_ORACLE_RUNTIME") != "1":
+        raise ImportError("Polar oracle runtime is opt-in")
     import sys as _sys
 
     if _ORACLE_MACE_CHECKOUT is not None and _ORACLE_MACE_CHECKOUT.is_dir():
@@ -459,11 +461,6 @@ except ImportError as _error:  # pragma: no cover - environment-dependent
 def _checkpoint_path(size: str) -> Path:
     import os
 
-    if _polar_oracle_import_error is not None:
-        pytest.skip(
-            "the reference comparison requires torch/e3nn/mace/graph_longrange: "
-            f"{_polar_oracle_import_error}"
-        )
     path = os.environ.get(f"SYMMETRIX_POLAR_MODEL_{size}")
     if not path:
         pytest.skip(
@@ -1118,6 +1115,14 @@ def test_the_backbone_half_is_parity_clean_against_the_oracle_reference(tmp_path
     diagnostic surface, then compares the remaining backbone energy against
     the frozen oracle's atomic-reference-plus-interaction record.
     """
+
+    if os.environ.get("SYMMETRIX_POLAR_ORACLE_RUNTIME") != "1":
+        pytest.skip("one-time Polar oracle opening is opt-in")
+    if _polar_oracle_import_error is not None:
+        pytest.skip(
+            "the reference comparison requires torch/e3nn/mace/graph_longrange: "
+            f"{_polar_oracle_import_error}"
+        )
 
     import json as _json
 

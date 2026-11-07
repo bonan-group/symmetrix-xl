@@ -10,25 +10,29 @@ from __future__ import annotations
 
 from typing import Any
 
-import torch
-
-# e3nn 0.4.x stores trusted package constants containing slices, which newer
-# PyTorch releases only unpickle inside an explicit weights-only allowlist.
-# Importing e3nn outside the allowlist raises, so the guard wraps the import and
-# degrades to a plain import on a PyTorch that predates the allowlist.
-_safe_globals = getattr(torch.serialization, "safe_globals", None)
-if _safe_globals is None:
-    from e3nn import o3
-else:
-    with _safe_globals([slice]):
-        from e3nn import o3
-
-# Keep local imports after the guarded e3nn import so package initialization
-# cannot run before the safe-globals context has loaded e3nn.
-from .mace_nonlinear_execution_contract import (  # noqa: E402
+from .mace_nonlinear_execution_contract import (
     MH1_CONTRACT_KEY,
     maybe_make_execution_mh1_contract,
 )
+
+torch = None
+o3 = None
+
+
+def _load_torch_dependencies() -> None:
+    global torch, o3
+    if torch is not None:
+        return
+    import torch as torch_module
+
+    safe_globals = getattr(torch_module.serialization, "safe_globals", None)
+    if safe_globals is None:
+        from e3nn import o3 as o3_module
+    else:
+        with safe_globals([slice]):
+            from e3nn import o3 as o3_module
+    torch = torch_module
+    o3 = o3_module
 
 
 def _tensor(value: torch.Tensor) -> dict[str, Any]:
@@ -283,6 +287,7 @@ def extract_mace_nonlinear_data(
     given, is written to ``radial_embedding`` and sets the node count of the
     runtime pair-spline table (the runtime default is 256).
     """
+    _load_torch_dependencies()
     from mace.modules.blocks import RealAgnosticResidualNonLinearInteractionBlock
 
     if not model.interactions or not all(
