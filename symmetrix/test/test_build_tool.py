@@ -2508,13 +2508,17 @@ def test_release_metadata_accepts_unreleased_until_publication(tmp_path):
         release_check.release_metadata(prepared, require_dated=True)
 
     dated = prepared_changelog.replace(
-        "## 0.2.0 - Unreleased", "## 0.2.0 - 2026-10-25", 1
+        "## 0.2.0 - Unreleased", "## 0.2.0 - 2026-11-05", 1
     )
     (prepared / "CHANGELOG.md").write_text("# Changelog\n\n" + dated)
     assert (
         release_check.release_metadata(prepared, require_dated=True)["date"]
-        == "2026-10-25"
+        == "2026-11-05"
     )
+    chronology_error = dated.replace("2026-11-05", "2026-10-25", 1)
+    (prepared / "CHANGELOG.md").write_text("# Changelog\n\n" + chronology_error)
+    with pytest.raises(ValueError, match="predates the latest prior release"):
+        release_check.release_metadata(prepared, require_dated=True)
 
 
 def test_publication_ref_must_be_the_matching_version_tag():
