@@ -33,8 +33,12 @@ exist, but PME remains outside the qualified public release contract. Select
 `polar_electrostatics="direct_reciprocal"` explicitly to reproduce the strict
 periodic frozen-oracle configuration. FP32 and FP64 are
 qualified on CPU and CUDA for the released M checkpoint, including E, EF,
-EFS, and dipole; isolated public stress is exactly zero. HIP is not currently
-runtime-qualified. CUDA real-space reverse automatically uses the bounded-memory
+EFS, and dipole; isolated public stress is exactly zero. HIP `gfx1151` is
+runtime-qualified from source builds only for Polar S/M/L in FP32/FP64, both
+`reference` and `direct`, on single-GPU molecule, slab, and bulk energy,
+forces, and stress workloads. HIP wheels, other HIP architectures,
+multi-GPU/distributed execution, and PME publication remain excluded.
+CUDA real-space reverse automatically uses the bounded-memory
 `pair_atomic` strategy.
 `materialized_forward` is only a forced internal experiment.
 
@@ -68,10 +72,11 @@ a separate future delivery.
 The scalar-only, one-interaction S backbone supports both native `reference`
 execution and specialized generated `direct` execution, including its linear
 energy readout, retained features, and the Polar chain's seeded reverse.
-Focused CPU and CUDA sm120 checks cover FP32/FP64, released-S frozen
-comparisons, and synthetic force/stress derivatives. These checks precede
-final combined-source release qualification, which remains pending. They do
-not qualify HIP, released Polar-L, multi-GPU execution, or distributed LAMMPS.
+Focused CPU, CUDA sm120, and HIP gfx1151 checks cover FP32/FP64, released-S
+frozen comparisons, and synthetic force/stress derivatives. HIP evidence is
+source-build/runtime evidence only; other HIP architectures, multi-GPU/
+distributed execution, PME publication, and distributed Polar LAMMPS remain
+excluded.
 
 ## MACE model contracts and usage
 
