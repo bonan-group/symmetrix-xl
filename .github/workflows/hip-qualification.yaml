@@ -23,35 +23,153 @@ jobs:
       LD_LIBRARY_PATH: /opt/rocm/lib
       KOKKOS_NUM_THREADS: 1
       SYMMETRIX_REQUIRED_TEST_MANIFEST: hip_required_tests.json
+      HIP_ARTIFACT_DIR: ${{ runner.temp }}/hip-qualification
     steps:
       - name: Clone trusted repository revision
         uses: actions/checkout@v6
         with:
           submodules: recursive
 
-      - name: Record device and ROCm inventory
-        run: |
-          /opt/rocm/bin/rocminfo
-          amd-smi static --gpu 0
-          /opt/rocm/bin/hipcc --version
-
       - name: Set up uv
         uses: astral-sh/setup-uv@v8.3.2
         with:
           python-version: "3.12"
 
+      - name: Prepare isolated task runtime roots
+        run: |
+          mkdir -p "$HIP_ARTIFACT_DIR"
+          for name in xdg-cache xdg-runtime tmp comgr-cache hip-cache; do
+            mkdir -p "$RUNNER_TEMP/symmetrix-hip-$name"
+            chmod 700 "$RUNNER_TEMP/symmetrix-hip-$name"
+          done
+          {
+            echo "XDG_CACHE_HOME=$RUNNER_TEMP/symmetrix-hip-xdg-cache"
+            echo "XDG_RUNTIME_DIR=$RUNNER_TEMP/symmetrix-hip-xdg-runtime"
+            echo "TMPDIR=$RUNNER_TEMP/symmetrix-hip-tmp"
+            echo "TMP=$RUNNER_TEMP/symmetrix-hip-tmp"
+            echo "TEMP=$RUNNER_TEMP/symmetrix-hip-tmp"
+            echo "ROCM_COMGR_CACHE_DIR=$RUNNER_TEMP/symmetrix-hip-comgr-cache"
+            echo "HIP_CACHE_DIR=$RUNNER_TEMP/symmetrix-hip-hip-cache"
+          } >> "$GITHUB_ENV"
+          {
+            printf 'task_roots\n'
+            grep -E '^(XDG_CACHE_HOME|XDG_RUNTIME_DIR|TMPDIR|TMP|TEMP|ROCM_COMGR_CACHE_DIR|HIP_CACHE_DIR)=' "$GITHUB_ENV"
+            printf '\ndisk_inode_inventory\n'
+            df -h "$RUNNER_TEMP" /tmp
+            df -i "$RUNNER_TEMP" /tmp
+          } | tee "$HIP_ARTIFACT_DIR/task-roots-and-disk.txt"
+
+      - name: Record source and submodule provenance
+        run: |
+          mkdir -p "$HIP_ARTIFACT_DIR"
+          git submodule status --recursive | tee "$HIP_ARTIFACT_DIR/submodule-status.txt"
+          git ls-files -s | awk '$1 == 160000 {print}' | tee "$HIP_ARTIFACT_DIR/gitlinks.txt"
+          git rev-parse HEAD | tee "$HIP_ARTIFACT_DIR/commit.txt"
+          git status --porcelain=v1 --untracked-files=all | tee "$HIP_ARTIFACT_DIR/status.txt"
+          test -z "$(cat "$HIP_ARTIFACT_DIR/status.txt")"
+          source_fingerprint="$(uv run --python 3.12 --no-project python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_source_fingerprint; print(symmetrix_source_fingerprint(Path.cwd()))')"
+          native_fingerprint="$(uv run --python 3.12 --no-project python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_native_source_fingerprint; print(symmetrix_native_source_fingerprint(Path.cwd()))')"
+          printf 'source_content_sha256=%s\nnative_source_content_sha256=%s\n' "$source_fingerprint" "$native_fingerprint" | tee "$HIP_ARTIFACT_DIR/source-fingerprints.txt"
+          echo "SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint" >> "$GITHUB_ENV"
+          echo "SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256=$native_fingerprint" >> "$GITHUB_ENV"
+
+      - name: Record device and ROCm inventory
+        run: |
+          { /opt/rocm/bin/rocminfo; amd-smi static --gpu 0; /opt/rocm/bin/hipcc --version; \
+            command -v hipcc; hipcc --version; \
+            for tool in hipfft rocfft rocblas; do command -v "$tool" || true; done; \
+            find /opt/rocm -maxdepth 3 -type f \( -name 'libhipfft*' -o -name 'librocfft*' -o -name 'librocblas*' \) -print; } \
+            | tee "$HIP_ARTIFACT_DIR/rocm-gpu-inventory.txt"
+
       - name: Build clean HIP extension
         run: |
           uv venv --clear
           source .venv/bin/activate
+          cat > "$HIP_ARTIFACT_DIR/cpu-build-command.txt" <<'EOF'
+          python tools/symmetrix_build.py install --backend cpu --cpu-target x86-64-v3 --build-root "$RUNNER_TEMP/symmetrix-cpu-build" --generator 'Unix Makefiles'
+          EOF
+          python tools/symmetrix_build.py install \
+            --backend cpu --cpu-target x86-64-v3 \
+            --build-root "$RUNNER_TEMP/symmetrix-cpu-build" \
+            --generator 'Unix Makefiles'
+          find "$RUNNER_TEMP/symmetrix-cpu-build" -name CMakeCache.txt -o -name '*manifest*.json' -o -name '*invocation*.json' | while read -r file; do cp --parents "$file" "$HIP_ARTIFACT_DIR"; done
+          cat > "$HIP_ARTIFACT_DIR/build-command.txt" <<'EOF'
+          uv pip install --verbose "./symmetrix[test]" --config-settings=build-dir=$RUNNER_TEMP/symmetrix-hip-build --config-settings=cmake.define.CMAKE_C_COMPILER=/usr/bin/gcc --config-settings=cmake.define.CMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc --config-settings=cmake.define.CMAKE_PREFIX_PATH=/opt/rocm --config-settings=cmake.define.SYMMETRIX_DEVICE_BACKEND=HIP --config-settings=cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256="$SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256" --config-settings=cmake.define.SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256="$SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256" --config-settings=cmake.define.Kokkos_ARCH_AMD_GFX1100=ON --config-settings=cmake.define.Kokkos_IMPL_AMDGPU_FLAGS=--offload-arch=gfx1151 --config-settings=cmake.define.Kokkos_IMPL_AMDGPU_LINK=--offload-arch=gfx1151
+          EOF
           uv pip install --verbose "./symmetrix[test]" \
+            --config-settings=build-dir="$RUNNER_TEMP/symmetrix-hip-build" \
             --config-settings=cmake.define.CMAKE_C_COMPILER=/usr/bin/gcc \
             --config-settings=cmake.define.CMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc \
             --config-settings=cmake.define.CMAKE_PREFIX_PATH=/opt/rocm \
             --config-settings=cmake.define.SYMMETRIX_DEVICE_BACKEND=HIP \
+            --config-settings=cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256="$SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256" \
+            --config-settings=cmake.define.SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256="$SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256" \
             --config-settings=cmake.define.Kokkos_ARCH_AMD_GFX1100=ON \
             --config-settings=cmake.define.Kokkos_IMPL_AMDGPU_FLAGS=--offload-arch=gfx1151 \
             --config-settings=cmake.define.Kokkos_IMPL_AMDGPU_LINK=--offload-arch=gfx1151
+          find "$RUNNER_TEMP/symmetrix-hip-build" -name CMakeCache.txt -o -name '*manifest*.json' -o -name '*invocation*.json' | while read -r file; do cp --parents "$file" "$HIP_ARTIFACT_DIR"; done
+
+      - name: Select architecture-qualified HIP backend
+        run: |
+          source .venv/bin/activate
+          python - <<'PY'
+          import importlib.metadata as metadata
+          import json
+          import os
+          from pathlib import Path
+          candidates = []
+          for entry in metadata.entry_points(group="symmetrix.backends"):
+              for file in entry.dist.files or ():
+                  if str(file).endswith("backend.json"):
+                      descriptor = json.loads((Path(entry.dist.locate_file(file))).read_text())
+                      if descriptor.get("backend") == "hip" and descriptor.get("architecture") == "gfx1151":
+                          selector = descriptor.get("selector")
+                          assert isinstance(selector, str) and selector, descriptor
+                          assert entry.name == selector, (entry.name, selector)
+                          candidates.append((selector, descriptor))
+          assert len(candidates) == 1, candidates
+          selector, descriptor = candidates[0]
+          (Path(os.environ["HIP_ARTIFACT_DIR"]) / "selected-backend.json").write_text(json.dumps({"selector": selector, "descriptor": descriptor}, indent=2))
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"SYMMETRIX_BACKEND={selector}\n")
+          PY
+
+      - name: Verify installed backend provenance
+        run: |
+          source .venv/bin/activate
+          symmetrix backend show --probe | tee "$HIP_ARTIFACT_DIR/backend.txt"
+          symmetrix doctor --json | tee "$HIP_ARTIFACT_DIR/doctor.json"
+          symmetrix version --probe --json | tee "$HIP_ARTIFACT_DIR/version-probe.json"
+          python - "$HIP_ARTIFACT_DIR/version-probe.json" "$HIP_ARTIFACT_DIR/provenance.json" <<'PY'
+          import hashlib, json, pathlib, subprocess, sys
+          from symmetrix import symmetrix as native
+          record = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert record["probe_status"] == "ok", record
+          backend, build = record["probe"]["backend"], record["probe"]["build_info"]
+          assert backend["source_commit"] == build["source_commit"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          assert backend["source_dirty"] is build["source_dirty"] is False
+          for key in ("source_content_sha256", "native_source_content_sha256"):
+              assert backend[key] == build[key] and len(backend[key]) == 64
+          paths = {"package": str(pathlib.Path(__import__("symmetrix").__file__).resolve())}
+          paths["extension"] = str(pathlib.Path(native.__file__).resolve())
+          build_info = native._backend_build_info()
+          assert build_info.get("backend") == "hip", build_info
+          native._init_kokkos()
+          try:
+              execution_space = native._kokkos_default_execution_space()
+              device_environment = getattr(native, "_execution_device_execution_environment", lambda: {})()
+              device_sentinel = getattr(native, "_kokkos_device_sentinel", lambda: None)()
+          finally:
+              native._finalize_kokkos()
+          assert execution_space == "HIP", execution_space
+          assert device_sentinel is True, device_environment
+          paths["native_backend"] = build_info.get("backend")
+          paths["execution_space"] = execution_space
+          paths["device_environment"] = device_environment
+          paths["device_sentinel"] = device_sentinel
+          paths["extension_sha256"] = hashlib.sha256(pathlib.Path(paths["extension"]).read_bytes()).hexdigest()
+          json.dump({"version": record, "paths": paths, "native_build_info": build_info}, open(sys.argv[2], "w"), indent=2)
+          PY
 
       - name: Compile ordinary R1 with required hipRTC
         env:
@@ -147,4 +265,12 @@ jobs:
 
       - name: Record final device health
         if: always()
-        run: amd-smi metric --gpu 0
+        run: amd-smi metric --gpu 0 | tee "$HIP_ARTIFACT_DIR/final-device-health.txt"
+
+      - name: Upload HIP provenance and qualification records
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hip-gfx1151-qualification
+          path: ${{ runner.temp }}/hip-qualification
+          if-no-files-found: warn
