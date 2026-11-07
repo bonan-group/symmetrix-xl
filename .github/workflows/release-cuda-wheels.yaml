@@ -96,10 +96,13 @@ jobs:
           done
 
       - name: Install each CUDA wheel without dependencies
+        env:
+          CUDA_MAJOR: ${{ matrix.cuda_major }}
+          CUDA_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          python -m venv "$RUNNER_TEMP/cuda-wheelcheck"
-          "$RUNNER_TEMP/cuda-wheelcheck/bin/pip" install --no-deps wheelhouse/release/*.whl
+          python3.12 -m venv "$RUNNER_TEMP/cuda-wheelcheck"
+          "$RUNNER_TEMP/cuda-wheelcheck/bin/pip" install --no-deps wheelhouse/release/*-cp312-cp312-*.whl
           "$RUNNER_TEMP/cuda-wheelcheck/bin/python" - <<'PY'
           import importlib.metadata as metadata
           import json
@@ -131,8 +134,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}
+          path: wheelhouse/release/*.whl
+          if-no-files-found: error
+
+      - name: Upload CUDA wheel audit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}-audit
           path: |
-            wheelhouse/release/*.whl
             wheelhouse/release/*.auditwheel.txt
             release-manifest/SHA256SUMS
           if-no-files-found: error
@@ -163,14 +172,18 @@ jobs:
           name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}
           path: wheelhouse
 
+      - name: Download CUDA wheel audit artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}-audit
+          path: audit
+
       - name: Verify wheel SHA256 manifest
         run: |
-          manifest="$(find wheelhouse -name SHA256SUMS -print -quit)"
-          test -n "$manifest"
+          manifest=audit/SHA256SUMS
+          test -f "$manifest"
           while read -r checksum name; do
-            wheel="$(find wheelhouse -name "$name" -type f -print -quit)"
-            test -n "$wheel"
-            printf '%s  %s\n' "$checksum" "$wheel" | sha256sum -c -
+            printf '%s  wheelhouse/%s\n' "$checksum" "$name" | sha256sum -c -
           done < "$manifest"
 
       - name: Publish to TestPyPI
@@ -206,14 +219,18 @@ jobs:
           name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}
           path: wheelhouse
 
+      - name: Download CUDA wheel audit artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}-audit
+          path: audit
+
       - name: Verify wheel SHA256 manifest
         run: |
-          manifest="$(find wheelhouse -name SHA256SUMS -print -quit)"
-          test -n "$manifest"
+          manifest=audit/SHA256SUMS
+          test -f "$manifest"
           while read -r checksum name; do
-            wheel="$(find wheelhouse -name "$name" -type f -print -quit)"
-            test -n "$wheel"
-            printf '%s  %s\n' "$checksum" "$wheel" | sha256sum -c -
+            printf '%s  wheelhouse/%s\n' "$checksum" "$name" | sha256sum -c -
           done < "$manifest"
 
       - name: Publish to PyPI
