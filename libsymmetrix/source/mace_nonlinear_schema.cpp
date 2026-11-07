@@ -529,8 +529,6 @@ MaceMH1FamilyDescriptor analyze_mh1_family_architecture(
     const auto full = spherical_blocks(result.node_channels, result.l_max);
     const auto gate_input = spherical_blocks(
         result.node_channels, result.l_max, result.l_max+1);
-    const std::vector<std::tuple<int, int, int>> node_hidden = {
-        {result.node_channels, 0, 1}, {result.node_channels, 1, -1}};
     const std::vector<std::tuple<int, int, int>> scalar_hidden = {
         {result.node_channels, 0, 1}};
     // Polar-S retains its single scalar product and reads its energy through
@@ -542,6 +540,24 @@ MaceMH1FamilyDescriptor analyze_mh1_family_architecture(
         && blocks_equal(
             Irreps(data.at("products").at(0).at("symmetric_contractions")
                 .at("irreps_out").get<std::string>()), scalar_hidden);
+    std::vector<std::tuple<int, int, int>> node_hidden = {
+        {result.node_channels, 0, 1}, {result.node_channels, 1, -1}};
+    if (keep_last && !scalar_polar) {
+        node_hidden.clear();
+        const auto& retained = result.layers.front().product_output_blocks;
+        if (retained.size() < 2 || retained.size() > 3)
+            return reject("MH-1 retained product representation is inconsistent.");
+        for (std::size_t block = 0; block < retained.size(); ++block) {
+            const auto expected_parity = block % 2 == 0 ? 1 : -1;
+            if (retained[block].multiplicity != result.node_channels
+                || retained[block].l != static_cast<int>(block)
+                || retained[block].parity != expected_parity)
+                return reject(
+                    "MH-1 retained product representation is inconsistent.");
+            node_hidden.emplace_back(
+                result.node_channels, static_cast<int>(block), expected_parity);
+        }
+    }
     // Every layer but the last carries the node representation its successor
     // consumes; the last layer carries the scalar representation its readout
     // consumes.  The rule is stated against the layer's position, so a model
@@ -565,13 +581,15 @@ MaceMH1FamilyDescriptor analyze_mh1_family_architecture(
                 expected_nodes))
             return reject_layer(layer, "node representation");
 
-        const std::vector<std::tuple<int, int, int>> expected_edges =
-            layer == 0
-            ? std::vector<std::tuple<int, int, int>>{
-                {layer_descriptor.uvu_channels, 0, 1}}
-            : std::vector<std::tuple<int, int, int>>{
-                {layer_descriptor.uvu_channels, 0, 1},
-                {layer_descriptor.uvu_channels, 1, -1}};
+        std::vector<std::tuple<int, int, int>> expected_edges;
+        if (layer == 0)
+            expected_edges.emplace_back(layer_descriptor.uvu_channels, 0, 1);
+        else
+            for (const auto& [multiplicity, l, parity] : node_hidden) {
+                (void)multiplicity;
+                expected_edges.emplace_back(
+                    layer_descriptor.uvu_channels, l, parity);
+            }
         if (!blocks_equal(
                 Irreps(interaction.at("edge_irreps").get<std::string>()),
                 expected_edges))

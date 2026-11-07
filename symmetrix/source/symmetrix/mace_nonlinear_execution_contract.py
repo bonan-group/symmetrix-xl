@@ -1,4 +1,4 @@
-"""Canonical generation contracts for two-interaction MACE-MH-1 UVU kernels.
+"""Canonical generation contracts for MACE-MH-1 UVU kernels.
 
 The contract deliberately contains no learned tensor values.  It identifies the
 generated program shared by checkpoints with the same architecture while the
@@ -613,8 +613,7 @@ def _product_descriptor(
         )
         if [_block_identity(block) for block in output_blocks] != expected_output:
             raise ValueError(
-                f"products[{index}] output irreps are outside the MH-1 "
-                "support matrix"
+                f"products[{index}] output irreps are outside the MH-1 support matrix"
             )
 
     for field in ("node_feats_irreps", "target_irreps"):
@@ -877,9 +876,19 @@ def project_execution_mh1_product_contract(
         expected_offset += channels * width
     if not input_topology_is_valid:
         raise ValueError("MH-1 product input block topology is inconsistent")
-    expected_output = (
-        [(channels, 0, "e")] if final else [(channels, 0, "e"), (channels, 1, "o")]
-    )
+    if final:
+        expected_output = [(channels, 0, "e")]
+    else:
+        # M0 supports every contiguous output band declared by the product.
+        # Polar-L retains l=2 descriptors, while the smaller backbones stop at
+        # l=1.  Keep scalar-only output reserved for the final M1 contract.
+        output_l_max = len(output_blocks) - 1
+        if output_l_max < 1 or len(output_blocks) > len(input_blocks):
+            raise ValueError("MH-1 product final marker and output topology disagree")
+        expected_output = [
+            (channels, l_value, "e" if l_value % 2 == 0 else "o")
+            for l_value in range(output_l_max + 1)
+        ]
     expected_offset = 0
     output_topology_is_valid = len(output_blocks) == len(expected_output)
     for block_index, block in enumerate(output_blocks):
@@ -1103,7 +1112,7 @@ def project_execution_mh1_product_contract(
         "monomials": monomials[0] if final else monomials,
     }
     if not final:
-        arguments["output_l_max"] = 1
+        arguments["output_l_max"] = len(expected_output) - 1
     return builder(**arguments)
 
 

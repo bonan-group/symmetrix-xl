@@ -503,6 +503,15 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
         .def(
             "_set_execution_mh1_node_arena_tile_rows_for_testing",
             &Evaluator::set_execution_mh1_node_arena_tile_rows_for_testing)
+        .def(
+            "_execution_mh1_node_arena_bytes_for_testing",
+            &Evaluator::execution_mh1_node_arena_bytes_for_testing,
+            py::arg("num_nodes"),py::arg("tile_rows"))
+        .def(
+            "_select_execution_mh1_capacity_node_arena_tile_rows_for_testing",
+            &Evaluator::
+                select_execution_mh1_capacity_node_arena_tile_rows_for_testing,
+            py::arg("num_nodes"))
         .def_property_readonly(
             "factorized_forward_evaluation_count",
             &Evaluator::factorized_forward_evaluation_count)

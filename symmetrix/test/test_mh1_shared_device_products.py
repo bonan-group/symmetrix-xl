@@ -232,7 +232,8 @@ def test_device_launch_plans_bind_the_active_module_abis():
 
 
 def test_cuda_launch_plan_exposes_linear2_as_typed_dense_operations():
-    plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(_contract(), 80)
+    contract = _contract()
+    plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(contract, 80)
 
     assert plan["schema"] == "symmetrix.jit.mh1.cuda-launch-plan/7"
     assert plan["version"] == 7
@@ -253,6 +254,11 @@ def test_cuda_launch_plan_exposes_linear2_as_typed_dense_operations():
         assert reverse[0]["direction"] == "reverse"
         assert forward[0]["batch_mode"] == "grouped_components"
         assert reverse[0]["batch_mode"] == "grouped_components"
+        linear_1_weight_count = mh1_codegen._dense_linear_weight_count(
+            contract["node_program"]["layers"][layer["index"]]["linears"]["linear_1"]
+        )
+        assert forward[0]["parameters"]["offset"] == linear_1_weight_count
+        assert reverse[0]["parameters"]["offset"] == linear_1_weight_count
         assert len(forward[0]["blocks"]) == 4
         assert len(reverse[0]["blocks"]) == 4
         assert all(
@@ -263,6 +269,80 @@ def test_cuda_launch_plan_exposes_linear2_as_typed_dense_operations():
             f"_l{layer['index']}_reverse_linear2_grouped" in launch["kernel"]
             for launch in reverse[0]["fallback"]
         )
+
+
+def test_cuda_launch_plan_uses_dense_message_forward_and_reverse():
+    plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(_contract(), 80)
+
+    for layer in plan["nodes"]:
+        index = layer["index"]
+        forward = [
+            operation
+            for operation in layer["split_pre_forward"]
+            if operation.get("name") == "linear_1"
+        ]
+        reverse = [
+            operation
+            for operation in layer["split_pre_reverse"]
+            if operation.get("name") == "linear_1"
+        ]
+        assert [operation["direction"] for operation in forward] == ["forward"]
+        assert [operation["direction"] for operation in reverse] == ["reverse"]
+        assert forward[0]["accumulate"] is True
+        assert reverse[0]["accumulate"] is False
+        assert forward[0]["parameters"]["offset"] == 0
+        assert reverse[0]["input"]["field"] == "node_arena"
+        assert reverse[0]["output"]["field"] == "message_adjoint"
+        scale_kernel = (
+            f"symmetrix_execution_mh1_split_message_scale_forward_kernel_{index}"
+        )
+        scale_position = next(
+            position
+            for position, operation in enumerate(layer["split_pre_forward"])
+            if operation.get("kernel") == scale_kernel
+        )
+        assert scale_position < layer["split_pre_forward"].index(forward[0])
+        assert all(
+            f"_l{index}_forward_message_grouped" in launch["kernel"]
+            for launch in forward[0]["fallback"]
+        )
+        assert all(
+            f"_l{index}_reverse_message_grouped" in launch["kernel"]
+            for launch in reverse[0]["fallback"]
+        )
+
+
+def test_retain_interaction_replays_message_with_dense_linear():
+    plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
+        _contract(), 80, node_state_policy="retain-interaction-v1"
+    )
+
+    for layer in plan["nodes"]:
+        index = layer["index"]
+        replay = [
+            operation
+            for operation in layer["split_pre_reverse"]
+            if operation.get("name") == "linear_1_replay"
+        ]
+        assert [operation["direction"] for operation in replay] == ["forward"]
+        assert replay[0]["accumulate"] is True
+        assert replay[0]["input"]["field"] == "messages"
+        scale_kernel = (
+            f"symmetrix_execution_mh1_split_message_scale_replay_kernel_{index}"
+        )
+        scale_position = next(
+            position
+            for position, operation in enumerate(layer["split_pre_reverse"])
+            if operation.get("kernel") == scale_kernel
+        )
+        replay_position = layer["split_pre_reverse"].index(replay[0])
+        restore_position = next(
+            position
+            for position, operation in enumerate(layer["split_pre_reverse"])
+            if operation.get("kernel")
+            == (f"symmetrix_execution_mh1_split_message_restore_replay_kernel_{index}")
+        )
+        assert scale_position < replay_position < restore_position
 
 
 def test_dense_linear_grouping_requires_uniform_contiguous_blocks():
@@ -291,6 +371,11 @@ def test_dense_linear_grouping_requires_uniform_contiguous_blocks():
     noncontiguous = tuple(dict(block) for block in grouped)
     noncontiguous[1]["output_offset"] += 1
     assert mh1_codegen._dense_linear_batch_mode(noncontiguous) == "block_strided"
+
+
+def test_dense_message_workspace_requires_residual_and_message_storage():
+    assert mh1_codegen._dense_message_workspace_fits(44, 36, 80)
+    assert not mh1_codegen._dense_message_workspace_fits(44, 42, 80)
 
 
 def _surrounding_shape(layer):
@@ -332,6 +417,7 @@ def test_generation_19_uses_qualified_external_surrounding_schedule():
                     32,
                     256,
                 ),
+                ("message_scale_forward_kernel_0", "persistent_nodes", None, 128),
                 (
                     "node_grouped_l0_forward_message_grouped",
                     "node_channel_tiles",
@@ -392,6 +478,7 @@ def test_generation_19_uses_qualified_external_surrounding_schedule():
                     32,
                     256,
                 ),
+                ("message_scale_forward_kernel_1", "persistent_nodes", None, 128),
                 (
                     "node_grouped_l1_forward_message_grouped",
                     "node_channel_tiles",
@@ -557,7 +644,7 @@ def test_generation_19_uses_qualified_external_surrounding_schedule():
     (
         ("full-retention-v1", "tuned-external-surrounding-retained-v1"),
         ("reuse-adjoints-v1", "tuned-external-surrounding-retained-v1"),
-        ("retain-interaction-v1", "composed-v5-pre-gate-replay-v1"),
+        ("retain-interaction-v1", "composed-v5-grouped-pre-gate-replay-v2"),
         ("recompute-v1", "composed-v5-full-replay-v1"),
     ),
 )
@@ -583,13 +670,14 @@ def test_generation_19_schedule_names_truthfully_describe_state_replay(
         ]
         for layer in plan["nodes"]
     ]
-    assert launch_counts[0] == [1, 6, 3, 3, 5, 1]
+    replay_launches = 4 if policy == "retain-interaction-v1" else 0
+    assert launch_counts[0] == [1, 7, 3, 3, 5 + replay_launches, 1]
     assert launch_counts[1] == [
         1,
-        6,
+        7,
         2,
         2 if policy == "recompute-v1" else 5,
-        7,
+        7 + replay_launches,
         1,
     ]
     for layer in plan["nodes"]:
@@ -730,6 +818,86 @@ def test_split_phase_full_retention_stores_and_consumes_pre_gate():
     assert "const float value = (retained_pre_gate)[column]" in retained_external
     assert "args.retained_pre_gate + node" not in recompute_external
     assert "retained_pre_gate[column] = arena[column]" not in recompute_external
+
+
+def test_split_pre_gate_replay_uses_grouped_reverse_packet_linears():
+    contract = _contract()
+    source = mh1_codegen.render_execution_mh1_cuda_module_v4(
+        contract, 80, node_state_policy="retain-interaction-v1"
+    )
+    plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
+        contract,
+        80,
+        node_state_policy="retain-interaction-v1",
+        dense_policy="generated",
+    )
+
+    for index, layer in enumerate(plan["nodes"]):
+        kernels = [operation["kernel"] for operation in layer["split_pre_reverse"]]
+        residual = (
+            "symmetrix_execution_mh1_split_"
+            f"node_grouped_l{index}_reverse_replay_residual_grouped"
+        )
+        message = (
+            "symmetrix_execution_mh1_split_"
+            f"node_grouped_l{index}_reverse_replay_message_grouped"
+        )
+        gate = f"symmetrix_execution_mh1_split_pre_gate_reverse_kernel_{index}"
+        assert kernels.index(residual) < kernels.index(message) < kernels.index(gate)
+
+        residual_source = source.split(f"{residual}(", 1)[1].split(
+            'extern "C" __global__ void', 1
+        )[0]
+        message_source = source.split(f"{message}(", 1)[1].split(
+            'extern "C" __global__ void', 1
+        )[0]
+        assert "SymmetrixJitMH1CudaNodeReverseArgsV5 args" in residual_source
+        assert "SymmetrixJitMH1CudaNodeReverseArgsV5 args" in message_source
+        assert "args.node_arena +" in residual_source
+        assert "args.node_arena +" in message_source
+        assert "args.node_density[node_" in message_source
+
+    assert "norm_res_recompute" not in source
+    assert "norm_msg_recompute" not in source
+
+
+def test_split_full_recompute_keeps_consistent_scalar_pre_gate_replay():
+    contract = _contract()
+    source = mh1_codegen.render_execution_mh1_cuda_module_v4(
+        contract, 80, node_state_policy="recompute-v1"
+    )
+    plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
+        contract, 80, node_state_policy="recompute-v1", dense_policy="generated"
+    )
+
+    assert "reverse_replay_residual" not in source
+    assert "reverse_replay_message" not in source
+    assert "l0_norm_res_recompute" in source
+    assert "l1_norm_msg_recompute" in source
+    assert all(
+        "reverse_replay" not in operation["kernel"]
+        for layer in plan["nodes"]
+        for operation in layer["split_pre_reverse"]
+    )
+
+
+def test_split_pre_gate_full_retention_does_not_schedule_grouped_replay():
+    contract = _contract()
+    source = mh1_codegen.render_execution_mh1_cuda_module_v4(
+        contract, 80, node_state_policy="full-retention-v1"
+    )
+    plan = mh1_codegen.execution_mh1_cuda_module_v4_launch_plan(
+        contract, 80, node_state_policy="full-retention-v1"
+    )
+
+    assert "reverse_replay_residual" not in source
+    assert "reverse_replay_message" not in source
+    assert all(
+        "reverse_replay" not in operation["kernel"]
+        for layer in plan["nodes"]
+        for operation in layer["split_pre_reverse"]
+        if "kernel" in operation
+    )
 
 
 def test_hip_device_module_uses_the_same_split_boundary():

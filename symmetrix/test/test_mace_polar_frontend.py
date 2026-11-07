@@ -5006,14 +5006,8 @@ def test_the_released_checkpoints_load_and_evaluate_through_the_family_entry(
     The released checkpoints are the family's admission gate: they carry the
     spellings and the readout classes the polar schema exists for, and they
     must reach a compiled program whose backbone scales with their own
-    interaction count.  All three are admitted at the evaluator level; S and M
-    then evaluate through the family's calculator (energy, forces, stress),
-    while L's *composition* is refused by name: its per-layer node features are
-    l<=2 (512 channels x (1+3+5) = 4608) and the model-convention conversion
-    the chain's input needs is landed for l<=1 only, so L parity stays a
-    follow-up record.  The refusal is asserted here, not env-skipped, so a
-    silent regression to "the backbone half served against the composed energy"
-    cannot hide behind a skip.
+    interaction count.  All three evaluate through the family's calculator;
+    L additionally exercises retained l=2 descriptors and a third interaction.
     """
 
     import numpy as np
@@ -5034,6 +5028,12 @@ def test_the_released_checkpoints_load_and_evaluate_through_the_family_entry(
     evaluator = evaluator_class(str(model_path))
     assert isinstance(evaluator, evaluator_class)
     assert evaluator.has_polar_long_range_contract
+    assert evaluator.uses_mh1_fast_path
+    assert evaluator.supports_factorized
+    assert (
+        len(evaluator.execution_mh1_retained_interaction_output_dimensions)
+        == facts["interaction_count"]
+    )
 
     nodes = _program_nodes(evaluator.family_program)
     assert evaluator.family_program["family"] == entry.capabilities.family
@@ -5054,11 +5054,6 @@ def test_the_released_checkpoints_load_and_evaluate_through_the_family_entry(
     assert set(family_registry.capabilities_of(entry, evaluator)) == set(
         family_registry.CAPABILITY_KEYS
     )
-
-    if size == "L":
-        with pytest.raises(RuntimeError, match="l<=2"):
-            Symmetrix(str(model_path), dtype="float64", streamed_edges="auto")
-        return
 
     calculator = Symmetrix(str(model_path), dtype="float64", streamed_edges="auto")
     assert isinstance(calculator.evaluator, evaluator_class)

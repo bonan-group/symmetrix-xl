@@ -1067,8 +1067,10 @@ def test_mh1_v4_retain_interaction_policy_replays_only_pre_gate(
     assert "float* retained_interaction = args.retained_interaction_output" in module
     assert "retained_interaction[column] = interaction[column]" in module
     assert "l0_retained_gate_reverse" not in module
-    assert "l0_norm_res_recompute" in module
-    assert "l1_norm_msg_recompute" in module
+    assert "l0_norm_res_recompute" not in module
+    assert "l1_norm_msg_recompute" not in module
+    assert "node_grouped_l0_reverse_replay_residual_grouped" in module
+    assert "node_grouped_l1_reverse_replay_message_grouped" in module
 
 
 def test_mh1_v4_reuse_adjoint_fusion_has_a_new_generation_identity(

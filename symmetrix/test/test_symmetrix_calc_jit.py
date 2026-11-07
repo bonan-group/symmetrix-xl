@@ -293,7 +293,7 @@ class _DummyEvaluator:
             self.events.append(("mh1_node_arena", policy))
         self.execution_mh1_node_arena_policy = policy
         self.execution_mh1_node_arena_tile_rows = (
-            256 if policy == "capacity-v1" else 1024
+            512 if policy == "capacity-v1" else 1024
         )
 
     def _load_jit_host_plugin(self, path):
@@ -408,7 +408,7 @@ def test_mh1_node_arena_policy_is_configured_before_jit_load(jit_harness):
     )
     assert arena_index < load_index
     assert calculator.execution_mh1_node_arena_policy == "capacity-v1"
-    assert jit_harness["evaluator"].execution_mh1_node_arena_tile_rows == 256
+    assert jit_harness["evaluator"].execution_mh1_node_arena_tile_rows == 512
 
 
 def test_compact_edge_geometry_is_configured_after_jit_load(jit_harness):
@@ -630,7 +630,7 @@ def test_low_memory_selects_mh1_hybrid_before_cuda_jit_configuration(
     assert calculator.execution_mh1_node_state_policy == "retain-interaction-v1"
     assert calculator.execution_mh1_node_arena_policy == "capacity-v1"
     assert calculator.jit_node_state_policy == "retain-interaction-v1"
-    assert jit_harness["evaluator"].execution_mh1_node_arena_tile_rows == 256
+    assert jit_harness["evaluator"].execution_mh1_node_arena_tile_rows == 512
     _, _, policies = jit_harness["mh1_cuda_module_render_contracts"][0]
     assert policies["node_state_policy"] == "retain-interaction-v1"
 

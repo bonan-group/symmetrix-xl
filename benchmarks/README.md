@@ -11,6 +11,9 @@ points. Names identify the workload or comparison they run. In particular:
 
 - `standard_mace_streamed_benchmark.py` exercises standard MACE streamed-edge
   execution.
+- `mh1_standard_mace_comparison.py` runs standard MACE and MH-1 on the same
+  deterministic cubic SrTiO3 graph for speed, capacity, parity, and profiling
+  comparisons.
 - `streamed_edge_release_benchmark.py` runs the milestone current/develop/
   PyTorch energy, forces, and stress comparison in isolated processes.
 - `ase_omat_md_backend_scale.py` measures OMAT backend scaling through ASE.
@@ -72,7 +75,12 @@ points. Names identify the workload or comparison they run. In particular:
   the same prepared graph (verified bit-identical), a stage breakdown, and a
   size ladder. It requires the cached `MACE-POLAR-1-{S,M,L}.model` checkpoints
   and the oracle `graph_longrange` checkout for the extraction. Record source/model hashes, backend, graph facts, and fresh-process timings
-  with each result. See the current execution support matrix for release gates.
+  with each result. Use `--mh1-dense-policy generated` and
+  `--mh1-dense-policy vendor_fp32` for controlled shared-backbone comparisons;
+  use `--execution-profile speed` and `--execution-profile capacity` to retain
+  the selected node-state and arena policies alongside the provider. Direct
+  records validate the speed-mode request and record capacity-mode overrides.
+  See the current execution support matrix for release gates.
 - `polar_torch_baseline.py` times the frozen torch oracle stack (mace
   `PolarMACE` + `graph_longrange`) on the same fixtures and protocol, on the
   CPU oracle environment or `--device cuda` through the repository

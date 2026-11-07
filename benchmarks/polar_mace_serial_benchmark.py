@@ -218,6 +218,15 @@ EXECUTION_COUNTERS = (
     "factorized_fallback_evaluation_count",
 )
 
+MH1_DENSE_POLICIES = ("auto", "generated", "vendor_fp32", "vendor_tf32")
+MH1_NODE_STATE_POLICIES = (
+    "full-retention-v1",
+    "recompute-v1",
+    "reuse-adjoints-v1",
+    "retain-interaction-v1",
+)
+MH1_NODE_ARENA_POLICIES = ("throughput-v1", "capacity-v1")
+
 
 def _execution_counter_snapshot(evaluator):
     return {name: int(getattr(evaluator, name)) for name in EXECUTION_COUNTERS}
@@ -275,6 +284,45 @@ def _aggregate_measured_execution_evidence(calculator, windows):
     evidence.pop("counter_start")
     evidence.pop("counter_end")
     return evidence
+
+
+def _dense_policy_evidence(calculator, requested):
+    """Record and validate the shared MH-1 backbone dense provider."""
+
+    selected = getattr(calculator, "jit_dense_policy", None)
+    direct_route = calculator.streamed_edges in ("direct", "direct_streamed")
+    if direct_route and selected != requested:
+        raise RuntimeError(
+            "Polar direct execution loaded an unexpected MH-1 dense policy: "
+            f"requested={requested!r}, selected={selected!r}"
+        )
+    return {
+        "requested": requested,
+        "selected": selected,
+        "environment": os.environ.get("SYMMETRIX_MH1_DENSE_POLICY"),
+    }
+
+
+def _node_policy_evidence(calculator, profile, node_state, node_arena):
+    """Record the requested and selected shared-backbone storage policies."""
+
+    selected_state = calculator.execution_mh1_node_state_policy
+    selected_arena = calculator.execution_mh1_node_arena_policy
+    direct_route = calculator.streamed_edges in ("direct", "direct_streamed")
+    if direct_route and profile == "speed" and selected_state != node_state:
+        raise RuntimeError(
+            "Polar speed execution selected an unexpected MH-1 node-state policy: "
+            f"requested={node_state!r}, selected={selected_state!r}"
+        )
+    return {
+        "profile_requested": profile,
+        "profile_selected": calculator.execution_profile,
+        "node_state_requested": node_state,
+        "node_state_selected": selected_state,
+        "node_arena_requested": node_arena,
+        "node_arena_selected": selected_arena,
+        "low_memory_policy": calculator.low_memory_policy,
+    }
 
 
 def _comparator_record_fields(enabled, equivalence=None):
@@ -656,8 +704,12 @@ def _median_ms(call, repeats, warmups):
 
 
 def _capacity_fields(calculator, composition, system, cache):
-    n_k = int(cache.n_k)
-    nodes = int(cache.n_nodes)
+    n_k = int(cache.n_k) if cache is not None else int(composition["n_k"])
+    nodes = (
+        int(cache.n_nodes)
+        if cache is not None
+        else int(np.asarray(composition["positions"]).shape[0])
+    )
     itemsize = 8 if calculator._polar_contract["table_dtype"] == "float64" else 4
     shapes = calculator._polar_shapes
     layers = int(shapes["interaction_count"])
@@ -854,55 +906,68 @@ def measure_system(name, calculator, mh1_evaluator, atoms, system, args):
     # synchronized timing and stage-attribution sample has completed.
     composition = calculator._materialize_polar_diagnostics()
     ops = calculator._polar_ops
-    positions = np.ascontiguousarray(composition["positions"], dtype=np.float64)
-    cell = np.ascontiguousarray(composition["cell"], dtype=np.float64).reshape(1, 3, 3)
-    index = composition["node_graph_index"]
-    cache_result = ops.geometry_cache(positions, cell, index)
-    cache = cache_result["cache"]
-    kernels = {
-        "geometry_cache": _median_ms(
+    cache = None
+    kernels = {}
+    kernel_diagnostics = {
+        "available": ops is not None,
+        "reason": (
+            "python PolarLongRangeOps surface available"
+            if ops is not None
+            else "long-range work is integrated into the native Polar transaction"
+        ),
+    }
+    if ops is not None:
+        positions = np.ascontiguousarray(composition["positions"], dtype=np.float64)
+        cell = np.ascontiguousarray(composition["cell"], dtype=np.float64).reshape(
+            1, 3, 3
+        )
+        index = composition["node_graph_index"]
+        cache_result = ops.geometry_cache(positions, cell, index)
+        cache = cache_result["cache"]
+        kernels["geometry_cache"] = _median_ms(
             lambda: ops.geometry_cache(positions, cell, index),
             args.repeats,
             args.warmups,
         )["median_ms"]
-    }
-    if "charge_density" in composition:
-        density = np.ascontiguousarray(composition["charge_density"], dtype=np.float64)
-        multipoles = density
-        structure = ops.assemble_fourier(cache, multipoles)
-        potential = ops.apply_coulomb(cache, structure)
-        kernels["assemble_fourier"] = _median_ms(
-            lambda: ops.assemble_fourier(cache, multipoles),
-            args.repeats,
-            args.warmups,
-        )["median_ms"]
-        kernels["apply_coulomb"] = _median_ms(
-            lambda: ops.apply_coulomb(cache, structure),
-            args.repeats,
-            args.warmups,
-        )["median_ms"]
-        kernels["project_to_features"] = _median_ms(
-            lambda: ops.project_to_features(cache, potential),
-            args.repeats,
-            args.warmups,
-        )["median_ms"]
-        kernels["coulomb_energy"] = _median_ms(
-            lambda: ops.coulomb_energy(cache, density, None),
-            args.repeats,
-            args.warmups,
-        )["median_ms"]
-        kernels["analytic_correction_energy"] = _median_ms(
-            lambda: ops.analytic_correction_energy(
-                density, positions, cell, index, composition["pbc"]
-            ),
-            args.repeats,
-            args.warmups,
-        )["median_ms"]
-        kernels["dipole_readout"] = _median_ms(
-            lambda: ops.dipole_readout(density, positions, index),
-            args.repeats,
-            args.warmups,
-        )["median_ms"]
+        if "charge_density" in composition:
+            density = np.ascontiguousarray(
+                composition["charge_density"], dtype=np.float64
+            )
+            multipoles = density
+            structure = ops.assemble_fourier(cache, multipoles)
+            potential = ops.apply_coulomb(cache, structure)
+            kernels["assemble_fourier"] = _median_ms(
+                lambda: ops.assemble_fourier(cache, multipoles),
+                args.repeats,
+                args.warmups,
+            )["median_ms"]
+            kernels["apply_coulomb"] = _median_ms(
+                lambda: ops.apply_coulomb(cache, structure),
+                args.repeats,
+                args.warmups,
+            )["median_ms"]
+            kernels["project_to_features"] = _median_ms(
+                lambda: ops.project_to_features(cache, potential),
+                args.repeats,
+                args.warmups,
+            )["median_ms"]
+            kernels["coulomb_energy"] = _median_ms(
+                lambda: ops.coulomb_energy(cache, density, None),
+                args.repeats,
+                args.warmups,
+            )["median_ms"]
+            kernels["analytic_correction_energy"] = _median_ms(
+                lambda: ops.analytic_correction_energy(
+                    density, positions, cell, index, composition["pbc"]
+                ),
+                args.repeats,
+                args.warmups,
+            )["median_ms"]
+            kernels["dipole_readout"] = _median_ms(
+                lambda: ops.dipole_readout(density, positions, index),
+                args.repeats,
+                args.warmups,
+            )["median_ms"]
 
     capacity = _capacity_fields(calculator, composition, system, cache)
     attribution = {}
@@ -951,6 +1016,7 @@ def measure_system(name, calculator, mh1_evaluator, atoms, system, args):
         "attribution_ms": attribution,
         "retention_backbone_ms": retention,
         "long_range_kernels_ms": kernels,
+        "long_range_kernel_diagnostics": kernel_diagnostics,
         "capacity": capacity,
         "measured_execution": measured_execution,
     }
@@ -1143,6 +1209,30 @@ def main(argv=None):
         help="the MH-1 conditioned-edge executor (exact or spline)",
     )
     parser.add_argument(
+        "--mh1-dense-policy",
+        default="auto",
+        choices=MH1_DENSE_POLICIES,
+        help="shared MH-1 backbone dense provider used by Polar direct execution",
+    )
+    parser.add_argument(
+        "--execution-profile",
+        default="capacity",
+        choices=("speed", "capacity"),
+        help="shared-backbone speed or bounded-memory execution profile",
+    )
+    parser.add_argument(
+        "--mh1-node-state-policy",
+        default="full-retention-v1",
+        choices=MH1_NODE_STATE_POLICIES,
+        help="requested MH-1 node-state policy; speed mode honors it directly",
+    )
+    parser.add_argument(
+        "--mh1-node-arena-policy",
+        default="throughput-v1",
+        choices=MH1_NODE_ARENA_POLICIES,
+        help="shared MH-1 node-arena allocation policy",
+    )
+    parser.add_argument(
         "--spline-nodes",
         type=int,
         default=None,
@@ -1163,6 +1253,7 @@ def main(argv=None):
         args.skip_diagnostics = True
     if args.spline_nodes is not None:
         model_path = _patched_spline_model(model_path, args.spline_nodes, args.output)
+    os.environ["SYMMETRIX_MH1_DENSE_POLICY"] = args.mh1_dense_policy
 
     output_dir = args.output.expanduser().resolve().parent
     (output_dir / "comparator").mkdir(parents=True, exist_ok=True)
@@ -1174,7 +1265,12 @@ def main(argv=None):
 
     build_start = time.perf_counter()
     calculator = symmetrix.Symmetrix(
-        str(model_path), dtype=args.dtype, streamed_edges=args.streamed_edges
+        str(model_path),
+        dtype=args.dtype,
+        streamed_edges=args.streamed_edges,
+        execution_profile=args.execution_profile,
+        execution_mh1_node_state_policy=args.mh1_node_state_policy,
+        execution_mh1_node_arena_policy=args.mh1_node_arena_policy,
     )
     build_seconds = time.perf_counter() - build_start
     mh1_evaluator = native_symmetrix.MACENonlinearKokkos(str(comparator_json))
@@ -1267,6 +1363,13 @@ def main(argv=None):
         "factorized_fallback_evaluation_count": (
             evaluator.factorized_fallback_evaluation_count
         ),
+        "dense_policy": _dense_policy_evidence(calculator, args.mh1_dense_policy),
+        "node_policy": _node_policy_evidence(
+            calculator,
+            args.execution_profile,
+            args.mh1_node_state_policy,
+            args.mh1_node_arena_policy,
+        ),
         "measured_workload": measured_execution,
     }
     if calculator.streamed_edges in ("direct", "direct_streamed"):
@@ -1314,6 +1417,10 @@ def main(argv=None):
             ),
             "streamed_edges_override": args.streamed_edges,
             "edge_executor": args.edge_executor,
+            "mh1_dense_policy": args.mh1_dense_policy,
+            "execution_profile": args.execution_profile,
+            "mh1_node_state_policy": args.mh1_node_state_policy,
+            "mh1_node_arena_policy": args.mh1_node_arena_policy,
             "spline_nodes": args.spline_nodes,
             "warmups": args.warmups,
             "repeats": args.repeats,
@@ -1473,7 +1580,7 @@ def measure_tier(calculator, comparator_json, args):
             make_execution_mh1_v4_contract,
             normalize_execution_mh1_v4_contract,
         )
-        from symmetrix.mace_nonlinear_jit_codegen import render_jit_mh1_cuda_plugin_v4
+        from symmetrix.mace_nonlinear_jit_codegen import render_jit_mh1_cuda_plugin
 
         device_artifact["attempted"] = True
         environment = dict(evaluator.device_cuda_environment)
@@ -1485,7 +1592,7 @@ def measure_tier(calculator, comparator_json, args):
             contract = normalize_execution_mh1_v4_contract(
                 make_execution_mh1_v4_contract(data)
             )
-            render_jit_mh1_cuda_plugin_v4(contract, capability)
+            render_jit_mh1_cuda_plugin(contract, capability)
             device_artifact["available"] = True
         except ValueError as error:
             device_artifact["available"] = False

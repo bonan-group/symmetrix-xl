@@ -66,7 +66,11 @@ void E3TensorProductKokkosT<Precision>::initialize_direct_execution_plan(
             &&instruction_multiplicity>0&&instruction.multiplicity_2==1
             &&instruction.output_multiplicity==instruction_multiplicity
             &&(multiplicity==0||multiplicity==instruction_multiplicity)
-            &&instruction.width_1<=3
+            // POLAR-L retains the l=2 node band between interactions.  The
+            // direct kernels support it within their 16-component bound; the
+            // previous l=1 width guard only reflected the first admitted
+            // MH-1 checkpoints.
+            &&instruction.width_1<=5
             &&path_shape==std::vector<int>({instruction_multiplicity,1});
         if(official_layout) {
             multiplicity=instruction_multiplicity;

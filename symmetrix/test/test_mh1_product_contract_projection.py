@@ -51,15 +51,21 @@ def _linear(irreps, channels, output_dimension, block_count):
     }
 
 
-def _product(channels, input_l_max, *, final):
+def _product(channels, input_l_max, *, final, output_l_max=1):
     irreps_in = "+".join(
         f"{channels}x{l_value}{'e' if l_value % 2 == 0 else 'o'}"
         for l_value in range(input_l_max + 1)
     )
-    irreps_out = f"{channels}x0e" if final else f"{channels}x0e+{channels}x1o"
+    if final:
+        irreps_out = f"{channels}x0e"
+    else:
+        irreps_out = "+".join(
+            f"{channels}x{l_value}{'e' if l_value % 2 == 0 else 'o'}"
+            for l_value in range(output_l_max + 1)
+        )
     angular = (input_l_max + 1) ** 2
     contractions = []
-    for output_l in [0] if final else [0, 1]:
+    for output_l in [0] if final else range(output_l_max + 1):
         width = 2 * output_l + 1
         tensors = []
         for degree in range(1, 4):
@@ -84,20 +90,29 @@ def _product(channels, input_l_max, *, final):
                 "u_tensors": tensors,
             }
         )
-    output_dimension = channels * (1 if final else 4)
+    output_dimension = channels * (
+        1 if final else sum(2 * l_value + 1 for l_value in range(output_l_max + 1))
+    )
     definition = {
         "node_feats_irreps": irreps_out,
         "target_irreps": irreps_out,
         "use_sc": True,
         "use_agnostic_product": True,
-        "linear": _linear(irreps_out, channels, output_dimension, 1 if final else 2),
+        "linear": _linear(
+            irreps_out, channels, output_dimension, 1 if final else output_l_max + 1
+        ),
         "symmetric_contractions": {
             "irreps_in": irreps_in,
             "irreps_out": irreps_out,
             "contractions": contractions,
         },
     }
-    return _product_descriptor(0, definition, last=final)
+    return _product_descriptor(
+        0,
+        definition,
+        last=final,
+        keep_last_layer_irreps=not final and output_l_max > 1,
+    )
 
 
 @pytest.mark.parametrize("layer_count", [2, 3])
@@ -149,6 +164,18 @@ def test_mh1_product_projection_uses_logical_angular_components():
     for index, component in enumerate(changed["components"]):
         component["output_component_offset"] = 1000 + index
     assert project_execution_mh1_product_contract(changed, final=False) == contract
+
+
+def test_mh1_product_projection_supports_retained_l2_output():
+    product = _product(7, 3, final=False, output_l_max=2)
+
+    contract = project_execution_mh1_product_contract(product, final=False)
+
+    assert contract["interaction"] == "M0"
+    assert contract["input_l_max"] == 3
+    assert contract["output_l_max"] == 2
+    assert contract["output_components"] == 9
+    assert normalize_standard_m0_contract(contract) == contract
 
 
 def test_mh1_product_projection_matches_native_term_order(tmp_path):

@@ -69,8 +69,8 @@ struct MaceMH1LayerDescriptor {
 
 //: The MH-1 node-program support matrix over a parsed backbone.  It describes
 //: the *generated* node program's admissible topologies, not the family's
-//: schema.  The matrix admits the explicit polar keep-last scalar-plus-vector
-//: output policy while preserving the scalar-final rule for ordinary MH-1.
+//: schema.  The matrix admits explicit polar keep-last outputs through l=2
+//: while preserving the scalar-final rule for ordinary MH-1.
 struct MaceMH1FamilyDescriptor {
     bool compatible = false;
     int l_max = 0;

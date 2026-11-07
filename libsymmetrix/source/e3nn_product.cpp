@@ -124,15 +124,17 @@ bool E3ProductBasis::has_compiled_product_layout(const nlohmann::json& data) con
             || block.parity != (index%2 == 0 ? 1 : -1))
             return false;
     }
-    const bool first_product = output.blocks.size() == 2
-        && output.blocks[0].multiplicity == num_features && output.blocks[0].l == 0
-        && output.blocks[0].parity == 1
-        && output.blocks[1].multiplicity == num_features && output.blocks[1].l == 1
-        && output.blocks[1].parity == -1;
+    bool retained_product = output.blocks.size() >= 2
+        && output.blocks.size() <= 3;
+    for (int l=0; retained_product && l<static_cast<int>(output.blocks.size()); ++l) {
+        const auto& block = output.blocks[l];
+        retained_product = block.multiplicity == num_features && block.l == l
+            && block.parity == (l%2 == 0 ? 1 : -1);
+    }
     const bool second_product = output.blocks.size() == 1
         && output.blocks[0].multiplicity == num_features && output.blocks[0].l == 0
         && output.blocks[0].parity == 1;
-    if (!first_product && !second_product) return false;
+    if (!retained_product && !second_product) return false;
     for (const auto& contraction : contractions)
         if (contraction.correlation != 3 || contraction.weights_max.shape[0] != 1)
             return false;

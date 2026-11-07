@@ -963,8 +963,11 @@ class Symmetrix(Calculator):
     execution_mh1_node_arena_policy : {"throughput-v1", "capacity-v1"}, default="throughput-v1"
         Transient node-arena policy for generated MH-1 execution.
         ``throughput-v1`` uses a wider CUDA arena to reduce repeated node-stage
-        launches. ``capacity-v1`` retains the bounded 256-row arena used for
-        near-capacity systems. This policy is independent of retained node state.
+        launches. On CUDA, ``capacity-v1`` selects the widest 1024-, 768-,
+        512-, 384-, or 256-row arena that fits the device-memory budget,
+        falling back to 512 rows when memory information is unavailable. Other
+        backends retain the conservative 256-row arena. This policy is
+        independent of retained node state.
     execution_mh0_state_policy : {"full-retention-v1", "reuse-adjoints-v1"}, default="full-retention-v1"
         State-storage policy for ordinary direct MH-0 inference.
         ``reuse-adjoints-v1`` destructively reuses dead forward tensors for

@@ -315,3 +315,26 @@ def test_the_mh1_stage_description_is_family_owned_data():
     assert not (SOURCE_ROOT / MH1_RETIRED_STAGE_HEADER).exists()
     for name in (*MH1_OWNERS, MH1_IMPL, MH1_STAGE_HEADER):
         assert MH1_RETIRED_STAGE_HEADER not in (SOURCE_ROOT / name).read_text(), name
+
+
+def test_mh1_cuda_spline_reverse_reuses_prepared_unit_directions():
+    header = (SOURCE_ROOT / "mace_nonlinear_kokkos.hpp").read_text()
+    implementation = (SOURCE_ROOT / MH1_IMPL).read_text()
+    compact_implementation = re.sub(r"\s+", "", implementation)
+
+    assert "Kokkos::View<const double*> distances" in header
+    assert "bool retain_unit_directions" in header
+    assert "const double inverse_distance=1.0/distances(edge);" in implementation
+    cuda_branch = implementation.index(
+        "#else", implementation.index("#elif !defined(SYMMETRIX_SPHERICART_CUDA)")
+    )
+    assert implementation.index("const double inverse_distance") > cuda_branch
+    assert implementation.count("const double inverse_distance") == 1
+    for component in range(3):
+        assert (
+            f"shuffled(3*edge+{component})=static_cast<Precision>("
+            f"xyz(3*edge+{component})*inverse_distance);"
+        ) in compact_implementation
+    assert "?static_cast<std::uint32_t>(sizeof(Precision))" in compact_implementation
+    assert "retain_unit_directions?1u:0u," in compact_implementation
+    assert "?static_cast<constvoid*>(xyz_shuffled.data())" in compact_implementation
