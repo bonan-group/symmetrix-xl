@@ -576,7 +576,7 @@ NequIPOAMKokkos<Precision>::NequIPOAMKokkos(
             schema, static_cast<int>(layer), contract.num_points, contract.grid_min);
     }
     const auto& embedding = schema.node_attributes;
-    const auto embedding_shape = embedding.at("shape").get<std::vector<int>>();
+    const auto embedding_shape = embedding.at("shape").template get<std::vector<int>>();
     if (embedding_shape.size() != 2 || embedding_shape[0] <= 0 || embedding_shape[1] <= 0)
         throw std::invalid_argument("NequIPOAMKokkos node attributes have an invalid shape.");
     node_attribute_width_ = embedding_shape[1];
@@ -603,7 +603,7 @@ NequIPOAMKokkos<Precision>::NequIPOAMKokkos(
         lane_block_plan(schema.layers.front().node_irreps_in));
     readout_ = E3LinearKokkosT<Precision>(normalize_linear_irreps(
         schema.readout, schema.layers.back().node_irreps_out,
-        schema.readout.at("irreps_out").get<std::string>()));
+        schema.readout.at("irreps_out").template get<std::string>()));
     readout_.set_workspace(linear_workspace_);
 
     type_to_model_host_.resize(schema.atomic_numbers.size(), -1);
@@ -622,15 +622,15 @@ NequIPOAMKokkos<Precision>::NequIPOAMKokkos(
     per_type_scale_ = schema.per_type_scale;
     model_atomic_numbers_ = schema.model_atomic_numbers;
     const auto& zbl = schema.zbl;
-    zbl_exponents_ = zbl.at("screening_exponents").get<std::vector<double>>();
-    zbl_coefficients_ = zbl.at("screening_coefficients").get<std::vector<double>>();
-    zbl_cutoff_ = zbl.at("cutoff").get<double>();
+    zbl_exponents_ = zbl.at("screening_exponents").template get<std::vector<double>>();
+    zbl_coefficients_ = zbl.at("screening_coefficients").template get<std::vector<double>>();
+    zbl_cutoff_ = zbl.at("cutoff").template get<double>();
     // OAM contracts before the explicit cutoff_p field used the edge
     // embedding polynomial exponent for the ZBL envelope. Keep that
     // backward-compatible default aligned with the serial evaluator.
     zbl_cutoff_p_ = zbl.value(
-        "cutoff_p", schema.edge_embedding.at("cutoff").at("p").get<double>());
-    zbl_half_prefactor_ = zbl.at("half_energy_prefactor").get<double>();
+        "cutoff_p", schema.edge_embedding.at("cutoff").at("p").template get<double>());
+    zbl_half_prefactor_ = zbl.at("half_energy_prefactor").template get<double>();
     per_type_shift_device_ = copy_device_vector(
         "oam per-type shifts", per_type_shift_);
     per_type_scale_device_ = copy_device_vector(
@@ -697,7 +697,7 @@ NequIPOAMKokkos<Precision>::NequIPOAMKokkos(
             state.self_attribute_block_plan = copy_block_plan(
                 "oam self attribute block plan",
                 lane_block_plan(
-                    data.self_connection.at("irreps_in2").get<std::string>()));
+                    data.self_connection.at("irreps_in2").template get<std::string>()));
         state.input_width = Irreps(data.node_irreps_in).dimension();
         state.input_block_plan = copy_block_plan(
             "oam layer input block plan", lane_block_plan(data.node_irreps_in));
@@ -768,11 +768,11 @@ NequIPOAMKokkos<Precision>::NequIPOAMKokkos(
                 state.self_tensor_product->supports_node_bilinear_uvw_lane()
                 && irrep_plans_equal(
                     irreps_block_plan(
-                        data.self_connection.at("irreps_in1").get<std::string>()),
+                        data.self_connection.at("irreps_in1").template get<std::string>()),
                     irreps_block_plan(data.node_irreps_in))
                 && irrep_plans_equal(
                     irreps_block_plan(
-                        data.self_connection.at("irreps_out").get<std::string>()),
+                        data.self_connection.at("irreps_out").template get<std::string>()),
                     irreps_block_plan(data.node_irreps_pre_gate));
             if (!state.self_lane_kernels)
                 self_definition_order_layers_.push_back(
@@ -1126,7 +1126,7 @@ NequIPOAMKokkos<Precision>::cuda_r1_layer_expectations() const
         const auto& radial = radial_sets_[index].kokkos_set();
         symmetrix::execution::OAMCudaLayerExpectation row;
         row.source_dimension =
-            Irreps(data.pre_linear.at("irreps_out").get<std::string>()).dimension();
+            Irreps(data.pre_linear.at("irreps_out").template get<std::string>()).dimension();
         row.edge_dimension = Irreps(data.edge_irreps).dimension();
         row.weight_dimension = data.edge_tensor_product.value("weight_numel", 0);
         row.output_dimension = Irreps(data.tp_output_irreps).dimension();

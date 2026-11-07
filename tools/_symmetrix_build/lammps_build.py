@@ -420,6 +420,7 @@ def lammps_build_invocation(
     build_root: str | Path | None = None,
     force_new: bool = False,
     require_gpu_aware_mpi: bool = False,
+    install_python_module: bool = False,
     lammps_packages: tuple[str, ...] = (),
     extra_cmake_definitions: tuple[str, ...] = (),
     materialize: bool = True,
@@ -432,6 +433,11 @@ def lammps_build_invocation(
     )
     packages = normalize_lammps_packages(lammps_packages, lammps_source)
     extra_definitions = parse_lammps_cmake_definitions(extra_cmake_definitions)
+    if install_python_module:
+        shared_libraries = extra_definitions.get("BUILD_SHARED_LIBS")
+        if shared_libraries is not None and shared_libraries.upper() != "ON":
+            raise BuildError("--install-python-module requires BUILD_SHARED_LIBS=ON")
+        extra_definitions["BUILD_SHARED_LIBS"] = "ON"
     install_prefix = Path(prefix).expanduser().resolve()
     if require_gpu_aware_mpi and manifest.backend not in {"cuda", "hip"}:
         raise BuildError("GPU-aware MPI can only be required for CUDA or HIP builds")
@@ -455,12 +461,19 @@ def lammps_build_invocation(
         packages=packages,
         extra_definitions=extra_definitions,
     )
+    if install_python_module:
+        install_rpath = definitions.get("CMAKE_INSTALL_RPATH", "")
+        prefix_rpath = "$ORIGIN/../lib"
+        definitions["CMAKE_INSTALL_RPATH"] = (
+            prefix_rpath if not install_rpath else f"{prefix_rpath};{install_rpath}"
+        )
     provenance = {
         "target_fingerprint": manifest.fingerprint,
         "symmetrix": symmetrix_source_provenance(root, runner),
         "lammps": lammps_source_provenance(lammps_source, version, runner),
         "install_prefix": str(install_prefix),
         "cmake_definitions": definitions,
+        "python_module": install_python_module,
         "mpi": {
             "enabled": mpi_enabled,
             "cxx": selected_mpi,
@@ -493,7 +506,7 @@ def lammps_build_invocation(
         manifest.toolchain.generator,
     ]
     configure.extend(f"-D{name}={value}" for name, value in definitions.items())
-    commands = (
+    commands = [
         (str(installer), str(lammps_source)),
         tuple(configure),
         (
@@ -504,7 +517,18 @@ def lammps_build_invocation(
             str(jobs),
         ),
         (manifest.toolchain.cmake, "--install", str(build_directory)),
-    )
+    ]
+    if install_python_module:
+        commands.append(
+            (
+                manifest.toolchain.cmake,
+                "--build",
+                str(build_directory),
+                "--target",
+                "install-python",
+            )
+        )
+    command_sequence = tuple(commands)
     environment = build_environment(manifest)
     if manifest.backend == "cuda":
         environment["CXX"] = definitions["CMAKE_CXX_COMPILER"]
@@ -512,14 +536,14 @@ def lammps_build_invocation(
         "build_fingerprint": fingerprint,
         "manifest_fingerprint": manifest.fingerprint,
         "provenance": provenance,
-        "commands": commands,
+        "commands": command_sequence,
     }
     if materialize:
         (build_directory / "lammps-invocation.json").write_text(
             json.dumps(record, indent=2, sort_keys=True) + "\n"
         )
     return LammpsInvocation(
-        commands,
+        command_sequence,
         environment,
         build_directory,
         manifest_path,

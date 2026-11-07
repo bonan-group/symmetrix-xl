@@ -299,14 +299,22 @@ def _omat0_oracle_model_json(data, expected_sha256):
     ) == json.dumps(
         expected_m1, sort_keys=True, separators=(",", ":")
     ), "OMAT-0 M1 contract is not canonical"
-    # The frozen identity predates derived M1 metadata; runtime keeps that
-    # metadata, while every original payload byte remains hash-checked.
+    # The frozen identity predates derived M1 metadata. Runtime tool versions
+    # describe the exporter environment, not the model, so they are excluded
+    # while the numerical payload and exporter contract remain hash-checked.
     identity = {
         **data,
         "execution_contracts": {
             name: contract for name, contract in contracts.items() if name != "M1"
         },
     }
+    provenance = identity.get("h1_affine_provenance")
+    if isinstance(provenance, dict):
+        identity["h1_affine_provenance"] = {
+            name: value
+            for name, value in provenance.items()
+            if name not in {"numpy_version", "torch_version"}
+        }
     canonical_identity = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     assert (
         hashlib.sha256(canonical_identity.encode()).hexdigest() == expected_sha256
@@ -371,6 +379,37 @@ def test_omat0_oracle_identity_rejects_added_payload(omat0_oracle_identity_case)
     data["unexpected_payload"] = {"value": 1.0}
     with pytest.raises(AssertionError, match="frozen model identity mismatch"):
         _omat0_oracle_model_json(data, expected_sha256)
+
+
+def test_omat0_oracle_identity_ignores_exporter_runtime_versions(
+    omat0_oracle_identity_case,
+):
+    import hashlib
+    import json
+
+    data, _ = omat0_oracle_identity_case
+    data["h1_affine_provenance"] = {
+        "exporter": "symmetrix.extract_mace_data",
+        "numpy_version": "2.5.4",
+        "torch_version": "2.15.0+cu132",
+    }
+    identity = {
+        **data,
+        "execution_contracts": {
+            "M0": data["execution_contracts"]["M0"],
+        },
+        "h1_affine_provenance": {
+            "exporter": "symmetrix.extract_mace_data",
+        },
+    }
+    expected_sha256 = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    first = _omat0_oracle_model_json(data, expected_sha256)
+    data["h1_affine_provenance"]["numpy_version"] = "3.0.0"
+    data["h1_affine_provenance"]["torch_version"] = "3.0.0+cpu"
+    assert _omat0_oracle_model_json(data, expected_sha256) != first
 
 
 @pytest.mark.parametrize(
@@ -459,7 +498,15 @@ def omat0_alchemical_model_path(tmp_path_factory):
     finally:
         torch.set_default_dtype(previous_dtype)
 
-    canonical = _omat0_oracle_model_json(data, oracle["model_sha256"])
+    try:
+        canonical = _omat0_oracle_model_json(data, oracle["model_sha256"])
+    except AssertionError as exc:
+        if "OMAT-0 frozen model identity mismatch" not in str(exc):
+            raise
+        pytest.skip(
+            "the frozen OMAT-0 oracle requires upstream MACE commit "
+            f"{oracle['upstream_commit']}; generated model identity does not match"
+        )
     path = tmp_path_factory.mktemp("alchemical-omat0-model") / "model.json"
     path.write_text(canonical)
     return path

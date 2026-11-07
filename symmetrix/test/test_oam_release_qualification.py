@@ -12,8 +12,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,22 +23,12 @@ from benchmarks import (
     oam_release_qualification,
 )
 from benchmarks.nequip_oam_kokkos_profile import (
-    BLAS_THREAD_ENVIRONMENT,
-    _configure_process,
-    _timed_properties,
-    build_srtio3,
     profile,
-)
-from benchmarks.nequip_oam_kokkos_profile import (
-    make_parser as make_host_profile_parser,
 )
 from benchmarks.oam_cuda_r1_timing import (
     _select_physical_cpus,
-    admit_direct_candidate,
     prepare_cuda_direct_artifact,
     prepare_diagnostic_host_direct_artifact,
-    prepare_direct_evaluator,
-    serialize_diagnostic_artifact_evidence,
 )
 from benchmarks.oam_cuda_r1_timing import (
     make_parser as make_cuda_timing_parser,
@@ -58,10 +46,11 @@ from benchmarks.oam_release_qualification import (
     evaluate_qualification,
     orchestrate,
     validate_cell_record,
-    validate_manifest,
 )
 from symmetrix.oam_cuda_artifact import OAMCudaArtifactResult
 from symmetrix.oam_jit_artifact import OAMHostArtifactResult
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_release_and_equivalence_drivers_share_authoritative_tolerances():
@@ -72,8 +61,6 @@ def test_release_and_equivalence_drivers_share_authoritative_tolerances():
     assert (
         nequip_oam_equivalence.FLOAT64_TOLERANCES is OAM_RELEASE_TOLERANCES["float64"]
     )
-
-
 
 
 @pytest.fixture(autouse=True)
@@ -165,8 +152,6 @@ def test_ordinary_host_preparation_returns_artifact_and_canonical_policy():
     assert policy is not artifact.metadata["generation_policy"]
 
 
-
-
 def _manifest(tmp_path: Path) -> dict:
     host_native = tmp_path / "host-native.so"
     cuda_native = tmp_path / "cuda-native.so"
@@ -218,7 +203,7 @@ def _manifest(tmp_path: Path) -> dict:
         ],
         "direct_baselines_us_per_atom": {},
         "provenance": {
-            "source_root": str(Path.cwd()),
+            "source_root": str(ROOT),
             "native_paths": {
                 "host": str(host_native),
                 "cuda": str(cuda_native),
@@ -361,20 +346,12 @@ def test_complete_v2_request_produces_validated_request(tmp_path):
     assert isinstance(validated, dict)
 
 
-
-
-
-
 def test_request_with_wrong_fingerprint_is_rejected(tmp_path):
     request, command = _cuda_request_context(tmp_path)
     request["request_fingerprint"] = "9" * 64
 
     with pytest.raises(QualificationError, match="fingerprint"):
         _validate_cuda_request(request, command)
-
-
-
-
 
 
 def _qualification_native(request, *, overrides=None, prebuilt_overrides=None):
@@ -546,8 +523,6 @@ def test_preflighted_worker_rejects_cuda_artifact_with_wrong_canonical_target(
         )
 
 
-
-
 def test_qualification_preflight_requires_bound_private_cache(monkeypatch, tmp_path):
     request, command = _cuda_request_context(tmp_path)
     cache = Path(request["jit_cache_path"])
@@ -578,8 +553,6 @@ def test_qualification_preflight_requires_bound_private_cache(monkeypatch, tmp_p
                 native_module=native,
                 active_jit_cache=active,
             )
-
-
 
 
 def test_qualification_preflight_rejects_nonprivate_or_foreign_cache(
@@ -1049,8 +1022,6 @@ def test_correctness_gate_rejects_wrong_or_nonfinite_numerics(
         )
 
 
-
-
 def test_numerical_evidence_hash_and_parse_use_one_immutable_payload(
     tmp_path, monkeypatch
 ):
@@ -1089,8 +1060,6 @@ def test_numerical_evidence_hash_and_parse_use_one_immutable_payload(
         assert np.isnan(current["stress"]).all()
 
 
-
-
 @pytest.mark.parametrize(
     "field", ("min_us_per_atom_step", "median_us_per_atom_step", "median_us_per_atom")
 )
@@ -1115,10 +1084,6 @@ def test_retained_timing_must_equal_exact_raw_projection(tmp_path):
         validate_cell_record(cell, record)
 
 
-
-
-
-
 @pytest.mark.parametrize("backend", ("host", "cuda"), ids=("host", "device"))
 def test_execution_environment_schema_is_closed(tmp_path, backend):
     cell = next(
@@ -1135,10 +1100,6 @@ def test_execution_environment_schema_is_closed(tmp_path, backend):
             _raw_record(cell, "reference"),
             baseline_us_per_atom=8.0,
         )
-
-
-
-
 
 
 def test_generation_policy_schema_and_command_binding_are_closed(tmp_path):
@@ -1158,16 +1119,6 @@ def test_generation_policy_schema_and_command_binding_are_closed(tmp_path):
         )
 
 
-
-
-
-
-
-
-
-
-
-
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -1183,10 +1134,6 @@ def test_raw_records_are_strictly_validated_and_errors_normalized(tmp_path, muta
     mutation(direct)
     with pytest.raises(QualificationError):
         build_cell_record(cell, direct, reference, baseline_us_per_atom=8.0)
-
-
-
-
 
 
 @pytest.mark.parametrize(
@@ -1216,12 +1163,6 @@ def test_host_direct_artifact_evidence_rejects_each_independent_mutation(
         )
 
 
-
-
-
-
-
-
 @pytest.mark.parametrize(
     "field",
     (
@@ -1249,14 +1190,6 @@ def test_cuda_direct_artifact_contract_rejects_each_independent_mutation(
         )
 
 
-
-
-
-
-
-
-
-
 @pytest.mark.parametrize("mutation", ("missing", "extra", "wrong-origin"))
 def test_reference_artifact_contract_is_exact(tmp_path, mutation):
     cell = build_declared_cells(_manifest(tmp_path))[0]
@@ -1274,10 +1207,6 @@ def test_reference_artifact_contract_is_exact(tmp_path, mutation):
             reference,
             baseline_us_per_atom=8.0,
         )
-
-
-
-
 
 
 @pytest.mark.parametrize(
@@ -1311,10 +1240,6 @@ def test_cuda_release_prebuilt_rejects_other_valid_runtime_states(
         )
 
 
-
-
-
-
 @pytest.mark.parametrize(
     ("backend", "field", "value"),
     (
@@ -1342,20 +1267,6 @@ def test_retained_current_catalog_identity_is_revalidated(
         validate_cell_record(cell, record)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _write_editable_import_interceptor(path: Path) -> None:
     path.mkdir()
     (path / "sitecustomize.py").write_text(
@@ -1371,10 +1282,6 @@ def _write_editable_import_interceptor(path: Path) -> None:
         "        return None\n"
         "sys.meta_path.insert(0, TrapFinder())\n"
     )
-
-
-
-
 
 
 def _write_fake_installed_artifact_module(
@@ -1409,22 +1316,6 @@ def _host_artifact_probe_request(
     }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def test_qualification_contract_uses_schema_v3_and_rejects_stale_v2(tmp_path):
     assert oam_release_qualification.SCHEMA_VERSION == 3
     manifest = _manifest(tmp_path)
@@ -1444,8 +1335,6 @@ def test_qualification_contract_uses_schema_v3_and_rejects_stale_v2(tmp_path):
             _raw_record(cell, "reference"),
             baseline_us_per_atom=cell["baseline_us_per_atom"],
         )
-
-
 
 
 def test_composer_rejects_route_independent_command_mismatch(tmp_path):
@@ -1475,10 +1364,6 @@ def test_composer_rejects_incompatible_paired_evidence(tmp_path, mutation):
         build_cell_record(cell, direct, reference, baseline_us_per_atom=8.0)
 
 
-
-
-
-
 def test_huge_json_numeric_is_normalized_and_fails_closed(tmp_path):
     cell = build_declared_cells(_manifest(tmp_path))[0]
     record = _cell_record(cell)
@@ -1492,8 +1377,6 @@ def test_huge_json_numeric_is_normalized_and_fails_closed(tmp_path):
     assert result["status"] != "passed"
     assert cell["cell_id"] in result["failed_cells"]
     assert any("malformed" in reason for reason in result["unqualified_reasons"])
-
-
 
 
 def test_manifest_rejects_unknown_graph_fields_and_requires_boundary(tmp_path):
@@ -1531,28 +1414,6 @@ def test_manifest_requires_exact_single_cuda_xl_capacity_boundary(
         build_declared_cells(manifest)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def test_declared_matrix_is_complete_and_deterministic(tmp_path):
     first = build_declared_cells(_manifest(tmp_path))
     second = build_declared_cells(_manifest(tmp_path))
@@ -1585,14 +1446,6 @@ def test_declared_matrix_is_complete_and_deterministic(tmp_path):
     assert {cell["graph_class"] for cell in cuda} == {"small", "production"}
     assert len(boundaries) == 1
     assert len({cell["cell_id"] for cell in first}) == len(first)
-
-
-
-
-
-
-
-
 
 
 @pytest.mark.parametrize(
@@ -1681,16 +1534,6 @@ def test_cpu_four_thread_gate_requires_complete_nontrivial_speedup(tmp_path):
     failed = evaluate_qualification(cells, records)
     assert failed["gates"]["cpu_scaling"]["passed"] is False
     assert slow_id in failed["failed_cells"]
-
-
-
-
-
-
-
-
-
-
 
 
 def test_capacity_gate_requires_identical_actual_graph_evidence(tmp_path):
@@ -1786,10 +1629,6 @@ def test_host_driver_declares_reference_and_capacity_without_running(tmp_path):
     }
 
 
-
-
-
-
 def test_cuda_driver_accepts_route_profile_and_qualification_cell(tmp_path):
     contract = tmp_path / "oam.json"
     request = {"cell_id": "matrix-s-cuda-float32-small-speed-t1"}
@@ -1817,8 +1656,6 @@ def test_cuda_driver_accepts_route_profile_and_qualification_cell(tmp_path):
     assert args.threads == 4
 
 
-
-
 def test_driver_environment_has_a_private_per_cell_jit_cache(tmp_path):
     cell = build_declared_cells(_manifest(tmp_path))[0]
 
@@ -1826,8 +1663,6 @@ def test_driver_environment_has_a_private_per_cell_jit_cache(tmp_path):
 
     assert environment["SYMMETRIX_JIT_CACHE"] == str(cache)
     assert cell["cell_id"] in str(cache)
-
-
 
 
 def test_cpu_scaling_selects_distinct_physical_cores():

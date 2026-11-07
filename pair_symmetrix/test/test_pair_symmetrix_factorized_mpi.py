@@ -1,5 +1,7 @@
 import functools
+import importlib
 import itertools
+import json
 import os
 import re
 import shutil
@@ -10,13 +12,33 @@ import numpy as np
 import pytest
 
 
+def _skip_or_fail(message):
+    if os.environ.get("SYMMETRIX_REQUIRE_LAMMPS_TESTS"):
+        pytest.fail(message, pytrace=False)
+    pytest.skip(message)
+
+
+def _import_or_skip(module_name):
+    try:
+        return importlib.import_module(module_name)
+    except ImportError as exc:
+        _skip_or_fail(f"Required Python module {module_name} is unavailable: {exc}")
+
+
+def test_required_lammps_mode_turns_prerequisite_skip_into_failure(monkeypatch):
+    monkeypatch.setenv("SYMMETRIX_REQUIRE_LAMMPS_TESTS", "1")
+
+    with pytest.raises(pytest.fail.Exception, match="required prerequisite"):
+        _skip_or_fail("missing required prerequisite")
+
+
 def _required_path(environment_name, description):
     value = os.environ.get(environment_name)
     if not value:
-        pytest.skip(f"Set {environment_name} for {description}.")
+        _skip_or_fail(f"Set {environment_name} for {description}.")
     path = Path(value).resolve()
     if not path.is_file():
-        pytest.skip(f"{description.capitalize()} is unavailable: {path}")
+        _skip_or_fail(f"{description.capitalize()} is unavailable: {path}")
     return path
 
 
@@ -449,7 +471,7 @@ print           "MIGRATED mode={mode} pe=$(pe:%.16g) pxx=$(pxx:%.16g) pyy=$(pyy:
     )
     mpiexec = os.environ.get("MPIEXEC_EXECUTABLE") or shutil.which("mpiexec")
     if not mpiexec:
-        pytest.skip("mpiexec is unavailable")
+        _skip_or_fail("mpiexec is unavailable")
     environment = os.environ.copy()
     environment.update(
         {
@@ -584,7 +606,7 @@ print           "SYMMETRIX_TIMING {timing_record}"
 
     mpiexec = os.environ.get("MPIEXEC_EXECUTABLE") or shutil.which("mpiexec")
     if not mpiexec:
-        pytest.skip("mpiexec is unavailable")
+        _skip_or_fail("mpiexec is unavailable")
     environment = os.environ.copy()
     environment.update(
         {
@@ -719,7 +741,7 @@ print           "RESULT mode=direct pe=$(pe:%.16g) pxx=$(pxx:%.16g) pyy=$(pyy:%.
     )
     mpiexec = os.environ.get("MPIEXEC_EXECUTABLE") or shutil.which("mpiexec")
     if not mpiexec:
-        pytest.skip("mpiexec is unavailable")
+        _skip_or_fail("mpiexec is unavailable")
     environment = os.environ.copy()
     environment.update(
         {
@@ -2036,4 +2058,114 @@ def test_direct_low_memory_macefield_four_rank_matches_single_rank(tmp_path):
     for key in ("initial_global", "migrated_global"):
         np.testing.assert_allclose(
             four_rank[key], single_rank[key], rtol=2.0e-4, atol=1.0e-1
+        )
+
+
+@pytest.fixture(scope="module")
+def residual_first_model(tmp_path_factory):
+    torch = _import_or_skip("torch")
+    o3 = _import_or_skip("e3nn.o3")
+    modules = _import_or_skip("mace.modules")
+    blocks = _import_or_skip("mace.modules.blocks")
+    extract_mace_data = _import_or_skip("symmetrix.extract_mace_data").extract_mace_data
+    artifact_dir = tmp_path_factory.mktemp("residual-first-models")
+
+    @functools.cache
+    def build(family):
+        if family == "macefield":
+            extensions = _import_or_skip("mace.modules.extensions")
+            if not hasattr(extensions, "MACEField"):
+                _skip_or_fail("This mace-torch does not provide MACEField.")
+            model_class = extensions.MACEField
+        else:
+            model_class = modules.ScaleShiftMACE
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float64)
+            torch.manual_seed(20261105)
+            model = model_class(
+                atomic_inter_scale=1.0,
+                atomic_inter_shift=0.0,
+                r_max=4.0,
+                num_bessel=4,
+                num_polynomial_cutoff=5,
+                max_ell=3,
+                interaction_cls=blocks.RealAgnosticResidualInteractionBlock,
+                interaction_cls_first=blocks.RealAgnosticResidualInteractionBlock,
+                num_interactions=2,
+                num_elements=2,
+                hidden_irreps=o3.Irreps("4x0e+4x1o"),
+                MLP_irreps=o3.Irreps("16x0e"),
+                atomic_energies=np.zeros((1, 2)),
+                avg_num_neighbors=4.0,
+                atomic_numbers=[7, 13],
+                correlation=3,
+                gate=torch.nn.functional.silu,
+                heads=["test"],
+            )
+            model.eval()
+            checkpoint_path = artifact_dir / f"{family}.model"
+            torch.save(model, checkpoint_path)
+            data = extract_mace_data(
+                checkpoint_path,
+                species=[7, 13],
+                head="test",
+                num_spline_points=256,
+            )
+        finally:
+            torch.set_default_dtype(previous_dtype)
+        assert data["first_interaction_residual"] is True
+        output_path = artifact_dir / f"{family}.json"
+        output_path.write_text(json.dumps(data))
+        return output_path
+
+    return build
+
+
+@pytest.mark.parametrize("ranks", (1, 2))
+@pytest.mark.parametrize(
+    "domain_mode", ("mpi_message_passing", "no_mpi_message_passing")
+)
+@pytest.mark.parametrize("mode", ("non-compiled", "materialized"))
+@pytest.mark.parametrize("precision", ("float64", "float32"))
+@pytest.mark.parametrize("family", ("mace", "macefield"))
+def test_manual_schedules_match_whole_model_for_residual_first_models(
+    tmp_path, residual_first_model, family, precision, mode, domain_mode, ranks
+):
+    executable = _required_path(
+        "SYMMETRIX_LAMMPS_EXECUTABLE", "a Kokkos and MPI-enabled LAMMPS executable"
+    )
+    model = residual_first_model(family)
+    field = (0.01, 0.02, -0.03) if family == "macefield" else None
+    manual = _run_lammps_case(
+        tmp_path,
+        executable,
+        model,
+        mode,
+        field,
+        precision,
+        ranks=ranks,
+        domain_mode=domain_mode,
+    )
+    whole_model = _run_lammps_case(
+        tmp_path,
+        executable,
+        model,
+        mode,
+        field,
+        precision,
+        ranks=1,
+        domain_mode="no_domain_decomposition",
+    )
+
+    rtol = 2.0e-4 if precision == "float32" else 1.0e-11
+    atom_atol = 1.0e-4 if precision == "float32" else 1.0e-10
+    global_atol = 1.0e-1 if precision == "float32" else 1.0e-8
+    for key in ("initial_atoms", "migrated_atoms"):
+        np.testing.assert_allclose(
+            manual[key][:, :9], whole_model[key][:, :9], rtol=rtol, atol=atom_atol
+        )
+    for key in ("initial_global", "migrated_global"):
+        np.testing.assert_allclose(
+            manual[key], whole_model[key], rtol=rtol, atol=global_atol
         )

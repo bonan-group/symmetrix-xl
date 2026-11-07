@@ -30,7 +30,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential cmake git libblas-dev liblapack-dev ninja-build
+        sudo apt-get install -y build-essential cmake git libblas-dev libfftw3-dev liblapack-dev ninja-build
     - name: Set up uv
       uses: astral-sh/setup-uv@v8.3.2
       with:
@@ -40,7 +40,12 @@ jobs:
       run: |
         uv venv --clear
         source .venv/bin/activate
-        uv pip install ./symmetrix[test]
+        uv pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.5.*"
+        uv pip install "mace-torch==0.3.16" pytest
+        source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_source_fingerprint; print(symmetrix_source_fingerprint(Path.cwd()))')
+        uv pip install ./symmetrix \
+          --config-settings="cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint" \
+          --config-settings=cmake.define.SYMMETRIX_PARTICLE_MESH=ON
         deactivate
     - name: Run tests
       run: |
@@ -61,7 +66,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential ccache cmake git libfftw3-dev libopenmpi-dev mpi-default-bin mpi-default-dev libblas-dev liblapack-dev
+        sudo apt-get install -y build-essential ccache cmake gfortran git libopenblas-dev libopenmpi-dev mpi-default-bin mpi-default-dev
     - name: Set up uv
       uses: astral-sh/setup-uv@v8.3.2
       with:
@@ -79,14 +84,12 @@ jobs:
       with:
         path: ~/.cache/symmetrix/test-models
         key: symmetrix-test-models-macefield-1.0.2
-    - name: Clone LAMMPS and install pair style
+    - name: Clone pinned LAMMPS source
       run: |
-        source .venv/bin/activate
-        git clone -b release --depth 1 https://github.com/lammps/lammps.git
-        cd pair_symmetrix
-        chmod +x install.sh
-        ./install.sh ../lammps
-        deactivate
+        git init lammps
+        git -C lammps remote add origin https://github.com/lammps/lammps.git
+        git -C lammps fetch --depth 1 origin 0165101ce505734e8fb249694b22e295a7ab4182
+        git -C lammps checkout --detach FETCH_HEAD
     - name: Cache C++ compiler results
       uses: actions/cache@v4
       with:
@@ -97,32 +100,40 @@ jobs:
     - name: Build LAMMPS
       run: |
         source .venv/bin/activate
-        cd lammps
-        cmake \
-            -B build \
-            -D CMAKE_BUILD_TYPE=Release \
-            -D CMAKE_CXX_STANDARD=20 \
-            -D CMAKE_CXX_STANDARD_REQUIRED=ON \
-            -D BUILD_SHARED_LIBS=ON \
-            -D PKG_KOKKOS=ON \
-            -D Kokkos_ENABLE_SERIAL=ON \
-            -D Kokkos_ENABLE_OPENMP=ON \
-            -D BUILD_OMP=ON \
-            -D SYMMETRIX_HOST_ARCH=x86-64-v3 \
-            -D Kokkos_ARCH_NATIVE=OFF \
-            -D Kokkos_ENABLE_AGGRESSIVE_VECTORIZATION=ON \
-            -D SYMMETRIX_KOKKOS=ON \
-            -D CMAKE_CXX_COMPILER_LAUNCHER=ccache \
-            cmake
-        cmake --build build -j 4
-        cd build
-        make install-python
+        python tools/symmetrix_build.py lammps \
+          --source "$GITHUB_WORKSPACE/lammps" \
+          --prefix "$RUNNER_TEMP/lammps-install" \
+          --build-root "$RUNNER_TEMP/symmetrix-lammps-build" \
+          --backend cpu \
+          --cpu-target x86-64-v3 \
+          --blas openblas \
+          --particle-mesh off \
+          --mpi on \
+          --install-python-module \
+          --lammps-cmake-define CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+          --jobs 4
+        test -x "$RUNNER_TEMP/lammps-install/bin/lmp"
+        "$RUNNER_TEMP/lammps-install/bin/lmp" -help | grep -F 'symmetrix/mace/kk'
+        python -c "from lammps import lammps; instance = lammps(cmdargs=['-screen', 'none']); instance.close()"
+        echo "SYMMETRIX_LAMMPS_EXECUTABLE=$RUNNER_TEMP/lammps-install/bin/lmp" >> "$GITHUB_ENV"
         deactivate
-    - name: Run tests
+
+    - name: Run required residual-first integration test
       run: |
         source .venv/bin/activate
-        cd pair_symmetrix/test/
-        python -m pytest
+        TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+        SYMMETRIX_REQUIRE_LAMMPS_TESTS=1 \
+          pytest -q pair_symmetrix/test/test_pair_symmetrix_factorized_mpi.py \
+            -k test_manual_schedules_match_whole_model_for_residual_first_models
+        deactivate
+
+    - name: Run pair style test suite
+      run: |
+        source .venv/bin/activate
+        cd pair_symmetrix/test
+        TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+          pytest -q -k 'not test_manual_schedules_match_whole_model_for_residual_first_models'
+        deactivate
 
   extract-mace-model:
     runs-on: ubuntu-latest
@@ -163,8 +174,10 @@ jobs:
         uv venv --clear
         source .venv/bin/activate
         uv pip install --index-url https://download.pytorch.org/whl/cpu "${{ matrix.torch }}"
+        source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_source_fingerprint; print(symmetrix_source_fingerprint(Path.cwd()))')
         uv pip install "${{ matrix.mace-torch }}" pytest \
           --config-settings=cmake.define.SYMMETRIX_HOST_ARCH=x86-64-v3 \
+          --config-settings="cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint" \
           "./symmetrix[mace]"
         deactivate
     - name: Cache test models
@@ -192,7 +205,7 @@ jobs:
           test_mace_streamed_edges.py \
           test_symmetrix_calc.py::test_compact_macefield_calculator_replaces_active_composition_cache \
           test_symmetrix_calc.py::test_macefield_native_json_ase_response_properties_match_pytorch \
-          test_symmetrix_calc.py::test_macefield_json_kokkos_response_properties_match_native \
+          test_symmetrix_calc.py::test_macefield_json_with_kokkos_requested_constructs_kokkos_evaluator \
           test_mace_streamed_edges.py::test_legacy_pair_spline_models_warn_and_default_to_legacy
         deactivate
     - name: Cache MACE-MH-1 checkpoint

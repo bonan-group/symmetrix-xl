@@ -102,9 +102,7 @@ def render_table(
             raise ValueError(f"{label}: record status is not passing: {status!r}")
         observed_atoms = _record_atoms(record)
         if observed_atoms != atoms:
-            raise ValueError(
-                f"{label}: expected {atoms} atoms, found {observed_atoms}"
-            )
+            raise ValueError(f"{label}: expected {atoms} atoms, found {observed_atoms}")
         backend = _display_backend(record, label)
         rows.append(
             (
@@ -146,11 +144,11 @@ def render_table(
     return "\n".join(lines)
 
 
-def update_readme(readme: Path, table: str, *, begin: str = BEGIN, end: str = END) -> None:
+def update_readme(
+    readme: Path, table: str, *, begin: str = BEGIN, end: str = END
+) -> None:
     text = readme.read_text(encoding="utf-8")
-    pattern = re.compile(
-        rf"{re.escape(begin)}.*?{re.escape(end)}", re.DOTALL
-    )
+    pattern = re.compile(rf"{re.escape(begin)}.*?{re.escape(end)}", re.DOTALL)
     if not pattern.search(text):
         raise ValueError(f"README is missing generated-table markers: {readme}")
     readme.write_text(pattern.sub(table, text, count=1), encoding="utf-8")

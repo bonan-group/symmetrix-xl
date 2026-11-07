@@ -1564,6 +1564,7 @@ def test_wheel_content_audit_uses_canonical_operator_catalog_validation(
         audit_wheel(wheel)
 
 
+@pytest.mark.skipif(shutil.which("readelf") is None, reason="requires readelf")
 def test_wheel_content_audit_does_not_trust_fake_shared_library(tmp_path):
     binary = b"not an ELF shared library"
     wheel = tmp_path / "fake-shared-library.whl"
@@ -1612,6 +1613,10 @@ def test_cpu_operator_set_rejects_mixed_vendored_openmp_owners():
         )
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("readelf") is None,
+    reason="requires a Linux ELF toolchain and readelf",
+)
 def test_cpu_operator_dependency_audit_rejects_unapproved_library(tmp_path):
     compiler = shutil.which("cc")
     if compiler is None:
@@ -1973,6 +1978,39 @@ def test_lammps_packages_and_extra_definitions_are_normalized_and_fingerprinted(
     assert definitions["PKG_KSPACE"] == "ON"
     assert definitions["FFT"] == "KISS"
     assert definitions["BUILD_SHARED_LIBS"] == "ON"
+    assert invocation.build_fingerprint != baseline.build_fingerprint
+
+
+def test_lammps_python_module_request_installs_shared_module(tmp_path):
+    arguments = {
+        "repo_root": REPOSITORY_ROOT,
+        "source": _lammps_source(tmp_path / "lammps"),
+        "prefix": tmp_path / "prefix",
+        "mpi": "off",
+        "mpi_cxx": "",
+        "jobs": 1,
+        "runner": FakeRunner({}, {}),
+        "build_root": tmp_path / "build",
+    }
+
+    invocation = lammps_build_invocation(
+        _manifest(), **arguments, install_python_module=True
+    )
+    baseline = lammps_build_invocation(_manifest(), **arguments)
+
+    assert invocation.provenance["python_module"] is True
+    assert invocation.provenance["cmake_definitions"]["BUILD_SHARED_LIBS"] == "ON"
+    assert (
+        invocation.provenance["cmake_definitions"]["CMAKE_INSTALL_RPATH"]
+        == "$ORIGIN/../lib"
+    )
+    assert invocation.commands[-1] == (
+        "/usr/bin/cmake",
+        "--build",
+        str(invocation.build_directory),
+        "--target",
+        "install-python",
+    )
     assert invocation.build_fingerprint != baseline.build_fingerprint
 
 
