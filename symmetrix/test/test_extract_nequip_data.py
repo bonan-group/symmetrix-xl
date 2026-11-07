@@ -6,6 +6,7 @@ from collections import namedtuple
 
 import pytest
 
+from symmetrix.cli import extract_nequip as extract_nequip_cli
 import symmetrix.extract_nequip_data as extraction
 from symmetrix.extract_nequip_data import extract_nequip_data
 from symmetrix.nequip_probe import NequIPProbeError
@@ -53,6 +54,47 @@ def test_malformed_oam_does_not_downgrade_to_legacy_contract():
 
     with pytest.raises(ValueError, match="no InteractionBlock"):
         extract_nequip_data(BrokenOAM())
+
+
+def test_cli_preserves_oam_archive_identity(monkeypatch, tmp_path, capsys):
+    model_path = tmp_path / "NequIP-OAM-S-0.1.nequip.zip"
+    model = object()
+    calls = {}
+    data = {
+        "model_metadata": {},
+        "num_layers": 2,
+        "model_atomic_numbers": [1],
+        "r_cut": 4.5,
+    }
+
+    monkeypatch.setattr(extract_nequip_cli, "load_nequip_model", lambda _: model)
+
+    def fake_extract(source, *, output_precision, source_path):
+        calls["extract"] = (source, output_precision, source_path)
+        return data
+
+    def fake_export(source, output, *, force, precision, data):
+        calls["export"] = (source, output, force, precision, data)
+        return output
+
+    monkeypatch.setattr(extract_nequip_cli, "extract_nequip_data", fake_extract)
+    monkeypatch.setattr(extract_nequip_cli, "export_nequip_model", fake_export)
+
+    assert (
+        extract_nequip_cli.main(
+            ["--model", str(model_path), "--output", str(tmp_path / "oam.json")]
+        )
+        == 0
+    )
+    assert calls["extract"] == (model, "float64", str(model_path))
+    assert calls["export"] == (
+        model,
+        str(tmp_path / "oam.json"),
+        False,
+        "float64",
+        data,
+    )
+    assert "layers: 2" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

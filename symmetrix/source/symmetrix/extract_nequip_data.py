@@ -1274,11 +1274,15 @@ def _source_declares_nequip_oam(path: str | Path) -> bool:
 
 
 def extract_nequip_data(
-    model: Any, *, output_precision: str = "float64"
+    model: Any,
+    *,
+    output_precision: str = "float64",
+    source_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Extract a supported NequIP OAM model into the v2 contract."""
-    source_declares_oam = isinstance(model, (str, Path)) and (
-        _source_declares_nequip_oam(model)
+    source = model if source_path is None else source_path
+    source_declares_oam = isinstance(source, (str, Path)) and (
+        _source_declares_nequip_oam(source)
     )
     if isinstance(model, (str, Path)):
         model = load_nequip_model(model)
@@ -1293,11 +1297,12 @@ def extract_nequip_data(
 
 
 def export_nequip_model(
-    model_path: str | Path,
+    model_path: Any,
     output_path: str | Path,
     *,
     force: bool = False,
     precision: str = "float64",
+    data: dict[str, Any] | None = None,
 ) -> Path:
     """Load and export a NequIP package/checkpoint to JSON.
 
@@ -1314,7 +1319,8 @@ def export_nequip_model(
         raise FileExistsError(
             f"output already exists: {destination}; pass --force to overwrite"
         )
-    data = extract_nequip_data(model_path, output_precision=precision)
+    if data is None:
+        data = extract_nequip_data(model_path, output_precision=precision)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     temporary.write_text(
