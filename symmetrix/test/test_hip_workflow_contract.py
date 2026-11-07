@@ -81,7 +81,9 @@ def test_hip_manifest_excludes_uncollected_mh1_nodes():
 
 
 def test_fixture_only_workflow_forbids_oracle_dependencies_and_downloads():
-    workflow = (WORKFLOW.parents[2] / ".github/workflows/polar-fixture-only.yaml").read_text()
+    workflow = (
+        WORKFLOW.parents[2] / ".github/workflows/polar-fixture-only.yaml"
+    ).read_text()
     assert "Build CPU frontend and run immutable fixture lane" in workflow
     assert "find_spec(name) is None" in workflow
     assert '"torch", "mace", "graph_longrange"' in workflow
