@@ -90,5 +90,16 @@ def test_fixture_only_workflow_forbids_oracle_dependencies_and_downloads():
     assert "test_polar_oracle_fixtures.py" in workflow
     assert "test_polar_end_to_end_fixtures.py" in workflow
     assert "test_mace_les_reference.py" in workflow
+    assert "benchmarks/polar_end_to_end_oracle_runner.py" in workflow
+    assert "benchmarks/polar_oracle_fixture_runner.py" in workflow
     assert "curl" not in workflow
     assert "download" not in workflow.lower()
+
+
+def test_polar_checkpoint_path_is_available_without_oracle_runtime():
+    source = (WORKFLOW.parents[2] / "symmetrix/test/test_polar_end_to_end_fixtures.py").read_text()
+    checkpoint = source.index("def _checkpoint_path")
+    oracle_skip = source.index("if _polar_oracle_import_error is not None", checkpoint)
+    path_lookup = source.index("os.environ.get", checkpoint)
+    assert path_lookup < oracle_skip
+    assert "SYMMETRIX_POLAR_ORACLE_RUNTIME" in source

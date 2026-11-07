@@ -461,11 +461,6 @@ except ImportError as _error:  # pragma: no cover - environment-dependent
 def _checkpoint_path(size: str) -> Path:
     import os
 
-    if _polar_oracle_import_error is not None:
-        pytest.skip(
-            "the reference comparison requires torch/e3nn/mace/graph_longrange: "
-            f"{_polar_oracle_import_error}"
-        )
     path = os.environ.get(f"SYMMETRIX_POLAR_MODEL_{size}")
     if not path:
         pytest.skip(
@@ -1123,6 +1118,11 @@ def test_the_backbone_half_is_parity_clean_against_the_oracle_reference(tmp_path
 
     if os.environ.get("SYMMETRIX_POLAR_ORACLE_RUNTIME") != "1":
         pytest.skip("one-time Polar oracle opening is opt-in")
+    if _polar_oracle_import_error is not None:
+        pytest.skip(
+            "the reference comparison requires torch/e3nn/mace/graph_longrange: "
+            f"{_polar_oracle_import_error}"
+        )
 
     import json as _json
 

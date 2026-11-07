@@ -11,6 +11,8 @@ on:
       - "symmetrix/test/data/polar/**"
       - "symmetrix/test/reference/fixtures/mace_les_monopole_cases.json"
       - "symmetrix/test/test_hip_workflow_contract.py"
+      - "benchmarks/polar_end_to_end_oracle_runner.py"
+      - "benchmarks/polar_oracle_fixture_runner.py"
       - ".github/workflows/polar-fixture-only.yaml"
 
 permissions:
