@@ -50,7 +50,7 @@ jobs:
       - name: Validate version sources and release tag
         run: |
           python tools/check_release_metadata.py
-          if [[ "${{ inputs.publish_pypi }}" == "true" ]]; then
+          if [[ "${{ inputs.publish_pypi }}" == "true" || "${{ inputs.publish_testpypi }}" == "true" ]]; then
             python tools/check_release_metadata.py --require-tag
           fi
 

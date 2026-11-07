@@ -2484,7 +2484,7 @@ def test_release_version_sources_agree():
     assert f'release = "{version}"' in docs_source
 
 
-def test_release_metadata_names_the_dated_version_and_tag(tmp_path):
+def test_release_metadata_accepts_unreleased_until_publication(tmp_path):
     prepared = tmp_path / "prepared-release"
     for relative in (
         "symmetrix/pyproject.toml",
@@ -2497,22 +2497,24 @@ def test_release_metadata_names_the_dated_version_and_tag(tmp_path):
         shutil.copy2(REPOSITORY_ROOT / relative, destination)
     changelog = (REPOSITORY_ROOT / "CHANGELOG.md").read_text()
     prepared_changelog = changelog[changelog.index("## 0.2.0") :]
-    (prepared / "CHANGELOG.md").write_text(
-        "# Changelog\n\n## Unreleased\n\n" + prepared_changelog
-    )
-    with pytest.raises(ValueError, match="Unreleased"):
-        release_check.release_metadata(prepared)
-
     (prepared / "CHANGELOG.md").write_text("# Changelog\n\n" + prepared_changelog)
 
     assert release_check.release_metadata(prepared) == {
         "version": "0.2.0",
-        "date": "2026-10-25",
+        "date": "Unreleased",
         "tag": "v0.2.0",
     }
-    assert release_check.release_metadata(
-        REPOSITORY_ROOT
-    ) == release_check.release_metadata(prepared)
+    with pytest.raises(ValueError, match="no dated"):
+        release_check.release_metadata(prepared, require_dated=True)
+
+    dated = prepared_changelog.replace(
+        "## 0.2.0 - Unreleased", "## 0.2.0 - 2026-10-25", 1
+    )
+    (prepared / "CHANGELOG.md").write_text("# Changelog\n\n" + dated)
+    assert (
+        release_check.release_metadata(prepared, require_dated=True)["date"]
+        == "2026-10-25"
+    )
 
 
 def test_publication_ref_must_be_the_matching_version_tag():

@@ -14,7 +14,9 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
-def release_metadata(repository: Path = REPOSITORY_ROOT) -> dict[str, str]:
+def release_metadata(
+    repository: Path = REPOSITORY_ROOT, *, require_dated: bool = False
+) -> dict[str, str]:
     pyproject = tomllib.loads((repository / "symmetrix/pyproject.toml").read_text())
     version = pyproject["project"]["version"]
     expected = {
@@ -32,16 +34,21 @@ def release_metadata(repository: Path = REPOSITORY_ROOT) -> dict[str, str]:
             raise ValueError(f"{name} release version does not match {version}")
 
     changelog = (repository / "CHANGELOG.md").read_text()
-    match = re.search(
-        rf"^## {re.escape(version)} - (\d{{4}}-\d{{2}}-\d{{2}})$",
+    heading = re.search(
+        rf"^## {re.escape(version)} - (Unreleased|\d{{4}}-\d{{2}}-\d{{2}})$",
         changelog,
         re.MULTILINE,
     )
-    if match is None:
+    if heading is None:
+        raise ValueError(f"CHANGELOG.md has no valid {version} release heading")
+    date = heading.group(1)
+    if require_dated and date == "Unreleased":
         raise ValueError(f"CHANGELOG.md has no dated {version} release heading")
-    if "## Unreleased" in changelog:
+    if require_dated and re.search(
+        r"^## \d+\.\d+\.\d+ - Unreleased$", changelog, re.MULTILINE
+    ):
         raise ValueError("CHANGELOG.md still has an Unreleased release section")
-    return {"version": version, "date": match.group(1), "tag": f"v{version}"}
+    return {"version": version, "date": date, "tag": f"v{version}"}
 
 
 def validate_publication_ref(
@@ -59,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ref-type", default=os.environ.get("GITHUB_REF_TYPE", ""))
     parser.add_argument("--ref-name", default=os.environ.get("GITHUB_REF_NAME", ""))
     args = parser.parse_args(argv)
-    metadata = release_metadata()
+    metadata = release_metadata(require_dated=args.require_tag)
     if args.require_tag:
         validate_publication_ref(metadata, args.ref_type, args.ref_name)
     print(json.dumps(metadata, indent=2, sort_keys=True))
