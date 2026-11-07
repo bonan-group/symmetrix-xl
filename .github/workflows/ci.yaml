@@ -20,8 +20,6 @@ jobs:
 
   symmetrix:
     runs-on: ubuntu-latest
-    env:
-      TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: "1"
     steps:
     - name: Clone repo
       uses: actions/checkout@v6
@@ -30,7 +28,7 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential cmake git libblas-dev libfftw3-dev liblapack-dev ninja-build
+        sudo apt-get install -y build-essential cmake git libopenblas-dev libfftw3-dev liblapack-dev ninja-build
     - name: Set up uv
       uses: astral-sh/setup-uv@v8.3.2
       with:
@@ -40,10 +38,10 @@ jobs:
       run: |
         uv venv --clear
         source .venv/bin/activate
-        uv pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.5.*"
-        uv pip install "mace-torch==0.3.16" pytest
+        uv pip install scikit-build-core pybind11 ninja pytest numpy scipy ase
         source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_source_fingerprint; print(symmetrix_source_fingerprint(Path.cwd()))')
         uv pip install ./symmetrix \
+          --config-settings=build-dir="$RUNNER_TEMP/symmetrix-cpu-build" \
           --config-settings="cmake.define.SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256=$source_fingerprint" \
           --config-settings=cmake.define.SYMMETRIX_PARTICLE_MESH=ON
         deactivate
@@ -51,8 +49,17 @@ jobs:
       run: |
         source .venv/bin/activate
         python -c "import symmetrix; print(symmetrix.__version__)"
-        cd symmetrix/test
-        pytest
+        python - <<'PY'
+        import importlib.util
+        for name in ("torch", "mace", "graph_longrange"):
+            assert importlib.util.find_spec(name) is None, name
+        PY
+        pytest -q \
+          symmetrix/test/test_polar_oracle_fixtures.py \
+          symmetrix/test/test_polar_end_to_end_fixtures.py \
+          symmetrix/test/test_mace_les_reference.py \
+          symmetrix/test/test_build_backend.py \
+          symmetrix/test/test_standard_modules.py
         deactivate
         cd ../..
 
