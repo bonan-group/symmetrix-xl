@@ -220,6 +220,25 @@ def test_portable_reference_checkpoint_and_recorded_runtime(validator, tmp_path)
             validator.validate_documents(reference, {**candidate, "checkpoint": broken})
 
 
+def test_model_identity_does_not_require_serialized_json_hash_match(
+    validator, tmp_path
+):
+    checkpoint = tmp_path / "model.pt"
+    reference_model = tmp_path / "reference.json"
+    candidate_model = tmp_path / "candidate.json"
+    structure = tmp_path / "fixture.xyz"
+    checkpoint.write_bytes(b"checkpoint")
+    reference_model.write_text('{"serialization": "reference"}')
+    candidate_model.write_text('{"serialization": "candidate"}')
+    structure.write_text("fixture")
+    reference = _result("upstream", checkpoint, reference_model, structure)
+    candidate = _result("symmetrix", checkpoint, candidate_model, structure)
+
+    result = validator.validate_documents(reference, candidate)
+
+    assert result["passed"]
+
+
 def test_recorded_converted_model_is_rejected_and_missing_local_file_fails(
     validator, tmp_path
 ):

@@ -163,12 +163,20 @@ def validate_documents(reference, candidate):
             raise CorrectnessError(f"{name} provenance does not match")
     for index, name in enumerate(("checkpoint", "converted model", "structure")):
         key = "sha256"
-        if ref[index][key] != cand[index][key]:
+        # The checkpoint identifies the upstream model. Converted JSON is a
+        # materialized artifact whose byte representation may vary with
+        # exporter/version/serialization details; its own identity is checked
+        # when the file is local, while model semantics are checked above.
+        if name != "converted model" and ref[index][key] != cand[index][key]:
             raise CorrectnessError(f"{name} provenance does not match")
-        if ref[index].get("size_bytes") != cand[index].get("size_bytes"):
+        if name != "converted model" and ref[index].get("size_bytes") != cand[
+            index
+        ].get("size_bytes"):
             raise CorrectnessError(f"{name} size provenance does not match")
-        if ref[index].get("materialization", "local") != cand[index].get(
-            "materialization", "local"
+        if (
+            name != "converted model"
+            and ref[index].get("materialization", "local")
+            != cand[index].get("materialization", "local")
         ):
             raise CorrectnessError(f"{name} identity mode does not match")
     if ref[2].get("frame") != cand[2].get("frame") or ref[2].get("atoms") != cand[
