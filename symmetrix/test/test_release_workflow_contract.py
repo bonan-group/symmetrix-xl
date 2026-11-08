@@ -43,13 +43,23 @@ def test_cuda_release_keeps_declared_matrix_and_metadata_gate():
 
 def test_cpu_release_compatibility_lane_is_pinned_and_downloads_fail_closed():
     workflow = (ROOT / ".github/workflows/release-cpu-wheels.yaml").read_text()
-    assert "'torch==2.5.*'" in workflow
-    assert "'mace-torch==0.3.16'" in workflow
+    assert "Run focused wheel compatibility suite" in workflow
+    assert "symmetrix/test/test_polar_end_to_end_fixtures.py" in workflow
+    assert "torch==2.5.*" not in workflow
+    assert "mace-torch==0.3.16" not in workflow
     assert 'SYMMETRIX_TEST_MODEL_DOWNLOADS: "0"' in workflow
     assert "qualify-full" in workflow
 
 
-def _cuda_wheel(tmp_path, *, descriptor=None, native=True, catalog=True, oam=True):
+def _cuda_wheel(
+    tmp_path,
+    *,
+    descriptor=None,
+    native=True,
+    catalog=True,
+    oam=True,
+    include_descriptor_prebuilt=True,
+):
     package = "symmetrix_backend_cuda13_sm120"
     descriptor = descriptor or {
         "distribution": "symmetrix-xl-cuda13-sm120",
@@ -74,12 +84,15 @@ def _cuda_wheel(tmp_path, *, descriptor=None, native=True, catalog=True, oam=Tru
     payload = {
         "artifacts": artifacts,
     }
-    descriptor["prebuilt_operator_artifacts"] = {
-        "backend": "cuda",
-        "target": "sm120",
-        "artifact_count": len(artifacts),
-        "catalog_sha256": hashlib.sha256(json.dumps(payload).encode()).hexdigest(),
-    }
+    if include_descriptor_prebuilt:
+        descriptor["prebuilt_operator_artifacts"] = {
+            "backend": "cuda",
+            "target": "sm120",
+            "artifact_count": len(artifacts),
+            "catalog_sha256": hashlib.sha256(
+                json.dumps(payload).encode()
+            ).hexdigest(),
+        }
     wheel = tmp_path / "wheel.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr(f"{package}/backend.json", json.dumps(descriptor))
@@ -103,6 +116,15 @@ def test_cuda_audit_accepts_valid_synthetic_wheel(tmp_path):
         _cuda_wheel(tmp_path), cuda_major="13", target="sm120"
     )
     assert result["selector"] == "cuda13-sm120"
+
+
+def test_cuda_audit_derives_catalog_provenance_for_legacy_descriptor(tmp_path):
+    result = audit_cuda_release_wheel.audit_cuda_wheel(
+        _cuda_wheel(tmp_path, include_descriptor_prebuilt=False),
+        cuda_major="13",
+        target="sm120",
+    )
+    assert result["artifacts"] == 1
 
 
 @pytest.mark.parametrize(

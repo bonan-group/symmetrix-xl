@@ -30,6 +30,7 @@ BUILD_IMAGE="${BUILD_IMAGE:-1}"
 WHEEL_DIR="${WHEEL_DIR:-wheelhouse/cuda${CUDA_MAJOR}}"
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+source_commit="$(git -C "$repo_root" rev-parse HEAD)"
 if [[ "$WHEEL_DIR" = /* ]] || [[ "$WHEEL_DIR" == *".."* ]]; then
   echo "error: WHEEL_DIR must be a relative path without '..': $WHEEL_DIR" >&2
   exit 1
@@ -77,6 +78,7 @@ for python_abi in $PYTHON_ABIS; do
     --env "PYTHON_ABI=$python_abi" \
     --env "CUDA_MAJOR=$CUDA_MAJOR" \
     --env "CUDA_TARGET=$CUDA_TARGET" \
+    --env "SYMMETRIX_RELEASE_SOURCE_COMMIT=$source_commit" \
     --env "OUTPUT_DIR=/io/$WHEEL_DIR/$python_abi" \
     --env "JOBS=${JOBS:-4}" \
     "$BUILDER_IMAGE" \
