@@ -15,8 +15,10 @@ namespace symmetrix {
 // Converts the orthonormal real spherical harmonics produced by the shared
 // device kernels to the unit-l=0 convention carried by the serialized model
 // definitions: sqrt(4*pi).
-inline constexpr double spherical_harmonic_real_normalization =
+inline constexpr double spherical_harmonic_mace_normalization =
     3.5449077018110318;
+inline constexpr double spherical_harmonic_real_normalization =
+    spherical_harmonic_mace_normalization;
 
 // Y normalization of the direct (y-only) plan, equal to the retained plan's
 // float(double(Y) * C) (normalize_Y in mace_kokkos_first_interaction.cpp) for

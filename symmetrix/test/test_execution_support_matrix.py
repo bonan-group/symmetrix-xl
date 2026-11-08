@@ -301,9 +301,10 @@ def test_polar_lammps_rows_state_the_qualified_one_rank_boundary(matrix):
     assert "artifact-free portable `pair_spline_v1`" in rows["reference"].lammps
 
     capabilities = {row.key: row for row in matrix.FAMILY_CAPABILITIES["MACE_Polar"]}
-    assert "HIP gfx1151 is runtime-qualified from source builds only" in capabilities[
-        "target"
-    ].limits
+    assert (
+        "HIP gfx1151 is runtime-qualified from source builds only"
+        in capabilities["target"].limits
+    )
     assert capabilities["stress"].status == "qualified"
     assert "exact-zero isolated stress" in capabilities["stress"].scope
 

@@ -2284,9 +2284,7 @@ def test_release_source_commit_fallback_preserves_clean_provenance(
     monkeypatch.setattr(runner, "which", lambda _command: None)
     monkeypatch.setenv("SYMMETRIX_RELEASE_SOURCE_COMMIT", "d" * 40)
 
-    provenance = build_source_provenance.symmetrix_source_provenance(
-        repository, runner
-    )
+    provenance = build_source_provenance.symmetrix_source_provenance(repository, runner)
 
     assert provenance["revision"] == "d" * 40
     assert provenance["dirty"] is False

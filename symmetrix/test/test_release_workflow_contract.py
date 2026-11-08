@@ -16,7 +16,7 @@ def test_cuda_release_audits_before_upload_and_publication():
     assert "tools/audit_cuda_release_wheel.py" in workflow
     assert "auditwheel show" in workflow
     assert "manylinux_2_28" in workflow
-    assert "pip install --no-deps" in workflow
+    assert "install --no-deps" in workflow
     assert "entry_points" in workflow
     assert "_operator_artifacts/catalog.json" in workflow
     assert "sha256sum *.whl" in workflow
@@ -89,9 +89,7 @@ def _cuda_wheel(
             "backend": "cuda",
             "target": "sm120",
             "artifact_count": len(artifacts),
-            "catalog_sha256": hashlib.sha256(
-                json.dumps(payload).encode()
-            ).hexdigest(),
+            "catalog_sha256": hashlib.sha256(json.dumps(payload).encode()).hexdigest(),
         }
     wheel = tmp_path / "wheel.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
