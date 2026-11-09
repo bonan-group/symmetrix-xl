@@ -10,6 +10,12 @@ All notable changes to Symmetrix-XL are documented in this file.
   U column's sign from the checkpoint's `U_matrix_<nu>` buffer and refuses a
   buffer that matches neither sign. Exports of checkpoints that already
   matched are unchanged.
+- Fixed the Kokkos pair style accepting fixed-workspace tiled plans under
+  `no_domain_decomposition` (`allow_fixed_workspace yes` or a tiled
+  `_debug_execution_plan`), which then failed during `run`. `pair_style` now
+  refuses them and names `mpi_message_passing`, and the generic evaluation
+  entry refuses edge vectors under an active tiled plan unless they are the
+  registered geometry or the prepared workspace.
 - Fixed the A1 channel-tile kernels of the Phi1 `channel-tiled-64` policy,
   which the CUDA dual-layer fixed-workspace plan selects: they read the
   evaluator's channel count through the host object pointer, which a GPU can
