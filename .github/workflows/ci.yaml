@@ -62,6 +62,8 @@ jobs:
           --ignore=symmetrix/test/test_polar_torch_baseline.py \
           --ignore=symmetrix/test/test_single_layer_mace.py \
           --ignore=symmetrix/test/test_jit_kokkos_integration.py \
+          --ignore=symmetrix/test/test_jit_device_artifact.py \
+          --ignore=symmetrix/test/test_mace_les_readout.py \
           --ignore=symmetrix/test/test_jit_operator_cuda.py \
           --ignore=symmetrix/test/test_mace_polar_frontend.py
         pytest -q \
@@ -252,6 +254,8 @@ jobs:
         cd symmetrix/test
         pytest -q \
           test_extract_mace_data.py \
+          test_jit_device_artifact.py \
+          test_mace_les_readout.py \
           test_field_calculators.py \
           test_macefield_native.py \
           test_macefield_indexing_source.py \
@@ -322,11 +326,31 @@ jobs:
         name: mh1-test-logs
         path: /tmp/mh1-logs/
         if-no-files-found: ignore
+    - name: Cache pinned MACE-OFF23 checkpoint
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/symmetrix/mace-off23/MACE-OFF23_small.model
+        key: mace-off23-small-165cce4cfec5a34b9c64d4ebf95de15d71106bb584b7291c8470f0749977c46f
+    - name: Download and verify pinned MACE-OFF23 checkpoint
+      run: |
+        model="$HOME/.cache/symmetrix/mace-off23/MACE-OFF23_small.model"
+        checksum=165cce4cfec5a34b9c64d4ebf95de15d71106bb584b7291c8470f0749977c46f
+        mkdir -p "$(dirname "$model")"
+        if ! echo "$checksum  $model" | sha256sum --check --strict; then
+          trap 'rm -f "$model.part"' EXIT
+          curl --fail --location --retry 5 --retry-all-errors \
+            --connect-timeout 30 --max-time 120 --retry-max-time 600 \
+            https://raw.githubusercontent.com/ACEsuit/mace-off/91a78c5a9c300d1104700d9352c8bfe449227737/mace_off23/MACE-OFF23_small.model \
+            --output "$model.part"
+          echo "$checksum  $model.part" | sha256sum --check --strict
+          mv "$model.part" "$model"
+        fi
+        echo "$checksum  $model" | sha256sum --check --strict
+        cp "$model" MACE-OFF23_small.model
     - name: Test model extraction
       run: |
         source .venv/bin/activate
         # check compact universal conversion and its default filename
-        wget https://github.com/ACEsuit/mace-off/raw/refs/heads/main/mace_off23/MACE-OFF23_small.model
         symmetrix_extract_mace --model MACE-OFF23_small.model
         python3 -c "from symmetrix import Symmetrix; calc = Symmetrix('MACE-OFF23_small-universal.json')"
         # Compare a chemical-symbol subset export with the universal compact
