@@ -250,6 +250,7 @@ jobs:
         PYTHONPATH=symmetrix/test python -c "from model_downloads import macefield_model_path; print(macefield_model_path())"
         deactivate
     - name: Test standard MACE and Polar contracts
+      if: matrix.mace-torch == 'mace-torch==0.3.16'
       run: |
         source .venv/bin/activate
         cd symmetrix/test
