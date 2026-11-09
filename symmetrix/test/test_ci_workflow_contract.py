@@ -106,9 +106,15 @@ def test_torch_dependent_modules_run_in_macefield_lane():
     )[1].split("    - name: Cache MACE-MH-1 checkpoint\n", 1)[0]
     standard = workflow.split(
         "    - name: Test standard MACE and Polar contracts\n", 1
-    )[1].split("    - name: Test compact MACEField conversion and ASE integration\n", 1)[0]
+    )[1].split(
+        "    - name: Test compact MACEField conversion and ASE integration\n", 1
+    )[0]
     assert "if: matrix.mace-torch == 'mace-torch==0.3.16'" in standard
-    for module in ("test_bench_cli.py", "test_family_registry.py", "test_polar_s_direct.py"):
+    for module in (
+        "test_bench_cli.py",
+        "test_family_registry.py",
+        "test_polar_s_direct.py",
+    ):
         assert module in standard
     assert "if: matrix.mace_field_compatible" in macefield
     assert "test_jit_device_artifact.py" in macefield
