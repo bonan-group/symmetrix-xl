@@ -28,7 +28,6 @@
 namespace symmetrix::les {
 namespace {
 
-constexpr double coulomb_norm_factor = 90.4756;
 constexpr double two_pi = 2.0 * std::numbers::pi;
 // Adequacy validation is a serial host enumeration backed by an ordered set.
 // Above this count, enumeration time and the active-tuple storage can consume
@@ -399,6 +398,7 @@ void LESParticleMesh::compute(
     const std::size_t count,
     const double sigma,
     const double reciprocal_spacing,
+    const double norm_factor,
     const bool remove_self_interaction,
     const MonopoleDeviceResult& output)
 {
@@ -438,7 +438,7 @@ void LESParticleMesh::compute(
     const auto cotangent = impl_->cotangent;
     const auto bin_energy = impl_->bin_energy;
     const auto bin_radial = impl_->bin_radial_derivative;
-    const double prefactor = coulomb_norm_factor / impl_->volume;
+    const double prefactor = norm_factor / impl_->volume;
     const double cutoff_squared = (two_pi / reciprocal_spacing)
         * (two_pi / reciprocal_spacing);
     const double sigma_squared = sigma * sigma;
@@ -480,7 +480,7 @@ void LESParticleMesh::compute(
 
     const auto atomic = output.atomic_energies;
     const auto charge_adjoints = output.charge_adjoints;
-    const double self = coulomb_norm_factor / (sigma * std::pow(two_pi, 1.5));
+    const double self = norm_factor / (sigma * std::pow(two_pi, 1.5));
     const double self_sign = remove_self_interaction ? -1.0 : 1.0;
     Kokkos::parallel_for(
         "LES particle-mesh atomic outputs",
@@ -577,6 +577,7 @@ void LESParticleMesh::compute(
     const Kokkos::View<double*>&,
     const Kokkos::View<double*>&,
     std::size_t,
+    double,
     double,
     double,
     bool,

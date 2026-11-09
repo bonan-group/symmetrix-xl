@@ -11,6 +11,7 @@ struct MACELESParameters {
     int schema_version = 0;
     double sigma = 0.0;
     double dl = 0.0;
+    double norm_factor = 90.4756;
     bool remove_self_interaction = true;
     double output_scale = 1.0;
     int readout_2_hidden_size = 0;

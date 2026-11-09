@@ -72,7 +72,8 @@ void MACELESKokkos<Precision>::initialize_les_readouts()
     les_.monopole =
         std::make_unique<symmetrix::les::LESMonopoleKokkos<Precision>>(
             les_.parameters->sigma, les_.parameters->dl,
-            les_.parameters->remove_self_interaction);
+            les_.parameters->remove_self_interaction,
+            les_.parameters->norm_factor);
     les_.energy_host = Kokkos::View<double,Kokkos::HostSpace>(
         "LES host total energy");
 }

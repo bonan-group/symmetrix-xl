@@ -38,6 +38,12 @@ def test_frozen_nonperiodic_oracle_matches_upstream_les():
         np.testing.assert_allclose(
             result["charge_adjoints"], case.charge_adjoints, atol=2.0e-12
         )
+        position_force = case.positions.T @ result["forces"]
+        np.testing.assert_allclose(
+            result["strain_derivative"],
+            -0.5 * (position_force + position_force.T),
+            atol=2.0e-12,
+        )
 
 
 def test_frozen_periodic_oracle_matches_upstream_les():

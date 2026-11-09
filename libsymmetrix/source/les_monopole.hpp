@@ -12,6 +12,8 @@
 
 namespace symmetrix::les {
 
+inline constexpr double default_coulomb_norm_factor = 90.4756;
+
 class LESParticleMesh;
 
 enum class LESPeriodicAlgorithm {
@@ -65,7 +67,11 @@ class LESMonopoleKokkos {
 public:
     using execution_space = Kokkos::DefaultExecutionSpace;
 
-    LESMonopoleKokkos(double sigma, double dl, bool remove_self_interaction);
+    LESMonopoleKokkos(
+        double sigma,
+        double dl,
+        bool remove_self_interaction,
+        double norm_factor = default_coulomb_norm_factor);
     ~LESMonopoleKokkos();
 
     MonopoleResult compute_nonperiodic(
@@ -125,6 +131,7 @@ private:
 
     double sigma_;
     double dl_;
+    double norm_factor_;
     bool remove_self_interaction_;
     Kokkos::View<double*> atomic_energies_;
     Kokkos::View<double> energy_;

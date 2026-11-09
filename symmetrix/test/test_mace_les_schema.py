@@ -42,7 +42,17 @@ def test_validate_mace_les_parameters_accepts_exact_schema():
     assert normalized["readout_1_weights"] == [1.0]
     assert normalized["mace_num_interactions"] == 2
     assert normalized["mace_num_channels"] == 1
+    assert normalized["ewald"]["norm_factor"] == pytest.approx(90.4756)
     assert normalized["mace_contract_fingerprints"]["M0"] == "sha256:" + "2" * 64
+
+
+def test_validate_mace_les_parameters_preserves_ewald_norm_factor():
+    parameters = _valid_mace_les_parameters()
+    parameters["ewald"]["norm_factor"] = 90.0474
+
+    normalized = validate_mace_les_parameters(parameters)
+
+    assert normalized["ewald"]["norm_factor"] == pytest.approx(90.0474)
 
 
 @pytest.mark.parametrize(
@@ -51,6 +61,7 @@ def test_validate_mace_les_parameters_accepts_exact_schema():
         (lambda data: data.update(version=3), "version"),
         (lambda data: data.update(kind="dipole"), "monopole"),
         (lambda data: data["ewald"].update(dl=0.0), "dl"),
+        (lambda data: data["ewald"].update(norm_factor=0.0), "norm_factor"),
         (lambda data: data["readout_1_weights"].append(0.0), "readout_1_weights"),
         (
             lambda data: data["mace_contract_fingerprints"].update(R1="sha256:bad"),

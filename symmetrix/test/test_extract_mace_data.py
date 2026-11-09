@@ -288,7 +288,10 @@ def test_prediction_head_payload_keeps_les_parameters_per_maceles_head():
 
 def test_extract_legacy_maceles_uses_nested_ewald_flag_and_default_scale():
     model = _scalar_maceles_model()
-    model.les.ewald = SimpleNamespace(remove_self_interaction=False)
+    model.les.ewald = SimpleNamespace(
+        remove_self_interaction=False,
+        norm_factor=90.0474,
+    )
     del model.les.remove_self_interaction
     del model.les_output_scale
 
@@ -300,6 +303,7 @@ def test_extract_legacy_maceles_uses_nested_ewald_flag_and_default_scale():
     )
 
     assert data["ewald"]["remove_self_interaction"] is False
+    assert data["ewald"]["norm_factor"] == pytest.approx(90.0474)
     assert data["output_scale"] == pytest.approx(1.0)
 
 
@@ -315,6 +319,7 @@ def test_extract_legacy_maceles_defaults_missing_self_interaction_flag():
     )
 
     assert data["ewald"]["remove_self_interaction"] is True
+    assert data["ewald"]["norm_factor"] == pytest.approx(90.4756)
 
 
 def test_extract_maceles_prefers_nested_self_interaction_flag():

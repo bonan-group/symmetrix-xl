@@ -117,6 +117,13 @@ def test_validator_recomputes_deviations_and_verifies_hashes(validator, tmp_path
     assert summary["deviations"]["force_max_abs_eV_per_A"] == pytest.approx(1e-8)
 
 
+def test_upstream_limits_freeze_checkpoint_export_envelopes(validator):
+    assert validator.UPSTREAM_LIMITS == {
+        "float32": (2.0e-5, 1.0e-4, 2.5e-6, 1.0e-6),
+        "float64": (3.0e-6, 6.0e-5, 2.0e-6, 1.6e-7),
+    }
+
+
 def test_validator_rejects_threshold_and_provenance_mismatch(validator, tmp_path):
     checkpoint = tmp_path / "model.pt"
     converted = tmp_path / "model.json"

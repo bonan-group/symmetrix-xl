@@ -134,12 +134,13 @@ def nonperiodic_monopole_oracle(case: MACELESCase) -> dict[str, np.ndarray | flo
         atomic_energies += self_factor * charges * charges
         potential += 2.0 * self_factor * charges
 
+    position_force = positions.T @ force
     return {
         "energy": energy,
         "atomic_energies": atomic_energies,
         "forces": force,
         "charge_adjoints": potential,
-        "strain_derivative": np.zeros((3, 3), dtype=np.float64),
+        "strain_derivative": -0.5 * (position_force + position_force.T),
     }
 
 
