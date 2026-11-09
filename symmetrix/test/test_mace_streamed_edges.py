@@ -2953,7 +2953,10 @@ def test_scalar_standard_m0_low_memory_matches_retained_direct(
     assert evaluator.factorized_jit_artifact_id
     assert evaluator.factorized_fallback_evaluation_count == 0
     assert evaluator.mh0_state_policy == "reuse-adjoints-v1"
-    assert evaluator.standard_m0_input_scale_adjoint_launch_count > 0
+    # The generated M0 keeps A0, so the R0 reverse prepare reduces the A0
+    # scale adjoint in a fixed order and M0 captures nothing.
+    assert evaluator.standard_m0_input_scale_adjoint_launch_count == 0
+    assert evaluator.standard_r0_module_launch_count > 0
     assert evaluator.standard_m0_poly_values_capacity_bytes == 0
     assert evaluator.standard_m0_poly_adjoints_capacity_bytes == 0
     for property_name in outputs["retained"]:

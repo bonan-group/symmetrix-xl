@@ -997,7 +997,8 @@ def test_cuda_low_memory_runtime_specializes_custom_m0_r0(
     assert evaluator.m0_module_reverse_launch_count > 0
     assert evaluator.generated_m1_module_forward_launch_count > 0
     assert evaluator.generated_m1_module_reverse_launch_count > 0
-    assert evaluator.m0_input_scale_adjoint_launch_count > 0
+    # The generated M0 keeps A0; R0 reduces the A0 scale adjoint itself.
+    assert evaluator.m0_input_scale_adjoint_launch_count == 0
     assert evaluator.r0_module_launch_count > 0
 
     first_addresses = evaluator._test_mh0_adjoint_addresses()

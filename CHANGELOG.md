@@ -37,6 +37,10 @@ All notable changes to Symmetrix-XL are documented in this file.
   and the documented flow stopped at the R0 load ("persistent-block profile
   does not match the generated backend schedule"). A fragment without the new
   keywords behaves as before.
+- Fixed run-to-run variation of stresses and edge forces for A0-scaled models
+  in the capacity profile with the generated M0: the R0 reverse prepare now
+  reduces the A0 scale adjoint in a fixed order instead of the generated M0
+  adding it with an FP64 atomic. The built-in M0 is unchanged.
 
 ### NequIP-OAM support
 
