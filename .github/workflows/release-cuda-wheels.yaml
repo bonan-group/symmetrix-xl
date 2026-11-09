@@ -119,7 +119,8 @@ jobs:
           package = Path(dist.locate_file(f"symmetrix_backend_{selector.replace('-', '_')}"))
           descriptor = json.loads((package / "backend.json").read_text())
           assert descriptor["selector"] == selector, descriptor
-          assert (package / f"_native_{selector.replace('-', '_')}.so").exists()
+          native = list(package.glob(f"_native_{selector.replace('-', '_')}*.so"))
+          assert len(native) == 1, native
           assert (package / "_operator_artifacts/catalog.json").exists()
           print("CUDA wheel metadata/import contract OK", dist_name)
           PY

@@ -18,6 +18,7 @@ def test_cuda_release_audits_before_upload_and_publication():
     assert "manylinux_2_28" in workflow
     assert "install --no-deps" in workflow
     assert "entry_points" in workflow
+    assert 'package.glob(f"_native_{selector.replace' in workflow
     assert "_operator_artifacts/catalog.json" in workflow
     assert "sha256sum *.whl" in workflow
     assert "sha256sum -c" in workflow
