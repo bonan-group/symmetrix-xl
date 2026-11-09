@@ -235,7 +235,7 @@ jobs:
           SYMMETRIX_OPENMP_RUNTIME_CHECK: strict
           SYMMETRIX_TEST_MODEL_DOWNLOADS: "0"
         run: >-
-          pytest -q
+          python -m pytest -q
           symmetrix/test/test_cpu_wheel_runtime.py
           symmetrix/test/test_runtime_diagnostics.py
           symmetrix/test/test_execution_support_matrix.py

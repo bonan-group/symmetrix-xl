@@ -44,11 +44,25 @@ def test_cuda_release_keeps_declared_matrix_and_metadata_gate():
 def test_cpu_release_compatibility_lane_is_pinned_and_downloads_fail_closed():
     workflow = (ROOT / ".github/workflows/release-cpu-wheels.yaml").read_text()
     assert "Run focused wheel compatibility suite" in workflow
+    assert "python -m pytest -q" in workflow
     assert "symmetrix/test/test_polar_end_to_end_fixtures.py" in workflow
     assert "torch==2.5.*" not in workflow
     assert "mace-torch==0.3.16" not in workflow
     assert 'SYMMETRIX_TEST_MODEL_DOWNLOADS: "0"' in workflow
     assert "qualify-full" in workflow
+
+
+def test_cuda12_periodic_graph_result_uses_class_owned_alias():
+    header = (ROOT / "libsymmetrix/source/mace_nonlinear_kokkos.hpp").read_text()
+    implementation = (
+        ROOT / "libsymmetrix/source/mace_nonlinear_kokkos_impl.tpp"
+    ).read_text()
+    assert "using PeriodicFactorizedGraphResult =" in header
+    assert "PeriodicFactorizedGraphResult prepare_periodic_factorized_graph(" in header
+    assert (
+        "typename MaceBackboneKokkosT<Precision>::PeriodicFactorizedGraphResult"
+        in implementation
+    )
 
 
 def _cuda_wheel(
