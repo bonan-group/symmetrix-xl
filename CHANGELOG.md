@@ -41,6 +41,12 @@ All notable changes to Symmetrix-XL are documented in this file.
   in the capacity profile with the generated M0: the R0 reverse prepare now
   reduces the A0 scale adjoint in a fixed order instead of the generated M0
   adding it with an FP64 atomic. The built-in M0 is unchanged.
+- Fixed periodic calculations with the factorized observer or execution
+  parameter gradients where the native Kokkos neighbor builder is selected
+  (CUDA and HIP at 512 atoms or more, or `SYMMETRIX_NEIGHBOR_BACKEND=kokkos`):
+  they now build the graph on the host instead of stopping with `Execution R1
+  source schedule has not been prepared`, and enabling either after an
+  evaluation rebuilds the topology instead of reusing a released graph token.
 
 ### NequIP-OAM support
 
