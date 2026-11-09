@@ -64,5 +64,5 @@ def test_pinned_sphericart_carries_async_lifecycle_and_hip():
 
 def test_pinned_sphericart_uses_cuda_header_compatible_gpulite():
     cmake = (_SPHERICART_SOURCE / "sphericart/CMakeLists.txt").read_text()
-    assert "https://github.com/metatensor/gpu-lite.git" in cmake
+    assert "https://github.com/bonan-group/gpu-lite.git" in cmake
     assert f"GIT_TAG {_GPULITE_COMMIT}" in cmake
