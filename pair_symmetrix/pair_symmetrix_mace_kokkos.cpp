@@ -446,6 +446,17 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
     error->all(
       FLERR,
       "pair_style symmetrix/mace/kk allow_fixed_workspace yes requires profile capacity");
+  // A tiled plan keeps per-edge forces for one tile only, while no_domain_decomposition
+  // reduces per-edge forces over the whole graph; mpi_message_passing reads per-atom forces.
+  if (mode == "no_domain_decomposition"
+      && (allow_fixed_workspace
+          || debug_execution_plan == "mh0-single-layer-tiled-v1"
+          || debug_execution_plan == "mh0-dual-layer-tiled-v1"))
+    error->all(
+      FLERR,
+      "pair_style symmetrix/mace/kk fixed-workspace tiled plans (allow_fixed_workspace yes or a "
+      "tiled _debug_execution_plan) are not supported with no_domain_decomposition; "
+      "use mpi_message_passing");
   if (debug_single_layer_workspace_receivers != 0
       && debug_execution_plan != "mh0-single-layer-tiled-v1")
     error->all(

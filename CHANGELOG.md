@@ -47,6 +47,12 @@ All notable changes to Symmetrix-XL are documented in this file.
   they now build the graph on the host instead of stopping with `Execution R1
   source schedule has not been prepared`, and enabling either after an
   evaluation rebuilds the topology instead of reusing a released graph token.
+- Fixed the Kokkos pair style accepting fixed-workspace tiled plans under
+  `no_domain_decomposition` (`allow_fixed_workspace yes` or a tiled
+  `_debug_execution_plan`), which then failed during `run`. `pair_style` now
+  refuses them and names `mpi_message_passing`, and the generic evaluation
+  entry refuses edge vectors under an active tiled plan unless they are the
+  registered geometry or the prepared workspace.
 
 ### NequIP-OAM support
 
