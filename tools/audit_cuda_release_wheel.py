@@ -89,16 +89,20 @@ def audit_cuda_wheel(wheel: Path, *, cuda_major: str, target: str) -> dict[str, 
             raise BuildError("CUDA wheel operator catalog has no OAM entries")
         for item in artifacts:
             provenance = item.get("build_provenance", {})
-            for field in ("source_content_sha256", "native_source_content_sha256"):
-                if not re.fullmatch(
-                    r"sha256:[0-9a-f]{64}", str(provenance.get(field, ""))
-                ):
-                    raise BuildError(f"CUDA catalog artifact has invalid {field}")
-                descriptor_hash = "sha256:" + str(descriptor.get(field, ""))
-                if provenance[field] != descriptor_hash:
-                    raise BuildError(
-                        f"CUDA catalog artifact {field} disagrees with descriptor"
-                    )
+            field = "source_content_sha256"
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(provenance.get(field, ""))):
+                raise BuildError(f"CUDA catalog artifact has invalid {field}")
+            descriptor_hash = "sha256:" + str(descriptor.get(field, ""))
+            if provenance[field] != descriptor_hash:
+                raise BuildError(
+                    f"CUDA catalog artifact {field} disagrees with descriptor"
+                )
+        for field in ("source_content_sha256", "native_source_content_sha256"):
+            summary_hash = prebuilt.get(field)
+            if summary_hash is not None and summary_hash != descriptor.get(field):
+                raise BuildError(
+                    f"CUDA prebuilt artifact {field} disagrees with descriptor"
+                )
         catalog_hash = hashlib.sha256(archive.read(catalog_name)).hexdigest()
         if prebuilt.get("catalog_sha256") != catalog_hash:
             raise BuildError("CUDA descriptor catalog_sha256 does not match catalog")

@@ -91,7 +91,6 @@ def _cuda_wheel(
                 "operator": "OAM",
                 "build_provenance": {
                     "source_content_sha256": "sha256:" + "a" * 64,
-                    "native_source_content_sha256": "sha256:" + "b" * 64,
                 },
             }
         )
@@ -104,6 +103,8 @@ def _cuda_wheel(
             "target": "sm120",
             "artifact_count": len(artifacts),
             "catalog_sha256": hashlib.sha256(json.dumps(payload).encode()).hexdigest(),
+            "source_content_sha256": "a" * 64,
+            "native_source_content_sha256": "b" * 64,
         }
     wheel = tmp_path / "wheel.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
@@ -144,6 +145,7 @@ def test_cuda_audit_derives_catalog_provenance_for_legacy_descriptor(tmp_path):
     (
         lambda descriptor: descriptor.update(selector="cuda13-sm90"),
         lambda descriptor: descriptor.update(source_content_sha256="c" * 64),
+        lambda descriptor: descriptor.update(native_source_content_sha256="c" * 64),
     ),
 )
 def test_cuda_audit_rejects_descriptor_or_provenance_mismatch(tmp_path, mutator):
