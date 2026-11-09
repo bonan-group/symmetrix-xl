@@ -57,10 +57,13 @@ other HIP architectures, multi-GPU/distributed execution, PME publication,
 and distributed Polar LAMMPS remain outside this support contract.
 
 MACELES is implemented for one fully periodic or nonperiodic ASE structure on
-CPU/OpenMP, CUDA, and HIP in FP32/FP64. Mixed periodicity, batches, fixed
-workspace, alchemical mixing, Metal, multi-GPU/distributed execution, and
-LAMMPS are excluded. The v0.2.0 decision keeps MACELES single-GPU; release
-qualification remains pending the portable qualification packet gate.
+CPU/OpenMP, CUDA, and HIP in FP32/FP64. The checkpoint-free qualification
+packet passed on CPU/OpenMP and HIP `gfx1151` for FP32/FP64, reference/direct
+routing, periodic and nonperiodic structures, and energy, forces, stress, and
+latent charges. Mixed periodicity, batches, fixed workspace, alchemical
+mixing, Metal, multi-GPU/distributed execution, and LAMMPS are excluded. HIP
+remains experimental and source-build/runtime only; HIP wheels and other HIP
+architectures are outside the v0.2.0 contract.
 
 Compatible format-version-2 MACE and MACEField JSON can be used from Python/ASE
 or from the `pair_symmetrix` LAMMPS integration. Two-interaction direct LAMMPS

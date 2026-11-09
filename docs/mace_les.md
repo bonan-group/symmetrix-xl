@@ -156,12 +156,13 @@ LAMMPS pair style. Unsupported requests fail with a MACELES capability error.
 ### v0.2.0 support boundary
 
 Implementation availability covers one fully periodic or nonperiodic ASE
-structure on CPU/OpenMP, CUDA, and HIP in FP32 and FP64. This does not by
-itself establish artifact availability, runtime qualification, wheel inclusion,
-or published support. Mixed periodicity, batches, fixed workspace, alchemical
-mixing, Metal, multi-GPU/distributed execution, and LAMMPS remain excluded.
-MACELES is intentionally single-GPU for this release; qualification remains
-pending the portable qualification packet gate.
+structure on CPU/OpenMP, CUDA, and HIP in FP32 and FP64. A checkpoint-free
+qualification packet passed on CPU/OpenMP and HIP `gfx1151` for FP32/FP64,
+`reference` and `direct` routing, periodic and nonperiodic structures, and
+energy, forces, stress, and latent charges. Mixed periodicity, batches, fixed
+workspace, alchemical mixing, Metal, multi-GPU/distributed execution, and
+LAMMPS remain excluded. HIP is experimental and source-build/runtime only;
+HIP wheels and other HIP architectures are outside this release boundary.
 
 ## Reproducible timing
 
