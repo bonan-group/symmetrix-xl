@@ -24,6 +24,7 @@ def test_routine_symmetrix_job_is_fixture_only_and_no_torch():
         "symmetrix-cpu-build",
         "SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256",
         '("torch", "mace", "graph_longrange")',
+        "numpy scipy ase matscipy",
         "pytest -q -m 'not extended' symmetrix/test",
         "--ignore=symmetrix/test/test_extract_mace_data.py",
         "--ignore=symmetrix/test/test_mace_streamed_edges.py",

@@ -249,6 +249,15 @@ jobs:
         source .venv/bin/activate
         PYTHONPATH=symmetrix/test python -c "from model_downloads import macefield_model_path; print(macefield_model_path())"
         deactivate
+    - name: Test standard MACE and Polar contracts
+      run: |
+        source .venv/bin/activate
+        cd symmetrix/test
+        pytest -q \
+          test_bench_cli.py \
+          test_family_registry.py \
+          test_polar_s_direct.py
+        deactivate
     - name: Test compact MACEField conversion and ASE integration
       if: matrix.mace_field_compatible
       env:
