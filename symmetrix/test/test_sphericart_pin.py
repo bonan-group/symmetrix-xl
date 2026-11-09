@@ -3,7 +3,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SPHERICART_SOURCE = _ROOT / "libsymmetrix/external/sphericart"
-_GPULITE_COMMIT = "2cd4213705efd5078874b761feb58e7ff263bef3"
+_GPULITE_COMMIT = "3fcc6b888f9d8f691d18af01801732ef4222a161"
 
 
 def test_pinned_sphericart_uses_wide_edge_offsets():

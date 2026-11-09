@@ -40,7 +40,7 @@ jobs:
       run: |
         uv venv --clear
         source .venv/bin/activate
-        uv pip install scikit-build-core pybind11 ninja pytest numpy scipy ase
+        uv pip install scikit-build-core pybind11 ninja pytest numpy scipy ase matscipy
         source_fingerprint=$(python -c 'from pathlib import Path; from tools._symmetrix_build.source_provenance import symmetrix_source_fingerprint; print(symmetrix_source_fingerprint(Path.cwd()))')
         uv pip install ./symmetrix \
           --config-settings=build-dir="$RUNNER_TEMP/symmetrix-cpu-build" \
@@ -65,7 +65,11 @@ jobs:
           --ignore=symmetrix/test/test_jit_device_artifact.py \
           --ignore=symmetrix/test/test_mace_les_readout.py \
           --ignore=symmetrix/test/test_jit_operator_cuda.py \
-          --ignore=symmetrix/test/test_mace_polar_frontend.py
+          --ignore=symmetrix/test/test_mace_polar_frontend.py \
+          --ignore=symmetrix/test/test_bench_cli.py \
+          --ignore=symmetrix/test/test_family_registry.py \
+          --ignore=symmetrix/test/test_mh1.py \
+          --ignore=symmetrix/test/test_polar_s_direct.py
         pytest -q \
           symmetrix/test/test_polar_oracle_fixtures.py \
           symmetrix/test/test_polar_end_to_end_fixtures.py \

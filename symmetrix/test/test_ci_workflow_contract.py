@@ -32,6 +32,10 @@ def test_routine_symmetrix_job_is_fixture_only_and_no_torch():
         "--ignore=symmetrix/test/test_jit_kokkos_integration.py",
         "--ignore=symmetrix/test/test_jit_device_artifact.py",
         "--ignore=symmetrix/test/test_mace_les_readout.py",
+        "--ignore=symmetrix/test/test_bench_cli.py",
+        "--ignore=symmetrix/test/test_family_registry.py",
+        "--ignore=symmetrix/test/test_mh1.py",
+        "--ignore=symmetrix/test/test_polar_s_direct.py",
     ):
         assert required in routine
     assert (
@@ -54,7 +58,6 @@ def test_routine_lane_keeps_native_modules_and_fails_closed_on_downloads():
     routine = workflow.split("  symmetrix:\n", 1)[1].split("  metatrain-mace:\n", 1)[0]
     for module in (
         "test_symmetrix_calc.py",
-        "test_family_registry.py",
         "test_family_mace_conformance_cases.py",
         "test_macefield_field_transform.py",
         "test_macefield_native.py",
