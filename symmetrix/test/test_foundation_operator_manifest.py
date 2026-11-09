@@ -198,6 +198,47 @@ def test_foundation_device_m1_identity_matches_codegen_metadata(
         assert request["identity"] == metadata["generated_identity"]
 
 
+@pytest.mark.parametrize(
+    "backend,target,schedule",
+    (
+        ("cuda", "sm_120", "table"),
+        ("cuda", "sm_120", "chunk32"),
+        ("hip", "gfx942", "chunk32"),
+        ("hip", "gfx942", "tiled128x4-v1"),
+        ("host", "x86-64-v3", "chunk32"),
+    ),
+)
+def test_foundation_m0_identity_matches_codegen_metadata(backend, target, schedule):
+    module = _manifest_module()
+    from symmetrix.mace_jit_operator_codegen import (
+        JIT_GENERATION_VERSION,
+        jit_m0_device_metadata,
+        jit_m0_host_metadata,
+    )
+
+    requests = module.foundation_m0_artifact_inputs(
+        module.load_foundation_operator_manifest(),
+        generation_revision=JIT_GENERATION_VERSION,
+        backend=backend,
+        target=target,
+        precisions=("float32", "float64"),
+        schedule=schedule,
+    )
+
+    assert requests
+    for request in requests:
+        render_metadata = (
+            jit_m0_host_metadata if backend == "host" else jit_m0_device_metadata
+        )
+        metadata = render_metadata(
+            request["contract"],
+            precision=request["identity"]["precision"],
+            target=target,
+            schedule=schedule,
+        )
+        assert request["identity"] == metadata["generated_identity"]
+
+
 def test_foundation_host_m1_preserves_chunk32_revision_two_and_rejects_others():
     module = _manifest_module()
     manifest = module.load_foundation_operator_manifest()

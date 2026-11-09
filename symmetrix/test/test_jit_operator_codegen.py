@@ -1,5 +1,6 @@
 import ctypes
 import json
+import re
 import shutil
 import subprocess
 from copy import deepcopy
@@ -65,7 +66,7 @@ def test_m0_device_source_covers_state_free_forward_reverse(
     )
 
     assert metadata["capabilities"] == M0_CAPABILITIES_V1
-    revision = 2 if schedule == "chunk32" else 1
+    revision = 3 if schedule == "chunk32" else 2
     assert metadata["artifact_id"].endswith(f"-{schedule}-r{revision}-sm_120")
     assert f"using Scalar = {scalar};" in source
     assert "symmetrix_m0_forward_v1" in source
@@ -207,6 +208,135 @@ def test_m1_device_source_has_distinct_identity_and_scalar_owner_kernels():
     assert "input_adjoint[input_adjoint_index] += grad[component]" in source
 
 
+@pytest.mark.parametrize("schedule", ("chunk32", "table"))
+def test_only_the_m1_device_reverse_accumulates_the_input_adjoint(schedule):
+    m0_source, _ = render_jit_m0_device_module(
+        _without_fingerprints(_contract("standard_m0_contract.json")),
+        precision="float32",
+        target="sm_120",
+        schedule=schedule,
+    )
+    m1_source, _ = render_jit_m1_device_module(
+        make_generated_m1_contract(
+            channels=7,
+            type_count=2,
+            input_l_max=1,
+            correlation=3,
+            monomials=[[0], [1, 1], [0, 2, 3]],
+        ),
+        precision="float32",
+        target="sm_120",
+        schedule=schedule,
+    )
+    m0_reverse = m0_source[m0_source.index("void symmetrix_m0_reverse_v1(") :]
+    m1_reverse = m1_source[m1_source.index("void symmetrix_m1_reverse_v1(") :]
+
+    # M0 launches pass reserved == 0, so the M0 reverse only stores.
+    assert "args.reserved" not in m0_source
+    assert "input_adjoint[input_adjoint_index] = grad[component];" in m0_reverse
+    assert "input_adjoint[input_adjoint_index] +=" not in m0_reverse
+    # Single-layer readouts accumulate the M1 polynomial adjoint into H1_adj.
+    assert "if (args.reserved&1u)" in m1_reverse
+    assert "input_adjoint[input_adjoint_index] += grad[component];" in m1_reverse
+    assert "input_adjoint[input_adjoint_index] = grad[component];" in m1_reverse
+
+
+@pytest.mark.parametrize("schedule", ("chunk32", "table"))
+@pytest.mark.parametrize(
+    ("target", "precision", "m0_reverse_bounds"),
+    (
+        ("sm_86", "float64", "256, 1"),
+        ("sm_86", "float32", "256"),
+        ("gfx1201", "float64", "256"),
+    ),
+)
+def test_only_the_cuda_fp64_m0_device_reverse_requires_one_resident_block(
+    schedule, target, precision, m0_reverse_bounds
+):
+    m0_source, _ = render_jit_m0_device_module(
+        _without_fingerprints(_contract("standard_m0_contract.json")),
+        precision=precision,
+        target=target,
+        schedule=schedule,
+    )
+    m1_source, _ = render_jit_m1_device_module(
+        make_generated_m1_contract(
+            channels=7,
+            type_count=2,
+            input_l_max=1,
+            correlation=3,
+            monomials=[[0], [1, 1], [0, 2, 3]],
+        ),
+        precision=precision,
+        target=target,
+        schedule=schedule,
+    )
+
+    def bounds(source, kernel):
+        declaration = re.search(
+            rf'extern "C" __global__ __launch_bounds__\(([^)]*)\)\nvoid {kernel}\(',
+            source,
+        )
+        return declaration.group(1)
+
+    # Given only the block size, NVRTC may halve the registers of the
+    # store-only FP64 M0 reverse and spill; HIP reads a second bound as
+    # waves per EU.
+    assert bounds(m0_source, "symmetrix_m0_reverse_v1") == m0_reverse_bounds
+    assert bounds(m0_source, "symmetrix_m0_forward_v1") == "256"
+    assert bounds(m1_source, "symmetrix_m1_forward_v1") == "256"
+    assert bounds(m1_source, "symmetrix_m1_reverse_v1") == "256"
+
+
+def _helpers(source, lower):
+    return re.findall(
+        rf"__device__ __forceinline__ void {lower}_(?:fwd|rev)_\d+\(.*?\n\}}",
+        source,
+        re.S,
+    )
+
+
+def test_only_the_m0_chunk32_helpers_preload_their_weights():
+    m0 = _without_fingerprints(_contract("standard_m0_contract.json"))
+    m1 = make_generated_m1_contract(
+        channels=128,
+        type_count=2,
+        input_l_max=1,
+        correlation=3,
+        monomials=[[0], [1, 1], [0, 2, 3]],
+    )
+    chunk32, metadata = render_jit_m0_device_module(
+        m0, precision="float32", target="sm_120", schedule="chunk32"
+    )
+    others = [
+        render_jit_m0_device_module(
+            m0, precision="float32", target="sm_120", schedule="tiled128x4-v1"
+        )[0],
+        *(
+            render_jit_m1_device_module(
+                m1, precision="float32", target="sm_120", schedule=schedule
+            )[0]
+            for schedule in ("chunk32", "tiled128x4-v1")
+        ),
+    ]
+    for source in others:
+        assert "const Scalar w_" not in source
+
+    # Each chunk reads its weights in term order, and with the reads undone
+    # the helpers equal the tiled128 ones: the statements are unchanged.
+    loads = [int(t) for t in re.findall(r"const Scalar w_(\d+) = ", chunk32)]
+    assert loads == 2 * list(range(metadata["term_count"]))
+    undone = [
+        re.sub(
+            r"\bw_(\d+)\b",
+            r"weights[\1*channels]",
+            re.sub(r"    const Scalar w_(\d+) = weights\[\1\*channels\];\n", "", h),
+        )
+        for h in _helpers(chunk32, "m0")
+    ]
+    assert undone == _helpers(others[0], "m0")
+
+
 @pytest.mark.parametrize("operator", ("M0", "M1"))
 @pytest.mark.parametrize("precision", ("float32", "float64"))
 def test_product_tiled128_schedule_uses_persistent_logical_tiles(operator, precision):
@@ -280,7 +410,7 @@ def test_chunk32_product_schedule_is_disjoint_only(operator):
         contract, precision="float32", target="sm_120", schedule="chunk32"
     )
 
-    assert metadata["schedule_revision"] == (2 if operator == "M0" else 3)
+    assert metadata["schedule_revision"] == 3
     assert metadata["capabilities"] == (
         M0_CAPABILITIES_V1 if operator == "M0" else M1_CAPABILITIES_V1
     )

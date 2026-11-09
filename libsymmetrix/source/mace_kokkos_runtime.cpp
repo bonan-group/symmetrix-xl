@@ -1378,8 +1378,8 @@ void MACEKokkos<Precision>::load_m0_device_module(
             +(normalized.features.empty() ? std::string() : ":"+normalized.features);
         max_threads = device.maxThreadsPerBlock;
 #endif
-        const int schedule_revision = schedule == "chunk32" ? 2
-            : schedule == "tiled128x4-v1" ? 3 : 1;
+        const int schedule_revision = schedule == "chunk32" ? 3
+            : schedule == "tiled128x4-v1" ? 3 : 2;
         const std::string artifact_id = "jit-m0-gen"
             +std::to_string(symmetrix::execution::required_jit_generation_version)
             +"-"+std::string(precision_suffix)+"-"

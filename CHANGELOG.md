@@ -4,6 +4,20 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ## 0.2.1 - Unreleased
 
+- The generated M0 device reverse stores its input adjoint and no longer
+  carries the M1 accumulate branch, which M0 launches never take and which
+  made the compiler spill the reverse (about 3.5 KB of scratch per thread at
+  hidden L = 2 on gfx1201). The chunk32 M0 forward and reverse helpers also
+  read each chunk's weights before its terms, so the compiler issues those
+  loads together instead of one per term. On CUDA the FP64 M0 reverse also
+  requires one resident 256-thread block per multiprocessor: given only the
+  block size, NVRTC compiled the store-only FP64 reverse at hidden L = 2 with
+  128 registers and about 3 KB of stack per thread on sm_86. The terms and
+  their order are unchanged; with floating-point contraction the reverse can
+  round differently in the last bit. The M0 device chunk32 and table schedule
+  revisions are now 3 and 2, so modules and artifacts from the previous
+  generator are rebuilt rather than loaded.
+
 ## 0.2.0 - 2026-11-17
 
 ### Execution and JIT

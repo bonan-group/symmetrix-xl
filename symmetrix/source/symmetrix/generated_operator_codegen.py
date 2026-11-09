@@ -36,6 +36,8 @@ M1_CAPABILITIES_V1 = 0x0B
 M1_HOST_CAPABILITIES_V1 = 0x1B
 M1_SCHEDULE_REVISION = 2
 M0_SCHEDULE_REVISION = 2
+M0_DEVICE_CHUNK32_SCHEDULE_REVISION = 3
+M0_DEVICE_TABLE_SCHEDULE_REVISION = 2
 M1_DEVICE_CHUNK32_SCHEDULE_REVISION = 3
 M1_DEVICE_TABLE_SCHEDULE_REVISION = 2
 PRODUCT_TILED128_SCHEDULE = "tiled128x4-v1"
@@ -58,7 +60,9 @@ def _m0_device_capabilities(schedule: str) -> int:
 def _m0_device_schedule_revision(schedule: str) -> int:
     if schedule == PRODUCT_TILED128_SCHEDULE:
         return PRODUCT_TILED128_SCHEDULE_REVISION
-    return M0_SCHEDULE_REVISION if schedule == "chunk32" else 1
+    if schedule == "chunk32":
+        return M0_DEVICE_CHUNK32_SCHEDULE_REVISION
+    return M0_DEVICE_TABLE_SCHEDULE_REVISION
 
 
 def _m1_device_schedule_revision(schedule: str) -> int:
@@ -342,6 +346,10 @@ def _render_contraction_chunked(metadata: Mapping[str, Any], *, operator: str) -
     lower = operator.lower()
     terms = _contraction_terms(metadata["contract"])
     chunks = [terms[start : start + 32] for start in range(0, len(terms), 32)]
+    # The M0 chunk32 helpers read the chunk's weights into locals before its
+    # terms, so the compiler can issue those loads together instead of waiting
+    # on each one. The statements and their order are unchanged.
+    preload = operator == "M0" and metadata["schedule"] == "chunk32"
     forward_helpers = []
     reverse_helpers = []
     term_offset = 0
@@ -350,12 +358,9 @@ def _render_contraction_chunked(metadata: Mapping[str, Any], *, operator: str) -
         reverse = []
         for local_term, (output, components) in enumerate(chunk):
             term = term_offset + local_term
-            forward.append(
-                f"    out[{output}] += weights[{term}*channels]*{_product(components)};"
-            )
-            reverse.append(
-                f"    const Scalar scale_{term} = adj[{output}]*weights[{term}*channels];"
-            )
+            weight = f"w_{term}" if preload else f"weights[{term}*channels]"
+            forward.append(f"    out[{output}] += {weight}*{_product(components)};")
+            reverse.append(f"    const Scalar scale_{term} = adj[{output}]*{weight};")
             for component, multiplicity in Counter(components).items():
                 remaining = list(components)
                 remaining.remove(component)
@@ -363,6 +368,13 @@ def _render_contraction_chunked(metadata: Mapping[str, Any], *, operator: str) -
                 if multiplicity != 1:
                     factor = f"(Scalar({multiplicity})*{factor})"
                 reverse.append(f"    grad[{component}] += scale_{term}*{factor};")
+        if preload:
+            loads = [
+                f"    const Scalar w_{term} = weights[{term}*channels];"
+                for term in range(term_offset, term_offset + len(chunk))
+            ]
+            forward = loads + forward
+            reverse = loads + reverse
         forward_helpers.append(
             f"__device__ __forceinline__ void {lower}_fwd_{chunk_index}("
             "const Scalar* x, const Scalar* weights, int channels, Scalar* out) {\n"
@@ -386,13 +398,42 @@ def _render_contraction_chunked(metadata: Mapping[str, Any], *, operator: str) -
     kernels = (
         _contraction_tiled128_kernels(metadata, reverse_calls, operator=operator)
         if metadata["schedule"] == PRODUCT_TILED128_SCHEDULE
-        else _contraction_kernels(forward_calls, reverse_calls, operator=operator)
+        else _contraction_kernels(
+            forward_calls, reverse_calls, metadata, operator=operator
+        )
     )
     return "\n".join((*forward_helpers, *reverse_helpers)) + kernels
 
 
-def _contraction_kernels(forward_body: str, reverse_body: str, *, operator: str) -> str:
+def _contraction_kernels(
+    forward_body: str,
+    reverse_body: str,
+    metadata: Mapping[str, Any],
+    *,
+    operator: str,
+) -> str:
     lower = operator.lower()
+    # The M1 reverse adds into the input adjoint when a single-layer readout
+    # asks for it (reserved bit 0). M0 launches always pass reserved == 0 and
+    # the loader refuses any other value, so the M0 reverse only stores: the
+    # never-taken accumulate branch made the compiler spill its registers.
+    reverse_bounds = "256"
+    if operator == "M1":
+        store_input_adjoint = """if (args.reserved&1u)
+                input_adjoint[input_adjoint_index] += grad[component];
+            else
+                input_adjoint[input_adjoint_index] = grad[component];"""
+    else:
+        store_input_adjoint = "input_adjoint[input_adjoint_index] = grad[component];"
+        # Given only the block size, NVRTC may compile the store-only FP64
+        # reverse for two resident blocks per multiprocessor and spill: for
+        # the hidden L = 2 structures on sm_86, 128 registers and about 3 KB
+        # of stack per thread instead of 254 registers and under 1 KB.
+        # Requiring one resident block keeps the registers. The FP32
+        # reverses do not spill and keep one bound, as HIP does, which reads
+        # a second bound as waves per EU.
+        if metadata["target"].startswith("sm_") and metadata["precision"] == "float64":
+            reverse_bounds = "256, 1"
     return f"""
 extern "C" __global__ __launch_bounds__(256)
 void symmetrix_{lower}_forward_v1({operator}Args args) {{
@@ -418,7 +459,7 @@ void symmetrix_{lower}_forward_v1({operator}Args args) {{
                 = out[component];
     }}
 }}
-extern "C" __global__ __launch_bounds__(256)
+extern "C" __global__ __launch_bounds__({reverse_bounds})
 void symmetrix_{lower}_reverse_v1({operator}Args args) {{
     const Scalar* input = static_cast<const Scalar*>(args.input_raw);
     const Scalar* packed_weights = static_cast<const Scalar*>(args.weights_raw);
@@ -447,10 +488,7 @@ void symmetrix_{lower}_reverse_v1({operator}Args args) {{
         for (int component=0; component<input_components; ++component) {{
             const long long input_adjoint_index =
                 node*args.input_adjoint_node_stride+component*channel_count+channel;
-            if (args.reserved&1u)
-                input_adjoint[input_adjoint_index] += grad[component];
-            else
-                input_adjoint[input_adjoint_index] = grad[component];
+            {store_input_adjoint}
             scale += static_cast<double>(x[component])
                 *static_cast<double>(grad[component]);
         }}
@@ -692,7 +730,7 @@ __device__ __constant__ int {lower}_output_offsets[output_components+1] = {{{off
                 grad[{lower}_term_components[term*correlation+factor]] += product;
             }}
         }}"""
-    return tables + _contraction_kernels(forward, reverse, operator=operator)
+    return tables + _contraction_kernels(forward, reverse, metadata, operator=operator)
 
 
 def render_jit_m0_device_module(
@@ -776,13 +814,14 @@ def jit_m0_host_metadata(
         correlation=metadata["correlation"],
         term_count=metadata["term_count"],
         schedule=schedule,
-        schedule_revision=metadata["schedule_revision"],
+        schedule_revision=M0_SCHEDULE_REVISION,
     )
     return {
         **metadata,
         "schema": "symmetrix.jit.m0-host-plugin/2",
         "abi": "symmetrix.jit.m0-host-plugin/2",
         "abi_version": 2,
+        "schedule_revision": M0_SCHEDULE_REVISION,
         "artifact_id": (
             f"jit-m0-host-gen{generation_version}-{suffix}-"
             f"{structure.removeprefix('sha256:')[:16]}-"
