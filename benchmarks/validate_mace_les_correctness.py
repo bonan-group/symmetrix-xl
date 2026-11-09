@@ -173,11 +173,9 @@ def validate_documents(reference, candidate):
             index
         ].get("size_bytes"):
             raise CorrectnessError(f"{name} size provenance does not match")
-        if (
-            name != "converted model"
-            and ref[index].get("materialization", "local")
-            != cand[index].get("materialization", "local")
-        ):
+        if name != "converted model" and ref[index].get(
+            "materialization", "local"
+        ) != cand[index].get("materialization", "local"):
             raise CorrectnessError(f"{name} identity mode does not match")
     if ref[2].get("frame") != cand[2].get("frame") or ref[2].get("atoms") != cand[
         2

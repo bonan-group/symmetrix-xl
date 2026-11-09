@@ -12,7 +12,7 @@ components:
 | Kokkos Kernels | <https://github.com/kokkos/kokkos-kernels> | Apache-2.0 with LLVM exception |
 | KokkosFFT | <https://github.com/kokkos/kokkos-fft> | MIT OR Apache-2.0 with LLVM exception |
 | pybind11 | <https://github.com/pybind/pybind11> | BSD-3-Clause |
-| SpheriCart (qualified bonan-group fork, pin `40748583ea6ed2b246445c426c462c504ca6b38d`; gpu-lite dependency pin `2cd4213705efd5078874b761feb58e7ff263bef3`) | <https://github.com/bonan-group/sphericart> (fork of <https://github.com/lab-cosmo/sphericart>) | MIT for SpheriCart and gpu-lite |
+| SpheriCart (qualified bonan-group fork, pin `8cd5b63e4da0d83579ddec0f36fadb6be49a4a5f`; gpu-lite dependency pin `4826cc76f7a66075be101aa7502a457ef755b13c`) | <https://github.com/bonan-group/sphericart> (fork of <https://github.com/lab-cosmo/sphericart>) | MIT for SpheriCart and gpu-lite |
 
 Symmetrix-XL's generated native D2/D3 parameter tables and immutable reference
 fixtures are derived from torch-dftd 0.5.3. The following notice applies to
