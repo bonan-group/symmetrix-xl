@@ -1114,6 +1114,74 @@ def test_pair_symmetrix_exposes_explicit_device_artifact_loader():
     )
 
 
+def _pair_call(source, name):
+    start = source.index(f"mace->{name}(")
+    return source[start : source.index(";", start)]
+
+
+def test_device_fragment_carries_each_operator_count_to_its_own_loader(
+    monkeypatch, capsys, tmp_path
+):
+    """R1, M0 and R0 keep their own persistent block counts from the preparation to the pair's loaders, and the R0
+    schedule goes with R0: the generated R0 schedule refuses R1's count.  The device load itself needs a GPU."""
+    result = SimpleNamespace(
+        artifact_path=tmp_path / "r1.hsaco",
+        edge_policy={"persistent_blocks_per_compute_unit": 8},
+        operator_modules={
+            "M0": {
+                "implementation": "device_module",
+                "artifact_path": str(tmp_path / "m0.hsaco"),
+                "schedule": "chunk32",
+                "persistent_blocks_per_compute_unit": 2,
+            },
+            "R0": {
+                "implementation": "generated",
+                "backend": "hip",
+                "artifact_origin": "runtime",
+                "artifact_path": str(tmp_path / "r0.hsaco"),
+                "schedule": "receiver-edge32",
+                "persistent_blocks_per_compute_unit": 4,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        artifact_cli.native_symmetrix, "_kokkos_is_initialized", lambda: True
+    )
+    monkeypatch.setattr(
+        artifact_cli, "prepare_jit_device_artifact", lambda *args, **kwargs: result
+    )
+    assert (
+        artifact_cli.main(
+            ["--model", "model.json", "--precision", "float32", "--lammps-arguments"]
+        )
+        == 0
+    )
+    tokens = capsys.readouterr().out.split()
+    pairs = dict(zip(tokens[::2], tokens[1::2]))
+    assert pairs["jit_device_blocks_per_compute_unit"] == "8"
+    assert pairs["jit_m0_device_blocks_per_compute_unit"] == "2"
+    assert pairs["jit_r0_device_blocks_per_compute_unit"] == "4"
+    assert pairs["jit_r0_device_schedule"] == "receiver-edge32"
+
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "pair_symmetrix/pair_symmetrix_mace_kokkos.cpp"
+    ).read_text()
+    for keyword in pairs:
+        assert f'token == "{keyword}"' in source, keyword
+    m0 = _pair_call(source, "load_m0_device_module")
+    r0 = _pair_call(source, "load_r0_device_module")
+    assert "jit_m0_device_blocks_per_compute_unit" in m0
+    assert "jit_r0_device" not in m0
+    assert "jit_r0_device_blocks_per_compute_unit" in r0
+    assert "jit_r0_device_schedule" in r0
+    assert "jit_m0_device" not in r0
+    # A fragment without the operator keywords (printed before them) keeps the common count and R0's default schedule.
+    assert ": jit_device_blocks_per_compute_unit" in m0
+    assert ": jit_device_blocks_per_compute_unit" in r0
+    assert '"receiver-edge16"' in r0
+
+
 def test_pair_symmetrix_fixed_workspace_is_explicit_and_fail_closed():
     repository = Path(__file__).resolve().parents[2]
     source = (repository / "pair_symmetrix/pair_symmetrix_mace_kokkos.cpp").read_text()

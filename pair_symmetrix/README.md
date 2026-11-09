@@ -387,8 +387,16 @@ available as `persistent_blocks_per_compute_unit`. HIP accepts the setting for
 portable input files but validates its launch policy from the artifact
 descriptor; the LAMMPS pair style warns when an explicit value differs from that
 descriptor. M0 and R0 device modules loaded with `jit_m0_device_artifact` and
-`jit_r0_device_artifact` honor the setting on both backends; the built-in M0
-and R0 modules do not use it.
+`jit_r0_device_artifact` honor the setting on both backends unless their own
+keywords set it; the built-in M0 and R0 modules do not use it. Each operator
+module keeps its own launch policy: `--lammps-arguments` prints
+`jit_m0_device_blocks_per_compute_unit N` and
+`jit_r0_device_blocks_per_compute_unit N jit_r0_device_schedule S` from the
+prepared modules, and the pair passes them to the M0 and R0 loaders only. The
+generated R0 schedule requires its own count (4 for HIP FP32 on gfx1201, 3 for
+CUDA FP32, 4 for CUDA FP64), which need not equal R1's. A fragment without
+these keywords keeps the common setting for M0 and R0 and the default R0
+schedule `receiver-edge16`.
 
 ### Building LAMMPS
 

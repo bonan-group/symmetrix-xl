@@ -29,6 +29,14 @@ All notable changes to Symmetrix-XL are documented in this file.
   runtime executor overrides. Generated execution is the only `direct` route
   for standard two-interaction MACE energy and forces; the in-evaluator serial
   reference remains an internal numerical oracle.
+- `prepare_jit_device_artifact --lammps-arguments` prints the M0 and R0 device
+  modules' own persistent block counts and the R0 schedule
+  (`jit_m0_device_blocks_per_compute_unit`,
+  `jit_r0_device_blocks_per_compute_unit`, `jit_r0_device_schedule`), and the
+  pair style passes them to those loaders only. Before, R0 received R1's count
+  and the documented flow stopped at the R0 load ("persistent-block profile
+  does not match the generated backend schedule"). A fragment without the new
+  keywords behaves as before.
 
 ### NequIP-OAM support
 

@@ -88,6 +88,11 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   bool jit_m0_device_schedule_set = false;
   bool jit_device_blocks_per_compute_unit_set = false;
   int jit_device_blocks_per_compute_unit = 8;
+  // Each operator module's own launch policy, as the preparation CLI prints it.  A count of 0 takes the common count
+  // above; an empty schedule takes the loader's default, receiver-edge16.
+  int jit_m0_device_blocks_per_compute_unit = 0;
+  int jit_r0_device_blocks_per_compute_unit = 0;
+  std::string jit_r0_device_schedule;
   std::uint64_t execution_graph_generation = 0;
   int execution_num_nodes = 0;
   int execution_num_feature_nodes = 0;
