@@ -53,6 +53,13 @@ def test_cpu_release_compatibility_lane_is_pinned_and_downloads_fail_closed():
     assert "qualify-full" in workflow
 
 
+def test_backend_release_passes_explicit_source_commit_to_container_build():
+    workflow = (ROOT / ".github/workflows/release-backend-wheels.yaml").read_text()
+    build_step = workflow[workflow.index("name: Build the x86-64-v4 add-on wheel") :]
+    assert "SYMMETRIX_RELEASE_SOURCE_COMMIT: ${{ github.sha }}" in build_step
+    assert "python tools/symmetrix_build.py wheel-matrix" in build_step
+
+
 def test_cuda12_periodic_graph_result_uses_class_owned_alias():
     header = (ROOT / "libsymmetrix/source/mace_nonlinear_kokkos.hpp").read_text()
     implementation = (
