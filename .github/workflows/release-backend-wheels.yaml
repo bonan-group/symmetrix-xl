@@ -102,6 +102,10 @@ jobs:
           ldconfig -p | grep -q 'libopenblas\.so'
 
       - name: Build the x86-64-v4 add-on wheel
+        env:
+          # The manylinux container may not expose usable Git metadata. Keep
+          # the descriptor bound to the exact checked-out release commit.
+          SYMMETRIX_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
         run: |
           export PATH="/opt/python/${{ matrix.python }}/bin:/usr/local/bin:$PATH"
           export CMAKE_PREFIX_PATH=/usr/local/openblas
