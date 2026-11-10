@@ -179,7 +179,14 @@ def _make_generalized_mh1(parameters, *, num_interactions=2):
     if mace_import_error is not None:
         pytest.skip(f"mace-torch is not available: {mace_import_error}")
     from e3nn import o3
-    from mace.modules.blocks import RealAgnosticResidualNonLinearInteractionBlock
+
+    try:
+        from mace.modules.blocks import RealAgnosticResidualNonLinearInteractionBlock
+    except ImportError:
+        pytest.skip(
+            "mace-torch does not provide the nonlinear interaction block required "
+            "by the generalized MH-1 fixture"
+        )
     from mace.modules.models import ScaleShiftMACE
     from symmetrix.extract_mace_nonlinear import extract_mace_nonlinear_data
 

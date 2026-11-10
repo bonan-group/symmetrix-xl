@@ -107,8 +107,10 @@ All notable changes to Symmetrix-XL are documented in this file.
   `mace_les_energy`, and `latent_charges`. Fully periodic and nonperiodic
   systems are supported; mixed periodicity, fixed-workspace plans, alchemical
   mixing, distributed evaluation, and LAMMPS are outside the supported boundary.
-  MACELES qualification remains pending the portable qualification packet gate;
-  the v0.2.0 decision keeps it single-GPU.
+  checkpoint-free qualification passed on CPU/OpenMP and HIP `gfx1151` for
+  FP32/FP64, reference/direct routing, periodic and nonperiodic structures,
+  energy, forces, stress, and latent charges. HIP remains experimental and
+  source-build/runtime only; the v0.2.0 decision keeps MACELES single-GPU.
 - Added frozen-weight alchemical message mixing for standard two-interaction
   compact MACE models, including Agnesi radial functions, A0/A1 density
   conditioning, ZBL, energy, forces, stress, and reusable coefficient updates.

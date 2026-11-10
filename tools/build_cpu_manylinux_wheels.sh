@@ -11,6 +11,7 @@ CPU_TARGET="${CPU_TARGET:-x86-64-v3}"
 WHEEL_DIR="${WHEEL_DIR:-wheelhouse/cpu}"
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+source_commit="$(git -C "$repo_root" rev-parse HEAD)"
 if [[ "$WHEEL_DIR" = /* ]] || [[ "$WHEEL_DIR" == *".."* ]]; then
   echo "error: WHEEL_DIR must be a relative path without '..': $WHEEL_DIR" >&2
   exit 1
@@ -55,6 +56,7 @@ for python_abi in $PYTHON_ABIS; do
     --env "HOME=/tmp" \
     --env "PYTHON_ABI=$python_abi" \
     --env "CPU_TARGET=$CPU_TARGET" \
+    --env "SYMMETRIX_RELEASE_SOURCE_COMMIT=$source_commit" \
     --env "OUTPUT_DIR=/io/$WHEEL_DIR/$python_abi" \
     --env "JOBS=${JOBS:-4}" \
     "$BUILDER_IMAGE" \

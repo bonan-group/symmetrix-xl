@@ -1476,12 +1476,53 @@ def test_collect_results_preserves_materialized_stress_fallback():
         np.linalg.norm(xyz, axis=1),
         np.array([0, 1]),
     )
-    atoms = Atoms("H2", positions=[[0, 0, 0], [1, 0, 0]], cell=[5, 5, 5])
+    atoms = Atoms("H2", positions=[[0, 0, 0], [1, 0, 0]], cell=[5, 5, 5], pbc=True)
     expected = full_3x3_to_voigt_6_stress(
         (-MaterializedEvaluator.node_forces.T @ xyz) / atoms.get_volume()
     )
     results = calculator._collect_mace_results(atoms, inputs, ["stress"])
     np.testing.assert_array_equal(results["stress"], expected)
+
+
+def test_collect_results_uses_mace_effective_volume_for_zero_cell_stress():
+    class StressEvaluator:
+        node_energies = np.array([0.0, 0.0])
+        node_forces = np.zeros((2, 3))
+
+        def __init__(self):
+            self.volume = None
+
+        def _reduce_atom_forces(self, num_nodes, receivers, sources, token):
+            return np.zeros((num_nodes, 3))
+
+        def _reduce_stress(self, volume, xyz, token):
+            self.volume = volume
+            return np.zeros(9)
+
+    calculator = object.__new__(Symmetrix)
+    calculator._alchemical = None
+    calculator.cutoff = 2.0
+    calculator.evaluator = StressEvaluator()
+    calculator.implemented_properties = list(Symmetrix.implemented_properties)
+    calculator._model_has_field_coupling = False
+    xyz = np.array([[0.95, 0.0, 0.0], [-0.95, 0.0, 0.0]])
+    inputs = (
+        2,
+        [0, 0],
+        np.array([1, 1]),
+        np.array([1, 0]),
+        [0, 0],
+        xyz,
+        np.linalg.norm(xyz, axis=1),
+        np.array([0, 1]),
+    )
+    atoms = Atoms("H2", positions=[[0.0, 0.0, 0.0], [0.95, 0.0, 0.0]])
+
+    results = calculator._collect_mace_results(atoms, inputs, ["stress"])
+
+    expected_side = (0.95 + 1.0) * 5.0 * calculator.cutoff
+    assert calculator.evaluator.volume == pytest.approx(expected_side**3)
+    np.testing.assert_array_equal(results["stress"], np.zeros(6))
 
 
 def test_collect_results_accumulates_float32_energy_and_stress_in_float64():
@@ -1513,6 +1554,7 @@ def test_collect_results_accumulates_float32_energy_and_stress_in_float64():
         "H3",
         positions=np.zeros((3, 3)),
         cell=np.eye(3),
+        pbc=True,
     )
 
     results = calculator._collect_mace_results(atoms, inputs, ["energy", "stress"])

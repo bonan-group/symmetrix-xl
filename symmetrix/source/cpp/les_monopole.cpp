@@ -20,13 +20,15 @@ void bind_les_monopole(py::module_& module, const char* name)
     using Operator = symmetrix::les::LESMonopoleKokkos<Precision>;
     py::class_<Operator>(module, name)
         .def(py::init([] (const double sigma, const double dl,
-                          const bool remove_self_interaction) {
+                          const bool remove_self_interaction,
+                          const double norm_factor) {
             if (!_kokkos_is_initialized())
                 _init_kokkos();
             return std::make_unique<Operator>(
-                sigma, dl, remove_self_interaction);
+                sigma, dl, remove_self_interaction, norm_factor);
         }), py::arg("sigma"), py::arg("dl"),
-             py::arg("remove_self_interaction"))
+             py::arg("remove_self_interaction"),
+             py::arg("norm_factor")=symmetrix::les::default_coulomb_norm_factor)
         .def("compute_nonperiodic", [] (Operator& self,
                                          const Array& charges,
                                          const Array& positions) {
@@ -43,14 +45,17 @@ void bind_les_monopole(py::module_& module, const char* name)
             py::array_t<double> force(py::array::ShapeContainer{
                 static_cast<py::ssize_t>(count), static_cast<py::ssize_t>(3)});
             py::array_t<double> adjoints({static_cast<py::ssize_t>(count)});
+            py::array_t<double> strain(py::array::ShapeContainer{3, 3});
             std::copy(result.atomic_energies.begin(), result.atomic_energies.end(), atomic_energies.mutable_data());
             std::copy(result.forces.begin(), result.forces.end(), force.mutable_data());
             std::copy(result.charge_adjoints.begin(), result.charge_adjoints.end(), adjoints.mutable_data());
+            std::copy(result.strain_derivative.begin(), result.strain_derivative.end(), strain.mutable_data());
             py::dict output;
             output["energy"] = result.energy;
             output["atomic_energies"] = atomic_energies;
             output["forces"] = force;
             output["charge_adjoints"] = adjoints;
+            output["strain_derivative"] = strain;
             return output;
         })
         .def("compute_periodic", [] (Operator& self, const Array& charges,

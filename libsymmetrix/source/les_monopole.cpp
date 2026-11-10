@@ -11,7 +11,6 @@
 
 namespace symmetrix::les {
 namespace {
-constexpr double coulomb_norm_factor = 90.4756;
 constexpr double two_pi = 2.0 * std::numbers::pi;
 
 [[noreturn]] void throw_reciprocal_bound_error(const std::string& detail)
@@ -238,11 +237,17 @@ struct PeriodicStrainReduction {
 
 template <typename Precision>
 LESMonopoleKokkos<Precision>::LESMonopoleKokkos(
-    const double sigma, const double dl, const bool remove_self_interaction)
-    : sigma_(sigma), dl_(dl), remove_self_interaction_(remove_self_interaction)
+    const double sigma,
+    const double dl,
+    const bool remove_self_interaction,
+    const double norm_factor)
+    : sigma_(sigma), dl_(dl), norm_factor_(norm_factor),
+      remove_self_interaction_(remove_self_interaction)
 {
     if (!std::isfinite(sigma_) || sigma_ <= 0.0 || !std::isfinite(dl_) || dl_ <= 0.0)
         throw std::invalid_argument("LES sigma and dl must be finite and positive.");
+    if (!std::isfinite(norm_factor_) || norm_factor_ <= 0.0)
+        throw std::invalid_argument("LES norm factor must be finite and positive.");
 }
 
 template <typename Precision>
@@ -333,10 +338,10 @@ MonopoleDeviceResult LESMonopoleKokkos<Precision>::compute_nonperiodic_device(
     Kokkos::deep_copy(execution_space, strain, 0.0);
     const double sigma = sigma_;
     const bool remove_self = remove_self_interaction_;
-    const double prefactor = coulomb_norm_factor/two_pi;
+    const double prefactor = norm_factor_/two_pi;
     const double root_two = std::sqrt(2.0);
     const double root_two_over_pi = std::sqrt(2.0/std::numbers::pi);
-    const double self = coulomb_norm_factor/(sigma_*std::pow(two_pi, 1.5));
+    const double self = norm_factor_/(sigma_*std::pow(two_pi, 1.5));
     Kokkos::parallel_for(
         "LES nonperiodic monopole",
         Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
@@ -382,6 +387,29 @@ MonopoleDeviceResult LESMonopoleKokkos<Precision>::compute_nonperiodic_device(
         KOKKOS_LAMBDA(const std::size_t atom, double& sum) {
             sum += atomic(atom);
         }, energy_);
+    using team_policy = Kokkos::TeamPolicy<
+        typename LESMonopoleKokkos<Precision>::execution_space>;
+    using team_member = typename team_policy::member_type;
+    Kokkos::parallel_for(
+        "LES nonperiodic position-force strain",
+        team_policy(execution_space, 9, Kokkos::AUTO, 1),
+        KOKKOS_LAMBDA(const team_member& team) {
+            const int component = team.league_rank();
+            const int row = component/3;
+            const int column = component%3;
+            double derivative = 0.0;
+            Kokkos::parallel_reduce(
+                Kokkos::TeamThreadRange(team, count),
+                [=] (const std::size_t atom, double& sum) {
+                    sum -= 0.5*(
+                        positions(3*atom+row)*force(3*atom+column)
+                        +positions(3*atom+column)*force(3*atom+row));
+                },
+                derivative);
+            Kokkos::single(Kokkos::PerTeam(team), [=] () {
+                strain(component) = derivative;
+            });
+        });
     return {
         energy_, atomic_energies_, forces_, charge_adjoints_, strain_derivative_};
 }
@@ -649,7 +677,8 @@ MonopoleDeviceResult LESMonopoleKokkos<Precision>::compute_periodic_device(
         const MonopoleDeviceResult result{
             energy_, atomic_energies_, forces_, charge_adjoints_, strain_derivative_};
         particle_mesh_->compute(
-            charges, positions, count, sigma_, dl_, remove_self_interaction_, result);
+            charges, positions, count, sigma_, dl_, norm_factor_,
+            remove_self_interaction_, result);
         return result;
     }
     const auto vectors = reciprocal_vectors_;
@@ -686,7 +715,8 @@ MonopoleDeviceResult LESMonopoleKokkos<Precision>::compute_periodic_device(
     const auto adjoint = charge_adjoints_;
     const auto cell = reciprocal_cell_;
     const bool remove_self = remove_self_interaction_;
-    const double self = coulomb_norm_factor/(sigma_*std::pow(two_pi, 1.5));
+    const double self = norm_factor_/(sigma_*std::pow(two_pi, 1.5));
+    const double norm_factor = norm_factor_;
     using team_policy = Kokkos::TeamPolicy<
         typename LESMonopoleKokkos<Precision>::execution_space>;
     using team_member = typename team_policy::member_type;
@@ -695,7 +725,7 @@ MonopoleDeviceResult LESMonopoleKokkos<Precision>::compute_periodic_device(
         team_policy(execution_space, count, Kokkos::AUTO, 1),
         KOKKOS_LAMBDA(const team_member& team) {
             const std::size_t atom = team.league_rank();
-            const double prefactor = coulomb_norm_factor/cell(9);
+            const double prefactor = norm_factor/cell(9);
             const double qi = charges(atom);
             const double self_sign = remove_self ? -1.0 : 1.0;
             const PeriodicAtomOutputReduction reduction{
@@ -735,7 +765,7 @@ MonopoleDeviceResult LESMonopoleKokkos<Precision>::compute_periodic_device(
                 const int component = team.league_rank();
                 const int row = component/3;
                 const int column = component%3;
-                const double prefactor = coulomb_norm_factor/cell(9);
+                const double prefactor = norm_factor/cell(9);
                 double derivative;
                 Kokkos::parallel_reduce(
                     Kokkos::TeamThreadRange(team, active_count),

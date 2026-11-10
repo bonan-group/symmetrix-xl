@@ -63,7 +63,13 @@ std::unique_ptr<MACELESParameters<Precision>> MACELESParameters<Precision>::from
     if (data.at("mace_num_channels").get<int>() != channels)
         throw std::invalid_argument("les.mace_num_channels does not match MACE.");
     const auto& ewald = data.at("ewald");
-    require_fields(ewald, {"sigma", "dl", "remove_self_interaction"}, "les.ewald");
+    if (!ewald.is_object()
+        || !ewald.contains("sigma")
+        || !ewald.contains("dl")
+        || !ewald.contains("remove_self_interaction")
+        || (ewald.size() != 3 && ewald.size() != 4)
+        || (ewald.size() == 4 && !ewald.contains("norm_factor")))
+        throw std::invalid_argument("les.ewald has an unsupported field set.");
     if (!ewald.at("remove_self_interaction").is_boolean())
         throw std::invalid_argument("les.ewald.remove_self_interaction must be boolean.");
     const int hidden = data.at("readout_2_hidden_size").get<int>();
@@ -100,6 +106,9 @@ std::unique_ptr<MACELESParameters<Precision>> MACELESParameters<Precision>::from
     result->mace_r1_fingerprint = compare_contract("R1", "fingerprint");
     result->sigma = finite(ewald.at("sigma"), "les.ewald.sigma", true);
     result->dl = finite(ewald.at("dl"), "les.ewald.dl", true);
+    result->norm_factor = ewald.contains("norm_factor")
+        ? finite(ewald.at("norm_factor"), "les.ewald.norm_factor", true)
+        : 90.4756;
     result->remove_self_interaction = ewald.at("remove_self_interaction").get<bool>();
     result->output_scale = finite(data.at("output_scale"), "les.output_scale");
     result->readout_2_hidden_size = hidden;

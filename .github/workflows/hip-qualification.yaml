@@ -23,7 +23,6 @@ jobs:
       LD_LIBRARY_PATH: /opt/rocm/lib
       KOKKOS_NUM_THREADS: 1
       SYMMETRIX_REQUIRED_TEST_MANIFEST: hip_required_tests.json
-      HIP_ARTIFACT_DIR: ${{ runner.temp }}/hip-qualification
     steps:
       - name: Clone trusted repository revision
         uses: actions/checkout@v6
@@ -37,6 +36,8 @@ jobs:
 
       - name: Prepare isolated task runtime roots
         run: |
+          HIP_ARTIFACT_DIR="$RUNNER_TEMP/hip-qualification"
+          echo "HIP_ARTIFACT_DIR=$HIP_ARTIFACT_DIR" >> "$GITHUB_ENV"
           mkdir -p "$HIP_ARTIFACT_DIR"
           for name in xdg-cache xdg-runtime tmp comgr-cache hip-cache; do
             mkdir -p "$RUNNER_TEMP/symmetrix-hip-$name"

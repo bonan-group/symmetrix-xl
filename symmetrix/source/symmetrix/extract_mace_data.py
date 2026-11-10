@@ -135,6 +135,11 @@ def _extract_mace_les_parameters(
         "remove_self_interaction",
         getattr(les, "remove_self_interaction", True),
     )
+    norm_factor = getattr(
+        getattr(les, "ewald", None),
+        "norm_factor",
+        getattr(les, "norm_factor", 90.4756),
+    )
     payload = {
         "schema": MACE_LES_SCHEMA,
         "version": MACE_LES_SCHEMA_VERSION,
@@ -144,6 +149,7 @@ def _extract_mace_les_parameters(
             "sigma": float(les.sigma),
             "dl": float(les.dl),
             "remove_self_interaction": bool(remove_self_interaction),
+            "norm_factor": float(norm_factor),
         },
         "output_scale": float(getattr(model, "les_output_scale", 1.0)),
         "mace_num_interactions": len(model.interactions),

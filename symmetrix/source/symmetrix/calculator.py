@@ -155,6 +155,36 @@ def _use_device_neighbor_graph(request, eligible, num_atoms, execution_space):
     )
 
 
+def _mace_stress_volume(atoms, cutoff=None):
+    """Return the cell volume used by MACE for stress normalization."""
+
+    positions = np.asarray(atoms.positions, dtype=float)
+    if positions.size == 0:
+        raise ValueError("MACE stress evaluation requires at least one atom.")
+
+    cell = np.array(atoms.cell.array, dtype=float, copy=True)
+    if not cell.any():
+        cell = np.eye(3, dtype=float)
+
+    pbc = np.asarray(atoms.pbc, dtype=bool)
+    if not pbc.all():
+        if cutoff is None:
+            raise ValueError(
+                "MACE nonperiodic stress evaluation requires a finite cutoff."
+            )
+        scale = (np.max(np.abs(positions)) + 1.0) * 5.0 * float(cutoff)
+        identity = np.eye(3, dtype=float)
+        for axis, periodic in enumerate(pbc):
+            if periodic:
+                continue
+            cell[axis, :] = scale * identity[axis, :]
+
+    volume = abs(float(np.linalg.det(cell)))
+    if not np.isfinite(volume) or volume <= 0.0:
+        raise ValueError("MACE stress evaluation requires a finite positive volume.")
+    return volume
+
+
 class _JitRequiredError(RuntimeError):
     pass
 
@@ -5856,11 +5886,12 @@ class Symmetrix(Calculator):
         if "dipole" in properties:
             results["dipole"] = self._polar_dipole_output()
         if "stress" in properties:
+            stress_volume = _mace_stress_volume(atoms, getattr(self, "cutoff", None))
             reduce_stress = getattr(self.evaluator, "_reduce_stress", None)
             if callable(reduce_stress):
                 stress_tensor = np.asarray(
                     reduce_stress(
-                        atoms.get_volume(),
+                        stress_volume,
                         np.empty(0, dtype=np.float64) if xyz is None else xyz,
                         execution_graph_generation,
                     ),
@@ -5871,7 +5902,7 @@ class Symmetrix(Calculator):
                     self.evaluator.node_forces, dtype=np.float64
                 ).reshape((-1, 3))
                 pair_forces = np.array(pair_forces[: len(i_list), :], copy=True)
-                stress_tensor = (-pair_forces.T @ xyz) / atoms.get_volume()
+                stress_tensor = (-pair_forces.T @ xyz) / stress_volume
             results["stress"] = full_3x3_to_voigt_6_stress(stress_tensor)
         return results
 

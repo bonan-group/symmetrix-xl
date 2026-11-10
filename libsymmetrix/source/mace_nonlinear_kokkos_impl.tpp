@@ -3475,7 +3475,7 @@ std::uint64_t MaceBackboneKokkosT<Precision>::prepare_factorized_graph(
 }
 
 template<typename Precision>
-std::pair<std::uint64_t,std::size_t>
+typename MaceBackboneKokkosT<Precision>::PeriodicFactorizedGraphResult
 MaceBackboneKokkosT<Precision>::prepare_periodic_factorized_graph(
     const std::span<const int> node_types,
     const std::span<const double> positions,

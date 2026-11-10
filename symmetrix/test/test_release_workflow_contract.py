@@ -16,8 +16,9 @@ def test_cuda_release_audits_before_upload_and_publication():
     assert "tools/audit_cuda_release_wheel.py" in workflow
     assert "auditwheel show" in workflow
     assert "manylinux_2_28" in workflow
-    assert "pip install --no-deps" in workflow
+    assert "install --no-deps" in workflow
     assert "entry_points" in workflow
+    assert 'package.glob(f"_native_{selector.replace' in workflow
     assert "_operator_artifacts/catalog.json" in workflow
     assert "sha256sum *.whl" in workflow
     assert "sha256sum -c" in workflow
@@ -43,13 +44,37 @@ def test_cuda_release_keeps_declared_matrix_and_metadata_gate():
 
 def test_cpu_release_compatibility_lane_is_pinned_and_downloads_fail_closed():
     workflow = (ROOT / ".github/workflows/release-cpu-wheels.yaml").read_text()
-    assert "'torch==2.5.*'" in workflow
-    assert "'mace-torch==0.3.16'" in workflow
+    assert "Run focused wheel compatibility suite" in workflow
+    assert "python -m pytest -q" in workflow
+    assert "symmetrix/test/test_polar_end_to_end_fixtures.py" in workflow
+    assert "torch==2.5.*" not in workflow
+    assert "mace-torch==0.3.16" not in workflow
     assert 'SYMMETRIX_TEST_MODEL_DOWNLOADS: "0"' in workflow
     assert "qualify-full" in workflow
 
 
-def _cuda_wheel(tmp_path, *, descriptor=None, native=True, catalog=True, oam=True):
+def test_cuda12_periodic_graph_result_uses_class_owned_alias():
+    header = (ROOT / "libsymmetrix/source/mace_nonlinear_kokkos.hpp").read_text()
+    implementation = (
+        ROOT / "libsymmetrix/source/mace_nonlinear_kokkos_impl.tpp"
+    ).read_text()
+    assert "using PeriodicFactorizedGraphResult =" in header
+    assert "PeriodicFactorizedGraphResult prepare_periodic_factorized_graph(" in header
+    assert (
+        "typename MaceBackboneKokkosT<Precision>::PeriodicFactorizedGraphResult"
+        in implementation
+    )
+
+
+def _cuda_wheel(
+    tmp_path,
+    *,
+    descriptor=None,
+    native=True,
+    catalog=True,
+    oam=True,
+    include_descriptor_prebuilt=True,
+):
     package = "symmetrix_backend_cuda13_sm120"
     descriptor = descriptor or {
         "distribution": "symmetrix-xl-cuda13-sm120",
@@ -67,19 +92,21 @@ def _cuda_wheel(tmp_path, *, descriptor=None, native=True, catalog=True, oam=Tru
                 "operator": "OAM",
                 "build_provenance": {
                     "source_content_sha256": "sha256:" + "a" * 64,
-                    "native_source_content_sha256": "sha256:" + "b" * 64,
                 },
             }
         )
     payload = {
         "artifacts": artifacts,
     }
-    descriptor["prebuilt_operator_artifacts"] = {
-        "backend": "cuda",
-        "target": "sm120",
-        "artifact_count": len(artifacts),
-        "catalog_sha256": hashlib.sha256(json.dumps(payload).encode()).hexdigest(),
-    }
+    if include_descriptor_prebuilt:
+        descriptor["prebuilt_operator_artifacts"] = {
+            "backend": "cuda",
+            "target": "sm120",
+            "artifact_count": len(artifacts),
+            "catalog_sha256": hashlib.sha256(json.dumps(payload).encode()).hexdigest(),
+            "source_content_sha256": "a" * 64,
+            "native_source_content_sha256": "b" * 64,
+        }
     wheel = tmp_path / "wheel.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr(f"{package}/backend.json", json.dumps(descriptor))
@@ -105,11 +132,21 @@ def test_cuda_audit_accepts_valid_synthetic_wheel(tmp_path):
     assert result["selector"] == "cuda13-sm120"
 
 
+def test_cuda_audit_derives_catalog_provenance_for_legacy_descriptor(tmp_path):
+    result = audit_cuda_release_wheel.audit_cuda_wheel(
+        _cuda_wheel(tmp_path, include_descriptor_prebuilt=False),
+        cuda_major="13",
+        target="sm120",
+    )
+    assert result["artifacts"] == 1
+
+
 @pytest.mark.parametrize(
     "mutator",
     (
         lambda descriptor: descriptor.update(selector="cuda13-sm90"),
         lambda descriptor: descriptor.update(source_content_sha256="c" * 64),
+        lambda descriptor: descriptor.update(native_source_content_sha256="c" * 64),
     ),
 )
 def test_cuda_audit_rejects_descriptor_or_provenance_mismatch(tmp_path, mutator):

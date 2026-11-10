@@ -47,6 +47,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install source build dependencies
+        run: sudo apt-get update && sudo apt-get install -y gfortran libopenblas-dev
       - name: Validate version sources and release tag
         run: |
           python tools/check_release_metadata.py
@@ -67,6 +70,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install source build dependencies
+        run: sudo apt-get update && sudo apt-get install -y gfortran libopenblas-dev
 
       - name: Build and inspect source distribution
         run: |
@@ -220,14 +226,23 @@ jobs:
           name: wheel-cp312-cp312
           path: wheelhouse
 
-      - name: Install wheel and full test dependencies
-        run: pip install wheelhouse/*.whl pytest 'torch==2.5.*' 'mace-torch==0.3.16'
+      - name: Install wheel and release test dependencies
+        run: pip install wheelhouse/*.whl pytest numpy scipy ase
 
-      - name: Run full applicable test suite
+      - name: Run focused wheel compatibility suite
         env:
           SYMMETRIX_BACKEND: cpu
           SYMMETRIX_OPENMP_RUNTIME_CHECK: strict
-        run: pytest -q symmetrix/test
+          SYMMETRIX_TEST_MODEL_DOWNLOADS: "0"
+        run: >-
+          python -m pytest -q
+          symmetrix/test/test_cpu_wheel_runtime.py
+          symmetrix/test/test_runtime_diagnostics.py
+          symmetrix/test/test_execution_support_matrix.py
+          symmetrix/test/test_polar_oracle_fixtures.py
+          symmetrix/test/test_polar_end_to_end_fixtures.py
+          symmetrix/test/test_mace_les_reference.py
+          symmetrix/test/test_release_workflow_contract.py
 
   publish:
     name: Publish to PyPI

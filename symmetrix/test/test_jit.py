@@ -2054,7 +2054,9 @@ def test_compile_progress_animates_on_interactive_stderr(jit, monkeypatch):
     monkeypatch.setattr(jit.sys, "stderr", stream)
 
     with jit._jit_compile_progress("test_plugin", "CXX", enabled=True):
-        time.sleep(0.22)
+        deadline = time.monotonic() + 2.0
+        while "⠙" not in stream.getvalue() and time.monotonic() < deadline:
+            time.sleep(0.01)
 
     output = stream.getvalue()
     assert "\rSymmetrix: compiling JIT artifact 'test_plugin' with CXX ⠋" in output

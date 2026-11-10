@@ -66,6 +66,7 @@ PairSymmetrixMACEKokkos<DeviceType, Precision>::PairSymmetrixMACEKokkos(LAMMPS *
   jit_m0_device_schedule = "chunk32";
   jit_m0_device_schedule_set = false;
   jit_device_blocks_per_compute_unit = 8;
+  jit_device_blocks_per_compute_unit_set = false;
 
   kokkosable = 1;
   reverse_comm_device = 1;
@@ -197,6 +198,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
   jit_m0_device_schedule = "chunk32";
   jit_m0_device_schedule_set = false;
   jit_device_blocks_per_compute_unit = 8;
+  jit_device_blocks_per_compute_unit_set = false;
 
   for (int i=0; i<narg; ++i) {
     const std::string token(arg[i]);
@@ -341,6 +343,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
       if (invalid_value || jit_device_blocks_per_compute_unit < 1
           || jit_device_blocks_per_compute_unit > 32)
         error->all(FLERR, "pair_style symmetrix/mace/kk jit_device_blocks_per_compute_unit requires an integer in [1, 32]");
+      jit_device_blocks_per_compute_unit_set = true;
     } else {
       error->all(FLERR, "The command \'pair_style symmetrix/mace/kk {}\' is invalid", token);
     }
@@ -503,6 +506,21 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
         lmp,
         "Activated Execution JIT device artifact '{}'\n",
         mace->jit_device_plugin_artifact_id());
+#ifdef KOKKOS_ENABLE_HIP
+      // The HIP R1 plugin takes its launch policy from the artifact descriptor
+      // and ignores this keyword; the M0 and R0 device modules still honor it.
+      if (jit_device_blocks_per_compute_unit_set && comm->me == 0) {
+        const int artifact_blocks =
+          mace->jit_device_plugin->persistent_blocks_per_compute_unit();
+        if (jit_device_blocks_per_compute_unit != artifact_blocks)
+          error->warning(
+            FLERR,
+            "pair_style symmetrix/mace/kk jit_device_blocks_per_compute_unit {} differs from "
+            "the HIP R1 device artifact's own {} blocks per compute unit; the R1 artifact keeps "
+            "its value, and the setting applies only to M0 and R0 device modules",
+            jit_device_blocks_per_compute_unit, artifact_blocks);
+      }
+#endif
     } else if (!mace->single_layer_readout) {
       error->all(
         FLERR,
@@ -1042,7 +1060,16 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
   auto mace_types = this->mace_types;
   int num_edges = execution_num_edges;
   if (rebuild_topology) {
-    k_map_array.template sync<DeviceType>();
+    // sync the map the atom style uses.  a hash filled on the host (legacy
+    // atom map, e.g. pair/only or atom/map no) is otherwise never copied to
+    // the device and every lookup below returns -1.  sync the atom's own
+    // member, since dual_hash_type keeps its modified flags by value, and
+    // take the copy afterwards, since the sync may reallocate the views
+    if (map_style == Atom::MAP_HASH) {
+      atomKK->k_map_hash.template sync<DeviceType>();
+      k_map_hash = atomKK->k_map_hash;
+    } else
+      k_map_array.template sync<DeviceType>();
     Kokkos::deep_copy(num_neigh, 0);
     Kokkos::parallel_for("PairSymmetrixMACEKokkos::set_node_based_views",
       Kokkos::TeamPolicy<>(num_nodes, Kokkos::AUTO),
@@ -1087,13 +1114,14 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
       });
 
   // neigh_indices, neigh_types, xyz, and r
+  const auto xyz_extent = std::size_t(3)*static_cast<std::size_t>(num_edges);
   if (neigh_indices.size() < num_edges) Kokkos::realloc(neigh_indices, num_edges);
   if (neigh_types.size() < num_edges) Kokkos::realloc(neigh_types, num_edges);
-  if (xyz.size() < 3*num_edges) Kokkos::realloc(xyz, 3*num_edges);
+  if (xyz.size() < xyz_extent) Kokkos::realloc(xyz, xyz_extent);
   if (r.size() < num_edges) Kokkos::realloc(r, num_edges);
   auto neigh_indices = Kokkos::subview(this->neigh_indices, Kokkos::make_pair(0,num_edges));
   auto neigh_types = Kokkos::subview(this->neigh_types, Kokkos::make_pair(0,num_edges));
-  auto xyz = Kokkos::subview(this->xyz, Kokkos::make_pair(0,3*num_edges));
+  auto xyz = Kokkos::subview(this->xyz, Kokkos::make_pair(std::size_t(0),xyz_extent));
   auto r = Kokkos::subview(this->r, Kokkos::make_pair(0,num_edges));
   const char* edge_kernel_label = rebuild_topology
     ? "PairSymmetrixMACEKokkos::set_edge_topology_geometry"
@@ -1687,7 +1715,8 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
     }
   } else {
   if (mace->node_energies.size() < num_nodes) Kokkos::realloc(mace->node_energies, num_nodes);
-  if (mace->node_forces.size() < 3*num_edges) Kokkos::realloc(mace->node_forces, 3*num_edges);
+  const auto node_forces_extent = std::size_t(3)*static_cast<std::size_t>(num_edges);
+  if (mace->node_forces.size() < node_forces_extent) Kokkos::realloc(mace->node_forces, node_forces_extent);
   Kokkos::deep_copy(mace->node_energies, 0.0);
   Kokkos::deep_copy(mace->node_forces, 0.0);
 
@@ -2059,13 +2088,15 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_mpi_message_pass
     Kokkos::realloc(neigh_indices, num_local_edges+num_ghost_edges);
   if (neigh_types.size() < num_local_edges+num_ghost_edges)
     Kokkos::realloc(neigh_types, num_local_edges+num_ghost_edges);
-  if (xyz.size() < 3*(num_local_edges+num_ghost_edges))
-    Kokkos::realloc(xyz, 3*(num_local_edges+num_ghost_edges));
+  const auto xyz_extent = std::size_t(3)
+    *(static_cast<std::size_t>(num_local_edges)+static_cast<std::size_t>(num_ghost_edges));
+  if (xyz.size() < xyz_extent)
+    Kokkos::realloc(xyz, xyz_extent);
   if (r.size() < num_local_edges+num_ghost_edges)
     Kokkos::realloc(r, num_local_edges+num_ghost_edges);
   auto neigh_indices = Kokkos::subview(this->neigh_indices, Kokkos::make_pair(0,num_local_edges+num_ghost_edges));
   auto neigh_types = Kokkos::subview(this->neigh_types, Kokkos::make_pair(0,num_local_edges+num_ghost_edges));
-  auto xyz = Kokkos::subview(this->xyz, Kokkos::make_pair(0,3*(num_local_edges+num_ghost_edges)));
+  auto xyz = Kokkos::subview(this->xyz, Kokkos::make_pair(std::size_t(0),xyz_extent));
   auto r = Kokkos::subview(this->r, Kokkos::make_pair(0,num_local_edges+num_ghost_edges));
   Kokkos::parallel_for("populate edge-based views",
     num_local_nodes+num_ghost_nodes,
@@ -2115,8 +2146,8 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_mpi_message_pass
   if (mace->node_energies.size() < num_local_nodes)
     Kokkos::realloc(mace->node_energies, num_local_nodes);
   Kokkos::deep_copy(mace->node_energies, 0.0);
-  if (mace->node_forces.size() < 3*(num_local_edges+num_ghost_edges))
-    Kokkos::realloc(mace->node_forces, 3*(num_local_edges+num_ghost_edges));
+  if (mace->node_forces.size() < xyz_extent)
+    Kokkos::realloc(mace->node_forces, xyz_extent);
   Kokkos::deep_copy(mace->node_forces, 0.0);
 
   if (mace->has_zbl)

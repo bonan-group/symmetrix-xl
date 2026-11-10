@@ -2277,6 +2277,19 @@ def test_python_cmake_definitions_share_descriptor_dirty_policy():
     assert definitions["SYMMETRIX_BUILD_SOURCE_DIRTY"] == "1"
 
 
+def test_release_source_commit_fallback_preserves_clean_provenance(
+    tmp_path, monkeypatch
+):
+    runner, repository, _, _ = _superproject_with_submodule(tmp_path)
+    monkeypatch.setattr(runner, "which", lambda _command: None)
+    monkeypatch.setenv("SYMMETRIX_RELEASE_SOURCE_COMMIT", "d" * 40)
+
+    provenance = build_source_provenance.symmetrix_source_provenance(repository, runner)
+
+    assert provenance["revision"] == "d" * 40
+    assert provenance["dirty"] is False
+
+
 def test_lammps_qualification_is_verified_and_reused(tmp_path):
     source = _lammps_source(tmp_path / "lammps")
     prefix = tmp_path / "prefix"

@@ -27,7 +27,8 @@ _REQUIRED_FIELDS = frozenset(
         "readout_2_scale_factor",
     }
 )
-_EWALD_FIELDS = frozenset({"sigma", "dl", "remove_self_interaction"})
+_EWALD_REQUIRED_FIELDS = frozenset({"sigma", "dl", "remove_self_interaction"})
+_EWALD_OPTIONAL_FIELDS = frozenset({"norm_factor"})
 _BASE_CONTRACT_FIELDS = frozenset({"R0", "M0", "R1"})
 
 
@@ -71,7 +72,11 @@ def validate_mace_les_parameters(data: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("les.periodicity must be 'geometry'")
 
     ewald = data["ewald"]
-    if not isinstance(ewald, Mapping) or set(ewald) != _EWALD_FIELDS:
+    if (
+        not isinstance(ewald, Mapping)
+        or not _EWALD_REQUIRED_FIELDS.issubset(ewald)
+        or not set(ewald).issubset(_EWALD_REQUIRED_FIELDS | _EWALD_OPTIONAL_FIELDS)
+    ):
         raise ValueError("les.ewald has an unsupported field set")
     if not isinstance(ewald["remove_self_interaction"], bool):
         raise TypeError("les.ewald.remove_self_interaction must be boolean")
@@ -109,6 +114,11 @@ def validate_mace_les_parameters(data: Mapping[str, Any]) -> dict[str, Any]:
             "sigma": _finite_number(ewald["sigma"], "ewald.sigma", positive=True),
             "dl": _finite_number(ewald["dl"], "ewald.dl", positive=True),
             "remove_self_interaction": ewald["remove_self_interaction"],
+            "norm_factor": _finite_number(
+                ewald.get("norm_factor", 90.4756),
+                "ewald.norm_factor",
+                positive=True,
+            ),
         },
         "output_scale": _finite_number(data["output_scale"], "output_scale"),
         "mace_num_interactions": 2,

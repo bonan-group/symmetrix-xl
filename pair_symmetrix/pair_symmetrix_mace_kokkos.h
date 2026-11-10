@@ -86,6 +86,7 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   std::string jit_r0_device_artifact;
   std::string jit_m0_device_schedule = "chunk32";
   bool jit_m0_device_schedule_set = false;
+  bool jit_device_blocks_per_compute_unit_set = false;
   int jit_device_blocks_per_compute_unit = 8;
   std::uint64_t execution_graph_generation = 0;
   int execution_num_nodes = 0;

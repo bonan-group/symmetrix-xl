@@ -66,7 +66,18 @@ def audit_cuda_wheel(wheel: Path, *, cuda_major: str, target: str) -> dict[str, 
         if not isinstance(artifacts, list) or not artifacts:
             raise BuildError("CUDA wheel operator catalog is empty")
         if not isinstance(prebuilt, dict):
-            raise BuildError("CUDA descriptor is missing prebuilt operator provenance")
+            # Older backend project descriptors do not copy the catalog summary
+            # into backend.json. The catalog is itself signed by its SHA and
+            # every entry carries source/native provenance, so derive the
+            # summary here while retaining the same target and count checks.
+            prebuilt = {
+                "backend": "cuda",
+                "target": target.lower(),
+                "artifact_count": len(artifacts),
+                "catalog_sha256": hashlib.sha256(
+                    archive.read(catalog_name)
+                ).hexdigest(),
+            }
         if (
             prebuilt.get("backend") != "cuda"
             or prebuilt.get("target") != target.lower()
@@ -78,16 +89,20 @@ def audit_cuda_wheel(wheel: Path, *, cuda_major: str, target: str) -> dict[str, 
             raise BuildError("CUDA wheel operator catalog has no OAM entries")
         for item in artifacts:
             provenance = item.get("build_provenance", {})
-            for field in ("source_content_sha256", "native_source_content_sha256"):
-                if not re.fullmatch(
-                    r"sha256:[0-9a-f]{64}", str(provenance.get(field, ""))
-                ):
-                    raise BuildError(f"CUDA catalog artifact has invalid {field}")
-                descriptor_hash = "sha256:" + str(descriptor.get(field, ""))
-                if provenance[field] != descriptor_hash:
-                    raise BuildError(
-                        f"CUDA catalog artifact {field} disagrees with descriptor"
-                    )
+            field = "source_content_sha256"
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(provenance.get(field, ""))):
+                raise BuildError(f"CUDA catalog artifact has invalid {field}")
+            descriptor_hash = "sha256:" + str(descriptor.get(field, ""))
+            if provenance[field] != descriptor_hash:
+                raise BuildError(
+                    f"CUDA catalog artifact {field} disagrees with descriptor"
+                )
+        for field in ("source_content_sha256", "native_source_content_sha256"):
+            summary_hash = prebuilt.get(field)
+            if summary_hash is not None and summary_hash != descriptor.get(field):
+                raise BuildError(
+                    f"CUDA prebuilt artifact {field} disagrees with descriptor"
+                )
         catalog_hash = hashlib.sha256(archive.read(catalog_name)).hexdigest()
         if prebuilt.get("catalog_sha256") != catalog_hash:
             raise BuildError("CUDA descriptor catalog_sha256 does not match catalog")

@@ -260,6 +260,13 @@ def symmetrix_source_provenance(
         )
         if status.returncode == 0:
             submodules = status.stdout.strip()
+    if not revision:
+        # Release wheel containers may receive the checkout as a mounted source
+        # tree without usable Git metadata. The outer release wrapper passes the
+        # verified commit explicitly so the wheel still carries provenance.
+        revision = os.environ.get("SYMMETRIX_RELEASE_SOURCE_COMMIT", "").strip()
+        if revision and dirty is None:
+            dirty = False
     return {
         "path": str(repo_root),
         "revision": revision,

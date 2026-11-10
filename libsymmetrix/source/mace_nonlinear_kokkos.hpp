@@ -284,12 +284,15 @@ public:
     symmetrix::execution::ImplementationBindingReport
         family_binding_report() const;
 public:
+    using PeriodicFactorizedGraphResult =
+        std::pair<std::uint64_t,std::size_t>;
+
     std::uint64_t prepare_factorized_graph(
         int num_nodes,std::span<const int> node_types,
         std::span<const int> num_neigh,
         std::span<const int> neigh_indices,
         std::span<const int> neigh_types);
-    std::pair<std::uint64_t,std::size_t> prepare_periodic_factorized_graph(
+    PeriodicFactorizedGraphResult prepare_periodic_factorized_graph(
         std::span<const int> node_types,
         std::span<const double> positions,
         std::span<const double> cell,

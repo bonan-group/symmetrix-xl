@@ -51,6 +51,7 @@ REQUIRED_SDIST_MEMBERS = (
     "CMakeLists.txt",
     "pyproject.toml",
     "LICENSE",
+    "THIRD_PARTY_LICENSES.md",
     "source/symmetrix/__init__.py",
     "source/symmetrix/mace_jit_cuda_plugin_abi.h",
     "source/symmetrix/mace_nonlinear_jit_cuda_plugin_abi.h",

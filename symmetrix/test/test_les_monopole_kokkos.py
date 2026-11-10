@@ -118,6 +118,24 @@ def test_nonperiodic_monopole_matches_frozen_reference(class_name, case):
 @pytest.mark.parametrize(
     "class_name", ["_LESMonopoleKokkos", "_LESMonopoleKokkosFloat"]
 )
+def test_nonperiodic_monopole_strain_derivative_includes_position_forces(class_name):
+    charges = np.array([0.31, -0.22, -0.09])
+    positions = np.array([[0.0, 0.0, 0.0], [0.91, 0.12, -0.08], [-0.27, 0.83, 0.19]])
+    operator = getattr(symmetrix.load_backend(), class_name)(1.0, 2.0, True)
+
+    result = operator.compute_nonperiodic(charges, positions)
+    position_force = positions.T @ np.asarray(result["forces"])
+    expected = -0.5 * (position_force + position_force.T)
+    tolerance = 2.0e-12 if class_name.endswith("Kokkos") else 2.0e-6
+
+    np.testing.assert_allclose(
+        result["strain_derivative"], expected, rtol=0.0, atol=tolerance
+    )
+
+
+@pytest.mark.parametrize(
+    "class_name", ["_LESMonopoleKokkos", "_LESMonopoleKokkosFloat"]
+)
 @pytest.mark.parametrize(
     "case",
     [case for case in load_mace_les_cases() if case.boundary == "periodic"],
@@ -140,6 +158,31 @@ def test_periodic_monopole_matches_frozen_reference(class_name, case):
     )
     np.testing.assert_allclose(result["strain_derivative"], case.stress, atol=tolerance)
     np.testing.assert_allclose(result["forces"].sum(axis=0), 0.0, atol=tolerance)
+
+
+@pytest.mark.parametrize(
+    "class_name", ["_LESMonopoleKokkos", "_LESMonopoleKokkosFloat"]
+)
+def test_monopole_outputs_scale_with_model_norm_factor(class_name):
+    case = next(case for case in load_mace_les_cases() if case.boundary == "periodic")
+    default = getattr(symmetrix.load_backend(), class_name)(
+        case.sigma, case.dl, case.remove_self_interaction
+    ).compute_periodic(case.charges, case.positions, case.cell)
+    scaled = getattr(symmetrix.load_backend(), class_name)(
+        case.sigma,
+        case.dl,
+        case.remove_self_interaction,
+        90.4756 / 2.0,
+    ).compute_periodic(case.charges, case.positions, case.cell)
+
+    for name in (
+        "energy",
+        "atomic_energies",
+        "forces",
+        "charge_adjoints",
+        "strain_derivative",
+    ):
+        np.testing.assert_allclose(scaled[name], np.asarray(default[name]) / 2.0)
 
 
 @pytest.mark.parametrize(

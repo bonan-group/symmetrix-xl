@@ -62,6 +62,7 @@ public:
         std::size_t count,
         double sigma,
         double reciprocal_spacing,
+        double norm_factor,
         bool remove_self_interaction,
         const MonopoleDeviceResult& output);
     [[nodiscard]] LESParticleMeshDiagnostics diagnostics() const;
