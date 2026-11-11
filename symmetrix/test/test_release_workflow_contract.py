@@ -74,6 +74,20 @@ def test_backend_release_accepts_catalog_bound_legacy_descriptor():
     assert '"sha256:" + descriptor["source_content_sha256"]' in install_step
 
 
+def test_backend_release_installs_numpy_before_native_runtime_probe():
+    workflow = (ROOT / ".github/workflows/release-backend-wheels.yaml").read_text()
+    install_step = workflow[
+        workflow.index(
+            "name: Install repaired wheel and prove metadata, catalog, and AVX-512 codegen"
+        ) :
+    ]
+    numpy_install = "/tmp/wheelcheck/bin/pip install numpy"
+    addon_install = "/tmp/wheelcheck/bin/pip install --no-deps dist-repaired/*.whl"
+    runtime_probe = "name: Probe AVX-512 runtime when host supports x86-64-v4"
+    assert install_step.index(numpy_install) < install_step.index(addon_install)
+    assert install_step.index(addon_install) < install_step.index(runtime_probe)
+
+
 def test_cuda12_periodic_graph_result_uses_class_owned_alias():
     header = (ROOT / "libsymmetrix/source/mace_nonlinear_kokkos.hpp").read_text()
     implementation = (
