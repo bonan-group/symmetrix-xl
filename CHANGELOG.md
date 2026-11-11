@@ -53,6 +53,12 @@ All notable changes to Symmetrix-XL are documented in this file.
   refuses them and names `mpi_message_passing`, and the generic evaluation
   entry refuses edge vectors under an active tiled plan unless they are the
   registered geometry or the prepared workspace.
+- Fixed the Kokkos pair style under `pair_style hybrid/overlay/kk` with
+  `mpi_message_passing`, the default on more than one MPI rank: the wrapper
+  kept the message sizes it had before `pair_coeff` set this style's, LAMMPS
+  sized the host communication buffers from them, and the per-atom message
+  passing wrote past those buffers (a crash in CPU Kokkos builds).
+  `init_style()` now raises the wrapper's sizes to this style's.
 
 ### NequIP-OAM support
 
