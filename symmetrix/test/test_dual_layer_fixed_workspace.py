@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 from itertools import combinations_with_replacement
@@ -8,6 +9,7 @@ import pytest
 from ase import Atoms
 from compact_r1_model import foundation_r1_test_model
 from symmetrix import Symmetrix
+from symmetrix.h1_affine import recompose_legacy_payload
 from symmetrix.mace_execution_contract import (
     make_generated_m1_contract,
     make_standard_m0_contract,
@@ -105,6 +107,19 @@ def generated_dual_layer_model(tmp_path_factory, dual_layer_model):
         monomials=model["M1_monomials"],
     )
     output = tmp_path_factory.mktemp("generated-dual-layer-workspace") / "model.json"
+    output.write_text(json.dumps(model, separators=(",", ":")))
+    return output
+
+
+@pytest.fixture(scope="module")
+def format4_dual_layer_model(tmp_path_factory, dual_layer_model):
+    source = Path(dual_layer_model).read_bytes()
+    model, _ = recompose_legacy_payload(
+        json.loads(source),
+        source_sha256=hashlib.sha256(source).hexdigest(),
+        source_bytes=len(source),
+    )
+    output = tmp_path_factory.mktemp("format4-dual-layer-workspace") / "model.json"
     output.write_text(json.dumps(model, separators=(",", ":")))
     return output
 
@@ -338,6 +353,34 @@ def test_dual_layer_float64_matches_y_only(dual_layer_model):
     assert evaluator.dual_layer_workspace_bytes > 0
     assert evaluator.dual_layer_tiled_evaluation_count == 1
     assert evaluator.factorized_fallback_evaluation_count == 0
+
+
+@pytest.mark.parametrize("dtype", ("float32", "float64"))
+def test_format4_dual_layer_tiles_match_one_tile(format4_dual_layer_model, dtype):
+    # Format 4 accumulates the direct M0 adjoint of the H1 readout and skip in
+    # each tile's reverse_H2; a tile must not inherit the previous tile's rows.
+    _require_cuda_backend()
+    atoms = _atoms(9)
+    reference = _calculator(format4_dual_layer_model, REFERENCE_PLAN, dtype=dtype)
+    expected, _ = _evaluate(reference, atoms)
+    for capacity in (len(atoms), 4):
+        tiled = _calculator(format4_dual_layer_model, PLAN, capacity, dtype=dtype)
+        actual, _ = _evaluate(tiled, atoms)
+
+        if dtype == "float64":
+            for name in PROPERTIES:
+                np.testing.assert_allclose(
+                    actual[name], expected[name], rtol=1.0e-10, atol=1e-11
+                )
+        else:
+            _assert_results(actual, expected)
+        evaluator = tiled.evaluator
+        assert tiled.execution_plan["selected_id"] == PLAN
+        assert evaluator.dual_layer_workspace_batch_count == 3 * math.ceil(
+            len(atoms) / capacity
+        )
+        assert evaluator.dual_layer_tiled_evaluation_count == 1
+        assert evaluator.factorized_fallback_evaluation_count == 0
 
 
 @pytest.mark.parametrize("schedule", ("chunk32", "tiled128x4-v1"))

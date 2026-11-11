@@ -1184,6 +1184,9 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
             if (h1_affine_v4()) {
                 const auto tile_m0 = h1_affine_M0_scalar;
                 const auto graph_m0 = h1_affine_graph_M0_scalar;
+                // reverse_H2 adds to the direct M0 adjoint of the tile rows,
+                // which still hold the previous tile's: clear them per tile.
+                const auto tile_direct = h1_affine_M0_direct_adj;
                 Kokkos::parallel_for(
                     "MACEKokkos::gather_dual_layer_phase2_m0_composite",
                     Kokkos::MDRangePolicy<decltype(factorized_execution_space),
@@ -1195,6 +1198,7 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
                         const int feature = identity_receiver_features
                             ? global_receiver : receiver_features(global_receiver);
                         tile_m0(receiver,0,k) = graph_m0(feature,k);
+                        tile_direct(receiver,k) = 0.0;
                     });
                 complete_device_stage(
                     "MACEKokkos::gather_dual_layer_phase2_m0_composite");
