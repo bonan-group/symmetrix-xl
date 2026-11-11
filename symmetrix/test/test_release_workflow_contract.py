@@ -60,6 +60,20 @@ def test_backend_release_passes_explicit_source_commit_to_container_build():
     assert "python tools/symmetrix_build.py wheel-matrix" in build_step
 
 
+def test_backend_release_accepts_catalog_bound_legacy_descriptor():
+    workflow = (ROOT / ".github/workflows/release-backend-wheels.yaml").read_text()
+    install_step = workflow[
+        workflow.index(
+            "name: Install repaired wheel and prove metadata, catalog, and AVX-512 codegen"
+        ) :
+    ]
+    assert 'prebuilt = descriptor.get("prebuilt_operator_artifacts")' in install_step
+    assert "if not isinstance(prebuilt, dict):" in install_step
+    assert '"target": "host-isa-x86-64-v4"' in install_step
+    assert 'item["build_provenance"]["source_content_sha256"]' in install_step
+    assert '"sha256:" + descriptor["source_content_sha256"]' in install_step
+
+
 def test_cuda12_periodic_graph_result_uses_class_owned_alias():
     header = (ROOT / "libsymmetrix/source/mace_nonlinear_kokkos.hpp").read_text()
     implementation = (

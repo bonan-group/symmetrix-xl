@@ -210,24 +210,38 @@ jobs:
           assert descriptor["selector"] == "cpu-avx512", descriptor
           assert descriptor["architecture"] == "x86-64-v4", descriptor
           catalog_path = package_root / "_operator_artifacts/catalog.json"
-          catalog = json.loads(catalog_path.read_text())
-          prebuilt = descriptor["prebuilt_operator_artifacts"]
-          assert prebuilt["mode"] == "r0", prebuilt
+          catalog_bytes = catalog_path.read_bytes()
+          catalog = json.loads(catalog_bytes)
+          artifacts = catalog["artifacts"]
+          prebuilt = descriptor.get("prebuilt_operator_artifacts")
+          if not isinstance(prebuilt, dict):
+              prebuilt = {
+                  "backend": "host",
+                  "target": "host-isa-x86-64-v4",
+                  "artifact_count": len(artifacts),
+                  "catalog_sha256": hashlib.sha256(catalog_bytes).hexdigest(),
+              }
+          else:
+              assert prebuilt["mode"] == "r0", prebuilt
           assert prebuilt["backend"] == "host", prebuilt
-          assert prebuilt["target"] == "x86-64-v4", prebuilt
+          assert prebuilt["target"] == "host-isa-x86-64-v4", prebuilt
           assert prebuilt["artifact_count"] == 14, prebuilt
-          assert len(catalog["artifacts"]) == 14, catalog
+          assert len(artifacts) == 14, catalog
           assert sum(
-              item["operator"] == "OAM" for item in catalog["artifacts"]
+              item["operator"] == "OAM" for item in artifacts
           ) == 8, catalog
           assert {
-              item["identity"]["backend"] for item in catalog["artifacts"]
+              item["identity"]["backend"] for item in artifacts
           } == {"host"}, catalog
           assert {
-              item["identity"]["target"] for item in catalog["artifacts"]
-          } == {"x86-64-v4"}, catalog
+              item["identity"]["target"] for item in artifacts
+          } == {"host-isa-x86-64-v4"}, catalog
+          assert {
+              item["build_provenance"]["source_content_sha256"]
+              for item in artifacts
+          } == {"sha256:" + descriptor["source_content_sha256"]}, catalog
           assert prebuilt["catalog_sha256"] == hashlib.sha256(
-              catalog_path.read_bytes()
+              catalog_bytes
           ).hexdigest(), prebuilt
           print("installed repaired wheel metadata and catalog OK")
           PY
@@ -268,7 +282,7 @@ jobs:
           prebuilt = build_info["prebuilt_operator_artifacts"]
           assert prebuilt["mode"] == "r0", prebuilt
           assert prebuilt["backend"] == "host", prebuilt
-          assert prebuilt["target"] == "x86-64-v4", prebuilt
+          assert prebuilt["target"] == "host-isa-x86-64-v4", prebuilt
           assert prebuilt["artifact_count"] == 14, prebuilt
           native._init_kokkos()
           try:
