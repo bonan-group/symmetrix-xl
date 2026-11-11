@@ -118,6 +118,12 @@ All notable changes to Symmetrix-XL are documented in this file.
   execution remains outside that record.
 - Published KokkosKernels TPL configuration to the native targets so compiled
   accelerator batched-BLAS routes and runtime capability reporting agree.
+- Fixed two Clang build stops. The Polar Kokkos pair style instantiated its
+  templates outside `namespace LAMMPS_NS`, which Clang rejects, so every
+  HIP (and other Clang) LAMMPS build stopped there. `-fbracket-depth=1024`,
+  needed by the several-hundred-operand standard M0 folds, was passed to
+  Apple builds only; it now reaches every Clang build, including ROCm 7.1
+  (clang 20). GCC and nvcc builds are unchanged.
 - Retained architecture-qualified CPU, CUDA, and HIP backend packages with
   exact frontend-version dependencies and source/native provenance. HIP support
   for ordinary MACE remains available, but NequIP-OAM HIP execution is not part

@@ -539,5 +539,7 @@ void *PairSymmetrixMACEPolarKokkos<DeviceType,Precision>::extract(
   return nullptr;
 }
 
+namespace LAMMPS_NS {
 template class PairSymmetrixMACEPolarKokkos<LMPDeviceType,double>;
 template class PairSymmetrixMACEPolarKokkos<LMPDeviceType,float>;
+}

@@ -805,11 +805,10 @@ if(_symmetrix_host_arch_flag
 endif()
 
 # The standard M0 term folds expand to several hundred operands, beyond the
-# default 256-level nesting limit of older Apple Clang releases (Xcode 16).
-if(APPLE)
-    target_compile_options(symmetrix PUBLIC
-        $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-fbracket-depth=1024>)
-endif()
+# default 256-level nesting limit of older Clang releases (Apple Clang of
+# Xcode 16, ROCm clang 20). hipcc builds are Clang builds here.
+target_compile_options(symmetrix PUBLIC
+    $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-fbracket-depth=1024>)
 
 set(_symmetrix_python_source_dir
     "${CMAKE_CURRENT_SOURCE_DIR}/../symmetrix/source/symmetrix")
