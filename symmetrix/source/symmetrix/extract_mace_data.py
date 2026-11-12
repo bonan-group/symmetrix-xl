@@ -1709,10 +1709,17 @@ def _extract_single_head_data(
                     torch.tensor([[model_i], [model_j]], dtype=torch.int64),
                     model.atomic_numbers,
                 )
+                cutoff = None
                 if isinstance(bessels, tuple):
-                    bessels = bessels[0]  # newer versions return (bessels, cutoffs)
+                    # newer versions return (bessels, cutoff); the cutoff is a
+                    # tensor only when the model applies it outside the basis
+                    # (apply_cutoff=False), as the interaction blocks then do.
+                    bessels, cutoff = bessels
                 # radial basis for interaction 0
-                R = model.interactions[0].conv_tp_weights(bessels).numpy(force=True)
+                R = model.interactions[0].conv_tp_weights(bessels)
+                if cutoff is not None:
+                    R = R * cutoff
+                R = R.numpy(force=True)
                 spl_0 = [
                     CubicSpline(r, R[:, k], bc_type=spline_bc_type)
                     for k in range(R.shape[1])
@@ -1722,7 +1729,10 @@ def _extract_single_head_data(
                     [spl.derivative()(r).tolist() for spl in spl_0]
                 )
                 if num_interactions == 2:
-                    R = model.interactions[1].conv_tp_weights(bessels).numpy(force=True)
+                    R = model.interactions[1].conv_tp_weights(bessels)
+                    if cutoff is not None:
+                        R = R * cutoff
+                    R = R.numpy(force=True)
                     spl_1 = [
                         CubicSpline(r, R[:, k], bc_type=spline_bc_type)
                         for k in range(R.shape[1])
@@ -1784,11 +1794,16 @@ def _extract_single_head_data(
                     torch.tensor([[model_i], [model_j]], dtype=torch.int64),
                     model.atomic_numbers,
                 )
+                cutoff = None
                 if isinstance(bessels, tuple):
-                    bessels = bessels[0]  # newer versions return (bessels, cutoffs)
-                R = torch.tanh(model.interactions[0].density_fn(bessels) ** 2).numpy(
-                    force=True
-                )
+                    # newer versions return (bessels, cutoff); the cutoff is a
+                    # tensor only when the model applies it outside the basis
+                    # (apply_cutoff=False), as the interaction blocks then do.
+                    bessels, cutoff = bessels
+                R = torch.tanh(model.interactions[0].density_fn(bessels) ** 2)
+                if cutoff is not None:
+                    R = R * cutoff
+                R = R.numpy(force=True)
                 spl = CubicSpline(r, R[:, 0], bc_type=spline_bc_type)
                 A0_spline_values.append(spl(r).tolist())
                 A0_spline_derivs.append(spl.derivative()(r).tolist())
@@ -2262,11 +2277,16 @@ def _extract_single_head_data(
                     torch.tensor([[model_i], [model_j]], dtype=torch.int64),
                     model.atomic_numbers,
                 )
+                cutoff = None
                 if isinstance(bessels, tuple):
-                    bessels = bessels[0]  # newer versions return (bessels, cutoffs)
-                R = torch.tanh(model.interactions[1].density_fn(bessels) ** 2).numpy(
-                    force=True
-                )
+                    # newer versions return (bessels, cutoff); the cutoff is a
+                    # tensor only when the model applies it outside the basis
+                    # (apply_cutoff=False), as the interaction blocks then do.
+                    bessels, cutoff = bessels
+                R = torch.tanh(model.interactions[1].density_fn(bessels) ** 2)
+                if cutoff is not None:
+                    R = R * cutoff
+                R = R.numpy(force=True)
                 spl = CubicSpline(r, R[:, 0], bc_type=spline_bc_type)
                 A1_spline_values.append(spl(r).tolist())
                 A1_spline_derivs.append(spl.derivative()(r).tolist())

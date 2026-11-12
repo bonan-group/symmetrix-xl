@@ -1610,3 +1610,70 @@ def test_export_refuses_correlation_orders_above_three(products):
         ),
     ):
         _extract_single_head_data(model, radial_format="compact", num_spline_points=64)
+
+
+def _mace_pair_radial_tables(model, num_spline_points):
+    """The radial weights mace-torch applies per element pair (cutoff included)."""
+    r = torch.linspace(
+        1e-12, model.r_max.item(), num_spline_points, dtype=torch.float64
+    )
+    num_types = len(model.atomic_numbers)
+    tables = {"radial_spline_values_0": [], "radial_spline_values_1": []}
+    density = "Density" in type(model.interactions[0]).__name__
+    if density:
+        tables.update(A0_spline_values=[], A1_spline_values=[])
+    with torch.no_grad():
+        for i in range(num_types):
+            for j in range(i, num_types):
+                bessels = model.radial_embedding(
+                    r.unsqueeze(-1),
+                    torch.eye(num_types, dtype=torch.float64),
+                    torch.tensor([[i], [j]], dtype=torch.int64),
+                    model.atomic_numbers,
+                )
+                bessels, cutoff = (
+                    bessels if isinstance(bessels, tuple) else (bessels, None)
+                )
+                scale = 1.0 if cutoff is None else cutoff
+                for layer in (0, 1):
+                    interaction = model.interactions[layer]
+                    tables[f"radial_spline_values_{layer}"].append(
+                        (interaction.conv_tp_weights(bessels) * scale).T.numpy()
+                    )
+                    if density:
+                        tables[f"A{layer}_spline_values"].append(
+                            (torch.tanh(interaction.density_fn(bessels) ** 2) * scale)[
+                                :, 0
+                            ].numpy()
+                        )
+    return tables
+
+
+@pytest.mark.parametrize("apply_cutoff", [False, True], ids=["external", "applied"])
+@pytest.mark.parametrize("density", [False, True], ids=["plain", "density"])
+def test_pair_spline_tables_include_the_cutoff(apply_cutoff, density):
+    from mace import modules
+    from symmetrix.extract_mace_data import _extract_single_head_data
+
+    options = {"apply_cutoff": apply_cutoff}
+    if density:
+        options.update(
+            interaction_cls_first=modules.interaction_classes[
+                "RealAgnosticDensityInteractionBlock"
+            ],
+            interaction_cls=modules.interaction_classes[
+                "RealAgnosticDensityResidualInteractionBlock"
+            ],
+        )
+    model = _small_mace_model(**options)
+    num_spline_points = 512
+    data = _extract_single_head_data(
+        model, radial_format="pair-splines", num_spline_points=num_spline_points
+    )
+    for key, expected in _mace_pair_radial_tables(model, num_spline_points).items():
+        np.testing.assert_allclose(
+            np.asarray(data[key]), np.asarray(expected), rtol=0, atol=1e-12
+        )
+    # every table vanishes at the cutoff
+    for key in ("radial_spline_values_0", "radial_spline_values_1"):
+        assert np.max(np.abs(np.asarray(data[key])[..., -1])) < 1e-12

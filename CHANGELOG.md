@@ -218,6 +218,13 @@ All notable changes to Symmetrix-XL are documented in this file.
   a message instead of failing or exporting a truncated product, and so are
   mixed orders in a multi-head model, which MACE's head selection cannot
   rebuild. Order-3 exports are unchanged.
+- Fixed pair-spline export (`radial_format="pair-splines"`) of models with
+  `apply_cutoff=False`: MACE then returns the polynomial cutoff separately and
+  multiplies it into the radial weights and edge densities, but the exporter
+  dropped it, so the R0, R1, A0 and A1 tables did not vanish at the cutoff
+  (forces off by 2e-2 eV/A on a small test model, 0.46 eV/A with density
+  blocks). The tables now include the cutoff. Exports of models with the
+  cutoff in the radial basis are unchanged.
 
 ### CUDA packaging
 

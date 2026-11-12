@@ -210,6 +210,9 @@ per layer (for example `correlation=[3, 2]`); higher orders are refused. A
 multi-head model needs the same order in every layer: selecting a head with
 MACE's `remove_pt_head` rebuilds every product with the first one's order, so
 mixed orders are refused there.
+Pair-spline tables (`--radial-format pair-splines`) of a model trained with
+`apply_cutoff=False` include the polynomial cutoff that MACE applies in its
+interaction blocks, so they vanish at the cutoff as in the compact format.
 
 The installed generated-operator catalog covers the verified foundation-model
 contracts, not every valid compact model. Aliases of a verified model share its
