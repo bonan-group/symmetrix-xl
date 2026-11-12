@@ -9,6 +9,12 @@ All notable changes to Symmetrix-XL are documented in this file.
   evaluator's channel count through the host object pointer, which a GPU can
   dereference only where it can access host memory. They now copy it before
   the launch, as the neighbouring kernels do; the values are unchanged.
+- Fixed the Kokkos pair style under `pair_style hybrid` or `hybrid/overlay`
+  with `mpi_message_passing`, the default on more than one MPI rank: the
+  wrapper kept the message sizes it had before `pair_coeff` set this style's,
+  LAMMPS sized the host communication buffers from them, and the per-atom
+  message passing wrote past those buffers (a crash in CPU Kokkos builds).
+  `init_style()` now raises the wrapper's sizes to this style's.
 
 ## 0.1.2 - 2026-11-04
 
