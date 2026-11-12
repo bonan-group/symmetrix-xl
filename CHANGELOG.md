@@ -204,6 +204,14 @@ All notable changes to Symmetrix-XL are documented in this file.
   U column's sign from the checkpoint's `U_matrix_<nu>` buffer and refuses a
   buffer that matches neither sign. Exports of checkpoints that already
   matched are unchanged.
+- Fixed MACE export of options the JSON cannot represent. A non-linear readout
+  gate other than SiLU (for example `tanh`) or a joint embedding
+  (`embedding_specs`) was exported silently and evaluated a different model;
+  `NonLinearBiasReadoutBlock` lost its biases; a missing gate,
+  `use_agnostic_product`, `use_last_readout_only` and plain `MACE` models
+  failed with an `AttributeError` or `IndexError`. The exporter now refuses
+  each with a `ValueError` that names the option. Supported models export
+  unchanged.
 
 ### CUDA packaging
 

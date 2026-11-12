@@ -1347,3 +1347,155 @@ def test_export_refuses_a_u_buffer_in_another_basis():
             )
     finally:
         torch.set_default_dtype(previous_dtype)
+
+
+def _small_mace_model(**options):
+    """A small two-interaction ScaleShiftMACE with ``options`` applied."""
+    import inspect
+
+    from mace import modules
+
+    with torch.serialization.safe_globals([slice]):
+        from e3nn import o3
+
+    plain = options.pop("plain", False)
+    accepted = inspect.signature(modules.ScaleShiftMACE.__init__).parameters
+    accepted = set(accepted) | set(inspect.signature(modules.MACE.__init__).parameters)
+    missing = sorted(set(options) - accepted)
+    if missing:
+        pytest.skip(f"the installed mace does not provide {missing}")
+    kwargs = dict(
+        r_max=5.0,
+        num_bessel=3,
+        num_polynomial_cutoff=5,
+        max_ell=3,
+        interaction_cls=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        interaction_cls_first=modules.interaction_classes[
+            "RealAgnosticInteractionBlock"
+        ],
+        num_interactions=2,
+        num_elements=3,
+        hidden_irreps=o3.Irreps("2x0e + 2x1o"),
+        MLP_irreps=o3.Irreps("2x0e"),
+        gate=torch.nn.functional.silu,
+        atomic_energies=np.array([-1.1, -2.2, -3.3]),
+        avg_num_neighbors=8.0,
+        atomic_numbers=[1, 6, 8],
+        correlation=3,
+        radial_type="bessel",
+        use_reduced_cg=False,
+    )
+    if not plain:
+        kwargs.update(atomic_inter_shift=0.1, atomic_inter_scale=1.3)
+    kwargs.update(options)
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        torch.manual_seed(7)
+        model = (modules.MACE if plain else modules.ScaleShiftMACE)(**kwargs)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    return model.eval()
+
+
+def _mace_energy_forces_stress(model, atoms):
+    from mace.calculators import MACECalculator
+
+    atoms = atoms.copy()
+    atoms.calc = MACECalculator(models=[model], device="cpu", default_dtype="float64")
+    return (
+        atoms.get_potential_energy(),
+        atoms.get_forces().copy(),
+        atoms.get_stress().copy(),
+    )
+
+
+def _bias_readout_cls():
+    from mace.modules import blocks
+
+    if not hasattr(blocks, "NonLinearBiasReadoutBlock"):
+        pytest.skip("the installed mace does not provide NonLinearBiasReadoutBlock")
+    return blocks.NonLinearBiasReadoutBlock
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (lambda: {"gate": torch.tanh}, "non-linear readout gate tanh"),
+        (lambda: {"gate": torch.abs}, "non-linear readout gate abs"),
+        (lambda: {"gate": None}, "non-linear readout gate None"),
+        (
+            lambda: {"readout_cls": _bias_readout_cls()},
+            "readout_cls NonLinearBiasReadoutBlock",
+        ),
+        (
+            lambda: {
+                "embedding_specs": {
+                    "total_charge": {
+                        "type": "categorical",
+                        "per": "graph",
+                        "num_classes": 5,
+                        "emb_dim": 2,
+                        "offset": 2,
+                    }
+                }
+            },
+            "embedding_specs",
+        ),
+        (lambda: {"use_agnostic_product": True}, "use_agnostic_product"),
+        (lambda: {"use_last_readout_only": True}, "use_last_readout_only"),
+        (lambda: {"plain": True}, "no scale_shift"),
+    ],
+    ids=[
+        "tanh-gate",
+        "abs-gate",
+        "no-gate",
+        "bias-readout",
+        "joint-embedding",
+        "agnostic-product",
+        "last-readout-only",
+        "plain-mace",
+    ],
+)
+def test_export_refuses_mace_options_the_json_cannot_represent(options, message):
+    from symmetrix.extract_mace_data import _extract_single_head_data
+
+    model = _small_mace_model(**options())
+    with pytest.raises(
+        ValueError, match=f"cannot export MACE models with (the )?{message}"
+    ):
+        _extract_single_head_data(model, radial_format="compact", num_spline_points=64)
+
+
+def test_silu_readout_export_matches_mace(tmp_path):
+    from ase import Atoms
+    from symmetrix import Symmetrix
+    from symmetrix.extract_mace_data import _extract_single_head_data
+
+    model = _small_mace_model()
+    data = _extract_single_head_data(model, radial_format="compact")
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps(data, separators=(",", ":")))
+    atoms = Atoms(
+        "COHHO",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.21, 0.05, -0.03],
+            [-0.62, 0.91, 0.12],
+            [-0.58, -0.94, 0.21],
+            [2.3, 1.1, 0.6],
+        ],
+        cell=[6.0, 6.5, 7.0],
+        pbc=True,
+    )
+    reference_energy, reference_forces, reference_stress = _mace_energy_forces_stress(
+        model, atoms
+    )
+    atoms.calc = Symmetrix(str(path), dtype="float64", streamed_edges="non-compiled")
+    assert atoms.get_potential_energy() == pytest.approx(
+        reference_energy, rel=0, abs=1e-8 * len(atoms)
+    )
+    np.testing.assert_allclose(atoms.get_forces(), reference_forces, rtol=0, atol=1e-6)
+    np.testing.assert_allclose(atoms.get_stress(), reference_stress, rtol=0, atol=1e-6)

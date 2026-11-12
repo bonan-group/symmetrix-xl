@@ -1009,6 +1009,72 @@ def _remove_prediction_head(model, head, device):
         torch.set_default_dtype(previous_dtype)
 
 
+def _refuse_unrepresented_mace_options(model, single_layer_invariant_readout):
+    """Raise for standard-MACE options that the exported JSON cannot represent.
+
+    The JSON stores per-element product weights, a scale and shift, bias-free
+    readouts (a linear one for each interaction but the last and a SiLU one for
+    the last), and no graph-level embedding.  A model outside that layout would
+    otherwise fail deep inside the extraction or export a different function.
+    """
+    from mace.modules.blocks import LinearReadoutBlock, NonLinearReadoutBlock
+
+    def refuse(option, detail):
+        raise ValueError(f"symmetrix cannot export MACE models with {option}: {detail}")
+
+    if not hasattr(model, "scale_shift"):
+        refuse(
+            "no scale_shift",
+            "only ScaleShiftMACE-type models are supported; "
+            f"got {type(model).__name__}.",
+        )
+    if hasattr(model, "joint_embedding") or hasattr(model, "embedding_readout"):
+        refuse(
+            "embedding_specs",
+            "the joint (graph-level) embedding and its readout are not exported.",
+        )
+    num_elements = len(model.atomic_numbers)
+    products = list(model.products) + list(getattr(model, "readout_products", ()))
+    for product in products:
+        for contraction in product.symmetric_contractions.contractions:
+            if contraction.weights_max.shape[0] != num_elements:
+                refuse(
+                    "use_agnostic_product",
+                    "the product basis must have weights per element.",
+                )
+
+    if single_layer_invariant_readout:
+        expected = (NonLinearReadoutBlock,)
+    else:
+        if len(model.readouts) != len(model.interactions):
+            refuse(
+                "use_last_readout_only",
+                f"{len(model.interactions)} interactions need one readout each; "
+                f"got {len(model.readouts)}.",
+            )
+        expected = (LinearReadoutBlock, NonLinearReadoutBlock)
+    for index, (readout, readout_cls) in enumerate(zip(model.readouts, expected)):
+        if not isinstance(readout, readout_cls):
+            refuse(
+                f"readout_cls {type(readout).__name__}",
+                f"readouts[{index}] must be a {readout_cls.__name__}.",
+            )
+        for name, parameter in readout.named_parameters():
+            if "bias" in name and parameter.numel() > 0:
+                refuse(
+                    f"a readout bias ({type(readout).__name__})",
+                    f"readouts[{index}].{name} is not exported.",
+                )
+    activation = model.readouts[-1].non_linearity.acts[0]
+    function = getattr(activation, "f", None)
+    if function is not torch.nn.functional.silu:
+        name = getattr(function, "__name__", repr(function))
+        refuse(
+            f"the non-linear readout gate {name}",
+            "the exported readout evaluates SiLU (MACE's default gate).",
+        )
+
+
 def _extract_single_head_data(
     model,
     species=None,
@@ -1157,6 +1223,7 @@ def _extract_single_head_data(
         raise RuntimeError(
             "Single-layer invariant readouts are currently supported only for MACE."
         )
+    _refuse_unrepresented_mace_options(model, single_layer_invariant_readout)
 
     if is_macefield:
         if not hasattr(model, "field_feats") or not hasattr(model, "field_linear"):
