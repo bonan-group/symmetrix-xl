@@ -68,6 +68,37 @@ finally:
 print("RESULT " + json.dumps(record))
 """
 
+# Runs each stage's commands in one process and records the state after it.
+_RUN_STAGES = r"""
+import json
+import sys
+
+import numpy as np
+from lammps import lammps
+
+spec = json.loads(sys.argv[1])
+lmp = lammps(cmdargs=spec["cmdargs"])
+try:
+    lmp.commands_string(spec["setup"])
+    count = lmp.get_natoms()
+    record = {"natoms": count}
+    for label, commands in spec["stages"]:
+        lmp.commands_string(commands)
+        ids = np.array(lmp.numpy.extract_atom("id", nelem=count), copy=True)
+        forces = np.array(
+            lmp.numpy.extract_atom("f", nelem=count, dim=3), copy=True
+        )
+        order = np.argsort(ids)
+        record[label] = {
+            "pe": lmp.get_thermo("pe"),
+            "forces": forces[order].tolist(),
+            "graph_rebuilds": lmp.extract_pair("symmetrix_graph_rebuild_count"),
+        }
+finally:
+    lmp.close()
+print("RESULT " + json.dumps(record))
+"""
+
 # 24 atoms (8 H2O) in a periodic box shorter than twice the 4.5 A cutoff, so
 # most neighbors are ghost images that the pair style maps back to owners.
 _POSITIONS = (
@@ -226,7 +257,7 @@ fix             integrate all nve
     return _case_result(label, completed, log_text)
 
 
-def _run_deck(tmp_path, label, setup, timeout=900):
+def _run_deck(tmp_path, label, setup, timeout=900, stages=None):
     log_path = tmp_path / f"{label}.log"
     spec = {
         "cmdargs": [
@@ -238,6 +269,7 @@ def _run_deck(tmp_path, label, setup, timeout=900):
             *_kokkos_arguments(),
         ],
         "setup": setup,
+        "stages": stages,
     }
     environment = os.environ.copy()
     environment.update(
@@ -248,7 +280,12 @@ def _run_deck(tmp_path, label, setup, timeout=900):
         }
     )
     completed = subprocess.run(
-        [sys.executable, "-c", _RUN_CASE, json.dumps(spec)],
+        [
+            sys.executable,
+            "-c",
+            _RUN_CASE if stages is None else _RUN_STAGES,
+            json.dumps(spec),
+        ],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -695,3 +732,81 @@ def test_mpi_message_passing_stops_on_a_type_filtered_list(
         "mpi_message_passing requires every owned atom in its neighbor list"
         in log_text + completed.stderr
     ), f"stderr:\n{completed.stderr[-2000:]}\nlog tail:\n{log_text[-2000:]}"
+
+
+def _cluster_deck(model, pair_style, kinds):
+    # The water cluster of _POSITIONS in a box with more than the cutoff plus
+    # the skin of vacuum on every side, so the neighbor list has no ghost atom.
+    atoms = "\n".join(
+        f"create_atoms {kind} single {x} {y} {z} units box"
+        for kind, (_, x, y, z) in zip(kinds, _POSITIONS)
+    )
+    return f"""
+package         kokkos neigh half newton on
+units           metal
+boundary        p p p
+atom_style      atomic/kk
+atom_modify     map array sort 0 0
+newton          on
+region          box block -10 16 -10 16 -10 16
+create_box      2 box
+{atoms}
+mass            1 1.008
+mass            2 15.999
+pair_style      {pair_style}
+pair_coeff      * * {model} H O
+neighbor        1.0 bin
+neigh_modify    every 1 delay 0 check yes
+"""
+
+
+@pytest.mark.parametrize("streamed_edges", ["generic", "direct"])
+def test_type_change_without_a_neighbor_build_matches_a_fresh_run(
+    request, tmp_path, compact_model_path, streamed_edges
+):
+    # fix sgcmc changes an atom's type and evaluates the forces without a
+    # neighbor list build. set followed by run 1 pre no post no reaches the same
+    # pair compute; the atoms do not move, so LAMMPS does not rebuild the list.
+    if streamed_edges == "direct":
+        artifact = request.getfixturevalue("host_artifact_path")
+        pair_style = _pair_style("direct", artifact)
+    else:
+        pair_style = _pair_style(streamed_edges)
+    kinds = [kind for kind, _, _, _ in _POSITIONS]
+    changed_kinds = list(kinds)
+    changed_kinds[1] = 2
+    completed, log_text = _run_deck(
+        tmp_path,
+        f"type-change-{streamed_edges}",
+        _cluster_deck(compact_model_path, pair_style, kinds),
+        stages=[
+            ["initial", "run 0"],
+            ["unchanged", "run 1 pre no post no"],
+            ["changed", "set atom 2 type 2\nrun 1 pre no post no"],
+        ],
+    )
+    result = _case_result(f"type-change-{streamed_edges}", completed, log_text)
+    assert f"resolved='{streamed_edges}'" in log_text
+    completed, log_text = _run_deck(
+        tmp_path,
+        f"type-change-{streamed_edges}-fresh",
+        _cluster_deck(compact_model_path, pair_style, changed_kinds),
+        stages=[["fresh", "run 0"]],
+    )
+    fresh = _case_result(f"type-change-{streamed_edges}-fresh", completed, log_text)[
+        "fresh"
+    ]
+
+    initial, unchanged, changed = (
+        result[stage] for stage in ("initial", "unchanged", "changed")
+    )
+    assert unchanged["pe"] == pytest.approx(initial["pe"], rel=1.0e-12, abs=1.0e-10)
+    assert abs(fresh["pe"] - initial["pe"]) > 1.0e-7
+    assert changed["pe"] == pytest.approx(fresh["pe"], rel=1.0e-12, abs=1.0e-10)
+    np.testing.assert_allclose(
+        changed["forces"], fresh["forces"], rtol=1.0e-12, atol=1.0e-10
+    )
+    if streamed_edges == "direct":
+        # The prepared graph is rebuilt for the type change only.
+        assert [initial["graph_rebuilds"], unchanged["graph_rebuilds"]] == [1, 1]
+        assert changed["graph_rebuilds"] == 2

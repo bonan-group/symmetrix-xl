@@ -1142,6 +1142,18 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
   // of its types belong to this style.
   auto node_of_atom = this->node_of_atom;
   auto mace_types = this->mace_types;
+  if (!rebuild_topology) {
+    // An atom type can change without a neighbor list build (fix sgcmc
+    // evaluates a trial species in place), and the prepared graph keeps the
+    // types it was built with.
+    int changed_node_types = 0;
+    Kokkos::parallel_reduce("PairSymmetrixMACEKokkos::count_changed_node_types",
+      num_nodes,
+      KOKKOS_LAMBDA (const int ii, int& count) {
+        if (node_types(ii) != mace_types(type(d_ilist(ii))-1)) count += 1;
+      }, changed_node_types);
+    rebuild_topology = changed_node_types != 0;
+  }
   int num_edges = execution_num_edges;
   if (rebuild_topology) {
     // sync the map the atom style uses.  a hash filled on the host (legacy

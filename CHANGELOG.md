@@ -77,6 +77,12 @@ All notable changes to Symmetrix-XL are documented in this file.
   MACE atom; it now maps atoms to receiver rows. `mpi_message_passing`, which
   needs every owned atom in its list, stops with an error naming the cause
   instead of writing past its receiver rows.
+- Fixed the prepared `no_domain_decomposition` route of the Kokkos pair style
+  (`streamed_edges direct`) after an atom type changes without a neighbor list
+  build, as in `fix sgcmc`: it kept the graph built for the old types and
+  returned the energy and forces of the old species. The pair style now
+  compares the receivers' types with the graph's on each step and rebuilds the
+  graph when one differs.
 
 ### NequIP-OAM support
 
