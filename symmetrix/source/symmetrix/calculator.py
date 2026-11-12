@@ -4399,6 +4399,15 @@ class Symmetrix(Calculator):
             ):
                 cache = self._neighbor_cache
             self._neighbor_cache = cache
+        if (
+            cache is not None
+            and cache.device_graph_generation != 0
+            and getattr(self.evaluator, "factorized_graph_generation", None)
+            not in (None, cache.device_graph_generation)
+        ):
+            # The evaluator released this device graph (an execution-profile
+            # change invalidates it), so its token cannot be reused.
+            cache = None
         displacements = None
         cell_changed = False
         geometry_reference_positions = None
@@ -4482,9 +4491,21 @@ class Symmetrix(Calculator):
                     "SYMMETRIX_NEIGHBOR_BACKEND=kokkos requires fully periodic "
                     "direct Kokkos execution with native geometry support."
                 )
+            # The native periodic builder prepares only the direct-profile
+            # source schedule. A stateful profile (the factorized observer or
+            # execution parameter gradients) reads the stateful schedule, which
+            # only host-graph preparation builds.
+            device_profile_supported = (
+                getattr(
+                    self.evaluator,
+                    "factorized_execution_profile",
+                    "direct_fixed_weight",
+                )
+                == "direct_fixed_weight"
+            )
             use_device_graph = _use_device_neighbor_graph(
                 neighbor_backend,
-                device_graph_eligible,
+                device_graph_eligible and device_profile_supported,
                 len(atomic_numbers),
                 getattr(symmetrix, "_kokkos_default_execution_space", lambda: None)(),
             )

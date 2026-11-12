@@ -31,6 +31,18 @@ def _lammps_token(value):
     return text
 
 
+def _module_blocks_per_compute_unit(module, stage):
+    """The module's own persistent blocks per compute unit, or None when the record predates the field."""
+    blocks = module.get("persistent_blocks_per_compute_unit")
+    if blocks is None:
+        return None
+    if not isinstance(blocks, int) or isinstance(blocks, bool) or not 1 <= blocks <= 32:
+        raise JitDeviceArtifactError(
+            f"the prepared {stage} device module has an invalid persistent block count"
+        )
+    return blocks
+
+
 def _format_lammps_arguments(result):
     edge_policy = getattr(result, "edge_policy", None)
     blocks_per_compute_unit = 8
@@ -64,6 +76,10 @@ def _format_lammps_arguments(result):
                 schedule,
             )
         )
+        # Each module keeps its own launch policy: the common count above is R1's.
+        m0_blocks = _module_blocks_per_compute_unit(m0_module, "M0")
+        if m0_blocks is not None:
+            arguments.extend(("jit_m0_device_blocks_per_compute_unit", str(m0_blocks)))
     r0_module = operator_modules.get("R0", {})
     if (
         r0_module.get("implementation") == "generated"
@@ -76,6 +92,17 @@ def _format_lammps_arguments(result):
                 _lammps_token(r0_module["artifact_path"]),
             )
         )
+        # The generated R0 schedule requires its own count (4 on HIP gfx1201 FP32, 3 on CUDA FP32), not R1's.
+        r0_blocks = _module_blocks_per_compute_unit(r0_module, "R0")
+        if r0_blocks is not None:
+            arguments.extend(("jit_r0_device_blocks_per_compute_unit", str(r0_blocks)))
+        r0_schedule = r0_module.get("schedule")
+        if r0_schedule is not None:
+            if r0_schedule not in ("receiver-edge16", "receiver-edge32"):
+                raise JitDeviceArtifactError(
+                    "the prepared R0 device module has an invalid schedule"
+                )
+            arguments.extend(("jit_r0_device_schedule", r0_schedule))
     return " ".join(arguments)
 
 

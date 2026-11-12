@@ -1683,6 +1683,7 @@ bool edge_geometry_policy_pinned = false;
 Kokkos::View<double*> mh0_a1_scale_adjoint;
 Kokkos::View<double*> mh0_a0_scale_adjoint;
 bool use_mh0_adjoint_reuse() const;
+bool m0_reverse_captures_a0_scale_adjoint() const;
 bool use_h1_m0_adjoint_ping_pong() const;
 void prepare_mh0_state_policy_views();
 ExecutionParameterGradientGroup& execution_parameter_gradient_group(

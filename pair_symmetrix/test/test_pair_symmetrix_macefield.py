@@ -363,8 +363,30 @@ def test_lammps_kokkos_accepts_fixed_workspace_opt_in():
     lmp = lammps(cmdargs=["-screen", "none", "-k", "on", "-sf", "kk"])
     try:
         lmp.command(
-            "pair_style symmetrix/mace/kk profile capacity allow_fixed_workspace yes"
+            "pair_style symmetrix/mace/kk mpi_message_passing profile capacity "
+            "allow_fixed_workspace yes"
         )
+    finally:
+        lmp.close()
+
+
+@pytest.mark.parametrize(
+    "settings",
+    (
+        "profile capacity allow_fixed_workspace yes",
+        "no_domain_decomposition profile capacity allow_fixed_workspace yes",
+        "no_domain_decomposition _debug_execution_plan mh0-single-layer-tiled-v1",
+        "no_domain_decomposition _debug_execution_plan mh0-dual-layer-tiled-v1",
+    ),
+)
+def test_lammps_kokkos_no_domain_decomposition_rejects_fixed_workspace(settings):
+    lmp = lammps(cmdargs=["-screen", "none", "-k", "on", "-sf", "kk"])
+    try:
+        with pytest.raises(
+            Exception,
+            match="not supported with no_domain_decomposition; use mpi_message_passing",
+        ):
+            lmp.command(f"pair_style symmetrix/mace/kk {settings}")
     finally:
         lmp.close()
 

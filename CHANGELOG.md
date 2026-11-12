@@ -29,6 +29,36 @@ All notable changes to Symmetrix-XL are documented in this file.
   runtime executor overrides. Generated execution is the only `direct` route
   for standard two-interaction MACE energy and forces; the in-evaluator serial
   reference remains an internal numerical oracle.
+- `prepare_jit_device_artifact --lammps-arguments` prints the M0 and R0 device
+  modules' own persistent block counts and the R0 schedule
+  (`jit_m0_device_blocks_per_compute_unit`,
+  `jit_r0_device_blocks_per_compute_unit`, `jit_r0_device_schedule`), and the
+  pair style passes them to those loaders only. Before, R0 received R1's count
+  and the documented flow stopped at the R0 load ("persistent-block profile
+  does not match the generated backend schedule"). A fragment without the new
+  keywords behaves as before.
+- Fixed run-to-run variation of stresses and edge forces for A0-scaled models
+  in the capacity profile with the generated M0: the R0 reverse prepare now
+  reduces the A0 scale adjoint in a fixed order instead of the generated M0
+  adding it with an FP64 atomic. The built-in M0 is unchanged.
+- Fixed periodic calculations with the factorized observer or execution
+  parameter gradients where the native Kokkos neighbor builder is selected
+  (CUDA and HIP at 512 atoms or more, or `SYMMETRIX_NEIGHBOR_BACKEND=kokkos`):
+  they now build the graph on the host instead of stopping with `Execution R1
+  source schedule has not been prepared`, and enabling either after an
+  evaluation rebuilds the topology instead of reusing a released graph token.
+- Fixed the Kokkos pair style accepting fixed-workspace tiled plans under
+  `no_domain_decomposition` (`allow_fixed_workspace yes` or a tiled
+  `_debug_execution_plan`), which then failed during `run`. `pair_style` now
+  refuses them and names `mpi_message_passing`, and the generic evaluation
+  entry refuses edge vectors under an active tiled plan unless they are the
+  registered geometry or the prepared workspace.
+- Fixed the Kokkos pair style under `pair_style hybrid/overlay/kk` with
+  `mpi_message_passing`, the default on more than one MPI rank: the wrapper
+  kept the message sizes it had before `pair_coeff` set this style's, LAMMPS
+  sized the host communication buffers from them, and the per-atom message
+  passing wrote past those buffers (a crash in CPU Kokkos builds).
+  `init_style()` now raises the wrapper's sizes to this style's.
 
 ### NequIP-OAM support
 
@@ -122,6 +152,12 @@ All notable changes to Symmetrix-XL are documented in this file.
   exact frontend-version dependencies and source/native provenance. HIP support
   for ordinary MACE remains available, but NequIP-OAM HIP execution is not part
   of this release.
+- Fixed MACE export for checkpoints whose stored symmetric-contraction U
+  matrices differ in sign from the recomputed ones, such as MACE-MP-0b2-large
+  (`mace-large-density-agnesi-stress.model`). The exporter takes each recomputed
+  U column's sign from the checkpoint's `U_matrix_<nu>` buffer and refuses a
+  buffer that matches neither sign. Exports of checkpoints that already
+  matched are unchanged.
 
 ### CUDA packaging
 

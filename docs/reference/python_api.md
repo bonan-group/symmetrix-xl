@@ -210,6 +210,9 @@ diagnostic environment variable `SYMMETRIX_NEIGHBOR_BACKEND=host|kokkos` pins
 either implementation. On CUDA and HIP, the default `automatic` selects the host
 builder below 512 atoms and Kokkos at 512 atoms or above when native
 construction is eligible. Serial and OpenMP use the host builder by default.
+An evaluator in a stateful execution profile (the factorized observer or
+execution parameter gradients) uses the host builder under either setting,
+because native construction prepares only the direct-profile schedule.
 The calculator attribute `neighbor_graph_backend` reports the implementation
 that built the current cached graph.
 

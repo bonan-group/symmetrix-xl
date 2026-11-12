@@ -1459,7 +1459,7 @@ void MACEKokkos<Precision>::reverse_A0_scaled(
 {
     if (not A0_scaled) return;
     if (standard_r0_module_active) {
-        const bool precomputed = use_mh0_adjoint_reuse();
+        const bool precomputed = m0_reverse_captures_a0_scale_adjoint();
         const symmetrix::execution::R0LogicalArguments<Precision> r0_arguments{
             .num_nodes = num_nodes,
             .active_type_count = num_active_types,
@@ -1888,6 +1888,19 @@ void MACEKokkos<Precision>::launch_M0_module_reverse(
 }
 
 template <typename Precision>
+bool MACEKokkos<Precision>::m0_reverse_captures_a0_scale_adjoint() const
+{
+    // Under adjoint reuse the built-in M0 reverse writes A0_adj over A0, so it
+    // captures the A0 scale adjoint while A0 is still intact. The generated M0
+    // keeps A0, and the R0 reverse prepare reduces A0 . A0_adj in a fixed
+    // order; its capture would add the channels in arrival order instead.
+    const bool generated_m0 =
+        selected_m0_implementation == M0Implementation::device_module
+        || selected_m0_implementation == M0Implementation::host_plugin;
+    return use_mh0_adjoint_reuse() && A0_scaled && !generated_m0;
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::reverse_M0_module(
     const int num_nodes,
     Kokkos::View<const int*> node_types)
@@ -1898,13 +1911,14 @@ void MACEKokkos<Precision>::reverse_M0_module(
     const bool generated_m0 =
         selected_m0_implementation == M0Implementation::device_module
         || selected_m0_implementation == M0Implementation::host_plugin;
-    const bool capture_input_scale_adjoint = reuse_adjoint && A0_scaled;
+    const bool capture_input_scale_adjoint =
+        m0_reverse_captures_a0_scale_adjoint();
     if (reuse_adjoint && !generated_m0)
         A0_adj = A0;
-    if (reuse_adjoint && A0_scaled && mh0_a0_scale_adjoint.extent(0)
+    if (capture_input_scale_adjoint && mh0_a0_scale_adjoint.extent(0)
             < static_cast<std::size_t>(num_nodes))
         Kokkos::realloc(mh0_a0_scale_adjoint, num_nodes);
-    if (reuse_adjoint && A0_scaled)
+    if (capture_input_scale_adjoint)
         Kokkos::deep_copy(
             execution_space, mh0_a0_scale_adjoint, double(0));
     if (generated_m0 && A0_adj.data() != nullptr

@@ -522,13 +522,17 @@ def main(argv=None) -> int:
         captured_scale_adjoint = (
             worker["standard_m0"]["input_scale_adjoint_launch_count"] > 0
         )
+        # Only the built-in M0 captures the A0 scale adjoint; the generated M0
+        # keeps A0 and the R0 reverse prepare reduces it.
+        builtin_m0 = worker["standard_m0"]["selected_executor"] != "runtime"
+        scale_adjoint_path = captured_scale_adjoint == builtin_m0
         tile_differences[tile] = {
-            "passed": result_passed and launched and captured_scale_adjoint,
+            "passed": result_passed and launched and scale_adjoint_path,
             "standard_m0_reverse_launched": launched,
             "input_scale_adjoint_captured": captured_scale_adjoint,
             "properties": result_differences,
         }
-        passed = passed and result_passed and launched and captured_scale_adjoint
+        passed = passed and result_passed and launched and scale_adjoint_path
 
     speedups = {}
     for mode in dict.fromkeys(args.modes):
