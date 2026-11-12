@@ -124,6 +124,13 @@ exchange. Host sub-styles such as `dispersion/d3` retain their own independent
 forward and reverse communication inside the overlay.
 `no_mpi_message_passing` is not supported with prepared direct execution.
 Other hybrid wrappers are rejected while parsing, before any workspace exists.
+A `pair_coeff` line that gives the pairs of some atom types to another
+sub-style (`pair_coeff 1 * zero` under `hybrid`, or `pair_coeff 1 * none` under
+`hybrid/overlay`) removes those atoms from this style's neighbor list.
+`no_domain_decomposition` evaluates the model on the remaining atoms.
+`mpi_message_passing` requires every owned atom in its list and stops with an
+error; on more than one rank use `no_mpi_message_passing` with
+`streamed_edges generic` or `materialized`.
 A JIT-generated CPU shared library can be selected with
 `jit_host_artifact /path/to/plugin.so`; CUDA/HIP modules use
 `jit_device_artifact /path/to/module.cubin` (or `.hsaco`). The native loaders

@@ -69,6 +69,14 @@ All notable changes to Symmetrix-XL are documented in this file.
   ghost: H1 kept no trailing extents, the R1 launch stopped with "R1 tensor
   shape is inconsistent with the plugin contract", and the run aborted. H1 and
   its adjoint now keep the model's trailing extents with zero rows.
+- Fixed the Kokkos pair style on type-filtered neighbor lists, where
+  `pair_style hybrid` or `hybrid/overlay` gives the pairs of some atom types to
+  another sub-style and the list skips those atoms. `no_domain_decomposition`
+  indexed each neighbor by its local atom instead of its receiver row, which
+  read the wrong features or crashed whenever a skipped atom came before a
+  MACE atom; it now maps atoms to receiver rows. `mpi_message_passing`, which
+  needs every owned atom in its list, stops with an error naming the cause
+  instead of writing past its receiver rows.
 
 ### NequIP-OAM support
 

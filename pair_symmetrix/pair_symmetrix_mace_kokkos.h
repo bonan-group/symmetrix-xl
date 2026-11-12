@@ -121,6 +121,7 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
 
   // neighbor list variables
   Kokkos::View<int*> node_indices;
+  Kokkos::View<int*> node_of_atom;
   Kokkos::View<int*> node_types;
   Kokkos::View<int*> feature_types;
   Kokkos::View<int*> num_neigh;

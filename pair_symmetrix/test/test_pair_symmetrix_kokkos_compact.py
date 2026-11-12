@@ -56,10 +56,12 @@ try:
         forces = np.array(
             lmp.numpy.extract_atom("f", nelem=count, dim=3), copy=True
         )
+        types = np.array(lmp.numpy.extract_atom("type", nelem=count), copy=True)
         order = np.argsort(ids)
         record[label] = {
             "pe": lmp.get_thermo("pe"),
             "forces": forces[order].tolist(),
+            "types": types[order].tolist(),
         }
 finally:
     lmp.close()
@@ -93,6 +95,18 @@ _POSITIONS = (
     (2, 4, 4, 4),
     (1, 5, 4, 4),
     (1, 4, 5, 4),
+)
+
+# Atoms of a third type that a hybrid pair_coeff gives to another sub-style.
+_DUMMY_POSITIONS = (
+    (2.6, 2.6, 2.6),
+    (5.6, 2.6, 2.6),
+    (2.6, 5.6, 2.6),
+    (2.6, 2.6, 5.6),
+    (5.6, 5.6, 2.6),
+    (5.6, 2.6, 5.6),
+    (2.6, 5.6, 5.6),
+    (5.6, 5.6, 5.6),
 )
 
 
@@ -184,7 +198,6 @@ def _kokkos_arguments():
 def _run_case(
     tmp_path, label, model, pair_style, atom_map, package_options="", coeff_style=""
 ):
-    log_path = tmp_path / f"{label}.log"
     coeff = f"{coeff_style} {model}".strip()
     atoms = "\n".join(
         f"create_atoms {kind} single {x} {y} {z} units box"
@@ -209,6 +222,12 @@ neigh_modify    every 2 delay 0 check no
 timestep        0.0001
 fix             integrate all nve
 """
+    completed, log_text = _run_deck(tmp_path, label, setup)
+    return _case_result(label, completed, log_text)
+
+
+def _run_deck(tmp_path, label, setup, timeout=900):
+    log_path = tmp_path / f"{label}.log"
     spec = {
         "cmdargs": [
             "-nocite",
@@ -232,10 +251,14 @@ fix             integrate all nve
         [sys.executable, "-c", _RUN_CASE, json.dumps(spec)],
         capture_output=True,
         text=True,
-        timeout=900,
+        timeout=timeout,
         env=environment,
     )
     log_text = log_path.read_text() if log_path.exists() else ""
+    return completed, log_text
+
+
+def _case_result(label, completed, log_text):
     assert completed.returncode == 0, (
         f"{label} exited with {completed.returncode}\n"
         f"stderr:\n{completed.stderr[-4000:]}\nlog tail:\n{log_text[-4000:]}"
@@ -552,3 +575,123 @@ neighbor        1.0 bin
     np.testing.assert_allclose(
         empty["forces"], expected_forces, rtol=1.0e-12, atol=1.0e-10
     )
+
+
+def _type_filtered_deck(model, pair_style, wrapper, placement):
+    # Type 1 has no MACE element: plain hybrid gives its pairs to zero, and
+    # hybrid/overlay removes them with none. The MACE atoms keep their
+    # positions, so they interact as in the two-type deck.
+    real = [
+        f"create_atoms {kind + 1} single {x} {y} {z} units box"
+        for kind, x, y, z in _POSITIONS
+    ]
+    dummy = [
+        f"create_atoms 1 single {x} {y} {z} units box" for x, y, z in _DUMMY_POSITIONS
+    ]
+    atoms = {
+        "first": dummy + real,
+        "middle": real[:12] + dummy + real[12:],
+        "last": real + dummy,
+    }[placement]
+    if wrapper == "hybrid":
+        pair = f"""pair_style      hybrid {pair_style} zero 6.0
+pair_coeff      * * symmetrix/mace {model} H H O
+pair_coeff      1 * zero"""
+    else:
+        pair = f"""pair_style      hybrid/overlay {pair_style} zero 6.0
+pair_coeff      * * symmetrix/mace {model} H H O
+pair_coeff      * * zero
+pair_coeff      1 * none"""
+    atom_lines = "\n".join(atoms)
+    return f"""
+package         kokkos neigh half newton on
+units           metal
+boundary        p p p
+atom_style      atomic/kk
+atom_modify     map array sort 0 0
+newton          on
+region          box block 0 6.2085633514918648 0 6.2085633514918648 0 6.2085633514918648
+create_box      3 box
+{atom_lines}
+mass            1 39.95
+mass            2 1.008
+mass            3 15.999
+{pair}
+neighbor        1.0 bin
+neigh_modify    every 2 delay 0 check no
+timestep        0.0001
+fix             integrate all nve
+"""
+
+
+@pytest.mark.parametrize("wrapper", ["hybrid", "hybrid/overlay"])
+@pytest.mark.parametrize("streamed_edges", ["generic", "materialized", "direct"])
+def test_type_filtered_hybrid_list_matches_the_mace_only_deck(
+    request, tmp_path, compact_model_path, streamed_edges, wrapper
+):
+    # A type-filtered list skips the atoms of the other type, so receiver rows
+    # and local atom indices differ before, between or after them. The MACE
+    # atoms are within the cutoff of each other, so a neighbor taken by its
+    # local index reads another receiver's features or an unwritten row.
+    if streamed_edges == "direct":
+        artifact = request.getfixturevalue("host_artifact_path")
+        pair_style = _pair_style("direct", artifact)
+    else:
+        pair_style = _pair_style(streamed_edges)
+    label = f"filtered-{streamed_edges}-{wrapper.replace('/', '-')}"
+    reference = _run_case(
+        tmp_path, f"{label}-reference", compact_model_path, pair_style, "array"
+    )
+    for placement in ("first", "middle", "last"):
+        completed, log_text = _run_deck(
+            tmp_path,
+            f"{label}-{placement}",
+            _type_filtered_deck(compact_model_path, pair_style, wrapper, placement),
+        )
+        result = _case_result(f"{label}-{placement}", completed, log_text)
+        assert result["natoms"] == len(_POSITIONS) + len(_DUMMY_POSITIONS)
+        assert f"resolved='{streamed_edges}'" in log_text
+        for stage in ("initial", "final"):
+            types = np.asarray(result[stage]["types"])
+            forces = np.asarray(result[stage]["forces"])
+            expected_forces = np.asarray(reference[stage]["forces"])
+            assert np.max(np.abs(expected_forces)) > 0.0
+            assert result[stage]["pe"] == pytest.approx(
+                reference[stage]["pe"], rel=1.0e-12, abs=1.0e-10
+            ), placement
+            np.testing.assert_allclose(
+                forces[types != 1],
+                expected_forces,
+                rtol=1.0e-12,
+                atol=1.0e-10,
+                err_msg=placement,
+            )
+            assert np.all(forces[types == 1] == 0.0), placement
+
+
+@pytest.mark.parametrize("streamed_edges", ["generic", "direct"])
+def test_mpi_message_passing_stops_on_a_type_filtered_list(
+    request, tmp_path, compact_model_path, streamed_edges
+):
+    # mpi_message_passing indexes receivers by local atom, so it requires every
+    # owned atom in the list and stops the rank that lacks one instead of
+    # writing past its receiver rows. The time-out turns a rank waiting in a
+    # collective into a failure.
+    if streamed_edges == "direct":
+        artifact = request.getfixturevalue("host_artifact_path")
+        pair_style = _pair_style("direct", artifact)
+    else:
+        pair_style = _pair_style(streamed_edges)
+    pair_style = pair_style.replace("no_domain_decomposition", "mpi_message_passing")
+    label = f"filtered-mpi-{streamed_edges}"
+    completed, log_text = _run_deck(
+        tmp_path,
+        label,
+        _type_filtered_deck(compact_model_path, pair_style, "hybrid/overlay", "first"),
+        timeout=300,
+    )
+    assert completed.returncode != 0, log_text[-2000:]
+    assert (
+        "mpi_message_passing requires every owned atom in its neighbor list"
+        in log_text + completed.stderr
+    ), f"stderr:\n{completed.stderr[-2000:]}\nlog tail:\n{log_text[-2000:]}"

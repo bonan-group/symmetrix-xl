@@ -1130,9 +1130,17 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
   if (node_indices.size() < num_nodes) Kokkos::realloc(node_indices, num_nodes);
   if (node_types.size() < num_nodes) Kokkos::realloc(node_types, num_nodes);
   if (num_neigh.size() < num_nodes) Kokkos::realloc(num_neigh, num_nodes);
+  if (node_of_atom.size() < static_cast<std::size_t>(atom->nlocal))
+    Kokkos::realloc(node_of_atom, atom->nlocal);
   auto node_indices = Kokkos::subview(this->node_indices, Kokkos::make_pair(0,num_nodes));
   auto node_types = Kokkos::subview(this->node_types, Kokkos::make_pair(0,num_nodes));
   auto num_neigh = Kokkos::subview(this->num_neigh, Kokkos::make_pair(0,num_nodes));
+  // Neighbors are indexed by their receiver row, not by their local atom
+  // index: under pair_style hybrid a type-filtered list (atoms of some type
+  // given to another sub-style) skips atoms, so the two differ. A kept
+  // neighbor is always a receiver, since the list keeps a pair only when both
+  // of its types belong to this style.
+  auto node_of_atom = this->node_of_atom;
   auto mace_types = this->mace_types;
   int num_edges = execution_num_edges;
   if (rebuild_topology) {
@@ -1153,6 +1161,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
         const int ii = team_member.league_rank();
         const int i = d_ilist(ii);
         node_indices(ii) = i;
+        node_of_atom(i) = ii;
         node_types(ii) = mace_types(type(i)-1);
         const double x_i = x(i,0);
         const double y_i = x(i,1);
@@ -1224,7 +1233,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
           if (rebuild_topology) {
             const int j_local = AtomKokkos::map_kokkos<DeviceType>(
               tag(j),map_style,k_map_array,k_map_hash);
-            neigh_indices(ij) = j_local;
+            neigh_indices(ij) = node_of_atom(j_local);
             neigh_types(ij) = mace_types(type(j)-1);
           }
           xyz(3*ij) = scale*dx;
@@ -1300,7 +1309,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
         Kokkos::TeamThreadRange(team_member, num_neigh(ii)),
         [&] (const int jj, double& f_x, double& f_y, double& f_z) {
           const int ij = first_neigh(ii) + jj;
-          const int j = neigh_indices(ij);
+          const int j = node_indices(neigh_indices(ij));
           f_x += mace_node_forces(3*ij);
           f_y += mace_node_forces(3*ij+1);
           f_z += mace_node_forces(3*ij+2);
@@ -1403,9 +1412,15 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
     error->one(FLERR,
       "pair_style symmetrix/mace/kk local feature-node count exceeds INT_MAX");
   const int num_feature_nodes = static_cast<int>(num_feature_nodes_size);
-  if (stable_execution && num_nodes != atom->nlocal)
-    error->all(FLERR,
-      "Factorized MPI execution requires one receiver for every owned atom");
+  // The per-atom message passing indexes receivers by local atom. The
+  // condition is rank-local, so stop this rank: a collective error would wait
+  // for ranks whose lists are full.
+  if (num_nodes != atom->nlocal)
+    error->one(FLERR,
+      "pair_style symmetrix/mace/kk mpi_message_passing requires every owned "
+      "atom in its neighbor list; a hybrid pair_coeff assignment removed atoms "
+      "of some type. Use no_domain_decomposition on one rank, or "
+      "no_mpi_message_passing with streamed_edges generic or materialized.");
   bool rebuild_topology = !stable_execution
     || execution_graph_generation == 0 || neighbor->ago == 0
     || num_nodes != execution_num_nodes
