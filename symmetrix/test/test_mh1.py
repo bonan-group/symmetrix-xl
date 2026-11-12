@@ -5537,3 +5537,117 @@ def test_mh1_embedded_cutoff_model_runs_on_the_reference_route(
             Symmetrix(model_path, dtype=dtype, streamed_edges="direct")
     with pytest.raises(ValueError, match="low_memory=True requires"):
         Symmetrix(model_path, dtype="float32", low_memory=True)
+
+
+def _mh1_cell_change_frames():
+    atoms = bulk("Si", "diamond", a=5.43, cubic=True)
+    atoms.numbers[3] = 1
+    atoms.rattle(0.02, seed=3)
+    moved = atoms.copy()
+    moved.positions += np.random.default_rng(5).normal(0.0, 0.01, (len(atoms), 3))
+    strained = moved.copy()
+    strained.set_cell(moved.cell * 1.01, scale_atoms=True)
+    after_strain = strained.copy()
+    after_strain.positions += np.random.default_rng(6).normal(
+        0.0, 0.01, (len(atoms), 3)
+    )
+    restored = after_strain.copy()
+    restored.set_cell(atoms.cell, scale_atoms=True)
+    return [atoms, moved, strained, after_strain, restored]
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_mh1_device_graph_follows_a_cell_change(
+    generalized_mh1_artifact, monkeypatch, dtype
+):
+    evaluator_name = (
+        "MACENonlinearKokkos" if dtype == "float64" else "MACENonlinearKokkosFloat"
+    )
+    if not hasattr(native_symmetrix, evaluator_name):
+        pytest.skip("Symmetrix was built without the requested Kokkos precision")
+    _, _, model_path = generalized_mh1_artifact
+    properties = ["energy", "forces", "stress"]
+    frames = _mh1_cell_change_frames()
+    results = {}
+    for backend in ("host", "kokkos"):
+        monkeypatch.setenv("SYMMETRIX_NEIGHBOR_BACKEND", backend)
+        calculator = Symmetrix(model_path, dtype=dtype)
+        results[backend] = []
+        graph_generations = []
+        for frame in frames:
+            calculator.calculate(frame.copy(), properties=properties)
+            assert calculator.neighbor_graph_backend == backend
+            graph_generations.append(calculator._neighbor_cache.device_graph_generation)
+            results[backend].append(
+                {name: np.array(calculator.results[name]) for name in properties}
+            )
+        # one topology for the whole sequence; the device graph is rebuilt
+        # at each cell change instead
+        assert calculator.neighbor_cache_build_count == 1
+        if backend == "kokkos":
+            assert graph_generations[0] == graph_generations[1]
+            assert graph_generations[2] != graph_generations[1]
+            assert graph_generations[3] == graph_generations[2]
+            assert graph_generations[4] != graph_generations[3]
+        del calculator
+        gc.collect()
+    tolerance = 2e-5 if dtype == "float32" else 1e-10
+    for index, (host, device) in enumerate(zip(results["host"], results["kokkos"])):
+        for name in properties:
+            np.testing.assert_allclose(
+                device[name],
+                host[name],
+                rtol=0.0,
+                atol=tolerance,
+                err_msg=f"frame={index} property={name}",
+            )
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_mh1_device_graph_reuse_is_measured_from_the_rebuilt_graph(
+    generalized_mh1_artifact, monkeypatch, dtype
+):
+    # Two atoms 3.1 A apart (cutoff 4 A, skin 0.5 A): a 50 % strain moves the
+    # pair to 4.65 A, so the rebuilt device graph has no edge. Moving each atom
+    # 1.3 A towards the other brings the pair to 2.05 A. Measured from the
+    # rebuilt geometry that move exceeds the skin and forces a new graph;
+    # measured from the first geometry it would still pass as reusable.
+    evaluator_name = (
+        "MACENonlinearKokkos" if dtype == "float64" else "MACENonlinearKokkosFloat"
+    )
+    if not hasattr(native_symmetrix, evaluator_name):
+        pytest.skip("Symmetrix was built without the requested Kokkos precision")
+    _, _, model_path = generalized_mh1_artifact
+    monkeypatch.setenv("SYMMETRIX_NEIGHBOR_BACKEND", "kokkos")
+    start = Atoms(
+        numbers=[14, 1],
+        positions=[[2.0, 5.0, 5.0], [5.1, 5.0, 5.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    strained = start.copy()
+    strained.set_cell(start.cell * 1.5, scale_atoms=True)
+    moved = strained.copy()
+    moved.positions[0, 0] += 1.3
+    moved.positions[1, 0] -= 1.3
+    properties = ["energy", "forces"]
+    calculator = Symmetrix(model_path, dtype=dtype)
+    for frame in (start, strained, moved):
+        calculator.calculate(frame.copy(), properties=properties)
+        assert calculator.neighbor_graph_backend == "kokkos"
+    fresh = Symmetrix(model_path, dtype=dtype)
+    fresh.calculate(strained.copy(), properties=["energy"])
+    energy_without_edge = fresh.results["energy"]
+    fresh = Symmetrix(model_path, dtype=dtype)
+    fresh.calculate(moved.copy(), properties=properties)
+    tolerance = 2e-5 if dtype == "float32" else 1e-10
+    # the pair interacts in the last frame: a graph without it is visible
+    assert abs(fresh.results["energy"] - energy_without_edge) > 100 * tolerance
+    for name in properties:
+        np.testing.assert_allclose(
+            calculator.results[name],
+            fresh.results[name],
+            rtol=0.0,
+            atol=tolerance,
+            err_msg=f"property={name}",
+        )

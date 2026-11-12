@@ -2218,6 +2218,42 @@ class Symmetrix(Calculator):
         )
         self._sync_low_memory_policy_state()
 
+    def _rebuild_device_neighbor_graph(self, cache, atoms):
+        """Rebuild the device-resident periodic graph after a cell change.
+
+        A family without ``prepared_cell_update`` cannot move its prepared
+        graph to the new cell, so the graph is built again at the current
+        geometry, and later neighbor reuse is measured from that geometry.
+        """
+        device_builder = getattr(
+            self.evaluator, "_prepare_periodic_factorized_graph", None
+        )
+        if not callable(device_builder):
+            raise family_registry.MissingCapabilityError(
+                "the evaluator cannot refresh its device neighbor graph after a "
+                "cell-geometry change"
+            )
+        positions = np.array(atoms.positions, dtype=float)
+        device_graph = device_builder(
+            np.asarray(cache.node_types, dtype=np.int32),
+            np.ascontiguousarray(positions).reshape(-1),
+            np.ascontiguousarray(cache.cell, dtype=float).reshape(-1),
+            np.ascontiguousarray(cache.inverse_cell, dtype=float).reshape(-1),
+            self.cutoff + self.neighbor_skin,
+        )
+        self._sync_low_memory_policy_state()
+        num_edges = int(device_graph["num_edges"])
+        validate_graph_cardinality(len(positions), num_edges)
+        cache.device_graph_generation = int(device_graph["generation"])
+        cache.device_geometry_generation = cache.geometry_generation
+        cache.num_edges = num_edges
+        cache.topology_cell = np.array(cache.cell, copy=True)
+        cache.topology_reference_positions = np.array(positions, copy=True)
+        cache.topology_fractional_positions = np.ascontiguousarray(
+            positions @ cache.inverse_cell, dtype=float
+        )
+        cache.reference_positions = np.array(positions, copy=True)
+
     def _sync_low_memory_policy_state(self):
         if not getattr(self, "low_memory_request", False) and not getattr(
             self, "_native_execution_plan_available", False
@@ -5203,6 +5239,13 @@ class Symmetrix(Calculator):
                         "neighbor cache."
                     )
                 if cache.device_graph_generation != 0:
+                    if (
+                        cache.device_geometry_generation != cache.geometry_generation
+                        and not family_registry.supports_surface(
+                            family, self.evaluator, "prepared_cell_update"
+                        )
+                    ):
+                        self._rebuild_device_neighbor_graph(cache, atoms)
                     graph_generation = cache.device_graph_generation
                     if cache.device_geometry_generation != cache.geometry_generation:
                         (update_cell,) = family_registry.require_surface(

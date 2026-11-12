@@ -148,6 +148,15 @@ All notable changes to Symmetrix-XL are documented in this file.
   3.4 eV/atom on a small test model). The default and `auto` now select
   `reference` for such models and an explicit `direct` refuses them; models
   trained with `apply_cutoff=False`, such as MACE-MH-1, keep `direct`.
+- Fixed MACE-MH-1 and MACE-Polar calculations on periodic cells with the
+  native Kokkos neighbor builder (CUDA and HIP at 512 atoms or more, or
+  `SYMMETRIX_NEIGHBOR_BACKEND=kokkos`) after a cell change inside the
+  neighbor-reuse window (NPT, cell relaxation). MACE-MH-1 stopped with
+  `MissingCapabilityError: family 'MACE_Nonlinear' declares no
+  'prepared_cell_update' evaluator capability`; MACE-Polar rebuilt its graph
+  but judged later frames against the old geometry and could miss a pair that
+  came within the cutoff. Both now rebuild the device graph at the new cell
+  and measure later neighbor reuse from it.
 - Added native MACELES evaluation and checkpoint export for two-interaction
   MACE models with learned scalar charges and intrinsic LES electrostatics.
   Both execution routings evaluate the complete fitted model, including charge
