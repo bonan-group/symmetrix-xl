@@ -1002,7 +1002,10 @@ void MACEKokkos<Precision>::compute_dual_layer_tiled_phase(
         Kokkos::View<const int*>(execution_prepared_node_types);
     const auto all_num_neigh =
         Kokkos::View<const int*>(execution_prepared_num_neigh);
-    const auto all_node_energies = node_energies_storage;
+    const auto all_node_energies = Kokkos::subview(
+        node_energies_storage,
+        Kokkos::make_pair(
+            std::size_t(0), static_cast<std::size_t>(num_receivers)));
     const auto receiver_features = execution_prepared_receiver_feature_indices;
     const bool identity_receiver_features = receiver_features.extent(0) == 0;
     const int capacity = dual_layer_workspace_active_capacity;

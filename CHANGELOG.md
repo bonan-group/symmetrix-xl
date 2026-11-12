@@ -35,6 +35,11 @@ All notable changes to Symmetrix-XL are documented in this file.
   the host object pointer, which a GPU can dereference only where it can
   access host memory. They now copy it before the launch, as the neighbouring
   kernels do; the values are unchanged.
+- Fixed the per-atom energies of the CUDA dual-layer fixed-workspace plan
+  after a calculator moved to a structure with fewer atoms: the plan kept the
+  larger result storage and left the node energies bound to all of its rows,
+  so `energies` had the old length and `energy` included the old structure's
+  extra rows. The node energies now cover the current receivers only.
 - Removed the compiled `team_cached` and `tiled_coupling` R1 strategies and
   runtime executor overrides. Generated execution is the only `direct` route
   for standard two-interaction MACE energy and forces; the in-evaluator serial
