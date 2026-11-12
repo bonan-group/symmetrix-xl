@@ -2169,3 +2169,112 @@ def test_manual_schedules_match_whole_model_for_residual_first_models(
         np.testing.assert_allclose(
             manual[key], whole_model[key], rtol=rtol, atol=global_atol
         )
+
+
+def _run_empty_rank_case(tmp_path, executable, model, artifact_option, ranks):
+    # A small AlN cube in the middle of the lower half of a tall box: on two
+    # ranks the upper rank owns no atom and, with more than the cutoff plus the
+    # skin of vacuum to the cube, holds no ghost either. Its graph has no
+    # receivers on every step.
+    label = f"empty-rank-{ranks}"
+    log_path = tmp_path / f"{label}.log"
+    dump_path = tmp_path / f"{label}.dump"
+    input_path = tmp_path / f"in.{label}"
+    atoms = "\n".join(
+        f"create_atoms {(i + j + k) % 2 + 1} single "
+        f"{11.0 + 2.0 * i} {11.0 + 2.0 * j} {14.0 + 2.0 * k} units box"
+        for i, j, k in itertools.product(range(2), repeat=3)
+    )
+    input_path.write_text(
+        f"""
+units           metal
+atom_style      atomic/kk
+atom_modify     map yes sort 0 0
+boundary        p p p
+package         kokkos neigh half newton on
+newton          on
+processors      {_PROCESSOR_GRIDS[ranks]}
+region          box block 0 24 0 24 0 60
+create_box      2 box
+{atoms}
+mass            1 26.9815385
+mass            2 14.0067
+pair_style      symmetrix/mace/kk mpi_message_passing streamed_edges direct profile speed {artifact_option}
+pair_coeff      * * {model} Al N
+neighbor        1.0 bin
+neigh_modify    every 10 delay 0 check no
+compute         atom_energy all pe/atom
+velocity        all create 300.0 4928459 loop geom
+fix             integrate all nve
+timestep        0.0005
+thermo          1
+thermo_style    custom step atoms pe pxx pyy pzz pxy pxz pyz
+thermo_modify   format float %.16g
+run             5
+write_dump      all custom {dump_path} id type x y z fx fy fz c_atom_energy proc modify sort id format float %.16g
+print           "RESULT mode=direct pe=$(pe:%.16g) pxx=$(pxx:%.16g) pyy=$(pyy:%.16g) pzz=$(pzz:%.16g) pxy=$(pxy:%.16g) pxz=$(pxz:%.16g) pyz=$(pyz:%.16g)"
+"""
+    )
+    mpiexec = os.environ.get("MPIEXEC_EXECUTABLE") or shutil.which("mpiexec")
+    if not mpiexec:
+        _skip_or_fail("mpiexec is unavailable")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "SYMMETRIX_JIT_POLICY": "none",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_PROC_BIND": "false",
+        }
+    )
+    # A rank that keeps a different rebuild state than its peer waits in a
+    # collective; the time-out turns that into a failure.
+    subprocess.run(
+        [
+            mpiexec,
+            "-n",
+            str(ranks),
+            str(executable),
+            "-screen",
+            "none",
+            "-log",
+            str(log_path),
+            "-k",
+            "on",
+            "t",
+            "1",
+            "-sf",
+            "kk",
+            "-in",
+            str(input_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=environment,
+    )
+    return _read_dump(dump_path), _read_result(log_path, "RESULT")
+
+
+def test_direct_mpi_rank_without_atoms_matches_single_rank(
+    tmp_path, direct_compact_model
+):
+    executable = _required_path(
+        "SYMMETRIX_LAMMPS_EXECUTABLE", "a Kokkos and MPI-enabled LAMMPS executable"
+    )
+    model, artifact = direct_compact_model((13, 7))
+    artifact_option = f"jit_host_artifact {artifact}"
+    distributed_atoms, distributed = _run_empty_rank_case(
+        tmp_path, executable, model, artifact_option, ranks=2
+    )
+    single_atoms, single = _run_empty_rank_case(
+        tmp_path, executable, model, artifact_option, ranks=1
+    )
+
+    assert np.all(distributed_atoms[:, 9] == 0)
+    assert np.max(np.abs(single_atoms[:, 5:8])) > 0.0
+    np.testing.assert_allclose(
+        distributed_atoms[:, :9], single_atoms[:, :9], rtol=1.0e-11, atol=1.0e-10
+    )
+    np.testing.assert_allclose(distributed, single, rtol=1.0e-11, atol=1.0e-9)

@@ -439,3 +439,116 @@ def test_hybrid_overlay_message_passing_matches_the_plain_style(
         np.testing.assert_allclose(
             hybrid[stage]["forces"], expected_forces, rtol=1.0e-12, atol=1.0e-10
         )
+
+
+_RUN_EMPTY_FIRST = r"""
+import json
+import sys
+
+import numpy as np
+from lammps import lammps
+
+spec = json.loads(sys.argv[1])
+lmp = lammps(cmdargs=spec["cmdargs"])
+try:
+    lmp.commands_string(spec["setup"])
+    record = {}
+    if spec["empty_first"]:
+        lmp.command("run 0")
+        record["empty_pe"] = lmp.get_thermo("pe")
+    lmp.commands_string(spec["atoms"])
+    lmp.command("run 0")
+    count = lmp.get_natoms()
+    ids = np.array(lmp.numpy.extract_atom("id", nelem=count), copy=True)
+    forces = np.array(lmp.numpy.extract_atom("f", nelem=count, dim=3), copy=True)
+    record["pe"] = lmp.get_thermo("pe")
+    record["forces"] = forces[np.argsort(ids)].tolist()
+finally:
+    lmp.close()
+print("RESULT " + json.dumps(record))
+"""
+
+
+@pytest.mark.parametrize(
+    "domain_mode", ["no_domain_decomposition", "mpi_message_passing"]
+)
+def test_direct_first_evaluation_without_atoms_matches_a_fresh_run(
+    tmp_path, compact_model_path, host_artifact_path, domain_mode
+):
+    # A box created without atoms is evaluated by the first run with a graph
+    # without receivers; the direct route must give that graph valid tensor
+    # shapes and then evaluate the atoms created afterwards.
+    pair_style = _pair_style("direct", host_artifact_path).replace(
+        "no_domain_decomposition", domain_mode
+    )
+    setup = f"""
+package         kokkos neigh half newton on
+units           metal
+boundary        p p p
+atom_style      atomic/kk
+atom_modify     map array sort 0 0
+newton          on
+region          box block 0 6.2085633514918648 0 6.2085633514918648 0 6.2085633514918648
+create_box      2 box
+mass            1 1.008
+mass            2 15.999
+pair_style      {pair_style}
+pair_coeff      * * {compact_model_path} H O
+neighbor        1.0 bin
+"""
+    atoms = "\n".join(
+        f"create_atoms {kind} single {x} {y} {z} units box"
+        for kind, x, y, z in _POSITIONS
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "OMP_NUM_THREADS": "1",
+            "OMP_PROC_BIND": "false",
+            "SYMMETRIX_JIT_POLICY": "none",
+        }
+    )
+    results = {}
+    for empty_first in (True, False):
+        label = f"empty-first-{domain_mode}-{empty_first}"
+        log_path = tmp_path / f"{label}.log"
+        spec = {
+            "cmdargs": [
+                "-nocite",
+                "-screen",
+                "none",
+                "-log",
+                str(log_path),
+                *_kokkos_arguments(),
+            ],
+            "setup": setup,
+            "atoms": atoms,
+            "empty_first": empty_first,
+        }
+        completed = subprocess.run(
+            [sys.executable, "-c", _RUN_EMPTY_FIRST, json.dumps(spec)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=environment,
+        )
+        log_text = log_path.read_text() if log_path.exists() else ""
+        assert completed.returncode == 0, (
+            f"{label} exited with {completed.returncode}\n"
+            f"stderr:\n{completed.stderr[-4000:]}\nlog tail:\n{log_text[-4000:]}"
+        )
+        assert "resolved='direct'" in log_text
+        lines = [
+            line for line in completed.stdout.splitlines() if line.startswith("RESULT ")
+        ]
+        assert lines, completed.stdout
+        results[empty_first] = json.loads(lines[-1][len("RESULT ") :])
+
+    empty, fresh = results[True], results[False]
+    assert empty["empty_pe"] == 0.0
+    expected_forces = np.asarray(fresh["forces"])
+    assert np.max(np.abs(expected_forces)) > 0.0
+    assert empty["pe"] == pytest.approx(fresh["pe"], rel=1.0e-12, abs=1.0e-10)
+    np.testing.assert_allclose(
+        empty["forces"], expected_forces, rtol=1.0e-12, atol=1.0e-10
+    )

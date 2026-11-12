@@ -64,6 +64,11 @@ All notable changes to Symmetrix-XL are documented in this file.
   atoms farther apart than the cutoff: it raised "Spherical-harmonic
   coordinates do not cover all edge radii." instead of returning the atomic
   energies. The float64 and reference routes already evaluated these frames.
+- Fixed the direct route on a graph without receivers, as in the first run of
+  a box created without atoms or on an MPI rank that owns no atom and no
+  ghost: H1 kept no trailing extents, the R1 launch stopped with "R1 tensor
+  shape is inconsistent with the plugin contract", and the run aborted. H1 and
+  its adjoint now keep the model's trailing extents with zero rows.
 
 ### NequIP-OAM support
 

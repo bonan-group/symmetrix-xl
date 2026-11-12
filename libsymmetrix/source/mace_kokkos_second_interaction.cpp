@@ -3064,7 +3064,9 @@ void MACEKokkos<Precision>::ensure_h1_adjoint_capacity()
         H1_adj = M0;
         return;
     }
-    if (H1_adj.extent(0) >= H1.extent(0))
+    if (H1_adj.extent(0) >= H1.extent(0)
+        && H1_adj.extent(1) >= H1.extent(1)
+        && H1_adj.extent(2) >= H1.extent(2))
         return;
     if (H1_adj.data() == M0.data())
         H1_adj = {};

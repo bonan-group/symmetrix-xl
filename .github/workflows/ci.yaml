@@ -186,12 +186,20 @@ jobs:
             -k test_manual_schedules_match_whole_model_for_residual_first_models
         deactivate
 
+    - name: Run required two-rank regression tests
+      run: |
+        source .venv/bin/activate
+        SYMMETRIX_REQUIRE_LAMMPS_TESTS=1 \
+          pytest -q pair_symmetrix/test/test_pair_symmetrix_factorized_mpi.py \
+            -k test_direct_mpi_rank_without_atoms_matches_single_rank
+        deactivate
+
     - name: Run pair style test suite
       run: |
         source .venv/bin/activate
         cd pair_symmetrix/test
         TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
-          pytest -q -k 'not test_manual_schedules_match_whole_model_for_residual_first_models'
+          pytest -q -k 'not test_manual_schedules_match_whole_model_for_residual_first_models and not test_direct_mpi_rank_without_atoms_matches_single_rank'
         deactivate
 
   extract-mace-model:
