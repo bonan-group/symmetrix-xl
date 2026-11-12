@@ -588,3 +588,50 @@ run 0
     assert "POLAR_IDENTICAL_REISSUE_RAN" in output, output[-2000:]
     assert completed.returncode != 0, output[-2000:]
     assert "options changed after pair_coeff; issue pair_coeff again" in output
+
+
+def test_polar_lammps_requires_metal_units_with_qualified_fixture(tmp_path):
+    import os
+
+    executable = os.environ.get("SYMMETRIX_LAMMPS_POLAR_EXECUTABLE")
+    model = os.environ.get("SYMMETRIX_LAMMPS_POLAR_MODEL")
+    missing = [
+        name
+        for name, value in (
+            ("SYMMETRIX_LAMMPS_POLAR_EXECUTABLE", executable),
+            ("SYMMETRIX_LAMMPS_POLAR_MODEL", model),
+        )
+        if not value
+    ]
+    if missing:
+        pytest.skip("missing qualified external fixture: " + ", ".join(missing))
+
+    # The model takes Angstrom and returns eV; under units real the same deck
+    # would read and return the wrong units without a message.
+    input_path = tmp_path / "units-real.in"
+    input_path.write_text(
+        f"""
+units real
+atom_style atomic/kk
+atom_modify map yes
+boundary f f f
+region box block 0 12 0 12 0 12 units box
+create_box 2 box
+create_atoms 1 single 3.0 3.0 3.0 units box
+create_atoms 2 single 3.96 3.0 3.0 units box
+mass 1 15.999
+mass 2 1.008
+pair_style symmetrix/mace/polar/kk polar_electrostatics realspace
+pair_coeff * * {model} O H
+run_style verlet/kk
+run 0
+"""
+    )
+    completed = subprocess.run(
+        [executable, "-k", "on", "t", "1", "-log", "none", "-in", str(input_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "requires 'units metal'" in completed.stdout + completed.stderr

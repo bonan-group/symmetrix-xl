@@ -812,7 +812,7 @@ def test_type_change_without_a_neighbor_build_matches_a_fresh_run(
         assert changed["graph_rebuilds"] == 2
 
 
-def _static_deck(model, pair_style):
+def _static_deck(model, pair_style, units="metal"):
     # The two-type deck of _run_case without integration.
     atoms = "\n".join(
         f"create_atoms {kind} single {x} {y} {z} units box"
@@ -820,7 +820,7 @@ def _static_deck(model, pair_style):
     )
     return f"""
 package         kokkos neigh half newton on
-units           metal
+units           {units}
 boundary        p p p
 atom_style      atomic/kk
 atom_modify     map array sort 0 0
@@ -972,3 +972,17 @@ def test_a_model_that_fails_to_load_is_a_lammps_error(
     assert len(errors) == 1, completed.stdout
     assert f"could not load model '{model}'" in errors[0]
     assert completed.stdout.splitlines()[-1] == "CLOSED"
+
+
+def test_pair_style_requires_metal_units(tmp_path, compact_model_path):
+    # Positions are read in the input's length unit and energies returned in
+    # its energy unit; the models use Angstrom and eV.
+    completed, log_text = _run_deck(
+        tmp_path,
+        "units-real",
+        _static_deck(compact_model_path, _REISSUE_BASE, units="real"),
+        stages=[["first", "run 0"]],
+        timeout=300,
+    )
+    assert completed.returncode != 0, log_text[-2000:]
+    assert "requires 'units metal'" in log_text + completed.stderr, log_text[-2000:]

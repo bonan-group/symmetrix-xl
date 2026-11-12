@@ -30,6 +30,7 @@
 #include "neighbor.h"
 #include "neighbor_kokkos.h"
 #include "platform.h"
+#include "update.h"
 #include "neigh_list_kokkos.h"
 #include "neigh_request.h"
 
@@ -782,6 +783,10 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::init_style()
   execution_timing_enabled = 0.0;
   if (atom->map_user == atom->MAP_NONE) error->all(FLERR, "symmetrix/mace/kk requires \'atom_modify map [yes|array|hash]\'");
   if (force->newton_pair == 0) error->all(FLERR, "symmetrix/mace/kk requires newton pair on");
+  // The models take positions in Angstrom and return energies in eV; the unit
+  // style is final once the box exists.
+  if (strcmp(update->unit_style, "metal") != 0)
+    error->all(FLERR, "symmetrix/mace/kk requires \'units metal\'");
   if (coeff_settings_key != settings_key)
     error->all(FLERR, "pair_style symmetrix/mace/kk options changed after pair_coeff; issue pair_coeff again");
 

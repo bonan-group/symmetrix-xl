@@ -17,6 +17,7 @@
 #include "neighbor.h"
 #include "neigh_list_kokkos.h"
 #include "neigh_request.h"
+#include "update.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -222,6 +223,10 @@ double PairSymmetrixMACEPolarKokkos<DeviceType,Precision>::init_one(int,int)
 template<class DeviceType,typename Precision>
 void PairSymmetrixMACEPolarKokkos<DeviceType,Precision>::init_style()
 {
+  // The models take positions in Angstrom and return energies in eV; the unit
+  // style is final once the box exists.
+  if(strcmp(update->unit_style,"metal")!=0)
+    error->all(FLERR,"symmetrix/mace/polar/kk requires 'units metal'");
   symmetrix::lammps::PolarAdmissionRequest admission{
     comm->nprocs,atom->nlocal,static_cast<std::int64_t>(atom->natoms)};
   admission.hybrid_substyle=polar_hybrid_substyle(lmp);

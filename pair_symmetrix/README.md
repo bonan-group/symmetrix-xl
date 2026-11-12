@@ -32,6 +32,9 @@ artifacts.
 Without `head NAME`, the JSON's declared default head is used. Original
 single-head JSON files use their existing behavior.
 
+The pair styles require `units metal`: the models take positions in Angstrom
+and return energies in eV.
+
 The final `Sr Ti O` assumes that Sr, Ti, and O correspond to LAMMPS
 types `1`, `2`, and `3`, respectively. A compact universal JSON can be reused by a
 different input with another element mapping; active radial tables are built

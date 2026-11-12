@@ -134,6 +134,8 @@ under `hybrid/overlay`, removes those atoms from the Symmetrix neighbor list.
 error; on more than one rank use `no_mpi_message_passing` with
 `streamed_edges generic` or `materialized`.
 
+The Symmetrix pair styles require `units metal`.
+
 `pair_coeff` loads the model with the options of the preceding `pair_style`
 line. A later `pair_style` line for the same style that changes an option
 needs a new `pair_coeff`; otherwise the pair style stops at the next run.
