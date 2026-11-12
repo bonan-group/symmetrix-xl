@@ -4,6 +4,12 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ## Unreleased
 
+- Fixed the A1 channel-tile kernels of the Phi1 `channel-tiled-64` policy,
+  which the CUDA dual-layer fixed-workspace plan selects: they read the
+  evaluator's channel count through the host object pointer, which a GPU can
+  dereference only where it can access host memory. They now copy it before
+  the launch, as the neighbouring kernels do; the values are unchanged.
+
 ## 0.1.2 - 2026-11-04
 
 - Added an opt-in Apple Metal backend for FP32 standard-MACE execution on
