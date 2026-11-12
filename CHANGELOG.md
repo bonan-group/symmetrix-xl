@@ -212,6 +212,12 @@ All notable changes to Symmetrix-XL are documented in this file.
   failed with an `AttributeError` or `IndexError`. The exporter now refuses
   each with a `ValueError` that names the option. Supported models export
   unchanged.
+- Fixed MACE export of models with correlation order 1 or 2 in any layer,
+  including mixed orders such as `correlation=[3, 2]`, which failed with
+  `IndexError: index 1 is out of range`. Orders above 3 are now refused with
+  a message instead of failing or exporting a truncated product, and so are
+  mixed orders in a multi-head model, which MACE's head selection cannot
+  rebuild. Order-3 exports are unchanged.
 
 ### CUDA packaging
 

@@ -1001,6 +1001,19 @@ def _align_u_matrix_to_checkpoint(u_matrix, contraction, correlation, site, warn
 
 
 def _remove_prediction_head(model, head, device):
+    # remove_pt_head rebuilds the selected head with the correlation order of
+    # products[0] for every product, so the weights of a model with per-layer
+    # orders do not fit the rebuilt products.
+    orders = [
+        product.symmetric_contractions.contractions[0].correlation
+        for product in getattr(model, "products", ())
+    ]
+    if len(set(orders)) > 1:
+        raise ValueError(
+            "symmetrix cannot export MACE models with several heads and "
+            f"correlation orders {orders}: selecting a head with mace's "
+            "remove_pt_head rebuilds every product with the order of products[0]."
+        )
     previous_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(next(model.parameters()).dtype)
@@ -1224,6 +1237,13 @@ def _extract_single_head_data(
             "Single-layer invariant readouts are currently supported only for MACE."
         )
     _refuse_unrepresented_mace_options(model, single_layer_invariant_readout)
+    for index, product in enumerate(model.products):
+        product_correlation = product.symmetric_contractions.contractions[0].correlation
+        if product_correlation > 3:
+            raise ValueError(
+                f"products[{index}] has correlation {product_correlation}: "
+                "correlation orders above 3 are not supported."
+            )
 
     if is_macefield:
         if not hasattr(model, "field_feats") or not hasattr(model, "field_linear"):
@@ -1899,25 +1919,16 @@ def _extract_single_head_data(
         for l, irrep_out in enumerate(irreps_out):
             # extract U in sparse format
             U = cached_u_sparse(l, irrep_out)
-            # extract weights from model
-            # warning: slightly odd order of the contractions weights due to reverse countdown
-            W = [[]]  # list of lists because W[0] should be empty
-            W.append(
-                model.products[0]
-                .symmetric_contractions.contractions[l]
-                .weights[1]
-                .numpy(force=True)
-            )
-            W.append(
-                model.products[0]
-                .symmetric_contractions.contractions[l]
-                .weights[0]
-                .numpy(force=True)
-            )
-            W.append(
-                model.products[0]
-                .symmetric_contractions.contractions[l]
-                .weights_max.numpy(force=True)
+            # extract weights from model; W[0] stays empty.  weights[k] holds
+            # correlation order correlation - 1 - k, weights_max the highest one.
+            contraction = model.products[0].symmetric_contractions.contractions[l]
+            W = (
+                [[]]
+                + [
+                    contraction.weights[correlation - corr - 1].numpy(force=True)
+                    for corr in range(1, correlation)
+                ]
+                + [contraction.weights_max.numpy(force=True)]
             )
             # combine U and W into polynomial-like terms for recursive evaluator
             for m in range(-l, l + 1):
@@ -2350,7 +2361,7 @@ def _extract_single_head_data(
     # extract U in sparse format
     U = [[]]
     use_reduced_cg = bool(getattr(model, "use_reduced_cg", False))
-    for corr in range(1, 4):
+    for corr in range(1, correlation + 1):
         # get U matrix for this correlation order
         try:
             U_matrix = U_matrix_real(
@@ -2384,25 +2395,15 @@ def _extract_single_head_data(
                     u_sparse_corr[nu][lm_tuple_sorted] += U_matrix[j].item()
                 j += 1
         U.append(u_sparse_corr)
-    # extract weights from model
-    # warning: slightly odd order of the contractions weights due to reverse countdown
-    W = [[]]
-    W.append(
-        model.products[1]
-        .symmetric_contractions.contractions[0]
-        .weights[1]
-        .numpy(force=True)
-    )
-    W.append(
-        model.products[1]
-        .symmetric_contractions.contractions[0]
-        .weights[0]
-        .numpy(force=True)
-    )
-    W.append(
-        model.products[1]
-        .symmetric_contractions.contractions[0]
-        .weights_max.numpy(force=True)
+    # extract weights from model; W[0] stays empty (same order as for M0)
+    contraction = model.products[1].symmetric_contractions.contractions[0]
+    W = (
+        [[]]
+        + [
+            contraction.weights[correlation - corr - 1].numpy(force=True)
+            for corr in range(1, correlation)
+        ]
+        + [contraction.weights_max.numpy(force=True)]
     )
     # combine U and W into polynomial-like terms for recursive evaluator
     C = {}
@@ -2411,7 +2412,7 @@ def _extract_single_head_data(
         C[i] = {}
         for k in range(num_channels):
             P_ik = {}
-            for corr in range(1, 4):
+            for corr in range(1, correlation + 1):
                 for nu in range(len(U[corr])):
                     for key, value in U[corr][nu].items():
                         if key not in P_ik.keys():
