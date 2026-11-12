@@ -5,7 +5,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from ase import Atoms
 from compact_r1_model import foundation_r1_test_model
+from symmetrix import Symmetrix
 from symmetrix import symmetrix as native_symmetrix
 from symmetrix.mace_jit_device_artifact import prepare_jit_device_artifact
 from symmetrix.mace_jit_host_artifact import prepare_jit_host_artifact
@@ -258,6 +260,55 @@ def test_prepared_factorized_graph_passes_cardinality_admission(
     assert token > 0
     assert evaluator.factorized_graph_generation == token
     assert evaluator.factorized_schedule_entries == 2
+
+
+def _calculator_results(calculator, atoms):
+    atoms = atoms.copy()
+    atoms.calc = calculator
+    return {
+        "energy": atoms.get_potential_energy(),
+        "energies": atoms.get_potential_energies(),
+        "forces": atoms.get_forces(),
+        "stress": atoms.get_stress(),
+    }
+
+
+def test_default_calculator_evaluates_frames_without_edges(
+    compact_model_path, tmp_path
+):
+    model = json.loads(compact_model_path.read_text())
+    model["atomic_energies"] = [-1.25, -2.5]
+    model["readout_1_weights"] = [
+        0.001 * (1 + channel % 7) for channel in range(model["num_channels"])
+    ]
+    model_path = tmp_path / "compact-atomic-energies.json"
+    model_path.write_text(json.dumps(model, separators=(",", ":")))
+
+    box = dict(cell=[30.0, 30.0, 30.0], pbc=True)
+    one_atom = Atoms(["Al"], positions=[[2.0, 2.0, 2.0]], **box)
+    distant_pair = Atoms(
+        ["Al", "N"], positions=[[2.0, 2.0, 2.0], [12.0, 12.0, 12.0]], **box
+    )
+    bonded_pair = Atoms(
+        ["Al", "N"], positions=[[2.0, 2.0, 2.0], [3.7, 2.2, 2.1]], **box
+    )
+    frames = (one_atom, distant_pair, bonded_pair, distant_pair, one_atom)
+
+    reused = Symmetrix(model_path)
+    assert isinstance(reused.evaluator, native_symmetrix.MACEKokkosFloat)
+    assert reused.evaluator.streamed_edges_mode == "direct"
+    for atoms in frames:
+        actual = _calculator_results(reused, atoms)
+        fresh = _calculator_results(Symmetrix(model_path), atoms)
+        reference = _calculator_results(Symmetrix(model_path, dtype="float64"), atoms)
+        for name, value in actual.items():
+            np.testing.assert_allclose(value, fresh[name], rtol=1e-6, atol=1e-9)
+            np.testing.assert_allclose(value, reference[name], rtol=0.0, atol=2e-5)
+
+    edge_free = _calculator_results(reused, distant_pair)
+    assert edge_free["energy"] == pytest.approx(-3.75, rel=0.0, abs=1e-12)
+    np.testing.assert_array_equal(edge_free["forces"], 0.0)
+    np.testing.assert_array_equal(edge_free["stress"], 0.0)
 
 
 def _function_source(source, start, end):

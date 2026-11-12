@@ -59,6 +59,11 @@ All notable changes to Symmetrix-XL are documented in this file.
   sized the host communication buffers from them, and the per-atom message
   passing wrote past those buffers (a crash in CPU Kokkos builds).
   `init_style()` now raises the wrapper's sizes to this style's.
+- Fixed the default float32 calculator route (`streamed_edges="direct"` with
+  compact edge geometry) on frames without edges, such as an isolated atom or
+  atoms farther apart than the cutoff: it raised "Spherical-harmonic
+  coordinates do not cover all edge radii." instead of returning the atomic
+  energies. The float64 and reference routes already evaluated these frames.
 
 ### NequIP-OAM support
 
