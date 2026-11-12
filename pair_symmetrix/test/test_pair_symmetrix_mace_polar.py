@@ -530,3 +530,61 @@ print "POLAR_FERMI_RESULT ${{result_e}} ${{result_fx1}} ${{result_fy1}} ${{resul
         return tuple(float(value) for value in marker.split()[1:])
 
     assert evaluate(7.5) == evaluate(0.0)
+
+
+def test_polar_lammps_changed_head_requires_pair_coeff_with_qualified_fixture(
+    tmp_path,
+):
+    import os
+
+    executable = os.environ.get("SYMMETRIX_LAMMPS_POLAR_EXECUTABLE")
+    model = os.environ.get("SYMMETRIX_LAMMPS_POLAR_MODEL")
+    missing = [
+        name
+        for name, value in (
+            ("SYMMETRIX_LAMMPS_POLAR_EXECUTABLE", executable),
+            ("SYMMETRIX_LAMMPS_POLAR_MODEL", model),
+        )
+        if not value
+    ]
+    if missing:
+        pytest.skip("missing qualified external fixture: " + ", ".join(missing))
+
+    # LAMMPS passes a re-issued pair_style line with the same style to the
+    # existing instance, which keeps the model loaded by the earlier pair_coeff
+    # with its head and artifact; an identical line keeps running.
+    input_path = tmp_path / "reissue.in"
+    style = "pair_style symmetrix/mace/polar/kk polar_electrostatics realspace"
+    input_path.write_text(
+        f"""
+units metal
+atom_style atomic/kk
+atom_modify map yes
+boundary f f f
+region box block 0 12 0 12 0 12 units box
+create_box 2 box
+create_atoms 1 single 3.0 3.0 3.0 units box
+create_atoms 2 single 3.96 3.0 3.0 units box
+mass 1 15.999
+mass 2 1.008
+{style}
+pair_coeff * * {model} O H
+run_style verlet/kk
+run 0
+{style}
+run 0
+print "POLAR_IDENTICAL_REISSUE_RAN"
+{style} head other
+run 0
+"""
+    )
+    completed = subprocess.run(
+        [executable, "-k", "on", "t", "1", "-log", "none", "-in", str(input_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    output = completed.stdout + completed.stderr
+    assert "POLAR_IDENTICAL_REISSUE_RAN" in output, output[-2000:]
+    assert completed.returncode != 0, output[-2000:]
+    assert "options changed after pair_coeff; issue pair_coeff again" in output

@@ -810,3 +810,110 @@ def test_type_change_without_a_neighbor_build_matches_a_fresh_run(
         # The prepared graph is rebuilt for the type change only.
         assert [initial["graph_rebuilds"], unchanged["graph_rebuilds"]] == [1, 1]
         assert changed["graph_rebuilds"] == 2
+
+
+def _static_deck(model, pair_style):
+    # The two-type deck of _run_case without integration.
+    atoms = "\n".join(
+        f"create_atoms {kind} single {x} {y} {z} units box"
+        for kind, x, y, z in _POSITIONS
+    )
+    return f"""
+package         kokkos neigh half newton on
+units           metal
+boundary        p p p
+atom_style      atomic/kk
+atom_modify     map array sort 0 0
+newton          on
+region          box block 0 6.2085633514918648 0 6.2085633514918648 0 6.2085633514918648
+create_box      2 box
+{atoms}
+mass            1 1.008
+mass            2 15.999
+pair_style      {pair_style}
+pair_coeff      * * {model} H O
+neighbor        1.0 bin
+"""
+
+
+_REISSUE_BASE = "symmetrix/mace no_domain_decomposition streamed_edges generic"
+_REISSUE_CHANGES = {
+    "mode": "symmetrix/mace mpi_message_passing streamed_edges generic",
+    "streamed-edges": "symmetrix/mace no_domain_decomposition streamed_edges materialized",
+    "profile": f"{_REISSUE_BASE} profile speed",
+    "ghost-mode": "symmetrix/mace no_mpi_message_passing streamed_edges generic",
+}
+
+
+def test_identical_pair_style_reissue_keeps_the_model(tmp_path, compact_model_path):
+    completed, log_text = _run_deck(
+        tmp_path,
+        "reissue-identical",
+        _static_deck(compact_model_path, _REISSUE_BASE),
+        stages=[
+            ["first", "run 0"],
+            ["second", f"pair_style {_REISSUE_BASE}\nrun 0"],
+        ],
+    )
+    result = _case_result("reissue-identical", completed, log_text)
+    assert log_text.count("Loading MACEKokkos model") == 1
+    assert result["second"]["pe"] == result["first"]["pe"]
+    np.testing.assert_array_equal(result["second"]["forces"], result["first"]["forces"])
+
+
+@pytest.mark.parametrize(
+    "change",
+    [*_REISSUE_CHANGES, "head"],
+)
+def test_changed_pair_style_options_require_pair_coeff(
+    tmp_path, compact_model_path, change
+):
+    # LAMMPS passes a re-issued pair_style line with the same style to the
+    # existing instance, which keeps the model loaded by the earlier pair_coeff
+    # and the options it was loaded with.
+    second = _REISSUE_CHANGES.get(change, f"{_REISSUE_BASE} head other")
+    completed, log_text = _run_deck(
+        tmp_path,
+        f"reissue-{change}",
+        _static_deck(compact_model_path, _REISSUE_BASE),
+        stages=[["first", "run 0"], ["second", f"pair_style {second}\nrun 0"]],
+        timeout=300,
+    )
+    assert completed.returncode != 0, log_text[-2000:]
+    assert (
+        "options changed after pair_coeff; issue pair_coeff again"
+        in log_text + completed.stderr
+    ), f"stderr:\n{completed.stderr[-2000:]}\nlog tail:\n{log_text[-2000:]}"
+
+
+@pytest.mark.parametrize("change", list(_REISSUE_CHANGES))
+def test_changed_pair_style_options_with_pair_coeff_match_a_fresh_deck(
+    tmp_path, compact_model_path, change
+):
+    second = _REISSUE_CHANGES[change]
+    completed, log_text = _run_deck(
+        tmp_path,
+        f"reissue-coeff-{change}",
+        _static_deck(compact_model_path, _REISSUE_BASE),
+        stages=[
+            ["first", "run 0"],
+            [
+                "second",
+                f"pair_style {second}\npair_coeff * * {compact_model_path} H O\nrun 0",
+            ],
+        ],
+    )
+    result = _case_result(f"reissue-coeff-{change}", completed, log_text)
+    completed, log_text = _run_deck(
+        tmp_path,
+        f"reissue-fresh-{change}",
+        _static_deck(compact_model_path, second),
+        stages=[["fresh", "run 0"]],
+    )
+    fresh = _case_result(f"reissue-fresh-{change}", completed, log_text)["fresh"]
+    assert result["second"]["pe"] == pytest.approx(
+        fresh["pe"], rel=1.0e-12, abs=1.0e-10
+    )
+    np.testing.assert_allclose(
+        result["second"]["forces"], fresh["forces"], rtol=1.0e-12, atol=1.0e-10
+    )

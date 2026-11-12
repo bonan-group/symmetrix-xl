@@ -93,6 +93,10 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   int jit_m0_device_blocks_per_compute_unit = 0;
   int jit_r0_device_blocks_per_compute_unit = 0;
   std::string jit_r0_device_schedule;
+  // The options of the last settings() call and of the one the model was
+  // loaded with in coeff().
+  std::string settings_key;
+  std::string coeff_settings_key;
   std::uint64_t execution_graph_generation = 0;
   int execution_num_nodes = 0;
   int execution_num_feature_nodes = 0;

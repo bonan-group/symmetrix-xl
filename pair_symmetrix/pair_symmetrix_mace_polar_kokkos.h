@@ -56,6 +56,10 @@ class PairSymmetrixMACEPolarKokkos : public Pair, public KokkosBase {
   std::string prediction_head_;
   std::string jit_artifact_;
   std::string jit_target_="host";
+  // The head and artifact of the last settings() call and of the one the
+  // model was loaded with in coeff().
+  std::string settings_key_;
+  std::string coeff_settings_key_;
   std::unique_ptr<Consumer> consumer_;
   Kokkos::View<int*,typename DeviceType::memory_space> atomic_numbers_;
   Kokkos::View<int*,typename DeviceType::memory_space> node_indices_;

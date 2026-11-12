@@ -37,6 +37,13 @@ types `1`, `2`, and `3`, respectively. A compact universal JSON can be reused by
 different input with another element mapping; active radial tables are built
 once during `pair_coeff` for that mapping.
 
+`pair_coeff` loads the model with the options of the preceding `pair_style`
+line. After a `pair_style` line for the same style that changes an option, such
+as the domain mode, `streamed_edges`, `profile`, `head` or an artifact, issue
+`pair_coeff` again; otherwise the pair style stops at the next run. The
+electric field components, and the Polar pair style's charge, spin, Fermi
+level and electrostatics settings, can change without a new `pair_coeff`.
+
 Compact universal files use Symmetrix-XL format version 2. The original
 Symmetrix pair-spline format (named v1 here) is retired. The Python calculators
 no longer load it at all; the pair styles still admit it, warn about the

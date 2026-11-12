@@ -171,8 +171,9 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::allocate()
       setflag[i][j] = 0;
 
   memory->create(cutsq, atom->ntypes+1, atom->ntypes+1, "pair:cutsq");
-  if (ghostneigh)
-    memory->create(cutghost, atom->ntypes+1, atom->ntypes+1, "pair:cutghost");
+  // A re-issued pair_style line can switch to no_mpi_message_passing after
+  // the first pair_coeff allocated these arrays.
+  memory->create(cutghost, atom->ntypes+1, atom->ntypes+1, "pair:cutghost");
 }
 
 /* ----------------------------------------------------------------------
@@ -469,6 +470,29 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
       FLERR,
       "pair_style symmetrix/mace/kk _debug_dual_layer_workspace_receivers requires "
       "_debug_execution_plan mh0-dual-layer-tiled-v1");
+
+  // coeff() applies these options when it loads the model. LAMMPS passes a
+  // re-issued pair_style line with the same style to settings() of this
+  // instance and keeps the loaded model, so init_style() compares the options
+  // with the ones the model was loaded with. The electric field components are
+  // read at every compute and may change without a new pair_coeff.
+  settings_key.clear();
+  for (const std::string &value : {
+         mode, streamed_edges, execution_profile,
+         std::string(allow_fixed_workspace ? "1" : "0"), debug_execution_plan,
+         std::to_string(debug_single_layer_workspace_receivers),
+         std::to_string(debug_dual_layer_workspace_receivers), prediction_head,
+         jit_host_artifact, jit_device_artifact, jit_m0_device_artifact,
+         jit_r0_device_artifact, jit_m0_device_schedule,
+         std::to_string(jit_device_blocks_per_compute_unit),
+         std::string(jit_device_blocks_per_compute_unit_set ? "1" : "0"),
+         std::to_string(jit_m0_device_blocks_per_compute_unit),
+         std::to_string(jit_r0_device_blocks_per_compute_unit),
+         jit_r0_device_schedule,
+         std::string(electric_field_set ? "1" : "0")}) {
+    settings_key += value;
+    settings_key += '\n';
+  }
 }
 
 /* ----------------------------------------------------------------------
@@ -717,6 +741,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
   for (int i=1; i<atom->ntypes+1; i++)
     for (int j=i; j<atom->ntypes+1; j++)
       setflag[i][j] = 1;
+  coeff_settings_key = settings_key;
 }
 
 /* ----------------------------------------------------------------------
@@ -744,6 +769,8 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::init_style()
   execution_timing_enabled = 0.0;
   if (atom->map_user == atom->MAP_NONE) error->all(FLERR, "symmetrix/mace/kk requires \'atom_modify map [yes|array|hash]\'");
   if (force->newton_pair == 0) error->all(FLERR, "symmetrix/mace/kk requires newton pair on");
+  if (coeff_settings_key != settings_key)
+    error->all(FLERR, "pair_style symmetrix/mace/kk options changed after pair_coeff; issue pair_coeff again");
 
   // Under pair_style hybrid or hybrid/overlay, Comm::init sizes the host
   // communication buffers from the wrapper's comm_forward and comm_reverse.
