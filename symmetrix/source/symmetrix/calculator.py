@@ -1737,6 +1737,34 @@ class Symmetrix(Calculator):
                 "execution: re-export the model with radial_format='compact'."
             )
 
+        # MACE_Nonlinear edge functions also take the element embeddings, so
+        # with the cutoff inside the radial basis (apply_cutoff=True) they do
+        # not vanish at r_max. The direct route keeps the edges up to
+        # cutoff + skin and evaluates those beyond r_max at r_max; the
+        # reference route drops them.
+        edges_need_reference = self._native_model_type == "MACE_Nonlinear" and bool(
+            (identity_model_data or {})
+            .get("radial_embedding", {})
+            .get("apply_cutoff", False)
+        )
+        if edges_need_reference and streamed_edges_unset:
+            # The unset default resolves to reference below, so the direct
+            # route's capacity plan is not implied; an explicit low_memory=True
+            # names the direct route and is refused like an explicit direct.
+            if legacy_low_memory_requested:
+                raise ValueError(
+                    "low_memory=True requires streamed_edges='direct', which does "
+                    "not support a MACE_Nonlinear model with apply_cutoff=True. "
+                    "Use streamed_edges='auto' or 'reference' for this model."
+                )
+            if self.low_memory_request:
+                self.low_memory_request = False
+                self.low_memory_selection_reason = (
+                    "implied low-memory plan unavailable for a MACE_Nonlinear "
+                    "model with apply_cutoff=True, which runs on the reference "
+                    "route; using default execution policies"
+                )
+
         if (
             self.low_memory_request
             and not legacy_low_memory_requested
@@ -1786,7 +1814,32 @@ class Symmetrix(Calculator):
         if family_registry.supports_surface(
             self._family_entry, self.evaluator, "mode_handshake"
         ):
-            if canonical_streamed_edges == "auto":
+            if (
+                edges_need_reference
+                and canonical_streamed_edges == "direct"
+                and not streamed_edges_unset
+            ):
+                raise ValueError(
+                    "streamed_edges='direct' does not support a MACE_Nonlinear "
+                    "model with apply_cutoff=True: its edge functions do not "
+                    "vanish at r_max, and the direct route evaluates edges beyond "
+                    "r_max at r_max. Use streamed_edges='auto' or 'reference' for "
+                    "this model; the direct route serves MACE_Nonlinear models "
+                    "trained with apply_cutoff=False."
+                )
+            if edges_need_reference and (
+                canonical_streamed_edges == "auto" or streamed_edges_unset
+            ):
+                self.streamed_edges_resolution_reason = (
+                    "the unset default" if streamed_edges_unset else "auto"
+                ) + (
+                    " selected reference because the edge functions of a "
+                    "MACE_Nonlinear model with apply_cutoff=True do not vanish at "
+                    "r_max and the direct route evaluates edges beyond r_max at "
+                    "r_max"
+                )
+                canonical_streamed_edges = "reference"
+            elif canonical_streamed_edges == "auto":
                 if bool(getattr(self.evaluator, "supports_factorized", False)):
                     canonical_streamed_edges = "direct"
                     self.streamed_edges_resolution_reason = (

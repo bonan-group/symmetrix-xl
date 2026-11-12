@@ -175,7 +175,7 @@ def mh1_h_si_artifact(tmp_path_factory):
     return data, path
 
 
-def _make_generalized_mh1(parameters, *, num_interactions=2):
+def _make_generalized_mh1(parameters, *, num_interactions=2, apply_cutoff=False):
     if mace_import_error is not None:
         pytest.skip(f"mace-torch is not available: {mace_import_error}")
     from e3nn import o3
@@ -220,6 +220,7 @@ def _make_generalized_mh1(parameters, *, num_interactions=2):
             use_edge_irreps_first=True,
             radial_MLP=radial_mlp,
             heads=["test"],
+            apply_cutoff=apply_cutoff,
         )
     finally:
         torch.set_default_dtype(previous_dtype)
@@ -250,6 +251,16 @@ def generalized_mh1_artifact(request, tmp_path_factory):
         )
         / "model.json"
     )
+    path.write_text(json.dumps(data, separators=(",", ":")))
+    return model, data, path
+
+
+@pytest.fixture(scope="module")
+def generalized_mh1_embedded_cutoff_artifact(tmp_path_factory):
+    """The default artifact's architecture with mace's default apply_cutoff=True."""
+
+    model, data = _make_generalized_mh1((4, 2, 4, 2, []), apply_cutoff=True)
+    path = tmp_path_factory.mktemp("mh1-general-embedded-cutoff") / "model.json"
     path.write_text(json.dumps(data, separators=(",", ":")))
     return model, data, path
 
@@ -5468,3 +5479,61 @@ def test_legacy_evaluator_rejects_nonlinear_schema(mh1_si_artifact):
         native_symmetrix._init_kokkos()
     with pytest.raises((RuntimeError, ValueError), match="MACE_Nonlinear"):
         native_symmetrix.MACEKokkos(str(model_path))
+
+
+def _skin_shell_si_atoms():
+    # Diamond Si (one H) has pairs between the 4 A cutoff and cutoff + skin.
+    atoms = bulk("Si", "diamond", a=5.43, cubic=True)
+    atoms.numbers[3] = 1
+    atoms.rattle(0.05, seed=3)
+    return atoms
+
+
+def test_mh1_embedded_cutoff_model_runs_on_the_reference_route(
+    generalized_mh1_embedded_cutoff_artifact, generalized_mh1_artifact
+):
+    # With apply_cutoff=True the edge functions also depend on the element
+    # embeddings and do not vanish at r_max, so the edges between r_max and
+    # r_max + skin must be dropped, as the reference route does.
+    if not hasattr(native_symmetrix, "MACENonlinearKokkos"):
+        pytest.skip("Symmetrix was built without Kokkos support")
+    atoms = _skin_shell_si_atoms()
+    properties = ["energy", "forces", "stress"]
+    for (model, data, model_path), expected_route in (
+        (generalized_mh1_embedded_cutoff_artifact, "reference"),
+        (generalized_mh1_artifact, "direct"),
+    ):
+        assert data["radial_embedding"]["apply_cutoff"] is (
+            expected_route == "reference"
+        )
+        upstream = MACECalculator(models=model, device="cpu", default_dtype="float64")
+        upstream.calculate(atoms.copy(), properties=properties)
+        for mode in ("auto", "reference"):
+            calculator = Symmetrix(model_path, dtype="float64", streamed_edges=mode)
+            assert calculator.streamed_edges == (
+                expected_route if mode == "auto" else "reference"
+            )
+            calculator.calculate(atoms.copy(), properties=properties)
+            for name in properties:
+                np.testing.assert_allclose(
+                    calculator.results[name],
+                    upstream.results[name],
+                    rtol=0.0,
+                    atol=1e-6,
+                    err_msg=f"route={expected_route} mode={mode} property={name}",
+                )
+    _, _, model_path = generalized_mh1_embedded_cutoff_artifact
+    for dtype in ("float32", "float64"):
+        # the default call (no streamed_edges) also resolves to reference
+        calculator = Symmetrix(model_path, dtype=dtype)
+        assert calculator.streamed_edges == "reference"
+        assert "apply_cutoff=True" in calculator.streamed_edges_resolution_reason
+        # the reported settings are the reference route's, not direct's
+        # capacity plan
+        assert not calculator.low_memory
+        assert calculator.execution_mh1_node_arena_policy != "capacity-v1"
+        assert calculator.execution_mh1_node_state_policy != "retain-interaction-v1"
+        with pytest.raises(ValueError, match="apply_cutoff=True"):
+            Symmetrix(model_path, dtype=dtype, streamed_edges="direct")
+    with pytest.raises(ValueError, match="low_memory=True requires"):
+        Symmetrix(model_path, dtype="float32", low_memory=True)

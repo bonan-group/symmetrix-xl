@@ -140,6 +140,14 @@ All notable changes to Symmetrix-XL are documented in this file.
   reference retained-feature/skin-graph handling. Strict frozen Polar oracle
   comparisons explicitly use 4096 radial spline points; the public 256-point
   default and frozen numerical tolerances are unchanged.
+- Fixed MACE_Nonlinear (MH-1-architecture) models trained with
+  `apply_cutoff=True`, mace-torch's default, on the default `direct` route.
+  Their edge functions depend on the element embeddings and do not vanish at
+  `r_max`, but the direct route evaluated the edges between `r_max` and
+  `r_max` + skin at `r_max` instead of dropping them (energies off by up to
+  3.4 eV/atom on a small test model). The default and `auto` now select
+  `reference` for such models and an explicit `direct` refuses them; models
+  trained with `apply_cutoff=False`, such as MACE-MH-1, keep `direct`.
 - Added native MACELES evaluation and checkpoint export for two-interaction
   MACE models with learned scalar charges and intrinsic LES electrostatics.
   Both execution routings evaluate the complete fitted model, including charge

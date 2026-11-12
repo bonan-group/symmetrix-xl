@@ -92,6 +92,7 @@ def _bias_readout_model():
             use_edge_irreps_first=True,
             radial_MLP=radial_mlp,
             heads=["test"],
+            apply_cutoff=False,
         )
         plain = model.readouts[-1]
         assert isinstance(plain, NonLinearReadoutBlock)
