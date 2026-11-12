@@ -506,18 +506,31 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
   if (narg != atom->ntypes + 3)
     error->all(FLERR, "Incorrect args for pair coefficients");
 
-  if (symmetrix_is_nonlinear_model(arg[2]))
+  // The loader reports an unreadable file, a malformed model or an unknown
+  // head as a C++ exception, which LAMMPS does not catch; report it as a
+  // LAMMPS error so that the input stops cleanly. The failure can be local to
+  // one rank (a file it cannot read), so stop that rank rather than wait in a
+  // collective error for ranks that loaded the model; when every rank fails,
+  // each prints its own line.
+  bool nonlinear_model = false;
+  try {
+    nonlinear_model = symmetrix_is_nonlinear_model(arg[2]);
+    if (!nonlinear_model) {
+      utils::logmesg(lmp, "Loading MACEKokkos model from \'{}\' ... ", arg[2]);
+      mace = std::make_unique<MACEKokkos<Precision>>(arg[2], prediction_head);
+      mace->set_allow_fixed_workspace(allow_fixed_workspace);
+      if (debug_single_layer_workspace_receivers != 0)
+        mace->set_single_layer_workspace_receiver_limit_for_testing(
+          debug_single_layer_workspace_receivers);
+      if (debug_dual_layer_workspace_receivers != 0)
+        mace->set_dual_layer_workspace_receiver_limit_for_testing(
+          debug_dual_layer_workspace_receivers);
+    }
+  } catch (const std::exception& exception) {
+    error->one(FLERR, "pair_style symmetrix/mace/kk could not load model '{}': {}", arg[2], exception.what());
+  }
+  if (nonlinear_model)
     error->all(FLERR, "MACE_Nonlinear models are not supported by pair_style symmetrix/mace/kk in this release");
-
-  utils::logmesg(lmp, "Loading MACEKokkos model from \'{}\' ... ", arg[2]);
-  mace = std::make_unique<MACEKokkos<Precision>>(arg[2], prediction_head);
-  mace->set_allow_fixed_workspace(allow_fixed_workspace);
-  if (debug_single_layer_workspace_receivers != 0)
-    mace->set_single_layer_workspace_receiver_limit_for_testing(
-      debug_single_layer_workspace_receivers);
-  if (debug_dual_layer_workspace_receivers != 0)
-    mace->set_dual_layer_workspace_receiver_limit_for_testing(
-      debug_dual_layer_workspace_receivers);
   utils::logmesg(lmp, "success\n");
   const std::string requested_streamed_edges = streamed_edges;
   if (streamed_edges == "auto") {

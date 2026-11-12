@@ -92,6 +92,10 @@ All notable changes to Symmetrix-XL are documented in this file.
   stops with an error; issue `pair_coeff` again after the change. An identical
   line, or one that changes only the electric field components or the Polar
   charge, spin, Fermi level or electrostatics settings, still needs none.
+- Fixed `pair_coeff` of the Kokkos pair style terminating the process when
+  the model cannot be loaded (an unreadable file, a malformed model or an
+  unknown `head`). It now reports a LAMMPS error, which a Python `lammps` host
+  can catch.
 
 ### NequIP-OAM support
 

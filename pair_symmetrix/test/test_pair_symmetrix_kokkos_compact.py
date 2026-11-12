@@ -917,3 +917,58 @@ def test_changed_pair_style_options_with_pair_coeff_match_a_fresh_deck(
     np.testing.assert_allclose(
         result["second"]["forces"], fresh["forces"], rtol=1.0e-12, atol=1.0e-10
     )
+
+
+_RUN_FAILED_LOAD = r"""
+import json
+import sys
+
+from lammps import lammps
+
+spec = json.loads(sys.argv[1])
+lmp = lammps(cmdargs=spec["cmdargs"])
+lmp.commands_string(spec["setup"])
+try:
+    lmp.command(spec["coeff"])
+except Exception as exception:
+    print("LAMMPS_ERROR " + json.dumps(str(exception)))
+lmp.close()
+print("CLOSED")
+"""
+
+
+@pytest.mark.parametrize("failure", ["unknown-head", "missing-file"])
+def test_a_model_that_fails_to_load_is_a_lammps_error(
+    tmp_path, compact_model_path, failure
+):
+    # The loader throws a C++ exception for these inputs; without a LAMMPS
+    # error the library interface cannot catch it and the process terminates.
+    if failure == "unknown-head":
+        pair_style, model = f"{_REISSUE_BASE} head other", compact_model_path
+    else:
+        pair_style, model = _REISSUE_BASE, tmp_path / "missing-model.json"
+    lines = _static_deck(model, pair_style).splitlines()
+    coeff = next(line for line in lines if line.startswith("pair_coeff"))
+    spec = {
+        "cmdargs": ["-nocite", "-screen", "none", "-log", "none", *_kokkos_arguments()],
+        "setup": "\n".join(line for line in lines if line != coeff),
+        "coeff": coeff,
+    }
+    environment = os.environ.copy()
+    environment.update({"OMP_NUM_THREADS": "1", "OMP_PROC_BIND": "false"})
+    completed = subprocess.run(
+        [sys.executable, "-c", _RUN_FAILED_LOAD, json.dumps(spec)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=environment,
+    )
+    assert completed.returncode == 0, completed.stderr[-4000:]
+    errors = [
+        json.loads(line[len("LAMMPS_ERROR ") :])
+        for line in completed.stdout.splitlines()
+        if line.startswith("LAMMPS_ERROR ")
+    ]
+    assert len(errors) == 1, completed.stdout
+    assert f"could not load model '{model}'" in errors[0]
+    assert completed.stdout.splitlines()[-1] == "CLOSED"
