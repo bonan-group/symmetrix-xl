@@ -701,6 +701,7 @@ void MACEKokkos<Precision>::compute_A1_channel_tile(
     ensure_mh0_a1_forward_capacity(num_nodes);
 
     const auto l_max = this->l_max;
+    const auto num_channels = this->num_channels;
     const auto Phi1_l = this->Phi1_l;
     const auto Phi1 = this->Phi1;
     const auto tile_weights = this->A1_channel_tile_weights;
@@ -778,6 +779,7 @@ void MACEKokkos<Precision>::reverse_A1_channel_tile(
         throw std::logic_error("Invalid reverse Phi1 channel tile.");
 
     const auto l_max = this->l_max;
+    const auto num_channels = this->num_channels;
     const auto Phi1_l = this->Phi1_l;
     auto Phi1 = this->Phi1;
     const auto tile_weights_trans = this->A1_channel_tile_weights_trans;
