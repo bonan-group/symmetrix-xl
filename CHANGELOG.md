@@ -30,6 +30,11 @@ All notable changes to Symmetrix-XL are documented in this file.
   second-interaction reverse added its direct M0 adjoint to rows that still
   held the previous tile's, so forces and stress were wrong while energies
   were right. Each tile now starts from cleared rows.
+- Fixed the A1 channel-tile kernels that the same plan runs under the Phi1
+  policy `channel-tiled-64`: they read the evaluator's channel count through
+  the host object pointer, which a GPU can dereference only where it can
+  access host memory. They now copy it before the launch, as the neighbouring
+  kernels do; the values are unchanged.
 - Removed the compiled `team_cached` and `tiled_coupling` R1 strategies and
   runtime executor overrides. Generated execution is the only `direct` route
   for standard two-interaction MACE energy and forces; the in-evaluator serial
