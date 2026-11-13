@@ -912,7 +912,7 @@ def test_generated_r0_loader_binds_the_requested_schedule_identity():
 
     assert "bool apply_edge_weights = false,\n    std::string schedule" in header
     assert 'schedule != "receiver-edge16" && schedule != "receiver-edge32"' in runtime
-    assert "constexpr int r0_device_schedule_revision = 6;" in runtime
+    assert "constexpr int r0_device_schedule_revision = 7;" in runtime
     assert (
         'apply_edge_weights ? "weighted" : "unity", schedule,\n'
         "            r0_device_schedule_revision);" in runtime

@@ -1,7 +1,7 @@
 """Version inputs shared by runtime and package-time operator generation."""
 
 JIT_GENERATION_VERSION = 19
-R0_DEVICE_SCHEDULE_REVISION = 6
+R0_DEVICE_SCHEDULE_REVISION = 7
 R0_HOST_SCHEDULE_REVISION = 4
 
 __all__ = [

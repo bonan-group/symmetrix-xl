@@ -411,7 +411,7 @@ def test_runtime_r0_metadata_publishes_the_canonical_generated_identity():
         backend="cuda",
         target="sm_120",
         schedule="receiver-edge16",
-        schedule_revision=6,
+        schedule_revision=7,
     )
     assert host["artifact_id"] == host["generated_identity"]["artifact_id"]
     assert device["artifact_id"] == device["generated_identity"]["artifact_id"]
