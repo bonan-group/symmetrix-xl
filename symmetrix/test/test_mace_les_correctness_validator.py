@@ -117,6 +117,45 @@ def test_validator_recomputes_deviations_and_verifies_hashes(validator, tmp_path
     assert summary["deviations"]["force_max_abs_eV_per_A"] == pytest.approx(1e-8)
 
 
+def test_validator_compares_stress_on_the_mace_torch_volume(validator, tmp_path):
+    checkpoint = tmp_path / "model.pt"
+    converted = tmp_path / "model.json"
+    structure = tmp_path / "fixture.xyz"
+    checkpoint.write_bytes(b"checkpoint")
+    converted.write_text("{}")
+    structure.write_text("fixture")
+    reference = _result("upstream", checkpoint, converted, structure)
+    # A molecule in a 20 A box: Symmetrix divides the virial by the cell
+    # volume, mace-torch by the cell its neighbor search extends.
+    volumes = {"stress_volume_A3": 8000.0, "mace_torch_stress_volume_A3": 2460375.0}
+    scale = volumes["mace_torch_stress_volume_A3"] / volumes["stress_volume_A3"]
+    stress = [value * scale for value in reference["stress"]]
+
+    candidate = _result("symmetrix", checkpoint, converted, structure)
+    candidate.update(stress=stress, **volumes)
+    summary = validator.validate_documents(reference, candidate)
+    assert summary["passed"] is True
+    assert summary["deviations"]["stress_max_abs_eV_per_A3"] < 1.0e-15
+    assert summary["thresholds"]["stress_max_abs_eV_per_A3"] == 1.6e-7
+
+    # Without the two volumes the stress is compared as recorded.
+    unscaled = _result("symmetrix", checkpoint, converted, structure)
+    unscaled["stress"] = stress
+    with pytest.raises(validator.CorrectnessError, match="tolerance"):
+        validator.validate_documents(reference, unscaled)
+
+    for bad in (
+        {"stress_volume_A3": 8000.0},
+        {**volumes, "mace_torch_stress_volume_A3": 0.0},
+        {**volumes, "stress_volume_A3": float("nan")},
+        {**volumes, "stress_volume_A3": True},
+    ):
+        broken = _result("symmetrix", checkpoint, converted, structure)
+        broken.update(stress=stress, **bad)
+        with pytest.raises(validator.CorrectnessError, match="stress volumes"):
+            validator.validate_documents(reference, broken)
+
+
 def test_upstream_limits_freeze_checkpoint_export_envelopes(validator):
     assert validator.UPSTREAM_LIMITS == {
         "float32": (2.0e-5, 1.0e-4, 2.5e-6, 1.0e-6),

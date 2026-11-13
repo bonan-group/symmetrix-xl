@@ -83,6 +83,30 @@ def _array(document, name):
     return result
 
 
+def _stress_on_mace_torch_volume(document, stress, label):
+    """Return ``stress`` rescaled to the volume mace-torch normalizes it by.
+
+    Symmetrix divides the stress by the cell volume whenever the cell has one,
+    and mace-torch by a cell it extends along each nonperiodic axis for its
+    neighbor search. Comparing both on mace-torch's volume keeps the limits
+    above meaningful for nonperiodic structures. A record without the two
+    volumes, such as every upstream record, is on mace-torch's volume already.
+    """
+    names = ("stress_volume_A3", "mace_torch_stress_volume_A3")
+    if all(name not in document for name in names):
+        return stress
+    volumes = [document.get(name) for name in names]
+    if any(
+        isinstance(volume, bool)
+        or not isinstance(volume, (int, float))
+        or not math.isfinite(volume)
+        or volume <= 0.0
+        for volume in volumes
+    ):
+        raise CorrectnessError(f"{label} stress volumes must be finite and positive")
+    return stress * (volumes[0] / volumes[1])
+
+
 def _runtime_provenance(document, label):
     value = document.get("runtime_provenance")
     if not isinstance(value, dict):
@@ -148,6 +172,7 @@ def _validate_document(document, label):
         raise CorrectnessError(f"{label} atom array shapes are inconsistent")
     if arrays["stress"].shape != (6,):
         raise CorrectnessError(f"{label} stress must have exact Voigt-6 shape")
+    arrays["stress"] = _stress_on_mace_torch_volume(document, arrays["stress"], label)
     runtime = _runtime_provenance(document, label)
     return checkpoint, converted, structure, float(energy), arrays, runtime
 

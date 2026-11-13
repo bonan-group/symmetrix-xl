@@ -220,6 +220,21 @@ All notable changes to Symmetrix-XL are documented in this file.
   execution remains outside that record.
 - Published KokkosKernels TPL configuration to the native targets so compiled
   accelerator batched-BLAS routes and runtime capability reporting agree.
+- Fixed the `Symmetrix` calculator's MACE stress for cells that have a volume
+  and a nonperiodic axis, such as a vacuum-padded slab, a wire, or a molecule
+  in a box. It was divided by the volume of the cell that mace-torch's
+  neighbor search extends along each nonperiodic axis, which grows with the
+  atoms' distance from the origin, so it was not the strain derivative of the
+  energy per cell volume and changed under a rigid shift. The stress is again
+  divided by the cell volume, as in 0.1.2, whenever the cell has three lattice
+  vectors with a positive volume, so for these cells it differs from
+  mace-torch's stress by the ratio of the two volumes; only a cell without a
+  volume keeps the extended mace-torch volume. Fully periodic cells are
+  unchanged. MACELES accepts only fully periodic or fully nonperiodic
+  structures, so for it the change concerns a molecule in a box; MACE Polar
+  has its own stress policy and is unchanged. The MACELES correctness driver
+  compares with mace-torch on mace-torch's volume, so its tolerances keep
+  their meaning.
 - Fixed two Clang build stops. The Polar Kokkos pair style instantiated its
   templates outside `namespace LAMMPS_NS`, which Clang rejects, so every
   HIP (and other Clang) LAMMPS build stopped there. `-fbracket-depth=1024`,

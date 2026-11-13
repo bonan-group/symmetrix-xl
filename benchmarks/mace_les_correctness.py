@@ -15,6 +15,10 @@ from pathlib import Path
 import numpy as np
 
 SCHEMA = "symmetrix.mace-les-correctness/2"
+# Symmetrix records the volume its stress is divided by and the volume
+# mace-torch would divide the same stress by; the two differ for a cell with
+# a nonperiodic axis.
+STRESS_VOLUME_KEYS = ("stress_volume_A3", "mace_torch_stress_volume_A3")
 
 
 def _sha256(path):
@@ -122,6 +126,9 @@ def build_result_document(
         "forces": _json_array(results["forces"], "forces"),
         "latent_charges": _json_array(results["latent_charges"], "latent_charges"),
         "stress": _json_array(results["stress"], "stress"),
+        **{
+            name: float(results[name]) for name in STRESS_VOLUME_KEYS if name in results
+        },
     }
 
 
@@ -142,6 +149,7 @@ def _evaluate_upstream(atoms, checkpoint, precision, device):
 
 def _evaluate_symmetrix(atoms, converted_model, precision, mode):
     from symmetrix import Symmetrix
+    from symmetrix.calculator import _mace_stress_volume, _mace_torch_stress_volume
 
     calculator = Symmetrix(
         converted_model,
@@ -156,7 +164,11 @@ def _evaluate_symmetrix(atoms, converted_model, precision, mode):
     missing = sorted(required - calculator.results.keys())
     if missing:
         raise RuntimeError("MACELES evaluation omitted " + ", ".join(missing))
-    return calculator.results
+    volumes = (
+        _mace_stress_volume(atoms, calculator.cutoff),
+        _mace_torch_stress_volume(atoms, calculator.cutoff),
+    )
+    return {**calculator.results, **dict(zip(STRESS_VOLUME_KEYS, volumes))}
 
 
 def run(args):
