@@ -194,6 +194,16 @@ jobs:
           pytest -q -k 'not test_manual_schedules_match_whole_model_for_residual_first_models'
         deactivate
 
+    - name: Run required Polar pair style JIT tests
+      run: |
+        uv venv --clear "$RUNNER_TEMP/polar-jit-venv"
+        source "$RUNNER_TEMP/polar-jit-venv/bin/activate"
+        uv pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.5.*"
+        uv pip install pytest "mace-torch==0.3.16" ./symmetrix
+        SYMMETRIX_REQUIRE_LAMMPS_TESTS=1 \
+          pytest -q pair_symmetrix/test/test_pair_symmetrix_mace_polar_jit.py::test_polar_lammps_jit_matches_ase
+        deactivate
+
   extract-mace-model:
     runs-on: ubuntu-latest
     strategy:
