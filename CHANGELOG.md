@@ -51,6 +51,12 @@ All notable changes to Symmetrix-XL are documented in this file.
   in the capacity profile with the generated M0: the R0 reverse prepare now
   reduces the A0 scale adjoint in a fixed order instead of the generated M0
   adding it with an FP64 atomic. The built-in M0 is unchanged.
+- Fixed a race in the built-in R0 reverse prepare on GPUs
+  (`StandardR0::reverse_prepare`): with the precomputed scale adjoint of the
+  MH-0 adjoint reuse, a warp or wave could read `density_state(receiver)`
+  after another had overwritten it, giving wrong forces with correct energies
+  on models with A0 density scaling such as OMAT-0. A team barrier now
+  orders the two; the values are otherwise unchanged.
 - Fixed periodic calculations with the factorized observer or execution
   parameter gradients where the native Kokkos neighbor builder is selected
   (CUDA and HIP at 512 atoms or more, or `SYMMETRIX_NEIGHBOR_BACKEND=kokkos`):
