@@ -107,9 +107,9 @@ and D3 terms:
 
 ```text
 atom_style charge
-pair_style hybrid/overlay \
-    symmetrix/mace/kk streamed_edges non-compiled \
-    coul/long 10.0 \
+pair_style hybrid/overlay &
+    symmetrix/mace/kk streamed_edges non-compiled &
+    coul/long 10.0 &
     dispersion/d3 original pbe 30.0 20.0
 pair_coeff * * symmetrix/mace/kk /absolute/path/model.json C H O
 pair_coeff * * coul/long
@@ -269,7 +269,7 @@ lmp -var jit_artifact "$jit_artifact" -in in.mace
 ```
 
 ```text
-pair_style symmetrix/mace/float32/kk mpi_message_passing streamed_edges direct \
+pair_style symmetrix/mace/float32/kk mpi_message_passing streamed_edges direct &
            profile capacity jit_host_artifact ${jit_artifact}
 pair_coeff * * srtio3-mace.json Sr Ti O
 ```

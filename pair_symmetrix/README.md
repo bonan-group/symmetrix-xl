@@ -281,7 +281,7 @@ lmp -var jit_artifact "$jit_artifact" -in in.mace
 Use the matching artifact in `in.mace`:
 
 ```text
-pair_style symmetrix/mace/float32/kk mpi_message_passing streamed_edges direct \
+pair_style symmetrix/mace/float32/kk mpi_message_passing streamed_edges direct &
            profile capacity jit_host_artifact ${jit_artifact}
 pair_coeff * * srtio3-mace.json Sr Ti O
 ```
@@ -328,8 +328,8 @@ lmp -var jit_arguments "$jit_arguments" -in in.mace
 Use the variable in `in.mace`:
 
 ```text
-pair_style symmetrix/mace/float32/kk no_domain_decomposition streamed_edges direct \
-           profile capacity \
+pair_style symmetrix/mace/float32/kk no_domain_decomposition streamed_edges direct &
+           profile capacity &
            ${jit_arguments}
 pair_coeff * * srtio3-mace.json Sr Ti O
 ```
