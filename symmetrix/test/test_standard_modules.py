@@ -194,6 +194,16 @@ def test_r0_standard_module_owns_scalar_source_execution():
     assert "artifact_id" not in source
 
 
+def test_r0_reverse_prepare_overwrites_the_density_state_after_a_team_barrier():
+    # Every team member reads density_state(receiver) and one member then overwrites
+    # it. With the precomputed scale adjoint only a team barrier orders the two.
+    source = "".join((NATIVE / "standard_r0.hpp").read_text().split())
+    kernel = source[source.index('"StandardR0::reverse_prepare",') :]
+    read = kernel.index("=density_state(receiver);")
+    write = kernel.index("density_state(receiver)=", read)
+    assert "team_barrier()" in kernel[read:write]
+
+
 def test_direct_geometry_assigns_an_exact_inactive_radius_sentinel():
     lifecycle = (NATIVE / "mace_kokkos_factorized_lifecycle.cpp").read_text()
 
