@@ -156,7 +156,29 @@ def _use_device_neighbor_graph(request, eligible, num_atoms, execution_space):
 
 
 def _mace_stress_volume(atoms, cutoff=None):
-    """Return the cell volume used by MACE for stress normalization."""
+    """Return the volume that normalizes the MACE stress.
+
+    This is the cell volume whenever the cell has one, whatever its
+    periodicity, so the stress is the strain derivative of the energy per
+    cell volume. A cell without a volume takes the volume mace-torch divides
+    by, see :func:`_mace_torch_stress_volume`.
+    """
+
+    volume = abs(float(np.linalg.det(np.asarray(atoms.cell.array, dtype=float))))
+    if np.isfinite(volume) and volume > 0.0:
+        return volume
+    return _mace_torch_stress_volume(atoms, cutoff)
+
+
+def _mace_torch_stress_volume(atoms, cutoff=None):
+    """Return the volume mace-torch divides the MACE stress by.
+
+    mace-torch's neighbor search replaces the cell vector of each nonperiodic
+    axis by an extent of ``(max|positions| + 1) * 5 * cutoff`` along that axis
+    (a zero cell becomes the identity first), and mace-torch divides the virial
+    by the volume of that cell. The extent grows with the atoms' distance from
+    the origin.
+    """
 
     positions = np.asarray(atoms.positions, dtype=float)
     if positions.size == 0:

@@ -2042,6 +2042,53 @@ def test_symmetrix_calc_finite_diff(generated_standard_mace_zbl_model):
     do_grad_test(atoms, calc, True)
 
 
+def test_stress_uses_the_cell_volume_on_nonperiodic_axes(
+    generated_standard_mace_zbl_model,
+):
+    calc = Symmetrix(
+        generated_standard_mace_zbl_model,
+        dtype="float64",
+        streamed_edges="reference",
+    )
+    try:
+        from ase.calculators.fd import calculate_numerical_stress
+    except ImportError:  # older ASE
+        calculate_numerical_stress = calc.calculate_numerical_stress
+
+    # The fixture's energy is ZBL only and vanishes beyond 2 A, so the H-O
+    # contacts are 1.3 to 1.5 A.
+    offsets = np.array(
+        [[0.2, 0.3, 0.4], [1.4, 0.5, 0.8], [1.6, 1.9, 1.3], [0.4, 1.7, 2.0]]
+    )
+    # Bulk, a vacuum-padded slab, a wire, and a molecule in a box.
+    for pbc in (
+        [True, True, True],
+        [True, True, False],
+        [False, False, True],
+        [False, False, False],
+    ):
+        periodic = np.array(pbc)
+        atoms = Atoms(
+            "OHOH",
+            positions=offsets + np.where(periodic, 0.0, 3.0),
+            cell=np.where(periodic, [3.0, 3.2, 3.4], 20.0),
+            pbc=pbc,
+        )
+        atoms.calc = calc
+
+        stress = atoms.get_stress()
+        numerical = calculate_numerical_stress(atoms)
+
+        assert np.abs(numerical).max() > 1.0e-5
+        np.testing.assert_allclose(stress, numerical, rtol=1.0e-6, atol=1.0e-9)
+
+        # A rigid shift along the nonperiodic axes must not change the stress.
+        atoms.positions += np.where(periodic, 0.0, 10.0)
+        np.testing.assert_allclose(
+            atoms.get_stress(), stress, rtol=1.0e-9, atol=1.0e-12
+        )
+
+
 @pytest.mark.skipif(mace is None, reason="mace-torch is not available")
 def test_mace_onthefly_calc_finite_diff(mace_foundation_model):
     atoms = Atoms("O", cell=[2] * 3, pbc=[True] * 3)
