@@ -749,7 +749,7 @@ def test_r0_device_schedule_metadata_is_backend_and_architecture_specific(
     )
 
     assert metadata["schedule"] == "receiver-edge16"
-    assert metadata["schedule_revision"] == 6
+    assert metadata["schedule_revision"] == 7
     assert metadata["compatibility_version"] == 2
     assert metadata["abi_version"] == 5
     assert metadata["schedule_capabilities"] == [
@@ -886,6 +886,28 @@ def test_r0_medium_persistent_grid_uses_schedule_owner_geometry(
         )
 
     assert tuple(blocks) == expected
+
+
+@pytest.mark.parametrize("target", ("sm_120", "gfx1201"))
+@pytest.mark.parametrize("precision", ("float32", "float64"))
+def test_r0_reverse_prepare_overwrites_the_density_state_after_a_barrier(
+    target, precision
+):
+    # Every thread scales its part of the receiver row by density_state[receiver]
+    # and thread 0 then overwrites it with the scale adjoint. Without a block
+    # barrier between the two, a thread that reads late scales by the new value.
+    source, _ = render_jit_r0_device_module(
+        _contract("standard_r0_contract.json"),
+        precision=precision,
+        target=target,
+    )
+    kernel = source[source.index("void symmetrix_r0_reverse_prepare_v1(") :]
+    kernel = kernel[: kernel.index("void symmetrix_r0_coordinate_reverse_v1(")]
+    read = kernel.index("const double inverse = args.density_state[receiver];")
+    scale = kernel.index("output_adjoint[base+value] *= static_cast<Scalar>(inverse);")
+    write = kernel.index("args.density_state[receiver] = result*inverse;")
+    assert read < scale < write
+    assert "__syncthreads();" in kernel[scale:write]
 
 
 def test_r0_device_source_uses_contract_bounds_and_optimized_forward_families():

@@ -269,6 +269,16 @@ def test_r0_standard_module_owns_scalar_source_execution():
     assert "artifact_id" not in source
 
 
+def test_r0_reverse_prepare_overwrites_the_density_state_after_a_team_barrier():
+    # Every team member reads density_state(receiver) and one member then overwrites
+    # it. With the precomputed scale adjoint only a team barrier orders the two.
+    source = "".join((NATIVE / "mace_standard_r0.hpp").read_text().split())
+    kernel = source[source.index('"StandardR0::reverse_prepare",') :]
+    read = kernel.index("=density_state(receiver);")
+    write = kernel.index("density_state(receiver)=", read)
+    assert "team_barrier()" in kernel[read:write]
+
+
 def test_accelerator_r0_forward_args_use_shared_device_abi_lowering(tmp_path):
     compiler = shutil.which("c++") or shutil.which("g++")
     if compiler is None:
@@ -902,7 +912,7 @@ def test_generated_r0_loader_binds_the_requested_schedule_identity():
 
     assert "bool apply_edge_weights = false,\n    std::string schedule" in header
     assert 'schedule != "receiver-edge16" && schedule != "receiver-edge32"' in runtime
-    assert "constexpr int r0_device_schedule_revision = 6;" in runtime
+    assert "constexpr int r0_device_schedule_revision = 7;" in runtime
     assert (
         'apply_edge_weights ? "weighted" : "unity", schedule,\n'
         "            r0_device_schedule_revision);" in runtime

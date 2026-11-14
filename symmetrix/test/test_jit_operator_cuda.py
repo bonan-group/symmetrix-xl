@@ -966,7 +966,7 @@ def test_cuda_low_memory_runtime_specializes_custom_m0_r0(
     assert compact.jit_operator_modules["M0"]["schedule"] == schedule
     assert compact.jit_operator_modules["M1"]["schedule"] == schedule
     assert compact.jit_operator_modules["R0"]["schedule"] == r0_schedule
-    assert compact.jit_operator_modules["R0"]["schedule_revision"] == 6
+    assert compact.jit_operator_modules["R0"]["schedule_revision"] == 7
     assert compact.jit_operator_modules["R0"]["compatibility_version"] == 2
     assert evaluator.r0_module_id == compact.jit_operator_modules["R0"]["artifact_id"]
     assert evaluator.standard_m0_poly_values_capacity_bytes == 0
@@ -1298,7 +1298,7 @@ def test_cuda_standard_r0_medium_weighted_retained_grid(
         )
     if dtype == "float32":
         revision_mismatch = source.replace(
-            "symmetrix_operator_schedule_revision_v1 = 6;",
+            "symmetrix_operator_schedule_revision_v1 = 7;",
             "symmetrix_operator_schedule_revision_v1 = 4;",
         )
         assert revision_mismatch != source

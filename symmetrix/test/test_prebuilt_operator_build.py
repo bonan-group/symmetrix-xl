@@ -242,7 +242,7 @@ def test_production_device_r0_plan_renders_and_enters_installed_catalog(
 
     metadata = json.loads(metadata_path.read_text())
     assert metadata["artifact_id"] == selected["artifact_id"]
-    assert metadata["schedule_revision"] == 6
+    assert metadata["schedule_revision"] == 7
     assert metadata["abi_version"] == 5
     binary = tmp_path / f"operator{suffix}"
     binary.write_bytes(b"device-r0")

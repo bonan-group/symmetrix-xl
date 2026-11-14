@@ -2242,6 +2242,9 @@ void symmetrix_r0_reverse_prepare_v1(R0Args args) {
         const double inverse = args.density_state[receiver];
         for (int value=threadIdx.x; value<value_count; value+=blockDim.x)
             output_adjoint[base+value] *= static_cast<Scalar>(inverse);
+        // Every thread reads density_state[receiver] above and thread 0
+        // overwrites it below; the barrier puts the reads before the write.
+        __syncthreads();
         if (threadIdx.x == 0) {
             const double result = args.use_precomputed_scale_adjoint
                 ? args.precomputed_scale_adjoint[receiver] : partial[0];

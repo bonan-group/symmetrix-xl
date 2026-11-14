@@ -590,6 +590,10 @@ void launch_reverse_prepare(
                         flat%channel_count) *=
                         static_cast<Precision>(inverse_scale);
                 });
+            // Every member reads density_state(receiver) above and one
+            // overwrites it below. With the precomputed dot the reduction is
+            // skipped, so only this barrier puts the reads before the write.
+            team.team_barrier();
             Kokkos::single(Kokkos::PerTeam(team), [=]() {
                 density_state(receiver) = output_dot_adjoint*inverse_scale;
             });

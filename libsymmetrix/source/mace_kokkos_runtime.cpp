@@ -1743,7 +1743,7 @@ void MACEKokkos<Precision>::load_r0_device_module(
         throw std::invalid_argument(
             "Execution R0 device modules require a device Kokkos execution space.");
     } else {
-        constexpr int r0_device_schedule_revision = 6;
+        constexpr int r0_device_schedule_revision = 7;
         if (!uses_compact_radial || !standard_r0_has_model_contract
             || !r0_model_payload_verified)
             throw std::invalid_argument(
