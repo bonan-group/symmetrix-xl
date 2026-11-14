@@ -32,10 +32,20 @@ artifacts.
 Without `head NAME`, the JSON's declared default head is used. Original
 single-head JSON files use their existing behavior.
 
+The pair styles require `units metal`: the models take positions in Angstrom
+and return energies in eV.
+
 The final `Sr Ti O` assumes that Sr, Ti, and O correspond to LAMMPS
 types `1`, `2`, and `3`, respectively. A compact universal JSON can be reused by a
 different input with another element mapping; active radial tables are built
 once during `pair_coeff` for that mapping.
+
+`pair_coeff` loads the model with the options of the preceding `pair_style`
+line. After a `pair_style` line for the same style that changes an option, such
+as the domain mode, `streamed_edges`, `profile`, `head` or an artifact, issue
+`pair_coeff` again; otherwise the pair style stops at the next run. The
+electric field components, and the Polar pair style's charge, spin, Fermi
+level and electrostatics settings, can change without a new `pair_coeff`.
 
 Compact universal files use Symmetrix-XL format version 2. The original
 Symmetrix pair-spline format (named v1 here) is retired. The Python calculators
@@ -124,6 +134,13 @@ exchange. Host sub-styles such as `dispersion/d3` retain their own independent
 forward and reverse communication inside the overlay.
 `no_mpi_message_passing` is not supported with prepared direct execution.
 Other hybrid wrappers are rejected while parsing, before any workspace exists.
+A `pair_coeff` line that gives the pairs of some atom types to another
+sub-style (`pair_coeff 1 * zero` under `hybrid`, or `pair_coeff 1 * none` under
+`hybrid/overlay`) removes those atoms from this style's neighbor list.
+`no_domain_decomposition` evaluates the model on the remaining atoms.
+`mpi_message_passing` requires every owned atom in its list and stops with an
+error; on more than one rank use `no_mpi_message_passing` with
+`streamed_edges generic` or `materialized`.
 A JIT-generated CPU shared library can be selected with
 `jit_host_artifact /path/to/plugin.so`; CUDA/HIP modules use
 `jit_device_artifact /path/to/module.cubin` (or `.hsaco`). The native loaders

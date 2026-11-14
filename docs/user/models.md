@@ -204,6 +204,20 @@ readout are supported with canonical equal-channel hidden irreps. This includes
 both the `L_max=1` single-v2 layout and the earlier `L_max=2` single-layer
 layout. Their compact JSON contains only the M0 and R0 execution contracts.
 
+The exporter refuses standard-MACE options that the JSON cannot represent and
+names the option: a model without `scale_shift` (plain `MACE`),
+`embedding_specs`, `use_agnostic_product`, `use_last_readout_only`, a readout
+other than MACE's linear and non-linear readout blocks (such as
+`NonLinearBiasReadoutBlock`), and a non-linear readout gate other than SiLU.
+Each interaction's product may use correlation order 1, 2 or 3, also mixed
+per layer (for example `correlation=[3, 2]`); higher orders are refused. A
+multi-head model needs the same order in every layer: selecting a head with
+MACE's `remove_pt_head` rebuilds every product with the first one's order, so
+mixed orders are refused there.
+Pair-spline tables (`--radial-format pair-splines`) of a model trained with
+`apply_cutoff=False` include the polynomial cutoff that MACE applies in its
+interaction blocks, so they vanish at the cutoff as in the compact format.
+
 The installed generated-operator catalog covers the verified foundation-model
 contracts, not every valid compact model. Aliases of a verified model share its
 canonical artifact identity. A different channel width, angular cutoff,

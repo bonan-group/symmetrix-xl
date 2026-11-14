@@ -1001,12 +1001,91 @@ def _align_u_matrix_to_checkpoint(u_matrix, contraction, correlation, site, warn
 
 
 def _remove_prediction_head(model, head, device):
+    # remove_pt_head rebuilds the selected head with the correlation order of
+    # products[0] for every product, so the weights of a model with per-layer
+    # orders do not fit the rebuilt products.
+    orders = [
+        product.symmetric_contractions.contractions[0].correlation
+        for product in getattr(model, "products", ())
+    ]
+    if len(set(orders)) > 1:
+        raise ValueError(
+            "symmetrix cannot export MACE models with several heads and "
+            f"correlation orders {orders}: selecting a head with mace's "
+            "remove_pt_head rebuilds every product with the order of products[0]."
+        )
     previous_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(next(model.parameters()).dtype)
         return remove_pt_head(model, head).to(device=device, dtype=torch.float64)
     finally:
         torch.set_default_dtype(previous_dtype)
+
+
+def _refuse_unrepresented_mace_options(model, single_layer_invariant_readout):
+    """Raise for standard-MACE options that the exported JSON cannot represent.
+
+    The JSON stores per-element product weights, a scale and shift, bias-free
+    readouts (a linear one for each interaction but the last and a SiLU one for
+    the last), and no graph-level embedding.  A model outside that layout would
+    otherwise fail deep inside the extraction or export a different function.
+    """
+    from mace.modules.blocks import LinearReadoutBlock, NonLinearReadoutBlock
+
+    def refuse(option, detail):
+        raise ValueError(f"symmetrix cannot export MACE models with {option}: {detail}")
+
+    if not hasattr(model, "scale_shift"):
+        refuse(
+            "no scale_shift",
+            "only ScaleShiftMACE-type models are supported; "
+            f"got {type(model).__name__}.",
+        )
+    if hasattr(model, "joint_embedding") or hasattr(model, "embedding_readout"):
+        refuse(
+            "embedding_specs",
+            "the joint (graph-level) embedding and its readout are not exported.",
+        )
+    num_elements = len(model.atomic_numbers)
+    products = list(model.products) + list(getattr(model, "readout_products", ()))
+    for product in products:
+        for contraction in product.symmetric_contractions.contractions:
+            if contraction.weights_max.shape[0] != num_elements:
+                refuse(
+                    "use_agnostic_product",
+                    "the product basis must have weights per element.",
+                )
+
+    if single_layer_invariant_readout:
+        expected = (NonLinearReadoutBlock,)
+    else:
+        if len(model.readouts) != len(model.interactions):
+            refuse(
+                "use_last_readout_only",
+                f"{len(model.interactions)} interactions need one readout each; "
+                f"got {len(model.readouts)}.",
+            )
+        expected = (LinearReadoutBlock, NonLinearReadoutBlock)
+    for index, (readout, readout_cls) in enumerate(zip(model.readouts, expected)):
+        if not isinstance(readout, readout_cls):
+            refuse(
+                f"readout_cls {type(readout).__name__}",
+                f"readouts[{index}] must be a {readout_cls.__name__}.",
+            )
+        for name, parameter in readout.named_parameters():
+            if "bias" in name and parameter.numel() > 0:
+                refuse(
+                    f"a readout bias ({type(readout).__name__})",
+                    f"readouts[{index}].{name} is not exported.",
+                )
+    activation = model.readouts[-1].non_linearity.acts[0]
+    function = getattr(activation, "f", None)
+    if function is not torch.nn.functional.silu:
+        name = getattr(function, "__name__", repr(function))
+        refuse(
+            f"the non-linear readout gate {name}",
+            "the exported readout evaluates SiLU (MACE's default gate).",
+        )
 
 
 def _extract_single_head_data(
@@ -1157,6 +1236,14 @@ def _extract_single_head_data(
         raise RuntimeError(
             "Single-layer invariant readouts are currently supported only for MACE."
         )
+    _refuse_unrepresented_mace_options(model, single_layer_invariant_readout)
+    for index, product in enumerate(model.products):
+        product_correlation = product.symmetric_contractions.contractions[0].correlation
+        if product_correlation > 3:
+            raise ValueError(
+                f"products[{index}] has correlation {product_correlation}: "
+                "correlation orders above 3 are not supported."
+            )
 
     if is_macefield:
         if not hasattr(model, "field_feats") or not hasattr(model, "field_linear"):
@@ -1622,10 +1709,17 @@ def _extract_single_head_data(
                     torch.tensor([[model_i], [model_j]], dtype=torch.int64),
                     model.atomic_numbers,
                 )
+                cutoff = None
                 if isinstance(bessels, tuple):
-                    bessels = bessels[0]  # newer versions return (bessels, cutoffs)
+                    # newer versions return (bessels, cutoff); the cutoff is a
+                    # tensor only when the model applies it outside the basis
+                    # (apply_cutoff=False), as the interaction blocks then do.
+                    bessels, cutoff = bessels
                 # radial basis for interaction 0
-                R = model.interactions[0].conv_tp_weights(bessels).numpy(force=True)
+                R = model.interactions[0].conv_tp_weights(bessels)
+                if cutoff is not None:
+                    R = R * cutoff
+                R = R.numpy(force=True)
                 spl_0 = [
                     CubicSpline(r, R[:, k], bc_type=spline_bc_type)
                     for k in range(R.shape[1])
@@ -1635,7 +1729,10 @@ def _extract_single_head_data(
                     [spl.derivative()(r).tolist() for spl in spl_0]
                 )
                 if num_interactions == 2:
-                    R = model.interactions[1].conv_tp_weights(bessels).numpy(force=True)
+                    R = model.interactions[1].conv_tp_weights(bessels)
+                    if cutoff is not None:
+                        R = R * cutoff
+                    R = R.numpy(force=True)
                     spl_1 = [
                         CubicSpline(r, R[:, k], bc_type=spline_bc_type)
                         for k in range(R.shape[1])
@@ -1697,11 +1794,16 @@ def _extract_single_head_data(
                     torch.tensor([[model_i], [model_j]], dtype=torch.int64),
                     model.atomic_numbers,
                 )
+                cutoff = None
                 if isinstance(bessels, tuple):
-                    bessels = bessels[0]  # newer versions return (bessels, cutoffs)
-                R = torch.tanh(model.interactions[0].density_fn(bessels) ** 2).numpy(
-                    force=True
-                )
+                    # newer versions return (bessels, cutoff); the cutoff is a
+                    # tensor only when the model applies it outside the basis
+                    # (apply_cutoff=False), as the interaction blocks then do.
+                    bessels, cutoff = bessels
+                R = torch.tanh(model.interactions[0].density_fn(bessels) ** 2)
+                if cutoff is not None:
+                    R = R * cutoff
+                R = R.numpy(force=True)
                 spl = CubicSpline(r, R[:, 0], bc_type=spline_bc_type)
                 A0_spline_values.append(spl(r).tolist())
                 A0_spline_derivs.append(spl.derivative()(r).tolist())
@@ -1832,25 +1934,16 @@ def _extract_single_head_data(
         for l, irrep_out in enumerate(irreps_out):
             # extract U in sparse format
             U = cached_u_sparse(l, irrep_out)
-            # extract weights from model
-            # warning: slightly odd order of the contractions weights due to reverse countdown
-            W = [[]]  # list of lists because W[0] should be empty
-            W.append(
-                model.products[0]
-                .symmetric_contractions.contractions[l]
-                .weights[1]
-                .numpy(force=True)
-            )
-            W.append(
-                model.products[0]
-                .symmetric_contractions.contractions[l]
-                .weights[0]
-                .numpy(force=True)
-            )
-            W.append(
-                model.products[0]
-                .symmetric_contractions.contractions[l]
-                .weights_max.numpy(force=True)
+            # extract weights from model; W[0] stays empty.  weights[k] holds
+            # correlation order correlation - 1 - k, weights_max the highest one.
+            contraction = model.products[0].symmetric_contractions.contractions[l]
+            W = (
+                [[]]
+                + [
+                    contraction.weights[correlation - corr - 1].numpy(force=True)
+                    for corr in range(1, correlation)
+                ]
+                + [contraction.weights_max.numpy(force=True)]
             )
             # combine U and W into polynomial-like terms for recursive evaluator
             for m in range(-l, l + 1):
@@ -2184,11 +2277,16 @@ def _extract_single_head_data(
                     torch.tensor([[model_i], [model_j]], dtype=torch.int64),
                     model.atomic_numbers,
                 )
+                cutoff = None
                 if isinstance(bessels, tuple):
-                    bessels = bessels[0]  # newer versions return (bessels, cutoffs)
-                R = torch.tanh(model.interactions[1].density_fn(bessels) ** 2).numpy(
-                    force=True
-                )
+                    # newer versions return (bessels, cutoff); the cutoff is a
+                    # tensor only when the model applies it outside the basis
+                    # (apply_cutoff=False), as the interaction blocks then do.
+                    bessels, cutoff = bessels
+                R = torch.tanh(model.interactions[1].density_fn(bessels) ** 2)
+                if cutoff is not None:
+                    R = R * cutoff
+                R = R.numpy(force=True)
                 spl = CubicSpline(r, R[:, 0], bc_type=spline_bc_type)
                 A1_spline_values.append(spl(r).tolist())
                 A1_spline_derivs.append(spl.derivative()(r).tolist())
@@ -2283,7 +2381,7 @@ def _extract_single_head_data(
     # extract U in sparse format
     U = [[]]
     use_reduced_cg = bool(getattr(model, "use_reduced_cg", False))
-    for corr in range(1, 4):
+    for corr in range(1, correlation + 1):
         # get U matrix for this correlation order
         try:
             U_matrix = U_matrix_real(
@@ -2317,25 +2415,15 @@ def _extract_single_head_data(
                     u_sparse_corr[nu][lm_tuple_sorted] += U_matrix[j].item()
                 j += 1
         U.append(u_sparse_corr)
-    # extract weights from model
-    # warning: slightly odd order of the contractions weights due to reverse countdown
-    W = [[]]
-    W.append(
-        model.products[1]
-        .symmetric_contractions.contractions[0]
-        .weights[1]
-        .numpy(force=True)
-    )
-    W.append(
-        model.products[1]
-        .symmetric_contractions.contractions[0]
-        .weights[0]
-        .numpy(force=True)
-    )
-    W.append(
-        model.products[1]
-        .symmetric_contractions.contractions[0]
-        .weights_max.numpy(force=True)
+    # extract weights from model; W[0] stays empty (same order as for M0)
+    contraction = model.products[1].symmetric_contractions.contractions[0]
+    W = (
+        [[]]
+        + [
+            contraction.weights[correlation - corr - 1].numpy(force=True)
+            for corr in range(1, correlation)
+        ]
+        + [contraction.weights_max.numpy(force=True)]
     )
     # combine U and W into polynomial-like terms for recursive evaluator
     C = {}
@@ -2344,7 +2432,7 @@ def _extract_single_head_data(
         C[i] = {}
         for k in range(num_channels):
             P_ik = {}
-            for corr in range(1, 4):
+            for corr in range(1, correlation + 1):
                 for nu in range(len(U[corr])):
                     for key, value in U[corr][nu].items():
                         if key not in P_ik.keys():

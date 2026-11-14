@@ -17,13 +17,19 @@ _GLOBAL_RESULT = re.compile(
 )
 
 
+def _skip_or_fail(message):
+    if os.environ.get("SYMMETRIX_REQUIRE_LAMMPS_TESTS"):
+        pytest.fail(message, pytrace=False)
+    pytest.skip(message)
+
+
 def _required_path(environment_name, description):
     value = os.environ.get(environment_name)
     if not value:
-        pytest.skip(f"Set {environment_name} for {description}.")
+        _skip_or_fail(f"Set {environment_name} for {description}.")
     path = Path(value).resolve()
     if not path.is_file():
-        pytest.skip(f"{description.capitalize()} is unavailable: {path}")
+        _skip_or_fail(f"{description.capitalize()} is unavailable: {path}")
     return path
 
 
@@ -282,6 +288,99 @@ pair_coeff * * zero 6.0""",
     _assert_repeated(direct)
     _assert_repeated(overlay)
     assert direct["atoms"]["initial"][3, 9] != direct["atoms"]["rebuilt"][3, 9]
+
+
+def test_mpi_message_passing_stops_on_a_type_filtered_overlay(
+    tmp_path, direct_compact_model
+):
+    # pair_coeff * 3 none removes every pair of the third type, so the Symmetrix
+    # list skips its atoms. They sit on rank 0 only, so rank 0 stops on the list
+    # without every owned atom while rank 1, whose list is full, is ended by that
+    # stop instead of waiting in a collective; the time-out turns a wait into a
+    # failure.
+    executable = _required_path(
+        "SYMMETRIX_LAMMPS_EXECUTABLE",
+        "a Kokkos and MPI-enabled LAMMPS executable",
+    )
+    model, artifact = direct_compact_model((1, 8))
+    data_path = tmp_path / "filtered.data"
+    input_path = tmp_path / "in.filtered"
+    log_path = tmp_path / "filtered.log"
+    data_path.write_text(
+        """LAMMPS type-filtered hybrid fixture
+
+10 atoms
+3 atom types
+
+0 12 xlo xhi
+0 8 ylo yhi
+0 8 zlo zhi
+
+Atoms # atomic
+
+1 3 1.0 2.0 2.0
+2 1 2.5 4.0 4.0
+3 2 3.5 4.1 4.0
+4 1 4.5 3.9 4.1
+5 2 5.5 4.0 3.9
+6 1 6.5 4.1 4.0
+7 2 7.5 3.9 4.1
+8 1 8.5 4.0 3.9
+9 2 9.5 4.1 4.0
+10 3 1.0 6.0 6.0
+"""
+    )
+    input_path.write_text(
+        f"""
+units           metal
+atom_style      atomic/kk
+atom_modify     map yes sort 0 0
+boundary        p p p
+package         kokkos neigh half newton on
+newton          on
+processors      2 1 1
+read_data       {data_path}
+mass            1 1.008
+mass            2 15.999
+mass            3 39.95
+pair_style      hybrid/overlay/kk symmetrix/mace/kk mpi_message_passing streamed_edges direct profile speed jit_host_artifact {artifact} zero 6.0
+pair_coeff      * * symmetrix/mace/kk {model} H O H
+pair_coeff      * * zero 6.0
+pair_coeff      * 3 none
+neighbor        0.2 bin
+run             0
+"""
+    )
+    mpiexec = os.environ.get("MPIEXEC_EXECUTABLE") or shutil.which("mpiexec")
+    if not mpiexec:
+        _skip_or_fail("mpiexec is unavailable")
+    environment = os.environ.copy()
+    environment.update({"SYMMETRIX_JIT_POLICY": "none", "OMP_NUM_THREADS": "1"})
+    result = subprocess.run(
+        [
+            mpiexec,
+            "-n",
+            "2",
+            str(executable),
+            "-screen",
+            "none",
+            "-log",
+            str(log_path),
+            *_kokkos_arguments(),
+            "-in",
+            str(input_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert (
+        "mpi_message_passing requires every owned atom in its neighbor list"
+        in log_path.read_text()
+    )
 
 
 def test_host_d3_is_additive_under_mpi_hybrid_overlay(tmp_path):

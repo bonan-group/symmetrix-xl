@@ -69,6 +69,46 @@ All notable changes to Symmetrix-XL are documented in this file.
   sized the host communication buffers from them, and the per-atom message
   passing wrote past those buffers (a crash in CPU Kokkos builds).
   `init_style()` now raises the wrapper's sizes to this style's.
+- Fixed the default float32 calculator route (`streamed_edges="direct"` with
+  compact edge geometry) on frames without edges, such as an isolated atom or
+  atoms farther apart than the cutoff: it raised "Spherical-harmonic
+  coordinates do not cover all edge radii." instead of returning the atomic
+  energies. The float64 and reference routes already evaluated these frames.
+- Fixed the direct route on a graph without receivers, as in the first run of
+  a box created without atoms or on an MPI rank that owns no atom and no
+  ghost: H1 kept no trailing extents, the R1 launch stopped with "R1 tensor
+  shape is inconsistent with the plugin contract", and the run aborted. H1 and
+  its adjoint now keep the model's trailing extents with zero rows.
+- Fixed the Kokkos pair style on type-filtered neighbor lists, where
+  `pair_style hybrid` or `hybrid/overlay` gives the pairs of some atom types to
+  another sub-style and the list skips those atoms. `no_domain_decomposition`
+  indexed each neighbor by its local atom instead of its receiver row, which
+  read the wrong features or crashed whenever a skipped atom came before a
+  MACE atom; it now maps atoms to receiver rows. `mpi_message_passing`, which
+  needs every owned atom in its list, stops with an error naming the cause
+  instead of writing past its receiver rows.
+- Fixed the prepared `no_domain_decomposition` route of the Kokkos pair style
+  (`streamed_edges direct`) after an atom type changes without a neighbor list
+  build, as in `fix sgcmc`: it kept the graph built for the old types and
+  returned the energy and forces of the old species. The pair style now
+  compares the receivers' types with the graph's on each step and rebuilds the
+  graph when one differs.
+- Fixed the Kokkos and Polar pair styles after a re-issued `pair_style` line
+  changes their options following `pair_coeff`. LAMMPS passes such a line to
+  the existing pair style, which kept the model loaded with the earlier
+  options: a new `streamed_edges`, `profile`, `head` or artifact was ignored
+  silently, and a change of the domain mode crashed, for
+  `no_mpi_message_passing` also after a new `pair_coeff`. The next run now
+  stops with an error; issue `pair_coeff` again after the change. An identical
+  line, or one that changes only the electric field components or the Polar
+  charge, spin, Fermi level or electrostatics settings, still needs none.
+- Fixed `pair_coeff` of the Kokkos pair style terminating the process when
+  the model cannot be loaded (an unreadable file, a malformed model or an
+  unknown `head`). It now reports a LAMMPS error, which a Python `lammps` host
+  can catch.
+- Fixed both pair styles reading positions and returning energies in the
+  wrong units, without a message, under unit styles other than `metal`. They
+  now require `units metal` and stop with an error otherwise.
 
 ### NequIP-OAM support
 
@@ -191,6 +231,27 @@ All notable changes to Symmetrix-XL are documented in this file.
   U column's sign from the checkpoint's `U_matrix_<nu>` buffer and refuses a
   buffer that matches neither sign. Exports of checkpoints that already
   matched are unchanged.
+- Fixed MACE export of options the JSON cannot represent. A non-linear readout
+  gate other than SiLU (for example `tanh`) or a joint embedding
+  (`embedding_specs`) was exported silently and evaluated a different model;
+  `NonLinearBiasReadoutBlock` lost its biases; a missing gate,
+  `use_agnostic_product`, `use_last_readout_only` and plain `MACE` models
+  failed with an `AttributeError` or `IndexError`. The exporter now refuses
+  each with a `ValueError` that names the option. Supported models export
+  unchanged.
+- Fixed MACE export of models with correlation order 1 or 2 in any layer,
+  including mixed orders such as `correlation=[3, 2]`, which failed with
+  `IndexError: index 1 is out of range`. Orders above 3 are now refused with
+  a message instead of failing or exporting a truncated product, and so are
+  mixed orders in a multi-head model, which MACE's head selection cannot
+  rebuild. Order-3 exports are unchanged.
+- Fixed pair-spline export (`radial_format="pair-splines"`) of models with
+  `apply_cutoff=False`: MACE then returns the polynomial cutoff separately and
+  multiplies it into the radial weights and edge densities, but the exporter
+  dropped it, so the R0, R1, A0 and A1 tables did not vanish at the cutoff
+  (forces off by 2e-2 eV/A on a small test model, 0.46 eV/A with density
+  blocks). The tables now include the cutoff. Exports of models with the
+  cutoff in the radial basis are unchanged.
 
 ### CUDA packaging
 

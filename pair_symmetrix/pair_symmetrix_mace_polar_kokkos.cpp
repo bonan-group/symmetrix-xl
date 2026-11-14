@@ -17,6 +17,7 @@
 #include "neighbor.h"
 #include "neigh_list_kokkos.h"
 #include "neigh_request.h"
+#include "update.h"
 #include "utils.h"
 
 #include <algorithm>
@@ -148,6 +149,11 @@ void PairSymmetrixMACEPolarKokkos<DeviceType,Precision>::settings(
   }
   try {symmetrix::lammps::validate_polar_graph_settings(graph_settings_);}
   catch(const std::exception& exception) {error->all(FLERR,"{}",exception.what());}
+  // coeff() loads the model with the head and the artifact; the graph
+  // settings are read at every compute. LAMMPS passes a re-issued pair_style
+  // line with the same style to settings() of this instance and keeps the
+  // loaded model, so init_style() compares the two.
+  settings_key_=prediction_head_+'\n'+jit_target_+'\n'+jit_artifact_;
 }
 
 template<class DeviceType,typename Precision>
@@ -205,6 +211,7 @@ void PairSymmetrixMACEPolarKokkos<DeviceType,Precision>::coeff(
   type_metadata_upload_pending_=true;
   for(int i=1;i<=atom->ntypes;++i)
     for(int j=i;j<=atom->ntypes;++j)setflag[i][j]=1;
+  coeff_settings_key_=settings_key_;
 }
 
 template<class DeviceType,typename Precision>
@@ -216,12 +223,18 @@ double PairSymmetrixMACEPolarKokkos<DeviceType,Precision>::init_one(int,int)
 template<class DeviceType,typename Precision>
 void PairSymmetrixMACEPolarKokkos<DeviceType,Precision>::init_style()
 {
+  // The models take positions in Angstrom and return energies in eV; the unit
+  // style is final once the box exists.
+  if(strcmp(update->unit_style,"metal")!=0)
+    error->all(FLERR,"symmetrix/mace/polar/kk requires 'units metal'");
   symmetrix::lammps::PolarAdmissionRequest admission{
     comm->nprocs,atom->nlocal,static_cast<std::int64_t>(atom->natoms)};
   admission.hybrid_substyle=polar_hybrid_substyle(lmp);
   try {symmetrix::lammps::admit_polar_pair_style(admission);}
   catch(const std::exception& exception) {error->all(FLERR,"{}",exception.what());}
   if(!consumer_)error->all(FLERR,"Pair coefficients are not set for symmetrix/mace/polar/kk");
+  if(coeff_settings_key_!=settings_key_)
+    error->all(FLERR,"pair_style symmetrix/mace/polar/kk options changed after pair_coeff; issue pair_coeff again");
   if(atom->map_style==Atom::MAP_NONE) {
     atom->map_user=Atom::MAP_YES;
     atom->map_style=Atom::MAP_YES;

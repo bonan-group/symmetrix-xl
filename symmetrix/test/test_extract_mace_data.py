@@ -1347,3 +1347,333 @@ def test_export_refuses_a_u_buffer_in_another_basis():
             )
     finally:
         torch.set_default_dtype(previous_dtype)
+
+
+def _small_mace_model(**options):
+    """A small two-interaction ScaleShiftMACE with ``options`` applied."""
+    import inspect
+
+    from mace import modules
+
+    with torch.serialization.safe_globals([slice]):
+        from e3nn import o3
+
+    plain = options.pop("plain", False)
+    accepted = inspect.signature(modules.ScaleShiftMACE.__init__).parameters
+    accepted = set(accepted) | set(inspect.signature(modules.MACE.__init__).parameters)
+    missing = sorted(set(options) - accepted)
+    if missing:
+        pytest.skip(f"the installed mace does not provide {missing}")
+    kwargs = dict(
+        r_max=5.0,
+        num_bessel=3,
+        num_polynomial_cutoff=5,
+        max_ell=3,
+        interaction_cls=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        interaction_cls_first=modules.interaction_classes[
+            "RealAgnosticInteractionBlock"
+        ],
+        num_interactions=2,
+        num_elements=3,
+        hidden_irreps=o3.Irreps("2x0e + 2x1o"),
+        MLP_irreps=o3.Irreps("2x0e"),
+        gate=torch.nn.functional.silu,
+        atomic_energies=np.array([-1.1, -2.2, -3.3]),
+        avg_num_neighbors=8.0,
+        atomic_numbers=[1, 6, 8],
+        correlation=3,
+        radial_type="bessel",
+        use_reduced_cg=False,
+    )
+    if not plain:
+        kwargs.update(atomic_inter_shift=0.1, atomic_inter_scale=1.3)
+    kwargs.update(options)
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        torch.manual_seed(7)
+        model = (modules.MACE if plain else modules.ScaleShiftMACE)(**kwargs)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    return model.eval()
+
+
+def _mace_energy_forces_stress(model, atoms):
+    from mace.calculators import MACECalculator
+
+    atoms = atoms.copy()
+    atoms.calc = MACECalculator(models=[model], device="cpu", default_dtype="float64")
+    return (
+        atoms.get_potential_energy(),
+        atoms.get_forces().copy(),
+        atoms.get_stress().copy(),
+    )
+
+
+def _bias_readout_cls():
+    from mace.modules import blocks
+
+    if not hasattr(blocks, "NonLinearBiasReadoutBlock"):
+        pytest.skip("the installed mace does not provide NonLinearBiasReadoutBlock")
+    return blocks.NonLinearBiasReadoutBlock
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        (lambda: {"gate": torch.tanh}, "non-linear readout gate tanh"),
+        (lambda: {"gate": torch.abs}, "non-linear readout gate abs"),
+        (lambda: {"gate": None}, "non-linear readout gate None"),
+        (
+            lambda: {"readout_cls": _bias_readout_cls()},
+            "readout_cls NonLinearBiasReadoutBlock",
+        ),
+        (
+            lambda: {
+                "embedding_specs": {
+                    "total_charge": {
+                        "type": "categorical",
+                        "per": "graph",
+                        "num_classes": 5,
+                        "emb_dim": 2,
+                        "offset": 2,
+                    }
+                }
+            },
+            "embedding_specs",
+        ),
+        (lambda: {"use_agnostic_product": True}, "use_agnostic_product"),
+        (lambda: {"use_last_readout_only": True}, "use_last_readout_only"),
+        (lambda: {"plain": True}, "no scale_shift"),
+    ],
+    ids=[
+        "tanh-gate",
+        "abs-gate",
+        "no-gate",
+        "bias-readout",
+        "joint-embedding",
+        "agnostic-product",
+        "last-readout-only",
+        "plain-mace",
+    ],
+)
+def test_export_refuses_mace_options_the_json_cannot_represent(options, message):
+    from symmetrix.extract_mace_data import _extract_single_head_data
+
+    model = _small_mace_model(**options())
+    with pytest.raises(
+        ValueError, match=f"cannot export MACE models with (the )?{message}"
+    ):
+        _extract_single_head_data(model, radial_format="compact", num_spline_points=64)
+
+
+def test_silu_readout_export_matches_mace(tmp_path):
+    from ase import Atoms
+    from symmetrix import Symmetrix
+    from symmetrix.extract_mace_data import _extract_single_head_data
+
+    model = _small_mace_model()
+    data = _extract_single_head_data(model, radial_format="compact")
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps(data, separators=(",", ":")))
+    atoms = Atoms(
+        "COHHO",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.21, 0.05, -0.03],
+            [-0.62, 0.91, 0.12],
+            [-0.58, -0.94, 0.21],
+            [2.3, 1.1, 0.6],
+        ],
+        cell=[6.0, 6.5, 7.0],
+        pbc=True,
+    )
+    reference_energy, reference_forces, reference_stress = _mace_energy_forces_stress(
+        model, atoms
+    )
+    atoms.calc = Symmetrix(str(path), dtype="float64", streamed_edges="non-compiled")
+    assert atoms.get_potential_energy() == pytest.approx(
+        reference_energy, rel=0, abs=1e-8 * len(atoms)
+    )
+    np.testing.assert_allclose(atoms.get_forces(), reference_forces, rtol=0, atol=1e-6)
+    np.testing.assert_allclose(atoms.get_stress(), reference_stress, rtol=0, atol=1e-6)
+
+
+def _small_periodic_atoms():
+    from ase import Atoms
+
+    return Atoms(
+        "COHHO",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.21, 0.05, -0.03],
+            [-0.62, 0.91, 0.12],
+            [-0.58, -0.94, 0.21],
+            [2.3, 1.1, 0.6],
+        ],
+        cell=[6.0, 6.5, 7.0],
+        pbc=True,
+    )
+
+
+@pytest.mark.parametrize("correlation", [1, 2, [3, 2], [2, 3]], ids=str)
+def test_export_matches_mace_for_correlation_orders_below_three(tmp_path, correlation):
+    from symmetrix import Symmetrix
+    from symmetrix.extract_mace_data import _extract_single_head_data
+
+    model = _small_mace_model(correlation=correlation)
+    data = _extract_single_head_data(model, radial_format="compact")
+    path = tmp_path / "model.json"
+    path.write_text(json.dumps(data, separators=(",", ":")))
+    atoms = _small_periodic_atoms()
+    reference_energy, reference_forces, reference_stress = _mace_energy_forces_stress(
+        model, atoms
+    )
+    for options in ({"streamed_edges": "non-compiled"}, {}):
+        atoms.calc = Symmetrix(str(path), dtype="float64", **options)
+        assert atoms.get_potential_energy() == pytest.approx(
+            reference_energy, rel=0, abs=1e-8 * len(atoms)
+        )
+        np.testing.assert_allclose(
+            atoms.get_forces(), reference_forces, rtol=0, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            atoms.get_stress(), reference_stress, rtol=0, atol=1e-6
+        )
+
+
+def _two_head_model(correlation):
+    return _small_mace_model(
+        correlation=correlation,
+        heads=["a", "b"],
+        atomic_energies=np.array([[-1.1, -2.2, -3.3], [-0.5, -0.7, -0.9]]),
+        atomic_inter_scale=[1.3, 1.4],
+        atomic_inter_shift=[0.1, 0.2],
+    )
+
+
+def test_multi_head_export_matches_mace_for_each_head_at_correlation_two(tmp_path):
+    from mace.calculators import MACECalculator
+
+    from symmetrix import Symmetrix
+    from symmetrix.extract_mace_data import extract_mace_data
+
+    model = _two_head_model(2)
+    checkpoint = tmp_path / "two-head.model"
+    torch.save(model, checkpoint)
+    path = tmp_path / "two-head.json"
+    path.write_text(json.dumps(extract_mace_data(checkpoint, radial_format="compact")))
+    atoms = _small_periodic_atoms()
+    for head in ("a", "b"):
+        atoms.calc = MACECalculator(
+            models=[model], device="cpu", default_dtype="float64", head=head
+        )
+        reference_energy = atoms.get_potential_energy()
+        reference_forces = atoms.get_forces().copy()
+        for options in ({"streamed_edges": "non-compiled"}, {}):
+            atoms.calc = Symmetrix(str(path), dtype="float64", head=head, **options)
+            assert atoms.get_potential_energy() == pytest.approx(
+                reference_energy, rel=0, abs=1e-8 * len(atoms)
+            )
+            np.testing.assert_allclose(
+                atoms.get_forces(), reference_forces, rtol=0, atol=1e-6
+            )
+
+
+@pytest.mark.parametrize("correlation", [[3, 2], [2, 3]], ids=str)
+def test_multi_head_export_refuses_per_layer_correlation_orders(tmp_path, correlation):
+    from symmetrix.extract_mace_data import extract_mace_data
+
+    checkpoint = tmp_path / "two-head.model"
+    torch.save(_two_head_model(correlation), checkpoint)
+    with pytest.raises(ValueError, match="several heads and correlation orders"):
+        extract_mace_data(checkpoint, radial_format="compact")
+
+
+@pytest.mark.parametrize("products", [(1,), (0, 1)], ids=["second", "both"])
+def test_export_refuses_correlation_orders_above_three(products):
+    from symmetrix.extract_mace_data import _extract_single_head_data
+
+    model = _small_mace_model()
+    # Building an order-4 product is too costly for a unit test; the refusal
+    # reads only the declared order.
+    for index in products:
+        for contraction in model.products[index].symmetric_contractions.contractions:
+            contraction.correlation = 4
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"products\[{products[0]}\] has correlation 4: "
+            "correlation orders above 3 are not supported"
+        ),
+    ):
+        _extract_single_head_data(model, radial_format="compact", num_spline_points=64)
+
+
+def _mace_pair_radial_tables(model, num_spline_points):
+    """The radial weights mace-torch applies per element pair (cutoff included)."""
+    r = torch.linspace(
+        1e-12, model.r_max.item(), num_spline_points, dtype=torch.float64
+    )
+    num_types = len(model.atomic_numbers)
+    tables = {"radial_spline_values_0": [], "radial_spline_values_1": []}
+    density = "Density" in type(model.interactions[0]).__name__
+    if density:
+        tables.update(A0_spline_values=[], A1_spline_values=[])
+    with torch.no_grad():
+        for i in range(num_types):
+            for j in range(i, num_types):
+                bessels = model.radial_embedding(
+                    r.unsqueeze(-1),
+                    torch.eye(num_types, dtype=torch.float64),
+                    torch.tensor([[i], [j]], dtype=torch.int64),
+                    model.atomic_numbers,
+                )
+                bessels, cutoff = (
+                    bessels if isinstance(bessels, tuple) else (bessels, None)
+                )
+                scale = 1.0 if cutoff is None else cutoff
+                for layer in (0, 1):
+                    interaction = model.interactions[layer]
+                    tables[f"radial_spline_values_{layer}"].append(
+                        (interaction.conv_tp_weights(bessels) * scale).T.numpy()
+                    )
+                    if density:
+                        tables[f"A{layer}_spline_values"].append(
+                            (torch.tanh(interaction.density_fn(bessels) ** 2) * scale)[
+                                :, 0
+                            ].numpy()
+                        )
+    return tables
+
+
+@pytest.mark.parametrize("apply_cutoff", [False, True], ids=["external", "applied"])
+@pytest.mark.parametrize("density", [False, True], ids=["plain", "density"])
+def test_pair_spline_tables_include_the_cutoff(apply_cutoff, density):
+    from mace import modules
+    from symmetrix.extract_mace_data import _extract_single_head_data
+
+    options = {"apply_cutoff": apply_cutoff}
+    if density:
+        options.update(
+            interaction_cls_first=modules.interaction_classes[
+                "RealAgnosticDensityInteractionBlock"
+            ],
+            interaction_cls=modules.interaction_classes[
+                "RealAgnosticDensityResidualInteractionBlock"
+            ],
+        )
+    model = _small_mace_model(**options)
+    num_spline_points = 512
+    data = _extract_single_head_data(
+        model, radial_format="pair-splines", num_spline_points=num_spline_points
+    )
+    for key, expected in _mace_pair_radial_tables(model, num_spline_points).items():
+        np.testing.assert_allclose(
+            np.asarray(data[key]), np.asarray(expected), rtol=0, atol=1e-12
+        )
+    # every table vanishes at the cutoff
+    for key in ("radial_spline_values_0", "radial_spline_values_1"):
+        assert np.max(np.abs(np.asarray(data[key])[..., -1])) < 1e-12

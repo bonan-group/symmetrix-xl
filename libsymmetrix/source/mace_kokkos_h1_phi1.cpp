@@ -373,8 +373,13 @@ void MACEKokkos<Precision>::compute_H1(
             "compute_H1_linear_up, as in compute_node_energies_forces_field.");
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
-    if (H1.extent(0) < M0.extent(0))
-        Kokkos::realloc(H1, M0.extent(0), M0.extent(1), M0.extent(2));
+    // Keep the trailing extents on a graph without receivers: M0 then has no
+    // rows, and the R1 launch packet checks H1's trailing extents.
+    if (H1.extent(0) < M0.extent(0)
+            || H1.extent(1) < static_cast<std::size_t>(num_LM)
+            || H1.extent(2) < static_cast<std::size_t>(num_channels))
+        Kokkos::realloc(
+            H1, std::max(H1.extent(0), M0.extent(0)), num_LM, num_channels);
     // m0_composite: retain the scalar M0 block before any adjoint reuses M0.
     if (h1_affine_v4())
         capture_h1_affine_M0_scalar(num_nodes);
@@ -451,8 +456,13 @@ void MACEKokkos<Precision>::compute_H1_product(
 {
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
-    if (H1.extent(0) < M0.extent(0))
-        Kokkos::realloc(H1, M0.extent(0), M0.extent(1), M0.extent(2));
+    // Keep the trailing extents on a graph without receivers: M0 then has no
+    // rows, and the R1 launch packet checks H1's trailing extents.
+    if (H1.extent(0) < M0.extent(0)
+            || H1.extent(1) < static_cast<std::size_t>(num_LM)
+            || H1.extent(2) < static_cast<std::size_t>(num_channels))
+        Kokkos::realloc(
+            H1, std::max(H1.extent(0), M0.extent(0)), num_LM, num_channels);
     // Format v4 consumes the original scalar M0 block for the affine
     // readout/skip path.  Field-coupled models use this product entry point
     // instead of compute_H1, so capture it here before H1 is overwritten.

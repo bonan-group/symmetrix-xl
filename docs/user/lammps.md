@@ -126,6 +126,20 @@ double counted. See the LAMMPS
 [`kspace_style`](https://docs.lammps.org/kspace_style.html) documentation for
 the full runtime syntax.
 
+A `pair_coeff` line that gives the pairs of some atom types to another
+sub-style, such as `pair_coeff 1 * zero` under `hybrid` or `pair_coeff 1 * none`
+under `hybrid/overlay`, removes those atoms from the Symmetrix neighbor list.
+`no_domain_decomposition` evaluates the model on the remaining atoms.
+`mpi_message_passing` requires every owned atom in the list and stops with an
+error; on more than one rank use `no_mpi_message_passing` with
+`streamed_edges generic` or `materialized`.
+
+The Symmetrix pair styles require `units metal`.
+
+`pair_coeff` loads the model with the options of the preceding `pair_style`
+line. A later `pair_style` line for the same style that changes an option
+needs a new `pair_coeff`; otherwise the pair style stops at the next run.
+
 `--require-gpu-aware-mpi` implies `--mpi on`. Before CMake runs, the helper
 compiles a small program with the selected `mpicxx` and requires the same
 provider extension that LAMMPS queries: `MPIX_Query_cuda_support()` for CUDA or

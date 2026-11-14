@@ -30,6 +30,7 @@
 #include "neighbor.h"
 #include "neighbor_kokkos.h"
 #include "platform.h"
+#include "update.h"
 #include "neigh_list_kokkos.h"
 #include "neigh_request.h"
 
@@ -171,8 +172,9 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::allocate()
       setflag[i][j] = 0;
 
   memory->create(cutsq, atom->ntypes+1, atom->ntypes+1, "pair:cutsq");
-  if (ghostneigh)
-    memory->create(cutghost, atom->ntypes+1, atom->ntypes+1, "pair:cutghost");
+  // A re-issued pair_style line can switch to no_mpi_message_passing after
+  // the first pair_coeff allocated these arrays.
+  memory->create(cutghost, atom->ntypes+1, atom->ntypes+1, "pair:cutghost");
 }
 
 /* ----------------------------------------------------------------------
@@ -469,6 +471,29 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
       FLERR,
       "pair_style symmetrix/mace/kk _debug_dual_layer_workspace_receivers requires "
       "_debug_execution_plan mh0-dual-layer-tiled-v1");
+
+  // coeff() applies these options when it loads the model. LAMMPS passes a
+  // re-issued pair_style line with the same style to settings() of this
+  // instance and keeps the loaded model, so init_style() compares the options
+  // with the ones the model was loaded with. The electric field components are
+  // read at every compute and may change without a new pair_coeff.
+  settings_key.clear();
+  for (const std::string &value : {
+         mode, streamed_edges, execution_profile,
+         std::string(allow_fixed_workspace ? "1" : "0"), debug_execution_plan,
+         std::to_string(debug_single_layer_workspace_receivers),
+         std::to_string(debug_dual_layer_workspace_receivers), prediction_head,
+         jit_host_artifact, jit_device_artifact, jit_m0_device_artifact,
+         jit_r0_device_artifact, jit_m0_device_schedule,
+         std::to_string(jit_device_blocks_per_compute_unit),
+         std::string(jit_device_blocks_per_compute_unit_set ? "1" : "0"),
+         std::to_string(jit_m0_device_blocks_per_compute_unit),
+         std::to_string(jit_r0_device_blocks_per_compute_unit),
+         jit_r0_device_schedule,
+         std::string(electric_field_set ? "1" : "0")}) {
+    settings_key += value;
+    settings_key += '\n';
+  }
 }
 
 /* ----------------------------------------------------------------------
@@ -482,18 +507,31 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
   if (narg != atom->ntypes + 3)
     error->all(FLERR, "Incorrect args for pair coefficients");
 
-  if (symmetrix_is_nonlinear_model(arg[2]))
+  // The loader reports an unreadable file, a malformed model or an unknown
+  // head as a C++ exception, which LAMMPS does not catch; report it as a
+  // LAMMPS error so that the input stops cleanly. The failure can be local to
+  // one rank (a file it cannot read), so stop that rank rather than wait in a
+  // collective error for ranks that loaded the model; when every rank fails,
+  // each prints its own line.
+  bool nonlinear_model = false;
+  try {
+    nonlinear_model = symmetrix_is_nonlinear_model(arg[2]);
+    if (!nonlinear_model) {
+      utils::logmesg(lmp, "Loading MACEKokkos model from \'{}\' ... ", arg[2]);
+      mace = std::make_unique<MACEKokkos<Precision>>(arg[2], prediction_head);
+      mace->set_allow_fixed_workspace(allow_fixed_workspace);
+      if (debug_single_layer_workspace_receivers != 0)
+        mace->set_single_layer_workspace_receiver_limit_for_testing(
+          debug_single_layer_workspace_receivers);
+      if (debug_dual_layer_workspace_receivers != 0)
+        mace->set_dual_layer_workspace_receiver_limit_for_testing(
+          debug_dual_layer_workspace_receivers);
+    }
+  } catch (const std::exception& exception) {
+    error->one(FLERR, "pair_style symmetrix/mace/kk could not load model '{}': {}", arg[2], exception.what());
+  }
+  if (nonlinear_model)
     error->all(FLERR, "MACE_Nonlinear models are not supported by pair_style symmetrix/mace/kk in this release");
-
-  utils::logmesg(lmp, "Loading MACEKokkos model from \'{}\' ... ", arg[2]);
-  mace = std::make_unique<MACEKokkos<Precision>>(arg[2], prediction_head);
-  mace->set_allow_fixed_workspace(allow_fixed_workspace);
-  if (debug_single_layer_workspace_receivers != 0)
-    mace->set_single_layer_workspace_receiver_limit_for_testing(
-      debug_single_layer_workspace_receivers);
-  if (debug_dual_layer_workspace_receivers != 0)
-    mace->set_dual_layer_workspace_receiver_limit_for_testing(
-      debug_dual_layer_workspace_receivers);
   utils::logmesg(lmp, "success\n");
   const std::string requested_streamed_edges = streamed_edges;
   if (streamed_edges == "auto") {
@@ -717,6 +755,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
   for (int i=1; i<atom->ntypes+1; i++)
     for (int j=i; j<atom->ntypes+1; j++)
       setflag[i][j] = 1;
+  coeff_settings_key = settings_key;
 }
 
 /* ----------------------------------------------------------------------
@@ -744,6 +783,12 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::init_style()
   execution_timing_enabled = 0.0;
   if (atom->map_user == atom->MAP_NONE) error->all(FLERR, "symmetrix/mace/kk requires \'atom_modify map [yes|array|hash]\'");
   if (force->newton_pair == 0) error->all(FLERR, "symmetrix/mace/kk requires newton pair on");
+  // The models take positions in Angstrom and return energies in eV; the unit
+  // style is final once the box exists.
+  if (strcmp(update->unit_style, "metal") != 0)
+    error->all(FLERR, "symmetrix/mace/kk requires \'units metal\'");
+  if (coeff_settings_key != settings_key)
+    error->all(FLERR, "pair_style symmetrix/mace/kk options changed after pair_coeff; issue pair_coeff again");
 
   // Under pair_style hybrid or hybrid/overlay, Comm::init sizes the host
   // communication buffers from the wrapper's comm_forward and comm_reverse.
@@ -1130,10 +1175,30 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
   if (node_indices.size() < num_nodes) Kokkos::realloc(node_indices, num_nodes);
   if (node_types.size() < num_nodes) Kokkos::realloc(node_types, num_nodes);
   if (num_neigh.size() < num_nodes) Kokkos::realloc(num_neigh, num_nodes);
+  if (node_of_atom.size() < static_cast<std::size_t>(atom->nlocal))
+    Kokkos::realloc(node_of_atom, atom->nlocal);
   auto node_indices = Kokkos::subview(this->node_indices, Kokkos::make_pair(0,num_nodes));
   auto node_types = Kokkos::subview(this->node_types, Kokkos::make_pair(0,num_nodes));
   auto num_neigh = Kokkos::subview(this->num_neigh, Kokkos::make_pair(0,num_nodes));
+  // Neighbors are indexed by their receiver row, not by their local atom
+  // index: under pair_style hybrid a type-filtered list (atoms of some type
+  // given to another sub-style) skips atoms, so the two differ. A kept
+  // neighbor is always a receiver, since the list keeps a pair only when both
+  // of its types belong to this style.
+  auto node_of_atom = this->node_of_atom;
   auto mace_types = this->mace_types;
+  if (!rebuild_topology) {
+    // An atom type can change without a neighbor list build (fix sgcmc
+    // evaluates a trial species in place), and the prepared graph keeps the
+    // types it was built with.
+    int changed_node_types = 0;
+    Kokkos::parallel_reduce("PairSymmetrixMACEKokkos::count_changed_node_types",
+      num_nodes,
+      KOKKOS_LAMBDA (const int ii, int& count) {
+        if (node_types(ii) != mace_types(type(d_ilist(ii))-1)) count += 1;
+      }, changed_node_types);
+    rebuild_topology = changed_node_types != 0;
+  }
   int num_edges = execution_num_edges;
   if (rebuild_topology) {
     // sync the map the atom style uses.  a hash filled on the host (legacy
@@ -1153,6 +1218,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
         const int ii = team_member.league_rank();
         const int i = d_ilist(ii);
         node_indices(ii) = i;
+        node_of_atom(i) = ii;
         node_types(ii) = mace_types(type(i)-1);
         const double x_i = x(i,0);
         const double y_i = x(i,1);
@@ -1224,7 +1290,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
           if (rebuild_topology) {
             const int j_local = AtomKokkos::map_kokkos<DeviceType>(
               tag(j),map_style,k_map_array,k_map_hash);
-            neigh_indices(ij) = j_local;
+            neigh_indices(ij) = node_of_atom(j_local);
             neigh_types(ij) = mace_types(type(j)-1);
           }
           xyz(3*ij) = scale*dx;
@@ -1300,7 +1366,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_no_domain_decomposi
         Kokkos::TeamThreadRange(team_member, num_neigh(ii)),
         [&] (const int jj, double& f_x, double& f_y, double& f_z) {
           const int ij = first_neigh(ii) + jj;
-          const int j = neigh_indices(ij);
+          const int j = node_indices(neigh_indices(ij));
           f_x += mace_node_forces(3*ij);
           f_y += mace_node_forces(3*ij+1);
           f_z += mace_node_forces(3*ij+2);
@@ -1403,9 +1469,15 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute_mpi_message_passing
     error->one(FLERR,
       "pair_style symmetrix/mace/kk local feature-node count exceeds INT_MAX");
   const int num_feature_nodes = static_cast<int>(num_feature_nodes_size);
-  if (stable_execution && num_nodes != atom->nlocal)
-    error->all(FLERR,
-      "Factorized MPI execution requires one receiver for every owned atom");
+  // The per-atom message passing indexes receivers by local atom. The
+  // condition is rank-local, so stop this rank: a collective error would wait
+  // for ranks whose lists are full.
+  if (num_nodes != atom->nlocal)
+    error->one(FLERR,
+      "pair_style symmetrix/mace/kk mpi_message_passing requires every owned "
+      "atom in its neighbor list; a hybrid pair_coeff assignment removed atoms "
+      "of some type. Use no_domain_decomposition on one rank, or "
+      "no_mpi_message_passing with streamed_edges generic or materialized.");
   bool rebuild_topology = !stable_execution
     || execution_graph_generation == 0 || neighbor->ago == 0
     || num_nodes != execution_num_nodes

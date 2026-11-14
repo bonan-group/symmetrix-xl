@@ -224,8 +224,7 @@ void MACEKokkos<Precision>::compute_Y(
     if ((!compact_geometry
             && (xyz.extent(0)%3 != 0 || xyz.extent(0) < 3*num_edges))
         || (compact_geometry
-            && (r.extent(0) == 0
-                || execution_prepared_unit_direction.extent(0) < 3*num_edges)))
+            && execution_prepared_unit_direction.extent(0) < 3*num_edges))
         throw std::invalid_argument(
             "Spherical-harmonic coordinates do not cover all edge radii.");
     const int num = static_cast<int>(num_edges);
