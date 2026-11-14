@@ -459,6 +459,32 @@ def test_dual_layer_tail_batches_reuse_disjoint_generated_adjoints(
     ) == first_allocations
 
 
+@pytest.mark.parametrize(
+    "dtype,rtol,atol", (("float32", 2.0e-4, 2e-5), ("float64", 1.0e-10, 1e-11))
+)
+def test_dual_layer_reports_active_node_energies_after_shrinking(
+    dual_layer_model, dtype, rtol, atol
+):
+    _require_cuda_backend()
+    calculator = _calculator(dual_layer_model, PLAN, capacity=4, dtype=dtype)
+    _evaluate(calculator, _atoms(9))
+    atoms = _atoms(5)
+    actual, _ = _evaluate(calculator, atoms)
+    fresh, _ = _evaluate(
+        _calculator(dual_layer_model, PLAN, capacity=4, dtype=dtype), atoms
+    )
+    expected, _ = _evaluate(
+        _calculator(dual_layer_model, REFERENCE_PLAN, dtype=dtype), atoms
+    )
+
+    assert calculator.execution_plan["selected_id"] == PLAN
+    assert calculator.evaluator.factorized_fallback_evaluation_count == 0
+    assert actual["energies"].shape == (len(atoms),)
+    for name in PROPERTIES:
+        np.testing.assert_allclose(actual[name], fresh[name], rtol=rtol, atol=atol)
+        np.testing.assert_allclose(actual[name], expected[name], rtol=rtol, atol=atol)
+
+
 def test_dual_layer_rejects_host_backend(dual_layer_model):
     import symmetrix as native
 
