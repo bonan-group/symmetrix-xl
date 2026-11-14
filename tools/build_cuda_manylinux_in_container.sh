@@ -70,7 +70,6 @@ mkdir -p "$raw_dir" "$repaired_dir"
   --cuda-root /usr/local/cuda \
   --accelerator-blas-root /opt/symmetrix-openblas \
   --prebuilt-operator-artifacts r0 \
-  --prebuilt-oam-artifacts known \
   --build-root /tmp/build \
   --wheel-dir "$raw_dir" \
   --jobs "${JOBS:-4}"

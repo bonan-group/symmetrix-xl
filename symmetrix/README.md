@@ -211,58 +211,6 @@ MACEField checkpoints must be converted before use. Passing an original
 MACEField checkpoint directly to the calculator is rejected rather than
 silently delegating evaluation to PyTorch.
 
-### NequIP OAM
-
-NequIP support uses the OAM v2 versioned JSON contract. Install the optional
-exporter stack in a fresh environment and export an upstream OAM package or
-checkpoint:
-
-```bash
-uv pip install "symmetrix-xl[nequip]"   # torch, nequip, and e3nn
-symmetrix_extract_nequip \
-    --model NequIP-OAM-S-0.1.nequip.zip \
-    --output oam-s-nequip.json
-```
-
-Runtime evaluation accepts the OAM v2 JSON contract with
-`symmetrix_nequip_format_version=2` and `architecture="oam"`. The contract
-retains a universal H through Pu element mapping, model cutoff, ordered layers,
-and precision-independent parameters. Runtime evaluation uses the exported
-JSON, ASE, and the native Symmetrix extension; PyTorch, NequIP, and e3nn remain
-exporter/reference dependencies. Implementation and generated-artifact paths
-exist for OAM-S/M/L/XL on host and
-CUDA, but this historical or compile evidence is not current published
-qualification. Fresh runtime qualification remains pending after the
-artifact-contract change. Live upstream FP64 parity and repaired-wheel
-inclusion are open gates. HIP, multi-GPU, and LAMMPS/MPI execution are
-unsupported; other CUDA targets may be artifact-available while remaining
-runtime-unqualified. The earlier `sm80`
-package/generated-path record predates ABI v4 and requires a merged-source
-rerun.
-
-Unsupported modules fail during export with a qualified diagnostic. Original
-`.nequip`/`.nequip.zip` packages, PyTorch checkpoints, and AOTInductor `.pt2`
-artifacts are upstream reference inputs and are not loaded implicitly by the
-native calculator. See the [model guide](../docs/user/models.md#nequip-and-oam)
-for current OAM support and artifact boundaries.
-
-The CPU and CUDA release-wheel build plan includes FP32 and FP64 generated
-artifacts for the known OAM-S/M/L/XL architectures; repaired-wheel inclusion
-remains a release gate. `NequIPCalculator` selects one only when the
-model's explicit ordered layer, irrep/channel, angular-order, tensor-product,
-and radial-table layout matches exactly; model paths and learned-weight hashes
-are not selection keys. A custom architecture is generated during preparation
-and stored in the configured runtime JIT cache when the matching compiler is
-available. As for MACE, the installed catalog reduces time to first energy but
-is not a correctness fallback.
-
-See the
-[model guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/user/models.md)
-for supported model families, multi-head models, precision, and conversion
-options. NequIP-OAM users should also follow the
-[publication guide](https://github.com/bonan-group/symmetrix-xl/blob/main/docs/reference/publications.md#nequip-oam)
-for the NequIP and OAM papers to cite.
-
 ## ASE calculator
 
 Use the compact model as a drop-in replacement for the usual MACECalculator in

@@ -1,7 +1,7 @@
 # Adding a Model Family
 
 A *family* is one retained model architecture the frontends serve: MH-0
-MACE/MACEField, MH-1 (`MACE_Nonlinear`), MACE Polar, and the NequIP OAM contract. A family
+MACE/MACEField, MH-1 (`MACE_Nonlinear`), and MACE Polar. A family
 owns its scientific kernels, its contract, its code generator, its artifact
 adapters, and its frontend. The shared layer owns only the contracts a family
 plugs into, so porting a family is parallel-friendly inside the family files and
@@ -21,8 +21,8 @@ carrying contract parameters plus `BufferContract`/`LayoutContract` data, with a
 report), `ArtifactRequest`/`ArtifactReadiness`, and `FamilyDiagnostics`. The
 compile-time gate is the `FamilyEvaluator` concept and its `TieredFamilyEvaluator`
 refinement, asserted in the family's own translation unit — for example
-`static_assert(symmetrix::execution::TieredFamilyEvaluator<NequIPOAMKokkos<float>>)`
-in `libsymmetrix/source/oam_kokkos.cpp`.
+`static_assert(symmetrix::execution::TieredFamilyEvaluator<MACEKokkos<float>>)`
+in `libsymmetrix/source/mace_kokkos_runtime.cpp`.
 
 **Execution layer** (`libsymmetrix/source/implementation_registry.hpp`). The
 family declares an `ImplementationRegistry` through
@@ -82,7 +82,7 @@ same scientific program.
 ## Family-side pattern
 
 Read `symmetrix/source/symmetrix/mace_family.py`,
-`mace_nonlinear_family.py`, `mace_polar_family.py`, and `oam_family.py` before
+`mace_nonlinear_family.py`, and `mace_polar_family.py` before
 writing yours; each is a declaration-only module of the same shape.
 
 `FamilyEntry` carries `key`, `precedence`, `detection`, `evaluators`, `modes`,
@@ -91,8 +91,7 @@ writing yours; each is a declaration-only module of the same shape.
 `artifacts`:
 
 - `Detection(model_types=..., architectures=...)` — the model-file keys that
-  admit a model. MACE and MH-1 detect by `model_type`, OAM by the `oam`
-  architecture marker.
+  admit a model. MACE and MH-1 detect by `model_type`.
 - `EvaluatorVariant` — exactly one evaluator class per precision
   (`float32`/`float64`); `declared_error` names the build-support failure a
   backend without the class must report before initializing a runtime.
@@ -125,7 +124,8 @@ the surface it drives, and whether it leaves a completed evaluation the stress
 reduction can consume. The two compact families share
 `family_registry.COMPACT_MODE_VOCABULARY`, declared beside the entry data model
 rather than inside one family's declaration, so a compact declaration points at
-it instead of owning it; OAM declares its own literal `ModeVocabulary`.
+it instead of owning it; a family with different rules declares its own literal
+`ModeVocabulary`.
 
 The three R1 artifact adapters share
 `symmetrix/source/symmetrix/mace_jit_artifact_common.py`: `read_model_json`,
@@ -160,7 +160,7 @@ and `family_registry.py` carry no family token.
 
 ## Shared-file edits
 
-A family that ships its own calculator (the OAM pattern) needs items 1–3 and
+A family that ships its own calculator needs items 1–3 and
 6–11; joining the compact frontend adds item 4 as well. Items 1–2 gate the
 build, items 3, 6, 7, and 10 gate a test or a validation, and items 8, 9, and 11
 are the family's own qualification declarations: one new module carries all
@@ -180,7 +180,7 @@ routing-parity suite read whatever the family's own module registers.
 2. **`symmetrix/CMakeLists.txt`** — add the family's binding translation units
    to `SYMMETRIX_BINDINGS` and/or `SYMMETRIX_BINDINGS_KOKKOS`. The native
    extension exposes the evaluator class the `FamilyEntry` variant names through
-   these (for example `source/cpp/oam_kokkos.cpp`).
+   these (for example `source/cpp/mace_kokkos.cpp`).
 3. **`symmetrix/test/test_family_registry.py`** — extend the `SHIPPED` tuple
    with `(key, declaration module)`. `test_declared_entries_are_the_shipped_families_in_precedence_order`
    asserts the declared order equals it, so the tuple is the enforcement point
@@ -194,11 +194,10 @@ routing-parity suite read whatever the family's own module registers.
    outputs in Python. A family that ships its own calculator class does not
    edit the compact frontend beyond generic adapter resolution.
 5. **`symmetrix/source/symmetrix/__init__.py`** — extend `__all__` only when the
-   family exports its own calculator class (as `NequIPCalculator` is exported
-   today).
+   family exports its own calculator class.
 6. **`precedence`** — pick a globally unique integer in the family's own
    declaration (`mace_nonlinear_family.py` is `0`, `mace_family.py` is `1`,
-   `mace_polar_family.py` is `2`, `oam_family.py` is `3`) and update `SHIPPED`
+   `mace_polar_family.py` is `2`) and update `SHIPPED`
    order to match. `FamilyRegistry`
    rejects a duplicate precedence, and the first admitter wins an overlapping
    detection key. This is a family-file value, but it is coupled to item 3.
@@ -227,8 +226,8 @@ routing-parity suite read whatever the family's own module registers.
    suite (`test_family_conformance.py`) nor the registry lists a family.
 9. **per-family interface tests, in that same module** — drive the neutral
    surface for each evaluator and assert the additive tier-binding report fields
-   (`test_oam_evaluator_satisfies_the_family_interface_without_an_artifact` and
-   its MACE/MH-1 siblings are the pattern, and
+   (`test_mace_evaluator_satisfies_the_family_interface_and_reports_the_binding` and
+   its MH-1/Polar siblings are the pattern, and
    `test_selected_implementation_id_names_the_dispatched_implementation` is
    where the binding authority is pinned against the dispatch).
    `test_family_interface_conformance.py` keeps only the contract stated once
@@ -261,13 +260,6 @@ routing-parity suite read whatever the family's own module registers.
     the appropriate `docs/` section and updates its index navigation.
     Keep raw qualification results outside tracked documentation.
     Documentation and contract changes land together.
-
-## Worked example: the NequIP OAM port
-
-The OAM family is a reference port. Its current execution contract is in
-{doc}`/reference/execution_support_matrix` and {doc}`/user/models`. Its
-family-side contract, exporter, code generators, adapters, and calculator
-provide concrete examples of the surfaces described above.
 
 ## Qualification expectations for a new family
 

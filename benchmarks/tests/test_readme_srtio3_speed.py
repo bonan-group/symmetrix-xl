@@ -9,8 +9,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
-
 import pytest
 
 
@@ -72,9 +70,9 @@ def test_energy_per_atom_and_force_bounds_are_both_enforced(adapter):
     with pytest.raises(RuntimeError, match="parity"):
         adapter.compare_ef(reference, direct, "mace-omat-0-medium")
     direct["energy"] = 0.0
-    direct["forces"] = [[0.0006, 0.0, 0.0]] * 40
+    direct["forces"] = [[0.006, 0.0, 0.0]] * 40
     with pytest.raises(RuntimeError, match="parity"):
-        adapter.compare_ef(reference, direct, "oam-s")
+        adapter.compare_ef(reference, direct, "mace-mh-1")
 
 
 @pytest.mark.parametrize("bad", [math.nan, math.inf])
@@ -82,10 +80,12 @@ def test_nonfinite_or_wrong_shape_results_cannot_earn_parity(adapter, bad):
     reference = {"energy": 0.0, "forces": [[0.0, 0.0, 0.0]] * 40}
     with pytest.raises(ValueError):
         adapter.compare_ef(
-            reference, {"energy": bad, "forces": reference["forces"]}, "oam-s"
+            reference, {"energy": bad, "forces": reference["forces"]}, "mace-mh-1"
         )
     with pytest.raises(ValueError):
-        adapter.compare_ef(reference, {"energy": 0.0, "forces": [[0, 0, 0]]}, "oam-s")
+        adapter.compare_ef(
+            reference, {"energy": 0.0, "forces": [[0, 0, 0]]}, "mace-mh-1"
+        )
 
 
 def test_sample_summary_labels_only_same_package_reference(adapter):
@@ -170,57 +170,6 @@ def test_controller_sigterm_still_reaps_its_owned_worker(adapter, tmp_path):
         if controller.poll() is None:
             controller.send_signal(signal.SIGTERM)
             controller.wait(timeout=3)
-
-
-def test_fresh_oam_uses_counter_bearing_graph_setup_without_evaluation(adapter):
-    evaluator = SimpleNamespace(
-        execution_diagnostic="NequIP OAM Kokkos execution: backend=host, state=ready",
-        graph_generation=0,
-        geometry_generation=0,
-        cuda_r1_fallback_count=0,
-        execution_active_edge_count=2,
-    )
-
-    def prepare_graph(n, types, degrees, sources, neigh_types):
-        assert (n, types, degrees, sources, neigh_types) == (
-            2,
-            [0, 1],
-            [1, 1],
-            [1, 0],
-            [1, 0],
-        )
-        evaluator.graph_generation = 1
-        evaluator.execution_diagnostic = "edge_dispatches=0, edge_generated_dispatches=0, edge_generated_regions=0, edge_full_message_launches=0, edge_generic_dispatches=0, edge_generic_regions=0"
-        return 1
-
-    evaluator.prepare_graph = prepare_graph
-    initial = adapter.initialize_oam_counters(
-        evaluator, (2, [0, 1], [1, 1], [1, 0], [1, 0]), "direct"
-    )
-    assert initial["work"] == 0
-    assert initial["graph_generation"] == 1
-    assert initial["actual_edges"] == 2
-
-
-def test_missing_oam_postwork_counters_are_never_defaulted_to_zero(adapter):
-    evaluator = SimpleNamespace(
-        execution_diagnostic="operation=compute_prepared", graph_generation=2
-    )
-    with pytest.raises(RuntimeError, match="counter"):
-        adapter.snapshot(evaluator, "oam-s", "direct")
-
-
-def test_oam_native_graph_must_rebuild_once_per_transaction(adapter):
-    before = {
-        "work": 3,
-        "fallback": 0,
-        "graph_policy": "rebuild",
-        "graph_generation": 1,
-        "actual_edges": 2,
-    }
-    with pytest.raises(RuntimeError, match="generation"):
-        adapter.validate_work(before, {**before, "work": 4})
-    adapter.validate_work(before, {**before, "work": 4, "graph_generation": 2})
 
 
 def test_mace_retained_topology_generation_and_skip_are_verified(adapter):

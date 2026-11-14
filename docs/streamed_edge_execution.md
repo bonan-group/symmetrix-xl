@@ -230,7 +230,7 @@ qualification boundary is maintained in {doc}`user/lammps` and the
 - Declared family registry, the shared compact mode vocabulary, and the
   per-family declarations beside each family's modules:
   `symmetrix/source/symmetrix/family_registry.py` with `mace_family.py`,
-  `mace_nonlinear_family.py`, `mace_polar_family.py`, and `oam_family.py`
+  `mace_nonlinear_family.py`, and `mace_polar_family.py`
 - Neutral host neighbor-graph builder shared by both frontends:
   `symmetrix/source/symmetrix/neighbor_graph.py`
 - Public, family-neutral mode parser: `libsymmetrix/source/execution_mode.hpp`

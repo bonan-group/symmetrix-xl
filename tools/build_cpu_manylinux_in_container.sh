@@ -42,7 +42,6 @@ mkdir -p "$raw_dir" "$grafted_dir" "$repaired_dir"
   --backend cpu \
   --cpu-target "$CPU_TARGET" \
   --prebuilt-operator-artifacts r0 \
-  --prebuilt-oam-artifacts known \
   --build-root /tmp/build \
   --wheel-dir "$raw_dir" \
   --jobs "${JOBS:-4}"

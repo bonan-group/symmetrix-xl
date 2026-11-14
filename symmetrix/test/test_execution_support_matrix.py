@@ -80,8 +80,8 @@ def test_check_mode_reports_a_drifted_document(matrix, tmp_path, monkeypatch):
     drifted = tmp_path / "execution_support_matrix.md"
     drifted.write_text(
         DOCUMENT.read_text().replace(
-            "| `OAM` (OAM v2 contract) | `stress` | requalification pending |",
-            "| `OAM` (OAM v2 contract) | `stress` | experimental |",
+            "| `MACE_Nonlinear` (mace-nonlinear) | `stress` | qualified |",
+            "| `MACE_Nonlinear` (mace-nonlinear) | `stress` | experimental |",
         )
     )
     monkeypatch.setattr(matrix, "DOCUMENT", drifted)
@@ -194,81 +194,6 @@ def test_a_rejected_request_without_a_reason_is_rejected(matrix):
         matrix.FAMILY_REQUESTS = original
 
 
-def test_the_oam_rows_require_current_runtime_qualification(matrix):
-    from symmetrix.oam_receiver_codegen import ABI_VERSION
-    from symmetrix.oam_cuda_codegen import ABI_VERSION as CUDA_ABI_VERSION
-
-    rows = {row.key: row for row in matrix.FAMILY_CAPABILITIES["OAM"]}
-    stress = rows["stress"]
-
-    assert stress.status == "requalification pending"
-    assert "implemented on the current host and CUDA routes" in stress.scope
-    assert f"ABI-v{ABI_VERSION}/ABI-v{CUDA_ABI_VERSION}" in stress.limits
-    assert "runtime qualification is pending" in stress.limits
-    assert "HIP is unsupported" in stress.limits
-
-    precision = rows["precision"]
-    assert precision.status == "build-dependent"
-    assert "float32 and float64 implementations" in precision.scope
-    assert "full-message-only artifact release-matrix qualification is pending" in (
-        precision.limits
-    )
-
-    reference = rows["reference"]
-    assert reference.status == "build-dependent"
-    assert "current release-matrix qualification is pending" in reference.limits
-    assert "same-spline parity does not establish upstream-NequIP parity" in (
-        reference.limits
-    )
-    portable = rows["portable"]
-    assert portable.status == "build-dependent"
-    assert "current runtime matrix is pending" in portable.limits
-
-    host_artifact = rows["host_artifact"]
-    assert f"ABI-v{ABI_VERSION}" in host_artifact.scope
-    assert "fresh host runtime qualification" in host_artifact.limits
-    assert "repaired-wheel inclusion gates are pending" in host_artifact.limits
-    device_artifact = rows["device_artifact"]
-    assert f"CUDA ABI-v{CUDA_ABI_VERSION}" in device_artifact.scope
-    assert "fresh CUDA runtime qualification" in device_artifact.limits
-    assert "repaired-wheel inclusion gates are pending" in device_artifact.limits
-
-    generated = rows["generated"]
-    assert f"host ABI v{ABI_VERSION}" in generated.scope
-    assert "full-message-only" in generated.scope
-    assert "compile-qualified" in generated.limits
-
-
-def test_the_oam_request_route_names_the_current_host_abi(matrix):
-    from symmetrix.oam_receiver_codegen import ABI_VERSION
-    from symmetrix.oam_cuda_codegen import ABI_VERSION as CUDA_ABI_VERSION
-
-    direct = next(row for row in matrix.FAMILY_REQUESTS["OAM"] if row.mode == "direct")
-
-    assert f"host ABI v{ABI_VERSION}" in direct.artifact
-    assert f"CUDA ABI v{CUDA_ABI_VERSION}" in direct.artifact
-
-
-def test_the_document_states_the_current_oam_requalification_boundary(matrix):
-    from symmetrix.oam_receiver_codegen import ABI_VERSION
-
-    document = DOCUMENT.read_text()
-
-    assert (
-        "| `OAM` (OAM v2 contract) | `stress` | requalification pending |" in document
-    )
-    assert "full-message-only artifact release-matrix qualification is pending" in (
-        document
-    )
-    assert "Host direct execution uses its ABI-v2" not in document
-    assert "Direct stress is experimental" not in document
-    assert f"host ABI v{ABI_VERSION}" in document
-    assert (
-        "fresh CUDA runtime qualification and repaired-wheel inclusion gates are pending"
-        in document
-    )
-
-
 def test_the_document_keeps_the_recorded_public_requests(matrix):
     document = DOCUMENT.read_text()
 
@@ -277,8 +202,8 @@ def test_the_document_keeps_the_recorded_public_requests(matrix):
         "`non-compiled`",
         "`materialized`",
         "`auto`",
-        "`debug_v1`",
-        "`mlp_reference`",
+        "`generic`",
+        "`all_interactions`",
     ):
         assert spelling in document
     # The hand-maintained table's compatibility row survives as declared data.

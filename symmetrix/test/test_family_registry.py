@@ -23,16 +23,11 @@ import contextlib
 import importlib
 import json
 import re
-import shutil
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import symmetrix.family_registry as registry_module
-from symmetrix import NequIPCalculator, Symmetrix
-
-FIXTURE_DIR = Path(__file__).parent / "data"
-OAM_FIXTURE = FIXTURE_DIR / "nequip" / "oam_s_v2_minimal.json"
+from symmetrix import Symmetrix
 
 #: Every shipped family with the module that declares it, in declared
 #: precedence order: the compact frontend resolved the nonlinear family first,
@@ -41,7 +36,6 @@ SHIPPED = (
     ("MACE_Nonlinear", "mace_nonlinear_family"),
     ("MACE", "mace_family"),
     ("MACE_Polar", "mace_polar_family"),
-    ("OAM", "oam_family"),
 )
 
 _PRECISIONS = frozenset(("float32", "float64"))
@@ -130,7 +124,6 @@ def test_declared_entries_are_the_shipped_families_in_precedence_order():
     import symmetrix.mace_family as compact_module
     import symmetrix.mace_nonlinear_family as nonlinear_module
     import symmetrix.mace_polar_family as polar_module
-    import symmetrix.oam_family as oam_module
 
     entries = registry_module.declared_entries()
 
@@ -139,7 +132,6 @@ def test_declared_entries_are_the_shipped_families_in_precedence_order():
         compact_module.FAMILY_ENTRY.key: compact_module.FAMILY_ENTRY,
         nonlinear_module.FAMILY_ENTRY.key: nonlinear_module.FAMILY_ENTRY,
         polar_module.FAMILY_ENTRY.key: polar_module.FAMILY_ENTRY,
-        oam_module.FAMILY_ENTRY.key: oam_module.FAMILY_ENTRY,
     }
 
 
@@ -309,47 +301,17 @@ def test_only_polar_declares_a_lazily_resolved_frontend_adapter():
     )
 
 
-# The two neutralizers the OAM CUDA adapter needs: a contract that reaches the
-# adapter's own target check, and a resolved CUDA JIT backend so the adapter
-# never probes the toolchain of the machine running the suite.
-def _oam_contract(_path):
-    """Return a contract the OAM CUDA generator reaches its target check with."""
-
-    return {"architecture": "oam"}
-
-
-def _resolved_cuda_backend(_request=None):
-    """Return a resolved CUDA JIT backend without probing the toolchain."""
-
-    return "nvrtc"
-
-
 #: The targets every declared artifact adapter is *not* asked to serve, keyed by
-#: the ``(family, routing, target)`` it declares, with the module-level entry
-#: points a wrong-target call must get past to reach the adapter's own target
-#: check.  An adapter that binds its target after it reads its model file would
-#: otherwise fail on the absent file instead of on the target the caller asked
-#: for, which is why the OAM CUDA adapter's file read is neutralized.  The wrong
-#: target is always one another adapter of the same routing serves, so the
-#: request is a real routing request and not a typo.
+#: the ``(family, routing, target)`` it declares.  A wrong-target call would
+#: otherwise fail on the absent model file instead of on the target the caller
+#: asked for.  The wrong target is always one another adapter of the same
+#: routing serves, so the request is a real routing request and not a typo.
 WRONG_TARGET_CALLS = {
     ("MACE_Nonlinear", "direct", "host"): ("cuda", ()),
     ("MACE_Polar", "direct", "host"): ("cuda", ()),
     ("MACE", "direct", "host"): ("cuda", ()),
     ("MACE", "direct", "cuda"): ("host", ()),
     ("MACE", "direct", "hip"): ("host", ()),
-    ("OAM", "direct", "host"): ("cuda", ()),
-    ("OAM", "direct", "cuda"): (
-        "host",
-        (
-            ("symmetrix.oam_cuda_artifact", "load_nequip_oam_data", _oam_contract),
-            (
-                "symmetrix.oam_cuda_artifact",
-                "select_execution_cuda_jit_backend",
-                _resolved_cuda_backend,
-            ),
-        ),
-    ),
 }
 
 #: The adapters MACE and MH-1 must declare: their direct routing runs a prepared
@@ -552,7 +514,7 @@ def test_each_family_resolves_its_documented_spellings_to_a_declared_routing():
 
     compact_modes = {"auto", "direct", "reference"}
     for entry in registry_module.declared_entries():
-        expected = compact_modes if entry.key != "OAM" else {"direct", "reference"}
+        expected = compact_modes
         assert entry.modes.canonical_modes == expected, entry.key
         for spelling in entry.modes.aliases:
             canonical = entry.modes.canonical_mode(spelling)
@@ -571,12 +533,11 @@ def test_detection_resolves_each_key_to_its_declared_family():
     assert registry.detect(model_type="MACEField").key == "MACE"
     assert registry.detect(model_type="MACE_Nonlinear").key == "MACE_Nonlinear"
     assert registry.detect(model_type="MACE_Polar").key == "MACE_Polar"
-    assert registry.detect(architecture="oam").key == "OAM"
 
     # A key the frontend does not serve stays unresolved, which leaves the
     # frontend's own rejection message in charge of reporting it.
-    assert registry.detect(model_type="NequIP") is None
-    assert registry.detect(architecture="nequip") is None
+    assert registry.detect(model_type="UndeclaredFamily") is None
+    assert registry.detect(architecture="undeclared-architecture") is None
     assert registry.detect(architecture="") is None
 
     # No key is declared twice, so no model can change family with the order.
@@ -739,26 +700,7 @@ def test_macefield_keeps_post_construction_electric_field_mutation():
     assert calculator.results == {}
 
 
-def _oam_calculator():
-    """Build the OAM family's Kokkos calculator for the checked-in fixture."""
-
-    _native_class("NequIPOAMKokkos")
-    query = getattr(_native(), "_execution_device_execution_environment", None)
-    environment = query() if callable(query) else {}
-    if isinstance(environment, dict) and (
-        str(environment.get("backend", "")).lower() == "hip"
-        or "hip" in str(environment.get("execution_space", "")).lower()
-    ):
-        pytest.skip(
-            "OAM native capability/dispatch positives require host or CUDA; "
-            "HIP execution is intentionally unsupported"
-        )
-    if shutil.which("c++") is None:
-        pytest.skip("a C++ compiler is required for the OAM host artifact")
-    return NequIPCalculator(OAM_FIXTURE, dtype="float64")
-
-
-@pytest.mark.parametrize("family_key", ("MACE", "MACE_Nonlinear", "OAM"))
+@pytest.mark.parametrize("family_key", ("MACE", "MACE_Nonlinear"))
 def test_the_native_capability_key_set_equals_the_declared_key_set(
     tmp_path, request, family_key
 ):
@@ -772,10 +714,8 @@ def test_the_native_capability_key_set_equals_the_declared_key_set(
 
     if family_key == "MACE":
         calculator = _mace_calculator(request.getfixturevalue("compact_mace_model"))
-    elif family_key == "MACE_Nonlinear":
-        calculator = _mh1_calculator(tmp_path)
     else:
-        calculator = _oam_calculator()
+        calculator = _mh1_calculator(tmp_path)
 
     entry = registry_module.declared_registry().by_key(family_key)
     reported = registry_module.capabilities_of(entry, calculator.evaluator)
@@ -885,26 +825,12 @@ def test_mh1_declares_both_nonlinear_and_canonical_product_codegen():
     }
 
 
-def test_oam_calculator_constructs_the_class_its_family_declares():
-    entry = registry_module.declared_registry().detect(architecture="oam")
-    expected = registry_module.resolve_evaluator_class(
-        entry, model_type=None, dtype="float64", native=_native()
-    )
-
-    calculator = _oam_calculator()
-
-    assert isinstance(calculator.evaluator, expected)
-    assert (
-        registry_module.program_family_of(entry, calculator.evaluator)
-        == entry.capabilities.family
-    )
-
-
 def test_unknown_model_type_is_rejected_exactly_as_before(tmp_path):
     model_path = tmp_path / "unknown.json"
-    model_path.write_text(json.dumps({"model_type": "NequIP"}))
+    model_path.write_text(json.dumps({"model_type": "UndeclaredFamily"}))
 
     with pytest.raises(
-        ValueError, match=re.escape("Unsupported Symmetrix model_type 'NequIP'.")
+        ValueError,
+        match=re.escape("Unsupported Symmetrix model_type 'UndeclaredFamily'."),
     ):
         Symmetrix(model_path)
