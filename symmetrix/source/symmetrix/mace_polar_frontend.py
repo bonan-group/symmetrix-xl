@@ -154,31 +154,7 @@ class MacePolarFrontendAdapter:
             raise RuntimeError("MACE Polar requires a prepared neighbor cache")
         if cache.device_graph_generation != 0:
             if cache.device_geometry_generation != cache.geometry_generation:
-                device_builder = getattr(
-                    calculator.evaluator,
-                    "_prepare_periodic_factorized_graph",
-                    None,
-                )
-                if not callable(device_builder):
-                    raise family_registry.MissingCapabilityError(
-                        "the MACE Polar evaluator cannot refresh its native "
-                        "periodic graph after a cell-geometry change"
-                    )
-                device_graph = device_builder(
-                    np.asarray(cache.node_types, dtype=np.int32),
-                    np.ascontiguousarray(
-                        atoms.get_positions(), dtype=np.float64
-                    ).reshape(-1),
-                    np.ascontiguousarray(cache.cell, dtype=np.float64).reshape(-1),
-                    np.ascontiguousarray(cache.inverse_cell, dtype=np.float64).reshape(
-                        -1
-                    ),
-                    calculator.cutoff + calculator.neighbor_skin,
-                )
-                calculator._sync_low_memory_policy_state()
-                cache.device_graph_generation = int(device_graph["generation"])
-                cache.device_geometry_generation = cache.geometry_generation
-                cache.num_edges = int(device_graph["num_edges"])
+                calculator._rebuild_device_neighbor_graph(cache, atoms)
             return int(cache.device_graph_generation)
         (prepare_graph,) = family_registry.require_surface(
             family, calculator.evaluator, "prepared_graph"

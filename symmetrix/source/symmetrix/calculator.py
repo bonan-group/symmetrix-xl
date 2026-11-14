@@ -1737,6 +1737,34 @@ class Symmetrix(Calculator):
                 "execution: re-export the model with radial_format='compact'."
             )
 
+        # MACE_Nonlinear edge functions also take the element embeddings, so
+        # with the cutoff inside the radial basis (apply_cutoff=True) they do
+        # not vanish at r_max. The direct route keeps the edges up to
+        # cutoff + skin and evaluates those beyond r_max at r_max; the
+        # reference route drops them.
+        edges_need_reference = self._native_model_type == "MACE_Nonlinear" and bool(
+            (identity_model_data or {})
+            .get("radial_embedding", {})
+            .get("apply_cutoff", False)
+        )
+        if edges_need_reference and streamed_edges_unset:
+            # The unset default resolves to reference below, so the direct
+            # route's capacity plan is not implied; an explicit low_memory=True
+            # names the direct route and is refused like an explicit direct.
+            if legacy_low_memory_requested:
+                raise ValueError(
+                    "low_memory=True requires streamed_edges='direct', which does "
+                    "not support a MACE_Nonlinear model with apply_cutoff=True. "
+                    "Use streamed_edges='auto' or 'reference' for this model."
+                )
+            if self.low_memory_request:
+                self.low_memory_request = False
+                self.low_memory_selection_reason = (
+                    "implied low-memory plan unavailable for a MACE_Nonlinear "
+                    "model with apply_cutoff=True, which runs on the reference "
+                    "route; using default execution policies"
+                )
+
         if (
             self.low_memory_request
             and not legacy_low_memory_requested
@@ -1786,7 +1814,32 @@ class Symmetrix(Calculator):
         if family_registry.supports_surface(
             self._family_entry, self.evaluator, "mode_handshake"
         ):
-            if canonical_streamed_edges == "auto":
+            if (
+                edges_need_reference
+                and canonical_streamed_edges == "direct"
+                and not streamed_edges_unset
+            ):
+                raise ValueError(
+                    "streamed_edges='direct' does not support a MACE_Nonlinear "
+                    "model with apply_cutoff=True: its edge functions do not "
+                    "vanish at r_max, and the direct route evaluates edges beyond "
+                    "r_max at r_max. Use streamed_edges='auto' or 'reference' for "
+                    "this model; the direct route serves MACE_Nonlinear models "
+                    "trained with apply_cutoff=False."
+                )
+            if edges_need_reference and (
+                canonical_streamed_edges == "auto" or streamed_edges_unset
+            ):
+                self.streamed_edges_resolution_reason = (
+                    "the unset default" if streamed_edges_unset else "auto"
+                ) + (
+                    " selected reference because the edge functions of a "
+                    "MACE_Nonlinear model with apply_cutoff=True do not vanish at "
+                    "r_max and the direct route evaluates edges beyond r_max at "
+                    "r_max"
+                )
+                canonical_streamed_edges = "reference"
+            elif canonical_streamed_edges == "auto":
                 if bool(getattr(self.evaluator, "supports_factorized", False)):
                     canonical_streamed_edges = "direct"
                     self.streamed_edges_resolution_reason = (
@@ -2164,6 +2217,42 @@ class Symmetrix(Calculator):
             )
         )
         self._sync_low_memory_policy_state()
+
+    def _rebuild_device_neighbor_graph(self, cache, atoms):
+        """Rebuild the device-resident periodic graph after a cell change.
+
+        A family without ``prepared_cell_update`` cannot move its prepared
+        graph to the new cell, so the graph is built again at the current
+        geometry, and later neighbor reuse is measured from that geometry.
+        """
+        device_builder = getattr(
+            self.evaluator, "_prepare_periodic_factorized_graph", None
+        )
+        if not callable(device_builder):
+            raise family_registry.MissingCapabilityError(
+                "the evaluator cannot refresh its device neighbor graph after a "
+                "cell-geometry change"
+            )
+        positions = np.array(atoms.positions, dtype=float)
+        device_graph = device_builder(
+            np.asarray(cache.node_types, dtype=np.int32),
+            np.ascontiguousarray(positions).reshape(-1),
+            np.ascontiguousarray(cache.cell, dtype=float).reshape(-1),
+            np.ascontiguousarray(cache.inverse_cell, dtype=float).reshape(-1),
+            self.cutoff + self.neighbor_skin,
+        )
+        self._sync_low_memory_policy_state()
+        num_edges = int(device_graph["num_edges"])
+        validate_graph_cardinality(len(positions), num_edges)
+        cache.device_graph_generation = int(device_graph["generation"])
+        cache.device_geometry_generation = cache.geometry_generation
+        cache.num_edges = num_edges
+        cache.topology_cell = np.array(cache.cell, copy=True)
+        cache.topology_reference_positions = np.array(positions, copy=True)
+        cache.topology_fractional_positions = np.ascontiguousarray(
+            positions @ cache.inverse_cell, dtype=float
+        )
+        cache.reference_positions = np.array(positions, copy=True)
 
     def _sync_low_memory_policy_state(self):
         if not getattr(self, "low_memory_request", False) and not getattr(
@@ -5150,6 +5239,13 @@ class Symmetrix(Calculator):
                         "neighbor cache."
                     )
                 if cache.device_graph_generation != 0:
+                    if (
+                        cache.device_geometry_generation != cache.geometry_generation
+                        and not family_registry.supports_surface(
+                            family, self.evaluator, "prepared_cell_update"
+                        )
+                    ):
+                        self._rebuild_device_neighbor_graph(cache, atoms)
                     graph_generation = cache.device_graph_generation
                     if cache.device_geometry_generation != cache.geometry_generation:
                         (update_cell,) = family_registry.require_surface(

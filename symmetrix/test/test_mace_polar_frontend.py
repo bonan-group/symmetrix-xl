@@ -3799,6 +3799,65 @@ def test_periodic_polar_forced_kokkos_graph_stays_device_resident_and_reuses(
     assert evaluator.polar_whole_model_transaction_count == before + 4
 
 
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_periodic_polar_device_graph_reuse_is_measured_from_the_rebuilt_graph(
+    polar_model_path, monkeypatch, dtype
+):
+    """A device graph rebuilt after a cell change is the new reuse reference.
+
+    Two atoms 3.1 A apart (cutoff 4 A, skin 0.5 A): a 50 % strain moves the
+    pair to 4.65 A, so the rebuilt device graph has no edge. Moving each atom
+    1.3 A towards the other brings the pair to 2.05 A. Measured from the
+    rebuilt geometry that move exceeds the skin and forces a new graph;
+    measured from the first geometry it would still pass as reusable.
+    """
+
+    from ase import Atoms
+
+    monkeypatch.setenv("SYMMETRIX_NEIGHBOR_BACKEND", "kokkos")
+    start = Atoms(
+        numbers=[14, 1],
+        positions=[[2.0, 5.0, 5.0], [5.1, 5.0, 5.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    strained = start.copy()
+    strained.set_cell(start.cell * 1.5, scale_atoms=True)
+    moved = strained.copy()
+    moved.positions[0, 0] += 1.3
+    moved.positions[1, 0] -= 1.3
+    properties = ["energy", "forces"]
+
+    def polar(model_path):
+        return Symmetrix(
+            str(model_path), dtype=dtype, polar_electrostatics="direct_reciprocal"
+        )
+
+    calculator = polar(polar_model_path)
+    generations = []
+    for frame in (start, strained, moved):
+        calculator.calculate(frame.copy(), properties=properties)
+        assert calculator.neighbor_graph_backend == "kokkos"
+        generations.append(calculator._neighbor_cache.device_graph_generation)
+    assert generations[1] != generations[0]
+    fresh = polar(polar_model_path)
+    fresh.calculate(strained.copy(), properties=["energy"])
+    energy_without_edge = fresh.results["energy"]
+    fresh = polar(polar_model_path)
+    fresh.calculate(moved.copy(), properties=properties)
+    tolerance = 2e-5 if dtype == "float32" else 1e-10
+    # the pair interacts in the last frame: a graph without it is visible
+    assert abs(fresh.results["energy"] - energy_without_edge) > 100 * tolerance
+    for name in properties:
+        np.testing.assert_allclose(
+            calculator.results[name],
+            fresh.results[name],
+            rtol=0.0,
+            atol=tolerance,
+            err_msg=f"property={name}",
+        )
+
+
 def test_large_periodic_polar_automatic_graph_selects_device_without_host_fallback(
     polar_model_path, monkeypatch
 ):

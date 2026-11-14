@@ -11,7 +11,11 @@
 - **MACE-MH-1** supports generated direct execution for admitted nonlinear
   contracts and an artifact-free optimized `reference` route. Each interaction
   declares and validates its own tied UVU channel multiplicity; the second
-  edge width is not derived from the first.
+  edge width is not derived from the first. A model trained with
+  `apply_cutoff=True` (mace-torch's default) runs on the `reference` route,
+  which the default and `auto` select: its edge functions do not vanish at
+  `r_max`, and an explicit `direct` refuses it. `direct` serves models
+  trained with `apply_cutoff=False`, such as MACE-MH-1.
 
 ## MACE-POLAR-1
 
