@@ -6,11 +6,14 @@ calculator, and the shared JIT entry point cannot stand in for a declared
 family adapter because it takes rendered source, not a model file. This module
 reads the staged node contract either model carries, renders the plugin for that
 topology, compiles it through the shared JIT cache, and returns the prepared
-artifact.
+artifact. It also names the artifacts a prepared calculator holds as
+``pair_style`` settings for the LAMMPS Polar pair style
+(``polar_lammps_jit_arguments``, ``format_lammps_arguments``).
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -242,11 +245,92 @@ def prepare_mh1_host_artifact(
     )
 
 
+def polar_lammps_jit_arguments(calculator) -> tuple[str, ...]:
+    """Return the ``pair_style`` artifact settings of a prepared Polar calculator.
+
+    A ``Symmetrix`` calculator constructed with ``streamed_edges="direct"`` has
+    prepared the generated backbone and one product module per interaction
+    layer. This names them for ``pair_style symmetrix/mace/polar/kk``, with the
+    persistent block count the calculator launches each module with. The pair
+    style reads each product module with the ``manifest.json`` the JIT cache
+    wrote beside it, so the cache entries must stay in place. Nothing is
+    compiled or copied here. ``format_lammps_arguments`` turns the result into
+    input text.
+    """
+
+    products = sorted(
+        (
+            record
+            for key, record in calculator.jit_operator_modules.items()
+            if key.startswith("product_")
+        ),
+        key=lambda record: record["layer"],
+    )
+    layers = [record["layer"] for record in products]
+    if not calculator.jit_artifact_path or not products:
+        raise ValueError(
+            "the calculator holds no generated Polar backbone; construct it "
+            "with streamed_edges='direct'"
+        )
+    if layers != list(range(len(products))):
+        raise ValueError(f"the prepared product layers are incomplete: {layers}")
+    backends = {record["backend"] for record in products}
+    if len(backends) != 1:
+        raise ValueError(f"the product modules name several backends: {backends}")
+    keyword = "jit_host_artifact" if backends == {"host"} else "jit_device_artifact"
+    arguments = [keyword, str(Path(calculator.jit_artifact_path).resolve())]
+    for record in products:
+        path = Path(record["artifact_path"]).resolve()
+        if not path.with_name("manifest.json").is_file():
+            raise ValueError(
+                f"the product module of layer {record['layer']} has no JIT "
+                f"manifest beside it (origin {record.get('origin')!r}): {path}"
+            )
+        arguments += [
+            "jit_product_artifact",
+            str(record["layer"]),
+            str(path),
+            str(record["persistent_blocks_per_compute_unit"]),
+        ]
+    return tuple(arguments)
+
+
+_LAMMPS_BARE_WORD = re.compile(r"[A-Za-z0-9_.+*-]+")
+
+
+def format_lammps_arguments(arguments) -> str:
+    """Join command arguments into LAMMPS input text, one word per argument.
+
+    Keywords and numbers stay bare. Every other argument, such as a path, is
+    quoted, so that whitespace, ``#`` and ``$`` in it reach LAMMPS as part of
+    one word. LAMMPS removes the quotes when it reads the line.
+    """
+
+    words = []
+    for argument in map(str, arguments):
+        if _LAMMPS_BARE_WORD.fullmatch(argument):
+            words.append(argument)
+            continue
+        if not argument or "\n" in argument or "\r" in argument:
+            raise ValueError(f"cannot pass {argument!r} as one LAMMPS argument")
+        if '"' not in argument:
+            words.append(f'"{argument}"')
+        elif "'" not in argument:
+            words.append(f"'{argument}'")
+        elif '"""' not in argument and not argument.endswith('"'):
+            words.append(f'"""{argument}"""')
+        else:
+            raise ValueError(f"cannot quote {argument!r} for LAMMPS")
+    return " ".join(words)
+
+
 __all__ = [
     "DEFAULT_NODE_STATE_POLICY",
     "GENERATOR",
     "MODEL_TYPES",
     "MaceNonlinearHostArtifactError",
     "MaceNonlinearHostArtifactResult",
+    "format_lammps_arguments",
+    "polar_lammps_jit_arguments",
     "prepare_mh1_host_artifact",
 ]

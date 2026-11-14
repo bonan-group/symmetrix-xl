@@ -72,11 +72,10 @@ native flattened-index capacity.
 For example, a qualified FP32 CPU invocation is:
 
 ```text
-pair_style symmetrix/mace/polar/float32/kk \
-           total_charge 0.0 total_spin 0.0 fermi_level 0.0 \
-           electric_field 0.0 0.0 0.0 \
-           polar_electrostatics auto \
-           jit_host_artifact /absolute/path/polar-backbone.so
+pair_style symmetrix/mace/polar/float32/kk &
+           total_charge 0.0 total_spin 0.0 fermi_level 0.0 &
+           electric_field 0.0 0.0 0.0 &
+           polar_electrostatics auto
 pair_coeff * * /absolute/path/MACE-POLAR-1-M.json H O
 ```
 
@@ -87,6 +86,21 @@ artifact with either `jit_host_artifact` or
 `pair_spline_v1` backbone. A matching artifact selects the generated/direct
 backbone. Supplying both artifact settings, or repeating one, is an error. The
 artifact must match the JSON, precision, backend, and JIT ABI.
+
+The generated backbone runs each interaction layer's product contraction from a
+separate M0 or M1 module. Give `jit_product_artifact LAYER PATH BLOCKS` once
+per layer: the layer from 0, the module, and the persistent blocks per compute
+unit it is launched with. `jit_device_artifact` selects the CUDA or HIP
+backend of the build and is refused by a CPU build. `pair_coeff` stops when an
+artifact comes without one module per layer; nothing falls back to the portable
+backbone. Every artifact is read with the `manifest.json` of its own JIT cache
+entry, so keep the entries where the calculator prepared them. A calculator
+constructed with `streamed_edges="direct"` prepares the complete set, and
+`format_lammps_arguments(polar_lammps_jit_arguments(calculator))` from
+`symmetrix.mace_nonlinear_jit_artifact` returns the quoted settings to append
+to `pair_style`; `pair_symmetrix/README.md` shows the recipe. An empty
+settings variable selects the portable backbone, so check that the log shows
+`MACE Polar JIT executed N/N product layers`.
 
 Backbone artifact selection is independent of the electrostatic solver. The
 JSON remains solver-neutral: `polar_electrostatics auto` chooses real space
@@ -107,9 +121,9 @@ and D3 terms:
 
 ```text
 atom_style charge
-pair_style hybrid/overlay \
-    symmetrix/mace/kk streamed_edges non-compiled \
-    coul/long 10.0 \
+pair_style hybrid/overlay &
+    symmetrix/mace/kk streamed_edges non-compiled &
+    coul/long 10.0 &
     dispersion/d3 original pbe 30.0 20.0
 pair_coeff * * symmetrix/mace/kk /absolute/path/model.json C H O
 pair_coeff * * coul/long
@@ -283,7 +297,7 @@ lmp -var jit_artifact "$jit_artifact" -in in.mace
 ```
 
 ```text
-pair_style symmetrix/mace/float32/kk mpi_message_passing streamed_edges direct \
+pair_style symmetrix/mace/float32/kk mpi_message_passing streamed_edges direct &
            profile capacity jit_host_artifact ${jit_artifact}
 pair_coeff * * srtio3-mace.json Sr Ti O
 ```

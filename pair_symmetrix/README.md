@@ -71,11 +71,10 @@ The type map must cover every LAMMPS type, the model must be `MACE_Polar`, and
 the complete-system atom count must fit the native flattened-index capacity.
 
 ```text
-pair_style symmetrix/mace/polar/float32/kk \
-           total_charge 0.0 total_spin 0.0 fermi_level 0.0 \
-           electric_field 0.0 0.0 0.0 \
-           polar_electrostatics auto \
-           jit_host_artifact /absolute/path/polar-backbone.so
+pair_style symmetrix/mace/polar/float32/kk &
+           total_charge 0.0 total_spin 0.0 fermi_level 0.0 &
+           electric_field 0.0 0.0 0.0 &
+           polar_electrostatics auto
 pair_coeff * * /absolute/path/MACE-POLAR-1-M.json H O
 ```
 
@@ -90,6 +89,59 @@ generated/direct backbone. Supplying both, or repeating one, is an error.
 Artifact selection does not change `polar_electrostatics`. The pair style
 returns energy, forces, and global virial and does not expose the model dipole
 as a LAMMPS output.
+
+The generated backbone holds no product contraction of its own: each
+interaction layer runs a separate M0 or M1 module. Name the backbone with
+`jit_host_artifact` (or `jit_device_artifact` on a CUDA or HIP build) and each
+layer's module with `jit_product_artifact LAYER PATH BLOCKS`, where `LAYER`
+counts from 0 and `BLOCKS` is the number of persistent blocks per compute unit
+a CUDA or HIP module is launched with (1 to 32; a host module does not use it).
+Each artifact is read together with the `manifest.json` beside it, so leave
+each file in its JIT cache entry:
+
+```text
+pair_style symmetrix/mace/polar/float32/kk polar_electrostatics auto &
+           jit_host_artifact "/path/to/jit-cache/artifacts/<backbone entry>/jit_mh1_host_plugin_gen19_src<hash>.so" &
+           jit_product_artifact 0 "/path/to/jit-cache/artifacts/<layer 0 entry>/execution_m0_host_module_gen19_src<hash>.so" 8 &
+           jit_product_artifact 1 "/path/to/jit-cache/artifacts/<layer 1 entry>/execution_m0_host_module_gen19_src<hash>.so" 8
+pair_coeff * * /absolute/path/MACE-POLAR-1-M.json H O
+```
+
+A one-layer scalar model (the S topology) has one `execution_m1_…` module.
+Layers with the same product structure name the same module.
+
+`pair_coeff` stops when an artifact comes without one module per layer; the
+pair style never falls back to the portable backbone. After the first
+evaluation the log reports `MACE Polar JIT executed N/N product layers;
+backbone fallbacks 0`.
+
+The ASE calculator prepares the complete set. Construct it with the precision
+and backend of the pair style, then print the settings:
+
+```python
+from symmetrix.calculator import Symmetrix
+from symmetrix.mace_nonlinear_jit_artifact import (
+    format_lammps_arguments,
+    polar_lammps_jit_arguments,
+)
+
+calculator = Symmetrix("MACE-POLAR-1-M.json", dtype="float32", streamed_edges="direct")
+print(format_lammps_arguments(polar_lammps_jit_arguments(calculator)))
+```
+
+`format_lammps_arguments` quotes each path for the LAMMPS input. Pass the
+printed text as one variable and end the `pair_style` line with
+`${jit_arguments}`:
+
+```bash
+lmp -k on t 1 -var jit_arguments "$(python polar_settings.py)" -in in.polar
+```
+
+Use `-k on g 1` for a CUDA or HIP build. If the script fails, the variable is
+empty and the pair style runs the portable backbone, so check that the log
+shows `MACE Polar JIT executed N/N product layers`. Product modules that the
+calculator takes from an installed prebuilt catalog have no JIT manifest; the
+helper refuses them.
 
 For MACEField JSON models, use the Kokkos pair style with an explicit
 uniform electric field:
@@ -298,7 +350,7 @@ lmp -var jit_artifact "$jit_artifact" -in in.mace
 Use the matching artifact in `in.mace`:
 
 ```text
-pair_style symmetrix/mace/float32/kk mpi_message_passing streamed_edges direct \
+pair_style symmetrix/mace/float32/kk mpi_message_passing streamed_edges direct &
            profile capacity jit_host_artifact ${jit_artifact}
 pair_coeff * * srtio3-mace.json Sr Ti O
 ```
@@ -345,8 +397,8 @@ lmp -var jit_arguments "$jit_arguments" -in in.mace
 Use the variable in `in.mace`:
 
 ```text
-pair_style symmetrix/mace/float32/kk no_domain_decomposition streamed_edges direct \
-           profile capacity \
+pair_style symmetrix/mace/float32/kk no_domain_decomposition streamed_edges direct &
+           profile capacity &
            ${jit_arguments}
 pair_coeff * * srtio3-mace.json Sr Ti O
 ```
