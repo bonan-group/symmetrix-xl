@@ -397,8 +397,8 @@ INSTANCE_SPECS: dict[str, dict] = {
         # suite's field, 0 at zero field).  The symmetric part still matches the
         # finite-strain oracle to 4e-11, so the physical stress is asserted and
         # the antisymmetric part is bounded here rather than asserted away.
-        # Reported as an open deviation; the non-field, MH-1, and OAM instances
-        # have no antisymmetric part.
+        # Reported as an open deviation; the non-field, MH-1, and legacy
+        # stress instances have no antisymmetric part.
         stress_antisymmetry_atol=2e-5,
     ),
     "macefield-f32": dict(

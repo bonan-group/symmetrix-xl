@@ -97,22 +97,6 @@ _R1_IDENTITY_FIELDS = frozenset(
         "artifact_id",
     }
 )
-_OAM_IDENTITY_FIELDS = frozenset(
-    {
-        "schema",
-        "operator",
-        "generation_revision",
-        "architecture",
-        "architecture_fingerprint",
-        "precision",
-        "backend",
-        "target",
-        "generation_fingerprint",
-        "semantic_fingerprint",
-        "structure_fingerprint",
-        "artifact_id",
-    }
-)
 _CATALOG_ARTIFACT_FIELDS = frozenset(
     {
         "operator",
@@ -124,9 +108,6 @@ _CATALOG_ARTIFACT_FIELDS = frozenset(
         "capabilities",
         "build_provenance",
     }
-)
-_CATALOG_ARTIFACT_AUXILIARY_FIELDS = _CATALOG_ARTIFACT_FIELDS | frozenset(
-    {"auxiliary_files"}
 )
 _CATALOG_ABI_BY_OPERATOR_BACKEND_AND_FORMAT = {
     ("M0", "host", "shared-library"): ("symmetrix.jit.m0-host-plugin/2", 2),
@@ -150,11 +131,6 @@ _CATALOG_ABI_BY_OPERATOR_BACKEND_AND_FORMAT = {
     ("R1", "host", "shared-library"): ("symmetrix.jit.host-plugin/4", 4),
     ("R1", "cuda", "cubin"): ("symmetrix.jit.cuda-plugin/4", 4),
     ("R1", "hip", "code-object"): ("symmetrix.jit.hip-plugin/3", 3),
-    ("OAM", "host", "shared-library"): (
-        "symmetrix.jit.oam.host-plugin/7",
-        7,
-    ),
-    ("OAM", "cuda", "cubin"): ("symmetrix.jit.oam.cuda-plugin/3", 3),
 }
 _INSTALLED_BUILD_FIELDS = frozenset(
     {
@@ -583,100 +559,10 @@ def validate_generated_operator_identity(
         "M1": validate_generated_m1_identity,
         "R0": validate_generated_r0_identity,
         "R1": validate_generated_r1_identity,
-        "OAM": validate_generated_oam_identity,
     }.get(identity.get("operator"))
     if validator is None:
         raise ValueError("identity operator is unsupported")
     return validator(identity)
-
-
-def validate_generated_oam_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate an OAM identity selected by its explicit layer architecture."""
-
-    identity_fields = _OAM_IDENTITY_FIELDS
-    if identity.get("backend") == "host":
-        identity_fields |= frozenset({"floating_point_policy"})
-    identity = _exact_fields(identity, identity_fields, "OAM identity")
-    if identity["schema"] != GENERATED_OPERATOR_IDENTITY_SCHEMA:
-        raise ValueError("OAM identity schema is unsupported")
-    if identity["operator"] != "OAM":
-        raise ValueError("identity operator must be 'OAM'")
-    architecture = _exact_fields(
-        identity["architecture"],
-        frozenset({"schema", "layer_count", "layers"}),
-        "OAM architecture",
-    )
-    if architecture["schema"] != "symmetrix.oam.generated-architecture/1":
-        raise ValueError("OAM architecture schema is unsupported")
-    layers = architecture["layers"]
-    if not isinstance(layers, list) or not layers:
-        raise ValueError("OAM architecture layers must be non-empty")
-    if architecture["layer_count"] != len(layers):
-        raise ValueError("OAM architecture layer_count does not match layers")
-    for index, layer in enumerate(layers):
-        if not isinstance(layer, Mapping) or layer.get("index") != index:
-            raise ValueError("OAM architecture layer indices must be contiguous")
-    codegen_architecture = {
-        **architecture,
-        "layers": [
-            {key: value for key, value in layer.items() if key != "post_linear"}
-            for layer in layers
-        ],
-    }
-    try:
-        encoded = json.dumps(
-            codegen_architecture,
-            allow_nan=False,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("ascii")
-    except (TypeError, ValueError) as error:
-        raise ValueError("OAM codegen architecture is not canonical JSON") from error
-    architecture_fingerprint = _fingerprint(
-        identity["architecture_fingerprint"], "architecture_fingerprint"
-    )
-    expected_fingerprint = "sha256:" + hashlib.sha256(encoded).hexdigest()
-    if architecture_fingerprint != expected_fingerprint:
-        raise ValueError(
-            "OAM architecture fingerprint does not match codegen architecture"
-        )
-    precision = identity["precision"]
-    if precision not in ("float32", "float64"):
-        raise ValueError("precision must be 'float32' or 'float64'")
-    backend = identity["backend"]
-    if backend not in ("host", "cuda"):
-        raise ValueError("OAM backend must be 'host' or 'cuda'")
-    normalized = {
-        "schema": GENERATED_OPERATOR_IDENTITY_SCHEMA,
-        "operator": "OAM",
-        "generation_revision": _positive_integer(
-            identity["generation_revision"], "generation_revision"
-        ),
-        "architecture": dict(architecture),
-        "architecture_fingerprint": architecture_fingerprint,
-        "precision": precision,
-        "backend": backend,
-        "target": _identity_token(identity["target"], "target"),
-        "generation_fingerprint": _fingerprint(
-            identity["generation_fingerprint"], "generation_fingerprint"
-        ),
-        "semantic_fingerprint": _fingerprint(
-            identity["semantic_fingerprint"], "semantic_fingerprint"
-        ),
-        "structure_fingerprint": _fingerprint(
-            identity["structure_fingerprint"], "structure_fingerprint"
-        ),
-        "artifact_id": _identity_token(identity["artifact_id"], "artifact_id"),
-    }
-    if backend == "host":
-        policy = _nonempty_text(
-            identity["floating_point_policy"], "floating_point_policy"
-        )
-        if policy not in ("strict", "fast"):
-            raise ValueError("OAM host floating-point policy must be strict or fast")
-        normalized["floating_point_policy"] = policy
-    return normalized
 
 
 def _installed_relative_path(value: Any) -> str:
@@ -701,12 +587,7 @@ def _installed_relative_path(value: Any) -> str:
 
 
 def _catalog_artifact(value: Any) -> dict[str, Any]:
-    fields = (
-        _CATALOG_ARTIFACT_AUXILIARY_FIELDS
-        if isinstance(value, Mapping) and "auxiliary_files" in value
-        else _CATALOG_ARTIFACT_FIELDS
-    )
-    value = _exact_fields(value, fields, "catalog artifact")
+    value = _exact_fields(value, _CATALOG_ARTIFACT_FIELDS, "catalog artifact")
     operator = _nonempty_text(value["operator"], "operator")
     identity = validate_generated_operator_identity(value["identity"])
     if operator != identity["operator"]:
@@ -742,7 +623,7 @@ def _catalog_artifact(value: Any) -> dict[str, Any]:
             f"tag {expected_abi[0]!r} at version {expected_abi[1]}"
         )
     provenance_fields = {"source_content_sha256", "compiler_id", "compiler_version"}
-    if operator == "R0" or (operator == "OAM" and identity["backend"] == "host"):
+    if operator == "R0":
         provenance_fields.add("floating_point_policy")
     provenance = _exact_fields(
         value["build_provenance"], frozenset(provenance_fields), "build_provenance"
@@ -756,7 +637,7 @@ def _catalog_artifact(value: Any) -> dict[str, Any]:
             provenance["compiler_version"], "compiler_version"
         ),
     }
-    if operator == "R0" or (operator == "OAM" and identity["backend"] == "host"):
+    if operator == "R0":
         policy = _nonempty_text(
             provenance["floating_point_policy"], "floating_point_policy"
         )
@@ -778,28 +659,6 @@ def _catalog_artifact(value: Any) -> dict[str, Any]:
         "capabilities": capabilities,
         "build_provenance": normalized_provenance,
     }
-    if operator == "OAM":
-        auxiliary = value.get("auxiliary_files")
-        if not isinstance(auxiliary, list) or len(auxiliary) != 1:
-            raise ValueError("OAM catalog artifact must have one manifest")
-        item = _exact_fields(
-            auxiliary[0],
-            frozenset({"role", "installed_relative_path", "checksum"}),
-            "OAM auxiliary file",
-        )
-        if item["role"] != "manifest":
-            raise ValueError("OAM auxiliary file role must be manifest")
-        normalized["auxiliary_files"] = [
-            {
-                "role": "manifest",
-                "installed_relative_path": _installed_relative_path(
-                    item["installed_relative_path"]
-                ),
-                "checksum": _fingerprint(item["checksum"], "manifest checksum"),
-            }
-        ]
-    elif "auxiliary_files" in value:
-        raise ValueError("only OAM artifacts may declare auxiliary files")
     return normalized
 
 
@@ -879,7 +738,7 @@ def _validate_installed_operator_artifacts_at_root(
         build_info, _INSTALLED_BUILD_FIELDS, "prebuilt operator build info"
     )
     mode = build_info["mode"]
-    if mode not in ("off", "r0", "full", "oam"):
+    if mode not in ("off", "r0", "full"):
         raise ValueError("prebuilt operator mode is unsupported")
     if mode == "off":
         if any(

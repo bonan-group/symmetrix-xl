@@ -119,21 +119,13 @@ value to CMake, and backend loading rejects descriptor/native disagreement.
 ## Prebuilt generated operators
 
 Every `detect`, `preflight`, `install`, `wheel`, and `wheel-matrix` target
-manifest records `prebuilt_operator_artifacts` and `prebuilt_oam_artifacts`.
+manifest records `prebuilt_operator_artifacts`.
 Select the MACE bundle with `--prebuilt-operator-artifacts`:
 
 - `off` installs no generated operator catalog;
 - `r0` installs six deduplicated verified R0 artifacts for the exact backend
   target and is the source, development, and publication default;
 - `full` installs the 32-artifact verified R1/R0/M0/M1 foundation bundle.
-
-Select the OAM bundle independently with `--prebuilt-oam-artifacts`:
-
-- `off` installs no generated OAM artifacts;
-- `known` installs FP32 and FP64 artifacts for the explicit OAM-S/M/L/XL
-  architecture descriptors. Runtime lookup compares those descriptors, not a
-  filename, package label, or learned-weight hash. Catalog inclusion is a build
-  fact and does not qualify the current artifact ABI at runtime.
 
 The mode is part of the build-manifest fingerprint. Do not reuse a build root
 across modes. Accelerator artifacts are compiled only for the manifest's exact
@@ -144,7 +136,6 @@ OpenMP policy.
 python tools/symmetrix_build.py wheel \
     --backend cpu --cpu-target x86-64-v3 \
     --prebuilt-operator-artifacts r0 \
-    --prebuilt-oam-artifacts known \
     --build-root "$HOME/tmp/symmetrix-cpu-r0" --wheel-dir dist
 ```
 
@@ -153,8 +144,6 @@ measured cold-setup benefit comes with 26 additional binaries and mixed
 per-case first-call results. No explicit package-size, build-time, and
 first-call release budgets have been accepted. The manylinux publication
 scripts therefore pin `r0` explicitly; promotion to `full` requires a reviewed
-policy change and fresh CPU, CUDA, and HIP qualification evidence. Official CPU
-and CUDA publication scripts select the independent `known` OAM bundle; HIP
-does not. See
+policy change and fresh CPU, CUDA, and HIP qualification evidence. See
 {doc}`/developer/jit_and_artifacts` for the measured comparison and security
 model.

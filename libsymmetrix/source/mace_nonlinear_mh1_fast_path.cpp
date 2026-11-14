@@ -153,8 +153,8 @@ void E3TensorProductKokkosT<Precision>::initialize_direct_execution_plan(
         "e3 mh1 tensor mask ir-mul",output_mask_ir_mul_host);
     // The compact MH1 plan supplies its weights per edge, so a contract that
     // carries an internal weight tensor is admitted to the generic schedule
-    // even when its layout is otherwise official.  NequIP-OAM does not need
-    // the relaxation: its only tensor-product consumer is the node-local
+    // even when its layout is otherwise official.  The only tensor-product
+    // consumer is the node-local
     // (u,v,w) self connection, which runs the node-bilinear kernels and never
     // consults this flag.
     std::vector<int> input_component_data;

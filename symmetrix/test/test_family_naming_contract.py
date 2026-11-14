@@ -48,9 +48,9 @@ def _family_prefix(entries) -> re.Pattern[str]:
 
 
 # Family files spell the family token followed by ``_`` or ``.``.  The bare
-# family-root basenames (``mace.cpp``, ``oam.hpp``) belonged to the serial
-# evaluators, which retired, and are recorded in ``NATIVE_RETIRED`` so a
-# reappearance fails there.
+# family-root basenames (``mace.cpp``) belonged to the serial evaluators,
+# which retired, and are recorded in ``NATIVE_RETIRED`` so a reappearance
+# fails there.
 FAMILY_PREFIX = _family_prefix(family_registry.declared_entries())
 
 # Framework/neutral files permitted to stay unprefixed in ``libsymmetrix/source``.
@@ -184,9 +184,9 @@ NATIVE_UNPREFIXED = frozenset(
 )
 
 # Framework/neutral files permitted to stay unprefixed in the Python package.
-# ``extract_mace_*``, ``prediction_heads.py``, and the ``nequip_*`` modules are
-# extraction/validation front-ends whose registry fate belongs to Stage 8, not
-# to the Task 6 loader/module rename sweep.
+# ``extract_mace_*`` and ``prediction_heads.py`` are extraction/validation
+# front-ends whose registry fate belongs to Stage 8, not to the Task 6
+# loader/module rename sweep.
 PYTHON_UNPREFIXED = frozenset(
     {
         "__init__.py",
@@ -199,13 +199,11 @@ PYTHON_UNPREFIXED = frozenset(
         "extract_mace_data.py",
         "extract_mace_nonlinear.py",
         "extract_mace_polar.py",
-        "extract_nequip_data.py",
         "factorized_r1_operator_fixture.py",
         "family_registry.py",
         "fourier_d3_capability.py",
         "fourier_d3_factors.py",
         "foundation_m0_topologies.json",
-        "foundation_oam_architectures.json",
         "foundation_operator_manifest.json",
         "foundation_operator_manifest.py",
         "generated_operator_codegen.py",
@@ -219,10 +217,6 @@ PYTHON_UNPREFIXED = frozenset(
         "kernel_launch_tuning.py",
         "metal_codegen.py",
         "neighbor_graph.py",
-        "nequip_calculator.py",
-        "nequip_oam_graph.py",
-        "nequip_probe.py",
-        "nequip_schema.py",
         "polar_long_range_kinds.py",
         "prediction_heads.py",
         "recompose_mace_json.py",
@@ -234,13 +228,12 @@ PYTHON_UNPREFIXED = frozenset(
 
 # Basenames retired by the family-alignment, neutralization, and direct-execution
 # sweeps, per tree.  The serial-evaluator translation units (``mace``,
-# ``mace_nonlinear``, ``oam``) retired with their evaluators, so their basenames
-# must not reappear beside the retained Kokkos ones.
+# ``mace_nonlinear``) retired with their evaluators, so their basenames must
+# not reappear beside the retained Kokkos ones.
 NATIVE_RETIRED = frozenset(
     {
         "mace",
         "mace_nonlinear",
-        "oam",
         "jit_host_plugin",
         "jit_cuda_plugin",
         "jit_hip_plugin",
@@ -249,20 +242,12 @@ NATIVE_RETIRED = frozenset(
         "jit_mh1_cuda_plugin",
         "mh1_stage",
         "jit_operator_module",
-        "jit_oam_host_plugin",
         "mace_streamed_edges",
         "standard_m0",
         "standard_m1",
         "standard_r0",
         "prediction_heads",
         "field_coupling",
-        "nequip_oam",
-        "nequip_oam_kokkos",
-        "nequip_oam_kokkos_forward",
-        "nequip_oam_kokkos_reverse",
-        "nequip_oam_radial",
-        "nequip_schema",
-        "nequip_validation",
     }
 )
 
@@ -283,7 +268,6 @@ PYTHON_RETIRED = frozenset(
         "jit_mh1_cuda_plugin_abi",
         "jit_m0_host_plugin_abi",
         "jit_operator_module_abi",
-        "jit_oam_host_plugin_abi",
     }
 )
 
@@ -366,7 +350,6 @@ def test_unregistered_and_misprefixed_names_stay_unclassified():
         FAMILY_PREFIX,
         {
             "mace_jit_codegen.py",
-            "oam.module.cpp",
             "recorded_neutral.py",
             "phantom_family.py",
             "macfoo.py",
@@ -493,9 +476,8 @@ SHARED_FAMILY_DEFERRED = {
     ),
 }
 
-# ``mace``/``mh1``/``nequip``/``oam`` as a family token, not as a substring of
-# an unrelated word.
-FAMILY_TOKEN = re.compile(r"mace|mh1|nequip|oam", re.IGNORECASE)
+# ``mace``/``mh1`` as a family token, not as a substring of an unrelated word.
+FAMILY_TOKEN = re.compile(r"mace|mh1", re.IGNORECASE)
 
 
 # Neutral Python modules that carry the same contract as the shared native

@@ -43,7 +43,7 @@ from .family_registry import COMPACT_MODE_VOCABULARY
 FAMILY_ENTRY = FamilyEntry(
     key="MACE_Polar",
     # The compact frontend resolved the nonlinear family first, then the compact
-    # model family, then this one, then the OAM contracts.
+    # model family, then this one.
     precedence=2,
     detection=Detection(model_types=("MACE_Polar",)),
     evaluators=(

@@ -46,19 +46,9 @@ from symmetrix.mace_nonlinear_jit_codegen import (
     jit_mh1_cuda_plugin_v4_metadata,
     jit_mh1_host_plugin_metadata,
 )
-from symmetrix.oam_cuda_codegen import (
-    OAM_CUDA_ARTIFACT_ENVELOPE,
-    oam_cuda_artifact_metadata,
-)
-from symmetrix.oam_jit_codegen import OAM_HOST_ARTIFACT_ENVELOPE, oam_jit_metadata
-from symmetrix.oam_receiver_codegen import (
-    OAM_RECEIVER_ARTIFACT_ENVELOPE,
-    oam_receiver_jit_metadata,
-)
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 CONTRACTS = REPOSITORY / "symmetrix" / "test" / "data" / "execution_contracts"
-NEQUIP_DATA = REPOSITORY / "symmetrix" / "test" / "data" / "nequip"
 
 HIP_TARGET = {
     "raw_agent_target": "gfx942:xnack-:sramecc+",
@@ -100,9 +90,6 @@ def _published_envelopes(mh1_v3_contract, mh1_v4_contract):
     r1 = _contract("jit_r1_mace_off23_small_contract.json")
     m0 = _contract("standard_m0_contract.json")
     r0 = _contract("standard_r0_contract.json")
-    oam = json.loads(
-        (NEQUIP_DATA / "oam_s_v2_minimal.json").read_text(encoding="utf-8")
-    )
     return {
         "jit_r1_host_plugin_metadata": (
             jit_r1_host_plugin_metadata(r1, precision="float32"),
@@ -156,18 +143,6 @@ def _published_envelopes(mh1_v3_contract, mh1_v4_contract):
             execution_mh1_hip_module_v4_metadata(mh1_v4_contract, MH1_HIP_TARGET),
             NONLINEAR_ARTIFACT_ENVELOPE,
         ),
-        "oam_jit_metadata": (
-            oam_jit_metadata(oam, "float64"),
-            OAM_HOST_ARTIFACT_ENVELOPE,
-        ),
-        "oam_receiver_jit_metadata": (
-            oam_receiver_jit_metadata(oam, "float64", host_target="host-isa-x86-64-v3"),
-            OAM_RECEIVER_ARTIFACT_ENVELOPE,
-        ),
-        "oam_cuda_artifact_metadata": (
-            oam_cuda_artifact_metadata(oam, "float32", 80),
-            OAM_CUDA_ARTIFACT_ENVELOPE,
-        ),
     }
 
 
@@ -175,7 +150,7 @@ def test_every_metadata_builder_publishes_its_envelope(
     mh1_v3_contract, mh1_v4_contract
 ):
     envelopes = _published_envelopes(mh1_v3_contract, mh1_v4_contract)
-    assert len(envelopes) == 16
+    assert len(envelopes) == 13
     for name, (metadata, envelope) in envelopes.items():
         view = validate_artifact_envelope(metadata, envelope)
         assert view["artifact_id"] == metadata["artifact_id"], name

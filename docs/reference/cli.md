@@ -12,9 +12,7 @@ the packaged descriptor and `_backend_build_info()` must agree or probing fails.
 The native build report also includes `prebuilt_operator_artifacts`: its
 `off`/`r0`/`full` MACE mode, exact backend target, catalog path and SHA-256,
 artifact count, installed bytes, compiler identity, source hashes, and measured
-artifact build duration. The catalog may also contain the independently
-selected known-OAM bundle; official CPU and CUDA wheels contain eight OAM
-entries alongside the six `r0` entries. Probe and doctor validation report catalog tampering, unsafe
+artifact build duration. Probe and doctor validation report catalog tampering, unsafe
 symlinks, missing or extra files, and provenance mismatches instead of treating
 package data as a JIT cache hit.
 The command probes the selected native backend by default, including its

@@ -42,12 +42,10 @@ has a null artifact origin.
 
 Official CPU and CUDA packages include the six verified MACE R0 artifacts
 (three foundation-model channel shapes in FP32 and FP64).
-OAM wheel inclusion is pending post-merge repaired-wheel build/install gates
-and the final release decision; the release build plan contains eight known
-S/M/L/XL generated architectures in FP32 and FP64. HIP packages include only
+HIP packages include only
 the MACE artifacts.
 Published packages do not include the larger optional MACE R1/R0/M0/M1 bundle.
-OAM selection compares the exact
+Artifact selection compares the exact
 resolved layer, irrep/channel, angular, tensor-product, radial, and
 normalization descriptor; paths and learned values are not selection keys.
 For capacity specialization, exact installed M0/M1/R0 artifacts are preferred.
@@ -147,15 +145,7 @@ described in {doc}`/streamed_edge_execution`.
 
 The graph-time execution-plan report currently covers MH-0 MACE and MACEField.
 MH-1 direct execution has its own qualified policies but does not yet expose
-the corresponding planner report.
-
-NequIP-OAM exposes the same `execution_profile="speed"` and `"capacity"`
-request spelling through `NequIPCalculator`. Both use generated execution and
-the same exact arena planner, select the sole `full_message` edge variant, and
-retain no more memory in capacity than in speed. Their plan identifiers are
-`oam-direct-speed` and `oam-direct-capacity`; current release qualification is
-pending for both after the artifact-contract change. `oam-fixed-workspace-v1`
-is deliberately unavailable until its separate matrix passes. Direct execution
+the corresponding planner report. Direct execution
 fails closed on a stale ABI, missing capability, wrong target, or missing exact
 artifact; the artifact-free `reference` route remains the same-spline
 diagnostic oracle.

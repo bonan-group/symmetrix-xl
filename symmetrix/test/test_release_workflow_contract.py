@@ -107,7 +107,7 @@ def _cuda_wheel(
     descriptor=None,
     native=True,
     catalog=True,
-    oam=True,
+    artifact=True,
     include_descriptor_prebuilt=True,
 ):
     package = "symmetrix_backend_cuda13_sm120"
@@ -121,10 +121,10 @@ def _cuda_wheel(
         "native_source_content_sha256": "b" * 64,
     }
     artifacts = []
-    if oam:
+    if artifact:
         artifacts.append(
             {
-                "operator": "OAM",
+                "operator": "R1",
                 "build_provenance": {
                     "source_content_sha256": "sha256:" + "a" * 64,
                 },
@@ -204,7 +204,7 @@ def test_cuda_audit_rejects_descriptor_or_provenance_mismatch(tmp_path, mutator)
 
 
 @pytest.mark.parametrize(
-    "kwargs", ({"native": False}, {"catalog": False}, {"oam": False})
+    "kwargs", ({"native": False}, {"catalog": False}, {"artifact": False})
 )
 def test_cuda_audit_rejects_missing_release_payload(tmp_path, kwargs):
     with pytest.raises(Exception):
