@@ -25,6 +25,18 @@ All notable changes to Symmetrix-XL are documented in this file.
   canonical generated operators: non-final layers use M0 and the final scalar
   layer uses M1. MH-1 retains its model-specific nonlinear stages, while every
   product layer reports its own exact artifact identity and origin.
+- Fixed `pair_style symmetrix/mace/polar/kk` with a prepared backbone
+  artifact. The generated backbone takes each layer's product contraction
+  from a separate M0 or M1 module, which the pair style never loaded, so
+  `jit_host_artifact` stopped at the first evaluation with `Execution MH-1
+  shared product composition is incomplete; fallback is forbidden`, and
+  `jit_device_artifact` stopped at `pair_coeff` on every build because its
+  target was passed on as `device`. `jit_product_artifact LAYER PATH BLOCKS`
+  now names each layer's module, `jit_device_artifact` selects the CUDA or HIP
+  backend of the build, and `pair_coeff` stops when an artifact comes without
+  its complete product set. `polar_lammps_jit_arguments` returns the settings
+  for a prepared calculator, and `format_lammps_arguments` quotes them for the
+  LAMMPS input.
 - Fixed the CUDA dual-layer fixed-workspace plan (`mh0-dual-layer-tiled-v1`)
   for format-4 models when it runs more than one tile: each tile's
   second-interaction reverse added its direct M0 adjoint to rows that still

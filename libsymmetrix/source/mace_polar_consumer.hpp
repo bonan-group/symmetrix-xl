@@ -214,6 +214,12 @@ public:
         evaluator_.set_streamed_edges(mode);
     }
 
+    // The backend an artifact must target on this build: host, cuda, or hip.
+    std::string artifact_backend() const
+    {
+        return evaluator_.family_capabilities().target;
+    }
+
     bool load_artifact(const std::string& path,const std::string& target)
     {
         const auto active_target=evaluator_.family_capabilities().target;
@@ -247,6 +253,37 @@ public:
             layer,kind,path,metadata_json,schedule,
             persistent_blocks_per_compute_unit,backend);
         return evaluator_.execution_mh1_product_module_ready(layer);
+    }
+
+    // Load one layer's product module with the operator record its JIT
+    // publication wrote beside it.  A native consumer such as LAMMPS has no
+    // Python frontend to hand that record over, and the record is the only
+    // description the native loader can validate the module against.
+    bool load_published_product_artifact(
+        const int layer,const std::string& path,
+        const int persistent_blocks_per_compute_unit)
+    {
+        try {
+            const auto backend=artifact_backend();
+            const nlohmann::json record=
+                read_product_artifact_record(path,backend!="host");
+            return load_product_artifact(
+                layer,record.at("operator").get<std::string>(),path,
+                record.dump(),record.at("schedule").get<std::string>(),
+                persistent_blocks_per_compute_unit,backend);
+        } catch(const std::exception& exception) {
+            throw std::invalid_argument(
+                "MACE Polar product artifact for layer "+std::to_string(layer)
+                +" ('"+path+"'): "+exception.what());
+        }
+    }
+
+    // True once the layer's product module has run a forward and a reverse
+    // pass: the evidence that the generated route, not another one, evaluated.
+    bool product_artifact_executed(const int layer) const
+    {
+        return evaluator_.execution_mh1_product_module_forward_launch_count(layer)>0
+            &&evaluator_.execution_mh1_product_module_reverse_launch_count(layer)>0;
     }
 
     bool product_artifacts_ready() const
@@ -684,10 +721,9 @@ private:
                 "MACE Polar prepared graph extents are inconsistent.");
     }
 
-    nlohmann::json install_artifact_contract_identity(
-        const std::string& artifact_path,const std::string& target)
+    // The manifest a JIT publication wrote beside its artifact.
+    static nlohmann::json read_artifact_manifest(const std::string& artifact_path)
     {
-        const bool device=target!="host";
         const auto manifest_path=
             std::filesystem::path(artifact_path).parent_path()/"manifest.json";
         std::ifstream stream(manifest_path);
@@ -702,6 +738,38 @@ private:
                 std::string("MACE Polar artifact manifest is malformed: ")
                 +exception.what());
         }
+        return manifest;
+    }
+
+    // The operator record of a product module's publication: its kind,
+    // schedule, dimensions, and identity.
+    static nlohmann::json read_product_artifact_record(
+        const std::string& artifact_path,const bool device)
+    {
+        const auto manifest=read_artifact_manifest(artifact_path);
+        try {
+            const auto& build=manifest.at("key_inputs").at("build");
+            // The CUDA and HIP publications nest the caller's build under
+            // `request`, as they do for the backbone module.
+            const auto& request=device&&build.contains("request")
+                ?build.at("request"):build;
+            const auto& record=request.at("operator");
+            if(!record.is_object())
+                throw std::invalid_argument(
+                    "the manifest's operator record must be an object.");
+            return record;
+        } catch(const nlohmann::json::exception& exception) {
+            throw std::invalid_argument(
+                std::string("the manifest records no operator: ")
+                +exception.what());
+        }
+    }
+
+    nlohmann::json install_artifact_contract_identity(
+        const std::string& artifact_path,const std::string& target)
+    {
+        const bool device=target!="host";
+        const auto manifest=read_artifact_manifest(artifact_path);
         try {
             const auto& build=manifest.at("key_inputs").at("build");
             // NVRTC wraps the same request carried directly by host/NVCC

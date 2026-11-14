@@ -1,12 +1,15 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace symmetrix::lammps {
@@ -123,9 +126,20 @@ struct PolarGraphSettings {
   std::string electrostatics = "auto";
 };
 
+// One generated product (M0 or M1) module of the prepared backbone: the
+// interaction layer it serves, its file, and the persistent blocks per compute
+// unit it is launched with.
+struct PolarJitProductArtifact {
+  int layer = 0;
+  std::string path;
+  int blocks_per_compute_unit = 0;
+};
+
 struct PolarJitArtifactSelection {
   std::string target;
   std::string path;
+  // One module per interaction layer, in layer order once validated.
+  std::vector<PolarJitProductArtifact> products;
 };
 
 inline void select_polar_jit_artifact(
@@ -141,6 +155,50 @@ inline void select_polar_jit_artifact(
       "pair_style symmetrix/mace/polar/kk accepts at most one JIT artifact setting");
   selection.target = setting == "jit_host_artifact" ? "host" : "device";
   selection.path = path;
+}
+
+inline void select_polar_jit_product_artifact(
+  PolarJitArtifactSelection &selection, const std::string &layer,
+  const std::string &path, const std::string &blocks)
+{
+  const auto integer = [](const std::string &text, const int minimum, const int maximum) {
+    int value = 0;
+    const char *const end = text.data() + text.size();
+    const auto parsed = std::from_chars(text.data(), end, value);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || value < minimum || value > maximum)
+      throw std::invalid_argument(
+        "pair_style symmetrix/mace/polar/kk jit_product_artifact requires a "
+        "non-negative layer index, a path, and a blocks-per-compute-unit count "
+        "in [1, 32]");
+    return value;
+  };
+  const PolarJitProductArtifact product{
+    integer(layer, 0, std::numeric_limits<int>::max()), path, integer(blocks, 1, 32)};
+  if (path.empty())
+    throw std::invalid_argument(
+      "MACE Polar JIT product artifact path must not be empty");
+  for (const auto &selected : selection.products)
+    if (selected.layer == product.layer)
+      throw std::invalid_argument(
+        "pair_style symmetrix/mace/polar/kk accepts one jit_product_artifact "
+        "per interaction layer");
+  selection.products.push_back(product);
+}
+
+inline void validate_polar_jit_artifact_selection(PolarJitArtifactSelection &selection)
+{
+  if (selection.path.empty() && !selection.products.empty())
+    throw std::invalid_argument(
+      "pair_style symmetrix/mace/polar/kk jit_product_artifact requires "
+      "jit_host_artifact or jit_device_artifact");
+  std::sort(selection.products.begin(), selection.products.end(),
+            [](const auto &left, const auto &right) { return left.layer < right.layer; });
+  // A gap can never be a complete set: the model's layers count from 0.
+  for (std::size_t index = 0; index < selection.products.size(); ++index)
+    if (static_cast<std::size_t>(selection.products[index].layer) != index)
+      throw std::invalid_argument(
+        "pair_style symmetrix/mace/polar/kk jit_product_artifact layers must "
+        "be consecutive from 0");
 }
 
 inline double parse_finite_polar_setting(

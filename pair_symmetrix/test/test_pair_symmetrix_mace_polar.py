@@ -232,6 +232,123 @@ int main() {
     assert "select_polar_jit_artifact" in settings_body
 
 
+def test_polar_lammps_selects_one_product_artifact_per_layer(tmp_path):
+    """A generated backbone names one product module per interaction layer."""
+
+    source = tmp_path / "product_artifact.cpp"
+    executable = tmp_path / "product_artifact"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <stdexcept>
+#include <string>
+#include "pair_symmetrix_mace_polar_admission.hpp"
+
+template <typename Call>
+bool rejected(Call call, const std::string& text) {
+  try {
+    call();
+  } catch (const std::invalid_argument& error) {
+    return std::string(error.what()).find(text) != std::string::npos;
+  }
+  return false;
+}
+
+int main() {
+  namespace polar = symmetrix::lammps;
+
+  // The modules may come in any order; validation keeps them by layer.
+  polar::PolarJitArtifactSelection selection;
+  polar::select_polar_jit_artifact(
+    selection, "jit_host_artifact", "/tmp/host.so");
+  polar::select_polar_jit_product_artifact(selection, "1", "/tmp/m1.so", "8");
+  polar::select_polar_jit_product_artifact(selection, "0", "/tmp/m0.so", "2");
+  polar::validate_polar_jit_artifact_selection(selection);
+  assert(selection.products.size() == 2);
+  assert(selection.products[0].layer == 0);
+  assert(selection.products[0].path == "/tmp/m0.so");
+  assert(selection.products[0].blocks_per_compute_unit == 2);
+  assert(selection.products[1].layer == 1);
+  assert(selection.products[1].path == "/tmp/m1.so");
+  assert(selection.products[1].blocks_per_compute_unit == 8);
+
+  const bool repeated = rejected([&] {
+    polar::select_polar_jit_product_artifact(
+      selection, "1", "/tmp/again.so", "8");
+  }, "one jit_product_artifact per interaction layer");
+  assert(repeated);
+  for (const char* layer : {"-1", "one", "1.5", "", "+1", " 1"}) {
+    const bool invalid = rejected([&] {
+      polar::select_polar_jit_product_artifact(
+        selection, layer, "/tmp/x.so", "8");
+    }, "non-negative layer index");
+    assert(invalid);
+  }
+  for (const char* blocks : {"0", "33", "eight", ""}) {
+    const bool invalid = rejected([&] {
+      polar::select_polar_jit_product_artifact(
+        selection, "2", "/tmp/x.so", blocks);
+    }, "blocks-per-compute-unit count in [1, 32]");
+    assert(invalid);
+  }
+  const bool empty = rejected([&] {
+    polar::select_polar_jit_product_artifact(selection, "2", "", "8");
+  }, "must not be empty");
+  assert(empty);
+  assert(selection.products.size() == 2);
+
+  // The model's layers count from 0, so a gap can never be a complete set.
+  polar::PolarJitArtifactSelection gap;
+  polar::select_polar_jit_artifact(
+    gap, "jit_device_artifact", "/tmp/device.hsaco");
+  polar::select_polar_jit_product_artifact(gap, "1", "/tmp/m1.hsaco", "8");
+  const bool gapped = rejected([&] {
+    polar::validate_polar_jit_artifact_selection(gap);
+  }, "layers must be consecutive from 0");
+  assert(gapped);
+
+  // A product module belongs to a prepared backbone, never to the portable one.
+  polar::PolarJitArtifactSelection portable;
+  polar::validate_polar_jit_artifact_selection(portable);
+  polar::select_polar_jit_product_artifact(portable, "0", "/tmp/m0.so", "8");
+  const bool orphan = rejected([&] {
+    polar::validate_polar_jit_artifact_selection(portable);
+  }, "requires jit_host_artifact or jit_device_artifact");
+  assert(orphan);
+}
+"""
+    )
+    compile_result = subprocess.run(
+        [
+            "c++",
+            "-std=c++20",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            f"-I{SOURCE_ROOT}",
+            str(source),
+            "-o",
+            str(executable),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert compile_result.returncode == 0, compile_result.stderr
+    subprocess.run([executable], check=True)
+    pair_source = (SOURCE_ROOT / "pair_symmetrix_mace_polar_kokkos.cpp").read_text()
+    settings_body = pair_source.split(
+        "void PairSymmetrixMACEPolarKokkos<DeviceType,Precision>::settings", 1
+    )[1].split("void PairSymmetrixMACEPolarKokkos<DeviceType,Precision>::coeff", 1)[0]
+    assert "select_polar_jit_product_artifact" in settings_body
+    assert "validate_polar_jit_artifact_selection" in settings_body
+    coeff_body = pair_source.split(
+        "void PairSymmetrixMACEPolarKokkos<DeviceType,Precision>::coeff", 1
+    )[1].split("double PairSymmetrixMACEPolarKokkos", 1)[0]
+    assert "load_published_product_artifact" in coeff_body
+    assert "product_artifacts_ready" in coeff_body
+
+
 def test_polar_lammps_force_and_virial_mapping_is_load_bearing(tmp_path):
     source = tmp_path / "mapping.cpp"
     executable = tmp_path / "mapping"
@@ -452,6 +569,27 @@ def test_polar_lammps_nonzero_fermi_is_inert_with_qualified_fixture(tmp_path):
     if missing:
         pytest.skip("missing qualified external fixture: " + ", ".join(missing))
 
+    # The generated backbone runs each layer's product from its own module.
+    # Prepare them for this model and keep the fixture's backbone.
+    from polar_jit_artifacts import prepare_polar_jit
+    from symmetrix.mace_nonlinear_jit_artifact import format_lammps_arguments
+
+    jit_cache = tmp_path / "jit"
+    jit_cache.mkdir(mode=0o700)
+    prepared = prepare_polar_jit(
+        model,
+        "float64",
+        jit_cache,
+        species=("O", "H", "H"),
+        positions=[[3.0, 3.0, 3.0], [3.96, 3.0, 3.0], [2.76, 3.93, 3.0]],
+    )
+    if prepared["arguments"][0] != "jit_host_artifact":
+        pytest.skip("the qualified fixture runs the CPU pair style")
+    artifact_settings = format_lammps_arguments(
+        ["jit_host_artifact", artifact, *prepared["arguments"][2:]]
+    )
+    coefficients = format_lammps_arguments(["*", "*", model, "O", "H"])
+
     # This optional external gate drives the real linked pair style twice; a
     # source-only parser check cannot catch the consumer request-mapping bug.
     result = subprocess.run(
@@ -479,8 +617,8 @@ mass 1 15.999
 mass 2 1.008
 neighbor 0.5 bin
 neigh_modify every 1 delay 0 check yes
-pair_style symmetrix/mace/polar/kk fermi_level {fermi_level} polar_electrostatics realspace jit_host_artifact {artifact}
-pair_coeff * * {model} O H
+pair_style symmetrix/mace/polar/kk fermi_level {fermi_level} polar_electrostatics realspace {artifact_settings}
+pair_coeff {coefficients}
 run_style verlet/kk
 timestep 0.0
 run 1
