@@ -42,6 +42,7 @@ jobs:
   release-metadata:
     name: Verify release metadata and publication ref
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
@@ -61,6 +62,7 @@ jobs:
     name: Build source distribution
     needs: release-metadata
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Clone repository
         uses: actions/checkout@v6
@@ -92,6 +94,7 @@ jobs:
     name: Build wheel ${{ matrix.python }}
     needs: release-metadata
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -121,6 +124,7 @@ jobs:
     name: Test wheel on ${{ matrix.os }}
     needs: build
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     env:
       SYMMETRIX_OPENMP_RUNTIME_CHECK: strict
     strategy:
@@ -202,6 +206,7 @@ jobs:
     name: Run full CPU wheel suite
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       SYMMETRIX_TEST_MODEL_DOWNLOADS: "0"
     steps:
@@ -243,6 +248,7 @@ jobs:
     if: inputs.publish_pypi
     needs: [build-sdist, test, qualify-full]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: pypi
       url: https://pypi.org/p/symmetrix-xl
@@ -290,6 +296,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.publish_testpypi
     needs: [build-sdist, test, qualify-full]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: testpypi
       url: https://test.pypi.org/p/symmetrix-xl

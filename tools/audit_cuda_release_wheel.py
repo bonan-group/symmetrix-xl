@@ -14,8 +14,23 @@ from _symmetrix_build.command import BuildError
 from _symmetrix_build.wheel_audit import audit_wheel
 
 
-def audit_cuda_wheel(wheel: Path, *, cuda_major: str, target: str) -> dict[str, object]:
-    """Apply common wheel policy plus the exact CUDA package contract."""
+def audit_cuda_wheel(
+    wheel: Path,
+    *,
+    cuda_major: str,
+    target: str,
+    foundation_manifest: Path | None = None,
+    prebuilt_mode: str = "r0",
+    floating_point_policy: str = "cuda-fast-math",
+) -> dict[str, object]:
+    """Apply common wheel policy plus the exact CUDA package contract.
+
+    ``foundation_manifest`` binds the catalog to the deterministic build
+    plan: every catalog artifact id must equal the planned artifact id set
+    for the wheel's own recorded source content hash.  That is the
+    independent provenance anchor; the descriptor-side summary below only
+    cross-checks consistency.
+    """
     audit_wheel(wheel)
     selector = f"cuda{cuda_major}-{target.lower()}"
     package = f"symmetrix_backend_{selector.replace('-', '_')}"
@@ -66,10 +81,11 @@ def audit_cuda_wheel(wheel: Path, *, cuda_major: str, target: str) -> dict[str, 
         if not isinstance(artifacts, list) or not artifacts:
             raise BuildError("CUDA wheel operator catalog is empty")
         if not isinstance(prebuilt, dict):
-            # Older backend project descriptors do not copy the catalog summary
-            # into backend.json. The catalog is itself signed by its SHA and
-            # every entry carries source/native provenance, so derive the
-            # summary here while retaining the same target and count checks.
+            # Backend project descriptors do not copy the catalog summary into
+            # backend.json yet; the derived summary below is deliberately only
+            # a self-consistency check.  Independent verification comes from
+            # the per-artifact descriptor hash comparison above and the
+            # plan-binding check driven by --foundation-manifest.
             prebuilt = {
                 "backend": "cuda",
                 "target": target.lower(),
@@ -95,6 +111,37 @@ def audit_cuda_wheel(wheel: Path, *, cuda_major: str, target: str) -> dict[str, 
                 raise BuildError(
                     f"CUDA catalog artifact {field} disagrees with descriptor"
                 )
+        if foundation_manifest is not None:
+            catalog_hashes = {
+                item["build_provenance"]["source_content_sha256"] for item in artifacts
+            }
+            if len(catalog_hashes) != 1:
+                raise BuildError(
+                    "CUDA catalog artifacts disagree on source_content_sha256"
+                )
+            from _symmetrix_build.prebuilt_operator_artifacts import (
+                plan_foundation_operator_artifacts,
+            )
+
+            plan = plan_foundation_operator_artifacts(
+                manifest_path=foundation_manifest,
+                mode=prebuilt_mode,
+                backend="cuda",
+                target=target.lower(),
+                source_content_sha256=catalog_hashes.pop().split(":", 1)[1],
+                floating_point_policy=floating_point_policy,
+            )
+            planned_ids = sorted(
+                artifact["artifact_id"] for artifact in plan["artifacts"]
+            )
+            catalog_ids = sorted(item["identity"]["artifact_id"] for item in artifacts)
+            if catalog_ids != planned_ids:
+                raise BuildError(
+                    "CUDA catalog artifact set does not match the planned "
+                    f"prebuilt operator set for mode {prebuilt_mode!r}: "
+                    f"catalog has {len(catalog_ids)} artifacts, plan has "
+                    f"{len(planned_ids)}"
+                )
         for field in ("source_content_sha256", "native_source_content_sha256"):
             summary_hash = prebuilt.get(field)
             if summary_hash is not None and summary_hash != descriptor.get(field):
@@ -117,11 +164,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("wheel", type=Path)
     parser.add_argument("--cuda-major", required=True)
     parser.add_argument("--target", required=True)
+    parser.add_argument(
+        "--foundation-manifest",
+        type=Path,
+        help="Bind the catalog to the deterministic plan from this manifest.",
+    )
+    parser.add_argument("--prebuilt-mode", default="r0")
+    parser.add_argument("--floating-point-policy", default="cuda-fast-math")
     args = parser.parse_args(argv)
     print(
         json.dumps(
             audit_cuda_wheel(
-                args.wheel, cuda_major=args.cuda_major, target=args.target
+                args.wheel,
+                cuda_major=args.cuda_major,
+                target=args.target,
+                foundation_manifest=args.foundation_manifest,
+                prebuilt_mode=args.prebuilt_mode,
+                floating_point_policy=args.floating_point_policy,
             ),
             sort_keys=True,
         )

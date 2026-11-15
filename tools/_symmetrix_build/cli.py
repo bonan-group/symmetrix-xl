@@ -457,6 +457,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     matrix.add_argument("--dry-run", action="store_true")
 
+    plan_artifacts = commands.add_parser(
+        "plan-artifacts",
+        help="Print the deterministic prebuilt-operator plan for one target.",
+    )
+    plan_artifacts.add_argument("--manifest", type=Path)
+    plan_artifacts.add_argument("--mode", choices=("off", "r0", "full"), default="r0")
+    plan_artifacts.add_argument(
+        "--backend", choices=("host", "cuda", "hip"), default="host"
+    )
+    plan_artifacts.add_argument("--target", required=True)
+    plan_artifacts.add_argument("--source-content-sha256")
+    plan_artifacts.add_argument("--floating-point-policy")
     sdist = commands.add_parser(
         "sdist",
         help="Build the self-contained source distribution at pinned submodule commits.",
@@ -524,6 +536,46 @@ def main(argv: list[str] | None = None) -> int:
                 jobs=args.jobs,
                 dry_run=args.dry_run,
             )
+        if args.command == "plan-artifacts":
+            from .prebuilt_operator_artifacts import (
+                plan_foundation_operator_artifacts,
+            )
+
+            source_sha256 = args.source_content_sha256
+            if source_sha256 is None:
+                from .source_provenance import symmetrix_source_fingerprint
+
+                source_sha256 = symmetrix_source_fingerprint(root)
+            manifest = args.manifest
+            if manifest is None:
+                manifest = (
+                    root
+                    / "symmetrix/source/symmetrix/foundation_operator_manifest.json"
+                )
+            plan = plan_foundation_operator_artifacts(
+                manifest_path=manifest,
+                mode=args.mode,
+                backend=args.backend,
+                target=args.target,
+                source_content_sha256=source_sha256,
+                floating_point_policy=args.floating_point_policy,
+            )
+            print(
+                json.dumps(
+                    {
+                        "mode": plan["mode"],
+                        "backend": args.backend,
+                        "target": args.target,
+                        "artifact_count": len(plan["artifacts"]),
+                        "artifact_ids": sorted(
+                            artifact["artifact_id"] for artifact in plan["artifacts"]
+                        ),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
         if args.command == "sdist":
             return run_sdist_command(
                 repo_root=root,

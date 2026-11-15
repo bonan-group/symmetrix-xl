@@ -10,6 +10,7 @@ on:
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - name: Clone repo
       uses: actions/checkout@v6
@@ -20,6 +21,7 @@ jobs:
 
   symmetrix:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
       SYMMETRIX_TEST_MODEL_DOWNLOADS: "0"
     steps:
@@ -79,6 +81,7 @@ jobs:
 
   metatrain-mace:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: "1"
     steps:
@@ -117,6 +120,7 @@ jobs:
 
   pair_symmetrix:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
     - name: Clone repo
       uses: actions/checkout@v6
@@ -215,6 +219,7 @@ jobs:
 
   extract-mace-model:
     runs-on: ubuntu-latest
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:

@@ -22,7 +22,6 @@ jobs:
       ROCM_PATH: /opt/rocm
       LD_LIBRARY_PATH: /opt/rocm/lib
       KOKKOS_NUM_THREADS: 1
-      SYMMETRIX_REQUIRED_TEST_MANIFEST: hip_required_tests.json
     steps:
       - name: Clone trusted repository revision
         uses: actions/checkout@v6
@@ -174,12 +173,22 @@ jobs:
 
       - name: Compile ordinary R1 with required hipRTC
         env:
-          SYMMETRIX_REQUIRED_TEST_MANIFEST: hip_compiler_required_tests.json
+          SYMMETRIX_REQUIRED_TEST_MANIFEST: test/hip_compiler_required_tests.json
         run: |
           source .venv/bin/activate
-          cd symmetrix/test
-          pytest -q \
-            'test_jit_compiler_qualification.py::test_hip_forced_compiler_produces_expected_artifact[hiprtc]'
+          cd symmetrix
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          import pytest
+
+          manifest = json.loads(
+              Path(os.environ["SYMMETRIX_REQUIRED_TEST_MANIFEST"]).read_text()
+          )
+          raise SystemExit(pytest.main(["-q", *manifest["required_nodes"]]))
+          PY
 
       - name: Exercise deprecated hipcc runtime compatibility
         continue-on-error: true

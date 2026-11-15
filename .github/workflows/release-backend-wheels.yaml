@@ -42,6 +42,7 @@ jobs:
   release-metadata:
     name: Verify release metadata and publication ref
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
@@ -58,6 +59,7 @@ jobs:
     name: Build cpu avx512 ${{ matrix.python }}
     needs: release-metadata
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     container: quay.io/pypa/manylinux_2_28_x86_64
     strategy:
       fail-fast: false
@@ -215,6 +217,9 @@ jobs:
           artifacts = catalog["artifacts"]
           prebuilt = descriptor.get("prebuilt_operator_artifacts")
           if not isinstance(prebuilt, dict):
+              # Descriptors do not carry the summary yet; the plan comparison
+              # below is the independent provenance anchor, this block only
+              # keeps the catalog self-consistent.
               prebuilt = {
                   "backend": "host",
                   "target": "host-isa-x86-64-v4",
@@ -225,14 +230,47 @@ jobs:
               assert prebuilt["mode"] == "r0", prebuilt
           assert prebuilt["backend"] == "host", prebuilt
           assert prebuilt["target"] == "host-isa-x86-64-v4", prebuilt
-          assert prebuilt["artifact_count"] == 6, prebuilt
-          assert len(artifacts) == 6, catalog
+          assert prebuilt["artifact_count"] == len(artifacts), prebuilt
           assert {
               item["identity"]["backend"] for item in artifacts
           } == {"host"}, catalog
           assert {
               item["identity"]["target"] for item in artifacts
           } == {"host-isa-x86-64-v4"}, catalog
+          catalog_hashes = {
+              item["build_provenance"]["source_content_sha256"]
+              for item in artifacts
+          }
+          assert len(catalog_hashes) == 1, catalog
+          assert (
+              "sha256:" + descriptor["source_content_sha256"]
+              in catalog_hashes
+          ), descriptor
+          import sys
+
+          sys.path.insert(0, "tools")
+          from _symmetrix_build.prebuilt_operator_artifacts import (
+              plan_foundation_operator_artifacts,
+          )
+
+          plan = plan_foundation_operator_artifacts(
+              manifest_path=Path(
+                  "symmetrix/source/symmetrix/foundation_operator_manifest.json"
+              ),
+              mode="r0",
+              backend="host",
+              target="host-isa-x86-64-v4",
+              source_content_sha256=descriptor["source_content_sha256"],
+              floating_point_policy="strict",
+          )
+          planned_ids = sorted(a["artifact_id"] for a in plan["artifacts"])
+          catalog_ids = sorted(
+              item["identity"]["artifact_id"] for item in artifacts
+          )
+          assert catalog_ids == planned_ids, (
+              f"catalog/planned artifact sets differ: {len(catalog_ids)} vs "
+              f"{len(planned_ids)}"
+          )
           assert {
               item["build_provenance"]["source_content_sha256"]
               for item in artifacts
@@ -280,7 +318,20 @@ jobs:
           assert prebuilt["mode"] == "r0", prebuilt
           assert prebuilt["backend"] == "host", prebuilt
           assert prebuilt["target"] == "host-isa-x86-64-v4", prebuilt
-          assert prebuilt["artifact_count"] == 14, prebuilt
+          import json as _json
+          from pathlib import Path as _Path
+
+          import symmetrix_backend_cpu_avx512 as _backend_pkg
+
+          _catalog = _json.loads(
+              (
+                  _Path(_backend_pkg.__file__).parent
+                  / "_operator_artifacts/catalog.json"
+              ).read_text()
+          )
+          assert prebuilt["artifact_count"] == len(
+              _catalog["artifacts"]
+          ), (prebuilt, len(_catalog["artifacts"]))
           native._init_kokkos()
           try:
               assert native._kokkos_default_execution_space() == "OpenMP"
@@ -301,6 +352,7 @@ jobs:
     if: inputs.publish_pypi
     needs: build-cpu-v4
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: pypi
     permissions:

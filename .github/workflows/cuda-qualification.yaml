@@ -104,17 +104,28 @@ jobs:
 
       - name: Compile ordinary R1 with required NVRTC
         env:
-          SYMMETRIX_REQUIRED_TEST_MANIFEST: cuda_compiler_required_tests.json
+          SYMMETRIX_REQUIRED_TEST_MANIFEST: test/cuda_compiler_required_tests.json
         run: |
           source .venv/bin/activate
-          cd symmetrix/test
-          pytest -q \
-            'test_jit_compiler_qualification.py::test_cuda_forced_compiler_produces_expected_artifact[nvrtc]'
+          cd symmetrix
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          import pytest
+
+          manifest = json.loads(
+              Path(os.environ["SYMMETRIX_REQUIRED_TEST_MANIFEST"]).read_text()
+          )
+          raise SystemExit(pytest.main(["-q", *manifest["required_nodes"]]))
+          PY
 
       - name: Exercise deprecated NVCC runtime compatibility
         continue-on-error: true
         env:
           SYMMETRIX_JIT_NVCC: ${{ env.CUDA_ROOT }}/bin/nvcc
+          SYMMETRIX_REQUIRED_TEST_MANIFEST: ""
         run: |
           source .venv/bin/activate
           cd symmetrix/test
@@ -124,17 +135,22 @@ jobs:
       - name: Require NVRTC ordinary, MH-1, and dispersion launches
         env:
           SYMMETRIX_JIT_CUDA_JIT_BACKEND: nvrtc
-          SYMMETRIX_REQUIRED_TEST_MANIFEST: cuda_runtime_required_tests.json
+          SYMMETRIX_REQUIRED_TEST_MANIFEST: test/cuda_runtime_required_tests.json
         run: |
           source .venv/bin/activate
-          cd symmetrix/test
-          pytest -q \
-            'test_cuda_runtime.py::test_cuda_r1_generated_module_matches_generic' \
-            'test_mh1.py::test_mh1_generated_cuda_handles_nondivisible_second_subgroup_iteration' \
-            'test_dispersion_device.py::test_cuda_dispersion_device_graph_reuse[d2]' \
-            'test_dispersion_device.py::test_cuda_dispersion_device_graph_reuse[d3]' \
-            'test_dispersion_device.py::test_cuda_dispersion_precision_parity[d2]' \
-            'test_dispersion_device.py::test_cuda_dispersion_precision_parity[d3]'
+          cd symmetrix
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          import pytest
+
+          manifest = json.loads(
+              Path(os.environ["SYMMETRIX_REQUIRED_TEST_MANIFEST"]).read_text()
+          )
+          raise SystemExit(pytest.main(["-q", *manifest["required_nodes"]]))
+          PY
 
       - name: Download and verify MACE-MH-1 checkpoint
         run: |
