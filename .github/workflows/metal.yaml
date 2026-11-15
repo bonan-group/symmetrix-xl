@@ -25,6 +25,7 @@ defaults:
 jobs:
   metal:
     runs-on: macos-15
+    timeout-minutes: 45
     steps:
     - name: Clone repo
       uses: actions/checkout@v6

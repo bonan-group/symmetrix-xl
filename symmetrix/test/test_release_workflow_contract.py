@@ -108,6 +108,7 @@ def _cuda_wheel(
     native=True,
     catalog=True,
     artifact=True,
+    artifacts=None,
     include_descriptor_prebuilt=True,
 ):
     package = "symmetrix_backend_cuda13_sm120"
@@ -120,16 +121,17 @@ def _cuda_wheel(
         "source_content_sha256": "a" * 64,
         "native_source_content_sha256": "b" * 64,
     }
-    artifacts = []
-    if artifact:
-        artifacts.append(
-            {
-                "operator": "R1",
-                "build_provenance": {
-                    "source_content_sha256": "sha256:" + "a" * 64,
-                },
-            }
-        )
+    if artifacts is None:
+        artifacts = []
+        if artifact:
+            artifacts.append(
+                {
+                    "operator": "R1",
+                    "build_provenance": {
+                        "source_content_sha256": "sha256:" + "a" * 64,
+                    },
+                }
+            )
     payload = {
         "artifacts": artifacts,
     }
@@ -201,6 +203,108 @@ def test_cuda_audit_rejects_descriptor_or_provenance_mismatch(tmp_path, mutator)
             cuda_major="13",
             target="sm120",
         )
+
+
+def _planned_cuda_catalog(source_sha256="a" * 64):
+    import sys
+
+    root = Path(__file__).resolve().parents[2]
+    sys.path.insert(0, str(root / "tools"))
+    from _symmetrix_build.prebuilt_operator_artifacts import (
+        plan_foundation_operator_artifacts,
+    )
+
+    plan = plan_foundation_operator_artifacts(
+        manifest_path=root
+        / "symmetrix/source/symmetrix/foundation_operator_manifest.json",
+        mode="r0",
+        backend="cuda",
+        target="sm120",
+        source_content_sha256=source_sha256,
+        floating_point_policy="cuda-fast-math",
+    )
+    return [
+        {
+            "identity": {
+                "artifact_id": artifact["artifact_id"],
+                "backend": "cuda",
+                "target": "sm120",
+            },
+            "build_provenance": {
+                "source_content_sha256": "sha256:" + source_sha256,
+            },
+        }
+        for artifact in plan["artifacts"]
+    ]
+
+
+def test_cuda_audit_binds_catalog_to_the_deterministic_plan(tmp_path):
+    manifest = (
+        Path(__file__).resolve().parents[2]
+        / "symmetrix/source/symmetrix/foundation_operator_manifest.json"
+    )
+    wheel = _cuda_wheel(tmp_path, artifact=False, artifacts=_planned_cuda_catalog())
+    result = audit_cuda_release_wheel.audit_cuda_wheel(
+        wheel,
+        cuda_major="13",
+        target="sm120",
+        foundation_manifest=manifest,
+    )
+    assert result["artifacts"] == 6
+
+    mutated = _planned_cuda_catalog()
+    mutated[0]["identity"]["artifact_id"] = "0" * 64
+    with pytest.raises(Exception, match="does not match the planned"):
+        audit_cuda_release_wheel.audit_cuda_wheel(
+            _cuda_wheel(tmp_path, artifact=False, artifacts=mutated),
+            cuda_major="13",
+            target="sm120",
+            foundation_manifest=manifest,
+        )
+
+    truncated = _planned_cuda_catalog()[:-1]
+    with pytest.raises(Exception, match="does not match the planned"):
+        audit_cuda_release_wheel.audit_cuda_wheel(
+            _cuda_wheel(tmp_path, artifact=False, artifacts=truncated),
+            cuda_major="13",
+            target="sm120",
+            foundation_manifest=manifest,
+        )
+
+
+def test_cuda_release_audits_against_the_deterministic_plan():
+    workflow = (ROOT / ".github/workflows/release-cuda-wheels.yaml").read_text()
+    assert "--foundation-manifest" in workflow
+    assert "foundation_operator_manifest.json" in workflow
+
+
+def test_backend_release_derives_artifact_counts_from_the_plan():
+    workflow = (ROOT / ".github/workflows/release-backend-wheels.yaml").read_text()
+    assert "plan_foundation_operator_artifacts" in workflow
+    assert "catalog_ids == planned_ids" in workflow
+    assert 'artifact_count"] == 14' not in workflow
+    assert 'artifact_count"] == 6' not in workflow
+
+
+def test_qualification_workflows_resolve_required_manifest_node_ids():
+    cuda = (ROOT / ".github/workflows/cuda-qualification.yaml").read_text()
+    hip = (ROOT / ".github/workflows/hip-qualification.yaml").read_text()
+    for workflow, manifests in (
+        (
+            cuda,
+            (
+                "test/cuda_compiler_required_tests.json",
+                "test/cuda_runtime_required_tests.json",
+            ),
+        ),
+        (hip, ("test/hip_compiler_required_tests.json",)),
+    ):
+        for manifest in manifests:
+            assert manifest in workflow, manifest
+        assert 'pytest.main(["-q", *manifest["required_nodes"]])' in workflow
+        # unprefixed manifest paths run from symmetrix/test and can never resolve
+        assert "SYMMETRIX_REQUIRED_TEST_MANIFEST: cuda_" not in workflow
+        assert "SYMMETRIX_REQUIRED_TEST_MANIFEST: hip_" not in workflow
 
 
 @pytest.mark.parametrize(
