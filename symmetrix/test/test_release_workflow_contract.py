@@ -37,8 +37,10 @@ def test_cuda_release_keeps_declared_matrix_and_metadata_gate():
     workflow = (ROOT / ".github/workflows/release-cuda-wheels.yaml").read_text()
     for target in ("sm70", "sm80", "sm86", "sm89", "sm90", "sm100", "sm120"):
         assert target in workflow
-    assert "python tools/check_release_metadata.py" in workflow
-    assert "python tools/check_release_metadata.py --require-tag" in workflow
+    assert "uses: ./.github/actions/release-metadata" in workflow
+    action = (ROOT / ".github/actions/release-metadata/action.yml").read_text()
+    assert "python tools/check_release_metadata.py" in action
+    assert "python tools/check_release_metadata.py --require-tag" in action
     assert "publish_pypi" in workflow
 
 

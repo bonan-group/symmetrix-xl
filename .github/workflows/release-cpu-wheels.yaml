@@ -44,19 +44,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/release-metadata
         with:
-          python-version: "3.12"
-
-      - name: Install source build dependencies
-        run: sudo apt-get update && sudo apt-get install -y gfortran libopenblas-dev
-      - name: Validate version sources and release tag
-        run: |
-          python tools/check_release_metadata.py
-          if [[ "${{ inputs.publish_pypi }}" == "true" || "${{ inputs.publish_testpypi }}" == "true" ]]; then
-            python tools/check_release_metadata.py --require-tag
-          fi
+          publish_pypi: ${{ inputs.publish_pypi }}
+          publish_testpypi: ${{ inputs.publish_testpypi }}
 
   build-sdist:
     name: Build source distribution
@@ -134,21 +125,36 @@ jobs:
           - os: ubuntu-22.04
             python: "3.10"
             abi: cp310-cp310
+            suite: native
           - os: ubuntu-22.04
             python: "3.12"
             abi: cp312-cp312
+            suite: native
           - os: ubuntu-22.04
             python: "3.14"
             abi: cp314-cp314
+            suite: native
           - os: ubuntu-24.04
             python: "3.10"
             abi: cp310-cp310
+            suite: native
           - os: ubuntu-24.04
             python: "3.12"
             abi: cp312-cp312
+            suite: native
           - os: ubuntu-24.04
             python: "3.14"
             abi: cp314-cp314
+            suite: native
+          # Every published ABI is at least installed, imported, and probed.
+          - os: ubuntu-24.04
+            python: "3.11"
+            abi: cp311-cp311
+            suite: smoke
+          - os: ubuntu-24.04
+            python: "3.13"
+            abi: cp313-cp313
+            suite: smoke
     steps:
       - name: Clone repo (tests only)
         uses: actions/checkout@v6
@@ -190,6 +196,7 @@ jobs:
           PY
 
       - name: Pure-native test subset (no torch required)
+        if: matrix.suite == 'native'
         run: |
           pip install pytest
           cd symmetrix/test
@@ -206,7 +213,7 @@ jobs:
     name: Run full CPU wheel suite
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       SYMMETRIX_TEST_MODEL_DOWNLOADS: "0"
     steps:
@@ -226,7 +233,7 @@ jobs:
           path: wheelhouse
 
       - name: Install wheel and release test dependencies
-        run: pip install wheelhouse/*.whl pytest numpy scipy ase
+        run: pip install wheelhouse/*.whl pytest numpy scipy ase matscipy
 
       - name: Run focused wheel compatibility suite
         env:
@@ -242,6 +249,36 @@ jobs:
           symmetrix/test/test_polar_end_to_end_fixtures.py
           symmetrix/test/test_mace_les_reference.py
           symmetrix/test/test_release_workflow_contract.py
+
+      - name: Broad host selection against the installed wheel
+        env:
+          SYMMETRIX_BACKEND: cpu
+          SYMMETRIX_OPENMP_RUNTIME_CHECK: strict
+          SYMMETRIX_TEST_MODEL_DOWNLOADS: "0"
+        run: >-
+          python -m pytest -q -m "not extended" symmetrix/test
+          --ignore=symmetrix/test/test_extract_mace_data.py
+          --ignore=symmetrix/test/test_mace_streamed_edges.py
+          --ignore=symmetrix/test/test_polar_torch_baseline.py
+          --ignore=symmetrix/test/test_single_layer_mace.py
+          --ignore=symmetrix/test/test_jit_kokkos_integration.py
+          --ignore=symmetrix/test/test_jit_device_artifact.py
+          --ignore=symmetrix/test/test_mace_les_readout.py
+          --ignore=symmetrix/test/test_jit_operator_cuda.py
+          --ignore=symmetrix/test/test_mace_polar_frontend.py
+          --ignore=symmetrix/test/test_bench_cli.py
+          --ignore=symmetrix/test/test_family_registry.py
+          --ignore=symmetrix/test/test_mh1.py
+          --ignore=symmetrix/test/test_polar_s_direct.py
+
+      - name: Torch-routed frontend against the installed wheel
+        env:
+          SYMMETRIX_BACKEND: cpu
+          SYMMETRIX_TEST_MODEL_DOWNLOADS: "0"
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -c "import torch; assert torch.cuda.is_available() is False"
+          python -m pytest -q -m "not extended" symmetrix/test/test_family_registry.py symmetrix/test/test_mace_polar_frontend.py
 
   publish:
     name: Publish to PyPI
