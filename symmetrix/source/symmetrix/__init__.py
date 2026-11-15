@@ -35,9 +35,6 @@ _FRONTEND_EXPORTS = {
         ".mace_jit_host_artifact",
         "prepare_jit_host_artifact",
     ),
-    "extract_nequip_data": (".extract_nequip_data", "extract_nequip_data"),
-    "export_nequip_model": (".extract_nequip_data", "export_nequip_model"),
-    "NequIPCalculator": (".nequip_calculator", "NequIPCalculator"),
 }
 
 # Stable native surface retained for direct imports and ``from symmetrix import *``.
@@ -123,12 +120,9 @@ __all__ = [
     "FieldAwareCalculator",
     "FieldContributionCalculator",
     "FourierD3Correction",
-    "NequIPCalculator",
     "Symmetrix",
     "SymmetrixEnsemble",
     "available_backends",
-    "export_nequip_model",
-    "extract_nequip_data",
     "load_backend",
     "selected_backend",
 ]

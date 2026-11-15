@@ -44,7 +44,6 @@ class TargetManifest:
     # provider discovery; this records what the build was asked for.
     particle_mesh_policy: str = "auto"
     prebuilt_operator_artifacts: str = "r0"
-    prebuilt_oam_artifacts: str = "off"
     cufft_linkage: str = "runtime"
     schema_version: int = SCHEMA_VERSION
 
@@ -53,8 +52,6 @@ class TargetManifest:
             raise BuildError("cufft_linkage must be runtime or direct")
         if self.prebuilt_operator_artifacts not in {"off", "r0", "full"}:
             raise BuildError("prebuilt_operator_artifacts must be off, r0, or full")
-        if self.prebuilt_oam_artifacts not in {"off", "known"}:
-            raise BuildError("prebuilt_oam_artifacts must be off or known")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -115,7 +112,6 @@ class TargetManifest:
                 prebuilt_operator_artifacts=value.get(
                     "prebuilt_operator_artifacts", "r0"
                 ),
-                prebuilt_oam_artifacts=value.get("prebuilt_oam_artifacts", "off"),
                 cufft_linkage=value.get("cufft_linkage", "direct"),
                 schema_version=value["schema_version"],
             )

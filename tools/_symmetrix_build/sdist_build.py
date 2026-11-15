@@ -55,14 +55,6 @@ REQUIRED_SDIST_MEMBERS = (
     "source/symmetrix/__init__.py",
     "source/symmetrix/mace_jit_cuda_plugin_abi.h",
     "source/symmetrix/mace_nonlinear_jit_cuda_plugin_abi.h",
-    "source/symmetrix/foundation_oam_architectures.json",
-    "source/symmetrix/oam_architecture.py",
-    "source/symmetrix/oam_cuda_codegen.py",
-    "source/symmetrix/oam_cuda_plugin_abi.h",
-    "source/symmetrix/oam_installed_artifact.py",
-    "source/symmetrix/oam_jit_codegen.py",
-    "source/symmetrix/oam_jit_host_plugin_abi.h",
-    "source/symmetrix/oam_receiver_codegen.py",
     "external/pybind11/CMakeLists.txt",
     "libsymmetrix/CMakeLists.txt",
     "libsymmetrix/cmake/cufft_runtime.cmake",
@@ -92,9 +84,7 @@ FORBIDDEN_SDIST_COMPONENTS = frozenset(
         "__pycache__",
     }
 )
-FORBIDDEN_SDIST_SUFFIXES = frozenset(
-    {".cubin", ".model", ".nequip", ".pt", ".pth", ".pyc", ".so"}
-)
+FORBIDDEN_SDIST_SUFFIXES = frozenset({".cubin", ".model", ".pt", ".pth", ".pyc", ".so"})
 
 
 def _git(runner: CommandRunner, repository: Path, *arguments: str) -> str:

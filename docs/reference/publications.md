@@ -87,33 +87,6 @@ reference implementation is maintained in the
 archive the exact software revision used for checkpoint conversion or
 comparison.
 
-## NequIP-OAM
-
-For NequIP-OAM calculations, cite Symmetrix-XL and these NequIP publications:
-
-1. C. W. Tan, M. L. Descoteaux, M. Kotak, G. de Miranda Nascimento,
-   S. R. Kavanagh, L. Zichi, M. Wang, A. Saluja, Y. R. Hu, T. Smidt,
-   A. Johansson, W. C. Witt, B. Kozinsky, and A. Musaelian,
-   "High-performance training and inference for deep equivariant interatomic
-   potentials," *Digital Discovery* **5**, 1558-1567 (2026).
-   [DOI](https://doi.org/10.1039/D5DD00423C)
-2. S. R. Kavanagh, C. W. Tan, M. Wang, M. L. Descoteaux,
-   G. de Miranda Nascimento, U. Unneberg, L. Zichi, F. Libbi, N. Rivano,
-   A. Glover, V. Bharadwaj, A. Johansson, W. C. Witt, A. Musaelian, and
-   B. Kozinsky, "Fast and Accurate Equivariant Foundation Models for
-   Atomistic Simulation," arXiv:2607.28461 (2026).
-   [DOI](https://doi.org/10.48550/arXiv.2607.28461)
-3. S. Batzner, A. Musaelian, L. Sun, M. Geiger, J. P. Mailoa,
-   M. Kornbluth, N. Molinari, T. E. Smidt, and B. Kozinsky,
-   "E(3)-equivariant graph neural networks for data-efficient and accurate
-   interatomic potentials," *Nature Communications* **13**, 2453 (2022).
-   [DOI](https://doi.org/10.1038/s41467-022-29939-5)
-
-The first paper describes the current NequIP software framework, the second
-introduces the OAM foundation-model family, and the third is the original
-NequIP method. The official NequIP repository maintains the authoritative
-[citation guidance and BibTeX records](https://github.com/mir-group/nequip#references--citing).
-
 ## Dispersion corrections
 
 Select citations according to the correction and damping actually used:
@@ -161,7 +134,6 @@ exact version or commit used for reproducibility.
 | [MACE](https://github.com/ACEsuit/mace) | Checkpoint conversion and upstream MACE-family parity | Repository plus the MACE method and checkpoint papers above |
 | [MACE-Field](https://github.com/mdi-group/mace-field) | Field-aware checkpoint and response reference | Repository revision plus the MACE method |
 | [LES](https://github.com/ChengUCB/les) | Scalar-monopole LES formulas and frozen numerical reference fixtures | Repository revision plus the LES papers above |
-| [NequIP](https://github.com/mir-group/nequip) and [e3nn](https://github.com/e3nn/e3nn) | Optional OAM export and upstream parity stack | NequIP papers above; M. Geiger and T. Smidt, "e3nn: Euclidean Neural Networks," arXiv:2207.09453 (2022), [DOI](https://doi.org/10.48550/arXiv.2207.09453) |
 | [torch-dftd](https://github.com/pfnet-research/torch-dftd) 0.5.3 | Source of generated D2/D3 parameter tables and offline reference fixtures; not a runtime dependency | Repository, D2/D3 papers above, and S. Takamoto *et al.*, "Towards universal neural network potential for material discovery applicable to arbitrary combinations of 45 elements," *Nature Communications* **13**, 2991 (2022), [DOI](https://doi.org/10.1038/s41467-022-30687-9), as requested by the software's [citation guidance](https://github.com/pfnet-research/torch-dftd#citation) |
 | [ALCHEMI Toolkit-Ops](https://github.com/NVIDIA/nvalchemi-toolkit-ops) 0.5.0 | FourierD3 decomposition and frozen reference-oracle provenance | Repository revision plus the FourierD3 paper above |
 | [graph_electrostatics](https://github.com/WillBaldwin0/graph_electrostatics) | Frozen MACE-POLAR-1 long-range operator oracle | Repository revision plus the MACE-POLAR-1 paper above |

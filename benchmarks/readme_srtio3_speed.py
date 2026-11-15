@@ -21,11 +21,11 @@ import time
 import traceback
 from pathlib import Path
 
-FAMILIES = ("mace-omat-0-medium", "mace-mh-1", "oam-s")
+FAMILIES = ("mace-omat-0-medium", "mace-mh-1")
 PROPERTIES = ("energy", "forces")
 BOUNDARY = (
     "retained PYTHON neighbors and fixed xyz; native graph/CSR preparation/rebuild "
-    "included (OAM every call), MACE topology reuse verified by generation/skip; "
+    "included, MACE topology reuse verified by generation/skip; "
     "forward+reverse, energy/atom-force reductions and Python EF materialization; "
     "no stress, ASE result cache, neighbor construction, compilation or diagnostics"
 )
@@ -262,15 +262,7 @@ def validate_work(before, after):
     for key, value in before.get("generated", {}).items():
         if after["generated"][key] <= value:
             raise RuntimeError(f"generated forward/reverse work did not advance: {key}")
-    if before.get("graph_policy") == "rebuild":
-        if after["graph_generation"] != before["graph_generation"] + 1:
-            raise RuntimeError("OAM graph generation did not advance exactly once")
-        if (
-            before["actual_edges"] <= 0
-            or after["actual_edges"] != before["actual_edges"]
-        ):
-            raise RuntimeError("native OAM edge count changed")
-    elif before.get("graph_policy") == "retained":
+    if before.get("graph_policy") == "retained":
         if after["graph_generation"] <= 0 or (
             before["graph_generation"]
             and before["graph_generation"] != after["graph_generation"]
@@ -315,7 +307,7 @@ def compare_ef(reference, direct, family):
         ),
     }
     # Maintained foundation_model_support_manifest.json FP32 family bounds.
-    limits = (1e-5, 5e-4) if family == "oam-s" else (5e-4, 5e-3)
+    limits = (5e-4, 5e-3)
     if any(value > limit for value, limit in zip(errors.values(), limits)):
         raise RuntimeError(f"EF parity failed: {errors}")
     return {"errors": errors, "limits": dict(zip(errors, limits))}
@@ -340,53 +332,6 @@ def summarize(samples):
 
 
 def snapshot(evaluator, family, route):
-    if family == "oam-s":
-        # These native counters are cumulative; no calculator-local call count.
-        import re
-
-        diagnostic = str(evaluator.execution_diagnostic)
-        counts = {
-            key: int(value)
-            for key, value in re.findall(r"\b(edge_[a-z_]+)=(\d+)", diagnostic)
-        }
-        required = {
-            "edge_dispatches",
-            "edge_generated_dispatches",
-            "edge_generated_regions",
-            "edge_full_message_launches",
-            "edge_generic_dispatches",
-            "edge_generic_regions",
-        }
-        if not required.issubset(counts):
-            raise RuntimeError(
-                "missing native OAM counter text (no default post-work zeros)"
-            )
-        work = counts["edge_dispatches"]
-        if route == "direct" and (
-            counts["edge_generic_dispatches"] or counts["edge_generic_regions"]
-        ):
-            raise RuntimeError("OAM direct generic fallback")
-        generated = (
-            {
-                key: counts[key]
-                for key in (
-                    "edge_generated_dispatches",
-                    "edge_generated_regions",
-                    "edge_full_message_launches",
-                )
-            }
-            if route == "direct"
-            else {}
-        )
-        return {
-            "work": work,
-            "fallback": int(evaluator.cuda_r1_fallback_count),
-            "counters": counts,
-            "generated": generated,
-            "graph_generation": int(evaluator.graph_generation),
-            "graph_policy": "rebuild",
-            "actual_edges": int(evaluator.execution_active_edge_count),
-        }
     counters = {
         name: int(getattr(evaluator, name))
         for name in (
@@ -432,28 +377,6 @@ def snapshot(evaluator, family, route):
     }
 
 
-def initialize_oam_counters(evaluator, graph_arguments, route):
-    """No evaluation: native prepare_graph exposes real initial counters.
-
-    The constructor's state-only diagnostic has no edge_* fields. Never infer
-    missing post-work counters as zero. This one untimed setup is within case
-    setup; each subsequent timed OAM call STILL includes its own CSR rebuild.
-    """
-    if int(evaluator.graph_generation) != 0 or int(evaluator.geometry_generation) != 0:
-        raise RuntimeError("expected a fresh OAM evaluator before graph setup")
-    generation = evaluator.prepare_graph(*graph_arguments)
-    initial = snapshot(evaluator, "oam-s", route)
-    if (
-        initial["graph_generation"] != generation
-        or generation != 1
-        or initial["work"] != 0
-        or initial["fallback"] != 0
-        or any(initial["counters"].values())
-    ):
-        raise RuntimeError("untimed fresh OAM graph setup unexpectedly evaluated work")
-    return initial
-
-
 def require_same_graph(direct, reference):
     for field in (
         "cutoff_A",
@@ -478,11 +401,10 @@ def route_case(model_path, family, route, atoms, deadline, output, *, audit_rout
     """Same timed logical work per route; no public calculate/cache/stress path."""
     import numpy as np
 
-    from symmetrix import NequIPCalculator, Symmetrix
+    from symmetrix import Symmetrix
 
     calc = evaluator = compute = None
     try:
-        cls = NequIPCalculator if family == "oam-s" else Symmetrix
         options = {
             "dtype": "float32",
             "neighbor_skin": 0.5,
@@ -491,158 +413,64 @@ def route_case(model_path, family, route, atoms, deadline, output, *, audit_rout
         }
         if family == "mace-mh-1":
             options["head"] = "omat_pbe"
-        calc = cls(model_path, **options)
+        calc = Symmetrix(model_path, **options)
         evaluator = calc.evaluator
-        expected_mode = (
-            "generic" if route == "reference" and family != "oam-s" else route
-        )
+        expected_mode = "generic" if route == "reference" else route
         if evaluator.streamed_edges_mode != expected_mode:
             raise RuntimeError("requested direct/reference route was not selected")
-        if family == "oam-s":
-            if type(evaluator).__name__ != "NequIPOAMKokkosFloat":
-                raise RuntimeError("OAM native evaluator is not FP32")
-        elif evaluator.scalar_size_bytes != 4:
+        if evaluator.scalar_size_bytes != 4:
             raise RuntimeError("MACE native evaluator is not FP32")
-        if family == "oam-s":
-            graph = calc._build_graph(atoms)
-            types, degrees, sources, neigh_types, receivers, _, xyz, distances = graph
-            retained_skin_values = [np.asarray(value).tolist() for value in graph]
-            retained_skin_hash = graph_hash(retained_skin_values)
-            retained_skin_count = len(sources)
-            cutoff = float(evaluator.r_cut)
-            active = np.asarray(distances) < cutoff
-            receivers = np.asarray(receivers)[active]
-            sources = np.asarray(sources)[active]
-            neigh_types = np.asarray(neigh_types)[active]
-            xyz = np.asarray(xyz).reshape(-1, 3)[active].reshape(-1)
-            distances = np.asarray(distances)[active]
-            degrees = np.bincount(receivers, minlength=40)
-            positions = np.ascontiguousarray(atoms.positions).reshape(-1)
-            cell = np.asarray(atoms.cell.array, dtype=float)
-            inverse = np.linalg.inv(cell).reshape(-1)
-            pbc = np.asarray(atoms.pbc, dtype=np.int32)
-            initial_counters = initialize_oam_counters(
-                evaluator, (40, types, degrees, sources, neigh_types), route
+        inputs = calc._mace_inputs(
+            atoms, native_geometry=False, allow_device_neighbor_graph=False
+        )
+        retained_skin_values = [np.asarray(value).tolist() for value in inputs]
+        retained_skin_hash = graph_hash(retained_skin_values)
+        retained_skin_count = len(inputs[3])
+        # Direct uses a skin-padded/clamped graph; reference filters it.
+        # Supply the SAME active physical graph to both supported native
+        # APIs, excluding only zero-contribution r>=cutoff skin entries.
+        n, types, _, sources, neigh_types, xyz, distances, receivers = inputs
+        active = np.asarray(distances) < calc.cutoff
+        receivers = np.asarray(receivers)[active]
+        sources = np.asarray(sources)[active]
+        inputs = (
+            n,
+            types,
+            np.bincount(receivers, minlength=n),
+            sources,
+            np.asarray(neigh_types)[active],
+            np.asarray(xyz)[active],
+            np.asarray(distances)[active],
+            receivers,
+        )
+
+        def compute():
+            generation = calc._compute_mace(inputs, atoms=atoms)
+            values = calc._collect_mace_results(
+                atoms, inputs, PROPERTIES, generation or 0
             )
+            return {
+                "energy": float(values["energy"]),
+                "forces": np.asarray(values["forces"]).tolist(),
+            }
 
-            def compute():
-                if route == "direct":
-                    generation = evaluator.prepare_graph(
-                        40, types, degrees, sources, neigh_types
-                    )
-                    evaluator.prepare_geometry(
-                        generation,
-                        positions,
-                        xyz,
-                        cell.reshape(-1),
-                        inverse,
-                        pbc,
-                    )
-                    evaluator.compute_prepared(generation, xyz, distances)
-                    evaluator.reduce_forces(generation)
-                    forces = (
-                        np.asarray(evaluator.atom_forces, dtype=float)
-                        .reshape(40, 3)
-                        .copy()
-                    )
-                else:
-                    evaluator.compute_node_energies_forces(
-                        40, types, degrees, sources, neigh_types, xyz, distances
-                    )
-                    pairs = np.asarray(evaluator.node_forces, dtype=float).reshape(
-                        -1, 3
-                    )
-                    forces = np.zeros((40, 3))
-                    # Preserve the reference calculator's reduction/order,
-                    # rather than introducing a benchmark-only fast baseline.
-                    for edge, (receiver, source) in enumerate(zip(receivers, sources)):
-                        forces[source] += pairs[edge]
-                        forces[receiver] -= pairs[edge]
-                return {
-                    "energy": float(
-                        np.asarray(evaluator.node_energies, dtype=float).sum()
-                    ),
-                    "forces": forces.tolist(),
-                }
-
-            edge_count = len(sources)
-        else:
-            inputs = calc._mace_inputs(
-                atoms, native_geometry=False, allow_device_neighbor_graph=False
-            )
-            retained_skin_values = [np.asarray(value).tolist() for value in inputs]
-            retained_skin_hash = graph_hash(retained_skin_values)
-            retained_skin_count = len(inputs[3])
-            # Direct uses a skin-padded/clamped graph; reference filters it.
-            # Supply the SAME active physical graph to both supported native
-            # APIs, excluding only zero-contribution r>=cutoff skin entries.
-            n, types, _, sources, neigh_types, xyz, distances, receivers = inputs
-            active = np.asarray(distances) < calc.cutoff
-            receivers = np.asarray(receivers)[active]
-            sources = np.asarray(sources)[active]
-            inputs = (
-                n,
-                types,
-                np.bincount(receivers, minlength=n),
-                sources,
-                np.asarray(neigh_types)[active],
-                np.asarray(xyz)[active],
-                np.asarray(distances)[active],
-                receivers,
-            )
-            initial_counters = None
-
-            def compute():
-                generation = calc._compute_mace(inputs, atoms=atoms)
-                values = calc._collect_mace_results(
-                    atoms, inputs, PROPERTIES, generation or 0
-                )
-                return {
-                    "energy": float(values["energy"]),
-                    "forces": np.asarray(values["forces"]).tolist(),
-                }
-
-            edge_count = len(inputs[3])
-            cutoff = float(calc.cutoff)
+        edge_count = len(inputs[3])
+        cutoff = float(calc.cutoff)
         if route == "reference" and (
             getattr(calc, "jit_artifact_path", None)
-            or getattr(evaluator, "jit_oam_host_plugin_ready", False)
             or getattr(evaluator, "factorized_jit_ready", False)
         ):
             raise RuntimeError("reference must be artifact-free")
         if not math.isfinite(cutoff) or cutoff <= 0 or edge_count <= 0:
             raise RuntimeError("invalid actual model cutoff/graph")
-        graph_values = (
-            [
-                np.asarray(value).tolist()
-                for value in (
-                    types,
-                    degrees,
-                    sources,
-                    neigh_types,
-                    receivers,
-                    xyz,
-                    distances,
-                )
-            ]
-            if family == "oam-s"
-            else [np.asarray(value).tolist() for value in inputs]
-        )
+        graph_values = [np.asarray(value).tolist() for value in inputs]
         graph_sha = graph_hash(graph_values)
-        if (
-            initial_counters is not None
-            and initial_counters["actual_edges"] != edge_count
-        ):
-            raise RuntimeError(
-                "native OAM graph count differs from captured Python graph"
-            )
         pre_evidence = audit_route(calc, family, route)
         journal(
             output,
             "route-admitted-before-work",
             route=route,
             evidence=pre_evidence,
-            initial_counters=initial_counters,
         )
         rows = []
         for phase, count in (("parity", 1), ("warmup", 3), ("measurement", 3)):
@@ -682,7 +510,7 @@ def route_case(model_path, family, route, atoms, deadline, output, *, audit_rout
             "precision": "float32",
             "route_evidence": evidence,
             "route_evidence_before_work": pre_evidence,
-            "untimed_native_graph_preparations": 1 if family == "oam-s" else 0,
+            "untimed_native_graph_preparations": 0,
             "retained_python_graph_sha256": graph_sha,
             "retained_skin_cache_graph_sha256": retained_skin_hash,
             "retained_skin_cache_graph_count": retained_skin_count,

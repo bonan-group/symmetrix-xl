@@ -168,12 +168,6 @@ jobs:
           python -c "import symmetrix; print('symmetrix', symmetrix.__version__)"
           symmetrix backend list
           symmetrix version --probe --json | tee version-probe.json
-          python tools/audit_oam_release_package.py \
-            --probe-json version-probe.json \
-            --wheel "$(find dist-repaired -maxdepth 1 -name '*.whl' -print -quit)" \
-            --backend host \
-            --target x86-64-v3 \
-            --output oam-package-audit.json
           symmetrix doctor --json | tee doctor.json
           python - <<'PY'
           import json, sys

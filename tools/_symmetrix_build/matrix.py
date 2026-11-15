@@ -109,7 +109,6 @@ def _child_arguments(
     jobs: int | None,
     accelerator_blas_root: Path | None,
     prebuilt_operator_artifacts: str | None,
-    prebuilt_oam_artifacts: str | None,
     openblas_root: Path | None,
 ) -> list[str]:
     arguments = ["--backend", spec.backend]
@@ -131,8 +130,6 @@ def _child_arguments(
         arguments.extend(("--accelerator-blas-root", os.fspath(accelerator_blas_root)))
     if prebuilt_operator_artifacts is not None:
         arguments.extend(("--prebuilt-operator-artifacts", prebuilt_operator_artifacts))
-    if prebuilt_oam_artifacts is not None:
-        arguments.extend(("--prebuilt-oam-artifacts", prebuilt_oam_artifacts))
     if spec.backend == "cpu" and openblas_root is not None:
         arguments.extend(("--openblas-root", os.fspath(openblas_root)))
     return arguments
@@ -149,7 +146,6 @@ def child_commands(
     jobs: int | None = None,
     accelerator_blas_root: Path | None = None,
     prebuilt_operator_artifacts: str | None = None,
-    prebuilt_oam_artifacts: str | None = None,
     openblas_root: Path | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     detect_arguments = _child_arguments(
@@ -160,7 +156,6 @@ def child_commands(
         None,
         accelerator_blas_root,
         prebuilt_operator_artifacts,
-        prebuilt_oam_artifacts,
         openblas_root,
     )
     wheel_arguments = _child_arguments(
@@ -171,7 +166,6 @@ def child_commands(
         jobs,
         accelerator_blas_root,
         prebuilt_operator_artifacts,
-        prebuilt_oam_artifacts,
         openblas_root,
     )
     detect_command = (
@@ -274,7 +268,6 @@ def run_wheel_matrix(
     jobs: int | None = None,
     accelerator_blas_root: Path | None = None,
     prebuilt_operator_artifacts: str | None = None,
-    prebuilt_oam_artifacts: str | None = None,
     openblas_root: Path | None = None,
     dry_run: bool = False,
 ) -> int:
@@ -297,7 +290,6 @@ def run_wheel_matrix(
                 jobs=jobs,
                 accelerator_blas_root=accelerator_blas_root,
                 prebuilt_operator_artifacts=prebuilt_operator_artifacts,
-                prebuilt_oam_artifacts=prebuilt_oam_artifacts,
                 openblas_root=openblas_root,
             )
             plan.append(
@@ -329,7 +321,6 @@ def run_wheel_matrix(
             jobs=jobs,
             accelerator_blas_root=accelerator_blas_root,
             prebuilt_operator_artifacts=prebuilt_operator_artifacts,
-            prebuilt_oam_artifacts=prebuilt_oam_artifacts,
             openblas_root=openblas_root,
         )
         result = runner.run(detect_command)

@@ -98,11 +98,6 @@ def _add_target_arguments(parser: argparse.ArgumentParser) -> None:
         choices=("off", "r0", "full"),
         help="Package no, R0-only, or complete verified operator artifacts.",
     )
-    parser.add_argument(
-        "--prebuilt-oam-artifacts",
-        choices=("off", "known"),
-        help="Package no OAM artifacts or the known architecture set.",
-    )
 
 
 def _particle_mesh_argument(args: argparse.Namespace, default: str) -> str:
@@ -251,16 +246,9 @@ def _resolve_manifest(
     request, devices = _base_request(args)
     manifest = detect_target(request, repo_root=root, runner=runner, devices=devices)
     mode = args.prebuilt_operator_artifacts
-    oam_mode = args.prebuilt_oam_artifacts
     if mode is None and args.target_manifest is not None:
         mode = TargetManifest.read(args.target_manifest).prebuilt_operator_artifacts
-    if oam_mode is None and args.target_manifest is not None:
-        oam_mode = TargetManifest.read(args.target_manifest).prebuilt_oam_artifacts
-    return replace(
-        manifest,
-        prebuilt_operator_artifacts=mode or "r0",
-        prebuilt_oam_artifacts=oam_mode or "off",
-    )
+    return replace(manifest, prebuilt_operator_artifacts=mode or "r0")
 
 
 def _preflight(manifest: TargetManifest, root: Path, runner: CommandRunner) -> None:
@@ -308,7 +296,6 @@ def _human_manifest(manifest: TargetManifest) -> str:
     if manifest.backend == "cuda":
         lines.append(f"cuFFT linkage: {manifest.cufft_linkage}")
     lines.append(f"Prebuilt operator artifacts: {manifest.prebuilt_operator_artifacts}")
-    lines.append(f"Prebuilt OAM artifacts: {manifest.prebuilt_oam_artifacts}")
     return "\n".join(lines)
 
 
@@ -464,10 +451,6 @@ def _parser() -> argparse.ArgumentParser:
         choices=("off", "r0", "full"),
     )
     matrix.add_argument(
-        "--prebuilt-oam-artifacts",
-        choices=("off", "known"),
-    )
-    matrix.add_argument(
         "--jobs",
         type=int,
         help="Parallel compiler processes forwarded to every child build.",
@@ -537,7 +520,6 @@ def main(argv: list[str] | None = None) -> int:
                 rocm_root=args.rocm_root,
                 accelerator_blas_root=args.accelerator_blas_root,
                 prebuilt_operator_artifacts=args.prebuilt_operator_artifacts,
-                prebuilt_oam_artifacts=args.prebuilt_oam_artifacts,
                 openblas_root=args.openblas_root,
                 jobs=args.jobs,
                 dry_run=args.dry_run,

@@ -52,9 +52,9 @@ to reproduce. Build from source when no suitable wheel exists or when developing
 the native implementation.
 
 Official CPU and CUDA wheels also carry generated artifacts for the known MACE
-contracts and OAM architectures. OAM lookup compares the exported model's
-ordered layer count, channel/irrep widths, angular orders, tensor-product
-instructions and masks, and radial-table dimensions with the catalog entry.
+contracts. Lookup compares the exported model's ordered layer count,
+channel/irrep widths, angular orders, tensor-product instructions and masks,
+and radial-table dimensions with the catalog entry.
 It does not select by model path or learned-weight hash. A custom architecture
 that has no exact catalog match is generated at runtime when the matching
 compiler is available.
@@ -71,10 +71,9 @@ implemented changes and pending release qualification.
 
 The public contract separates implementation availability, artifact
 availability, runtime qualification, wheel inclusion, and published support.
-OAM S/M/L/XL are single-GPU host/CUDA contracts only where qualified. HIP,
-multi-GPU, and LAMMPS/MPI are unsupported; live upstream FP64 parity and
-repaired-wheel inclusion remain open gates. Ordinary MACE HIP does not imply
-OAM or Polar HIP support, and OAM remains single-GPU by decision.
+HIP, multi-GPU, and LAMMPS/MPI are unsupported where not stated below;
+repaired-wheel inclusion remains an open gate. Ordinary MACE HIP does not imply
+Polar HIP support.
 
 Released Polar-M CPU/CUDA FP32/FP64 remains qualified. Polar S/M/L HIP
 `gfx1151` source-build/runtime evidence covers FP32/FP64, `reference` and
@@ -124,9 +123,7 @@ workload. All published rows use the direct execution path. Run
 | Backend | Model | Hardware | Timing boundary | Median µs/atom | Median atoms/s |
 |---|---|---|---|---:|---:|
 | cpu | MACE-OMAT-0 medium | CPU · AMD Ryzen 9 9950X3D2 | complete EFS call | 164.532 | 6,078 |
-| cpu | NequIP-OAM-M | CPU · AMD Ryzen 9 9950X3D2 | prepared direct EFS reduction | 279.504 | 3,578 |
 | cuda | MACE-OMAT-0 medium | CUDA · RTX 5090 | complete EFS call | 1.869 | 535,158 |
-| cuda | NequIP-OAM-M | CUDA · RTX 5090 | prepared direct EFS reduction | 4.917 | 203,390 |
 
 The canonical comparison workload is a 5,000-atom cubic SrTiO₃
 energy–forces–stress evaluation; see the paper for the full protocol.
@@ -301,35 +298,6 @@ MACE models reject subsets. Exports use format version 4 (no inverse of
 converted with `symmetrix_recompose_mace_json --input old.json --output new.json`.
 Re-export to v4 is recommended but optional.
 
-### NequIP-OAM (experimental)
-
-Version 0.2.0 includes experimental native evaluation of exported NequIP-OAM
-S/M/L/XL models through the OAM v2 JSON contract. It is not a general NequIP
-graph compiler. Exporting an upstream package requires the optional reference
-stack; evaluating the resulting JSON does not import PyTorch, NequIP, or e3nn:
-
-```bash
-python -m pip install "symmetrix-xl[nequip]"
-symmetrix_extract_nequip \
-    --model NequIP-OAM-S-0.1.nequip.zip \
-    --output oam-s-nequip.json
-```
-
-```python
-from symmetrix import NequIPCalculator
-
-atoms.calc = NequIPCalculator("oam-s-nequip.json", dtype="float32")
-```
-
-Current host ABI-v7 and CUDA ABI-v3 `direct` artifacts use the
-full-message-only generated path. Source generation supports FP32 and FP64,
-but the fresh runtime release matrix and repaired-wheel gates remain pending.
-HIP and multi-GPU execution are unsupported.
-See the [model guide](docs/user/models.md#nequip-and-oam) for the
-exact property and artifact boundaries, and the
-[publication guide](docs/reference/publications.md#nequip-oam) for the NequIP
-and OAM papers to cite.
-
 CUDA and HIP backends are installed separately for a matching GPU architecture;
 see the [installation guide](docs/user/installation.md) and [Symmetrix-XL
 package README](symmetrix/README.md) for backend-specific builds.
@@ -365,7 +333,7 @@ If you use Symmetrix-XL, please cite:
 Also cite the method implemented by the model or correction and the publication
 for the checkpoint used. The [publication and software citation
 guide](docs/reference/publications.md) covers MACE, MACE-MH-1, MACELES,
-MACE-POLAR-1, MACEField, NequIP-OAM, DFT-D2/D3 damping variants, FourierD3,
+MACE-POLAR-1, MACEField, DFT-D2/D3 damping variants, FourierD3,
 and the open-source numerical reference implementations used during
 development. Follow the model package or model card when it requests further
 model-specific citations.

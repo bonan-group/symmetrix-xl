@@ -85,8 +85,6 @@ def audit_cuda_wheel(wheel: Path, *, cuda_major: str, target: str) -> dict[str, 
             raise BuildError("CUDA prebuilt operator provenance has the wrong target")
         if prebuilt.get("artifact_count") != len(artifacts):
             raise BuildError("CUDA prebuilt artifact count does not match catalog")
-        if not any(item.get("operator") == "OAM" for item in artifacts):
-            raise BuildError("CUDA wheel operator catalog has no OAM entries")
         for item in artifacts:
             provenance = item.get("build_provenance", {})
             field = "source_content_sha256"

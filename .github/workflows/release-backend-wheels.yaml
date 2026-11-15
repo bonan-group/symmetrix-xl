@@ -114,7 +114,6 @@ jobs:
           python tools/symmetrix_build.py wheel-matrix \
             --target cpu:avx512 \
             --prebuilt-operator-artifacts r0 \
-            --prebuilt-oam-artifacts known \
             --build-root /tmp/symmetrix-cpu-addon-build \
             --wheel-dir dist
 
@@ -226,11 +225,8 @@ jobs:
               assert prebuilt["mode"] == "r0", prebuilt
           assert prebuilt["backend"] == "host", prebuilt
           assert prebuilt["target"] == "host-isa-x86-64-v4", prebuilt
-          assert prebuilt["artifact_count"] == 14, prebuilt
-          assert len(artifacts) == 14, catalog
-          assert sum(
-              item["operator"] == "OAM" for item in artifacts
-          ) == 8, catalog
+          assert prebuilt["artifact_count"] == 6, prebuilt
+          assert len(artifacts) == 6, catalog
           assert {
               item["identity"]["backend"] for item in artifacts
           } == {"host"}, catalog

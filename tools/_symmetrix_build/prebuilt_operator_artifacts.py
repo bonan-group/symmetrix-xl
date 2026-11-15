@@ -6,8 +6,6 @@ import argparse
 import hashlib
 import importlib.util
 import json
-import math
-import numbers
 import re
 import time
 from pathlib import Path
@@ -41,21 +39,10 @@ else:
 
 _SOURCE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MODES = ("off", "r0", "full")
-_OAM_MODES = ("off", "known")
 _BACKENDS = ("host", "cuda", "hip")
-OAM_RELEASE_ARTIFACT_COUNT = 8
-OAM_RELEASE_INSTALLED_BYTES_MAX = 128_000_000
-OAM_RELEASE_BUILD_SECONDS_MAX = 1_800.0
-OAM_RELEASE_WHEEL_BYTES_MAX = 256_000_000
-OAM_RELEASE_ARCHITECTURE_FINGERPRINTS = {
-    "oam-l-v0.1": "sha256:8e8b6c963d1be1449a43b0c02c6b80bdbd1b83070fb7abff5f6c806a0efa670f",
-    "oam-m-v0.1": "sha256:d8b773a86ebec83d1ea4dcbc3babe72242aebac3c88df245d6afbfc8352ced79",
-    "oam-s-v0.1": "sha256:676b385abb23c436411e3d9cb6032a7030b7141d4dd42db5b2e2f7104d93a307",
-    "oam-xl-v0.1": "sha256:4ad5f8500b618300493547dca76321e8d9c870988239228e071d91bd9cc40c12",
-}
 
 
-def _canonical_oam_host_target(target: str) -> str:
+def _canonical_host_target(target: str) -> str:
     return load_build_source_module("jit").canonical_host_artifact_target(target)
 
 
@@ -92,133 +79,6 @@ def _build_modules():
 
 def _catalog_module():
     return load_build_source_module("generated_operator_core")
-
-
-def _oam_modules():
-    return (
-        load_build_source_module("oam_architecture"),
-        load_build_source_module("oam_receiver_codegen"),
-        load_build_source_module("oam_cuda_codegen"),
-        load_build_source_module("generated_operator_version"),
-    )
-
-
-def _load_oam_manifest(path: Path | str) -> dict[str, Any]:
-    value = json.loads(Path(path).read_text(encoding="utf-8"))
-    if value.get("schema") != "symmetrix.foundation-oam-architectures/1":
-        raise ValueError("foundation OAM architecture manifest schema is unsupported")
-    architectures = value.get("architectures")
-    if not isinstance(architectures, list) or not architectures:
-        raise ValueError("foundation OAM architecture manifest must not be empty")
-    architecture_module, _, _, _ = _oam_modules()
-    identifiers = []
-    normalized = []
-    for entry in architectures:
-        if not isinstance(entry, dict):
-            raise ValueError("foundation OAM architecture entry must be an object")
-        identifier = entry.get("id")
-        if not isinstance(identifier, str) or not identifier:
-            raise ValueError("foundation OAM architecture id must not be empty")
-        architecture = architecture_module.validate_oam_architecture(
-            entry.get("architecture")
-        )
-        source_fingerprint = architecture_module.oam_architecture_fingerprint(
-            architecture
-        )
-        if entry.get("architecture_fingerprint") != source_fingerprint:
-            raise ValueError(
-                f"foundation OAM architecture fingerprint mismatch for {identifier}"
-            )
-        artifact_fingerprint = (
-            architecture_module.oam_tensor_product_architecture_fingerprint(
-                architecture
-            )
-        )
-        source_sha256 = entry.get("source_contract_sha256")
-        _complete_sha256(source_sha256, "source_contract_sha256")
-        identifiers.append(identifier)
-        normalized.append(
-            {
-                "id": identifier,
-                "source_contract_sha256": source_sha256,
-                "architecture_fingerprint": artifact_fingerprint,
-                "architecture": architecture,
-            }
-        )
-    if len(set(identifiers)) != len(identifiers):
-        raise ValueError("foundation OAM architecture ids must be unique")
-    return {"schema": value["schema"], "architectures": normalized}
-
-
-def _oam_generated_metadata(
-    architecture: dict[str, Any],
-    backend: str,
-    target: str,
-    precision: str,
-    floating_point_policy: str | None = None,
-) -> tuple[dict[str, Any], str]:
-    architecture_module, receiver, cuda, _ = _oam_modules()
-    contract = architecture_module.oam_codegen_contract(architecture)
-    if backend == "host":
-        target = _canonical_oam_host_target(target)
-        metadata = receiver.oam_receiver_jit_metadata(
-            contract,
-            precision,
-            architecture=architecture,
-            host_target=target,
-            floating_point_policy=floating_point_policy or "strict",
-        )
-        source = receiver.render_oam_receiver_host_plugin(
-            contract,
-            precision,
-            architecture=architecture,
-            host_target=target,
-            floating_point_policy=floating_point_policy or "strict",
-        )
-    elif backend == "cuda":
-        metadata = cuda.oam_cuda_artifact_metadata(
-            contract,
-            precision=precision,
-            target=target,
-            architecture=architecture,
-        )
-        source = cuda.render_oam_cuda_plugin(
-            contract,
-            target,
-            precision=precision,
-            architecture=architecture,
-        )
-    else:
-        raise ValueError("known OAM artifacts support host and CUDA backends only")
-    return metadata, source
-
-
-def _oam_identity(
-    metadata: dict[str, Any], *, backend: str, target: str, generation_revision: int
-) -> dict[str, Any]:
-    architecture = metadata["architecture"]
-    architecture_module, _, _, _ = _oam_modules()
-    identity = {
-        "schema": "symmetrix.generated-operator-identity/1",
-        "operator": "OAM",
-        "generation_revision": generation_revision,
-        "architecture": architecture,
-        "architecture_fingerprint": (
-            architecture_module.oam_tensor_product_architecture_fingerprint(
-                architecture
-            )
-        ),
-        "precision": metadata["precision"],
-        "backend": backend,
-        "target": metadata.get("host_target", target),
-        "generation_fingerprint": metadata["generation_fingerprint"],
-        "semantic_fingerprint": metadata["semantic_fingerprint"],
-        "structure_fingerprint": metadata["structure_fingerprint"],
-        "artifact_id": metadata["artifact_id"],
-    }
-    if backend == "host":
-        identity["floating_point_policy"] = metadata["floating_point_policy"]
-    return identity
 
 
 def _r0_schedule_revision(version, backend: str) -> int:
@@ -369,14 +229,14 @@ def write_installed_operator_catalog(
 ) -> dict[str, Any]:
     """Create a canonical installed catalog from exact compiled outputs."""
 
-    if mode not in ("r0", "full", "oam"):
-        raise ValueError("installed artifact mode must be 'r0', 'full', or 'oam'")
+    if mode not in ("off", "r0", "full"):
+        raise ValueError("installed artifact mode must be 'off', 'r0', or 'full'")
     if backend not in _BACKENDS:
         raise ValueError(f"backend must be one of {', '.join(_BACKENDS)}")
     if not target:
         raise ValueError("target must not be empty")
     if backend == "host":
-        target = _canonical_oam_host_target(target)
+        target = _canonical_host_target(target)
     source_content_sha256 = _complete_sha256(
         source_content_sha256, "source_content_sha256"
     )
@@ -394,14 +254,10 @@ def write_installed_operator_catalog(
         catalog_path.stat().st_mtime_ns if catalog_path.is_file() else None
     )
     for artifact_values in artifacts:
-        if len(artifact_values) not in (4, 6):
-            raise ValueError("artifact record must contain 4 or 6 values")
+        if len(artifact_values) != 4:
+            raise ValueError("artifact record must contain 4 values")
         metadata_value, binary_value, installed_relative_path, started_value = (
-            artifact_values[:4]
-        )
-        auxiliary_value = artifact_values[4] if len(artifact_values) == 6 else None
-        auxiliary_installed_path = (
-            artifact_values[5] if len(artifact_values) == 6 else None
+            artifact_values
         )
         # Reject unsafe paths before opening caller-controlled metadata so path
         # diagnostics remain precise and no absolute build path can leak out.
@@ -441,7 +297,7 @@ def write_installed_operator_catalog(
             or build.get("compiler_id") != compiler_id
             or build.get("compiler_version") != compiler_version
             or (
-                identity.get("operator") in ("R0", "OAM")
+                identity.get("operator") == "R0"
                 and "floating_point_policy" in identity
                 and build.get("floating_point_policy")
                 != identity.get("floating_point_policy")
@@ -472,20 +328,6 @@ def write_installed_operator_catalog(
                 ),
             },
         }
-        if auxiliary_value is not None:
-            auxiliary_path = Path(auxiliary_value)
-            if not auxiliary_path.is_file():
-                raise ValueError(
-                    f"artifact auxiliary file is unavailable: {auxiliary_path}"
-                )
-            entry["auxiliary_files"] = [
-                {
-                    "role": "manifest",
-                    "installed_relative_path": str(auxiliary_installed_path),
-                    "checksum": sha256_file(auxiliary_path),
-                }
-            ]
-            binary_bytes += auxiliary_path.stat().st_size
         entries.append(entry)
         binary_bytes += binary_path.stat().st_size
 
@@ -524,24 +366,19 @@ def plan_foundation_operator_artifacts(
     target: str,
     source_content_sha256: str,
     floating_point_policy: str | None = None,
-    oam_manifest_path: Path | str | None = None,
-    oam_mode: str = "off",
-    oam_floating_point_policy: str | None = None,
 ) -> dict[str, Any]:
     """Return the deterministic build plan for one qualified target."""
 
     if mode not in _MODES:
         raise ValueError(f"mode must be one of {', '.join(_MODES)}")
-    if oam_mode not in _OAM_MODES:
-        raise ValueError(f"oam_mode must be one of {', '.join(_OAM_MODES)}")
-    if mode == "off" and oam_mode == "off":
+    if mode == "off":
         return {"mode": "off", "artifacts": []}
     if backend not in _BACKENDS:
         raise ValueError(f"backend must be one of {', '.join(_BACKENDS)}")
     if not target:
         raise ValueError("target must not be empty")
     if backend == "host":
-        target = _canonical_oam_host_target(target)
+        target = _canonical_host_target(target)
     if _SOURCE_SHA256.fullmatch(source_content_sha256) is None:
         raise ValueError("source_content_sha256 must be a SHA-256 digest")
 
@@ -641,329 +478,12 @@ def plan_foundation_operator_artifacts(
                 "target": target,
             }
         )
-    if oam_mode == "known":
-        if backend == "hip":
-            raise ValueError("known OAM artifacts are not available for HIP")
-        if oam_manifest_path is None:
-            raise ValueError("known OAM artifacts require an architecture manifest")
-        oam_manifest = _load_oam_manifest(oam_manifest_path)
-        for entry in oam_manifest["architectures"]:
-            for precision in ("float32", "float64"):
-                metadata, _ = _oam_generated_metadata(
-                    entry["architecture"],
-                    backend,
-                    target,
-                    precision,
-                    oam_floating_point_policy,
-                )
-                artifacts.append(
-                    {
-                        "artifact_id": metadata["artifact_id"],
-                        "architecture_id": entry["id"],
-                        "architecture_fingerprint": entry["architecture_fingerprint"],
-                        "backend": backend,
-                        "binary_format": binary_format,
-                        "bundle_ids": [entry["id"]],
-                        "channels": None,
-                        "operator": "OAM",
-                        "precision": precision,
-                        "capabilities": metadata["required_capabilities"],
-                        "variants": ["full-message"],
-                        "schedule": "generated-architecture",
-                        "source_extension": extension,
-                        "stem": f"oam-{entry['id']}-{precision}",
-                        "target": target,
-                        **(
-                            {"floating_point_policy": metadata["floating_point_policy"]}
-                            if backend == "host"
-                            else {}
-                        ),
-                    }
-                )
     artifacts.sort(key=lambda value: value["stem"])
     for index, artifact in enumerate(artifacts):
         # Two dependency lanes bound artifact compilation without starting a
         # nested worker pool, so the outer build tool retains job ownership.
         artifact["build_lane"] = index % 2
-    return {"mode": mode, "oam_mode": oam_mode, "artifacts": artifacts}
-
-
-def audit_oam_release_plan(
-    plan: dict[str, Any], *, backend: str, target: str
-) -> dict[str, Any]:
-    """Validate the minimal full-message-only OAM release artifact plan."""
-
-    if backend not in ("host", "cuda"):
-        raise ValueError("OAM release artifacts support host and CUDA only")
-    expected_target = (
-        _canonical_oam_host_target(target) if backend == "host" else target
-    )
-    artifacts = [
-        artifact
-        for artifact in plan.get("artifacts", ())
-        if artifact.get("operator") == "OAM"
-    ]
-    if len(artifacts) != OAM_RELEASE_ARTIFACT_COUNT:
-        raise ValueError("release plan must contain exactly 8 OAM artifacts")
-    keys = {
-        (artifact.get("architecture_id"), artifact.get("precision"))
-        for artifact in artifacts
-    }
-    expected_keys = {
-        (f"oam-{size}-v0.1", precision)
-        for size in ("s", "m", "l", "xl")
-        for precision in ("float32", "float64")
-    }
-    if keys != expected_keys:
-        raise ValueError(
-            "release plan must contain one artifact per OAM architecture/precision"
-        )
-    fingerprints = {
-        (artifact.get("architecture_id"), artifact.get("architecture_fingerprint"))
-        for artifact in artifacts
-    }
-    if fingerprints != set(OAM_RELEASE_ARCHITECTURE_FINGERPRINTS.items()):
-        raise ValueError("release plan must contain only qualified OAM architectures")
-    for artifact in artifacts:
-        if (
-            artifact.get("backend") != backend
-            or artifact.get("target") != expected_target
-        ):
-            raise ValueError("release OAM artifact backend or target mismatch")
-        if artifact.get("variants") != ["full-message"]:
-            raise ValueError("release OAM artifacts must contain only full-message")
-        capabilities = artifact.get("capabilities")
-        if isinstance(capabilities, bool) or not isinstance(capabilities, int):
-            raise ValueError("release OAM artifact capabilities are invalid")
-    return {
-        "artifact_count": len(artifacts),
-        "architectures": sorted({key[0] for key in keys}),
-        "precisions": sorted({key[1] for key in keys}),
-        "variants": ["full-message"],
-    }
-
-
-def audit_oam_release_budgets(measurement: dict[str, Any]) -> dict[str, Any]:
-    """Fail closed when an installed release catalog exceeds packaging budgets."""
-
-    limits = {
-        "oam_artifact_count": OAM_RELEASE_ARTIFACT_COUNT,
-        "installed_bytes": OAM_RELEASE_INSTALLED_BYTES_MAX,
-        "build_duration_seconds": OAM_RELEASE_BUILD_SECONDS_MAX,
-        "wheel_bytes": OAM_RELEASE_WHEEL_BYTES_MAX,
-    }
-    for field in limits:
-        value = measurement.get(field)
-        valid_number = (
-            not isinstance(value, bool)
-            and isinstance(value, numbers.Real)
-            and math.isfinite(float(value))
-            and value >= 0
-        )
-        integer_field = field in (
-            "oam_artifact_count",
-            "installed_bytes",
-            "wheel_bytes",
-        )
-        if not valid_number or (integer_field and not isinstance(value, int)):
-            raise ValueError(
-                f"release measurement {field} must be a finite nonnegative "
-                + ("integer" if integer_field else "real number")
-            )
-    if measurement["oam_artifact_count"] != limits["oam_artifact_count"]:
-        raise ValueError("OAM artifact count must be exactly 8")
-    if measurement["installed_bytes"] > limits["installed_bytes"]:
-        raise ValueError("installed-byte budget exceeded")
-    if measurement["build_duration_seconds"] > limits["build_duration_seconds"]:
-        raise ValueError("build-time budget exceeded")
-    if measurement["wheel_bytes"] > limits["wheel_bytes"]:
-        raise ValueError("wheel-size budget exceeded")
-    return dict(measurement)
-
-
-def audit_installed_oam_release_catalog(
-    *,
-    native_extension_path: Path | str,
-    build_info: dict[str, Any],
-    backend_descriptor: dict[str, Any],
-    native_build_info: dict[str, Any],
-    reported_validation: dict[str, Any],
-    wheel_bytes: int,
-    backend: str,
-    target: str,
-) -> dict[str, Any]:
-    """Audit a repaired wheel's installed OAM catalog and packaging budgets."""
-
-    if backend not in ("host", "cuda"):
-        raise ValueError("OAM release catalogs support host and CUDA only")
-    extension = Path(native_extension_path)
-    if extension.is_symlink() or not extension.is_file():
-        raise ValueError("installed native extension must be a regular file")
-    package_root = extension.parent
-    validation, catalog, _ = _catalog_module().validated_installed_operator_catalog(
-        package_root, build_info
-    )
-    if reported_validation != validation:
-        raise ValueError("probe installed-package validation is stale or inconsistent")
-    if native_build_info.get("prebuilt_operator_artifacts") != build_info:
-        raise ValueError("probe native build info does not bind the audited catalog")
-    entries = catalog["artifacts"]
-    expected_target = (
-        _canonical_oam_host_target(target)
-        if backend == "host"
-        else load_build_source_module(
-            "cuda_codegen_common"
-        ).canonical_cuda_target_identity(target)
-    )
-    build_target = build_info.get("target")
-    canonical_build_target = (
-        _canonical_oam_host_target(build_target)
-        if backend == "host"
-        else load_build_source_module(
-            "cuda_codegen_common"
-        ).canonical_cuda_target_identity(build_target)
-    )
-    if (
-        build_info.get("backend") != backend
-        or canonical_build_target != expected_target
-    ):
-        raise ValueError("installed release backend or target mismatch")
-    descriptor_target = backend_descriptor.get("architecture")
-    canonical_descriptor_target = (
-        _canonical_oam_host_target(descriptor_target)
-        if backend == "host"
-        else load_build_source_module(
-            "cuda_codegen_common"
-        ).canonical_cuda_target_identity(descriptor_target)
-    )
-    # Native descriptors name the CPU backend; artifact catalogs name host code.
-    expected_descriptor_backend = "cpu" if backend == "host" else "cuda"
-    if (
-        backend_descriptor.get("backend") != expected_descriptor_backend
-        or canonical_descriptor_target != expected_target
-    ):
-        raise ValueError("probe backend descriptor does not bind the requested target")
-    commit = native_build_info.get("source_commit")
-    if (
-        not isinstance(commit, str)
-        or re.fullmatch(r"[0-9a-f]{40}", commit) is None
-        or backend_descriptor.get("source_commit") != commit
-        or native_build_info.get("source_dirty") is not False
-        or backend_descriptor.get("source_dirty") is not False
-    ):
-        raise ValueError("probe/backend provenance is missing, dirty, or inconsistent")
-    for field in ("source_content_sha256", "native_source_content_sha256"):
-        value = build_info.get(field)
-        if (
-            not isinstance(value, str)
-            or _SOURCE_SHA256.fullmatch(value) is None
-            or native_build_info.get(field) != value
-            or backend_descriptor.get(field) != value
-        ):
-            raise ValueError(f"probe/backend provenance {field} is inconsistent")
-    oam_entries = [entry for entry in entries if entry.get("operator") == "OAM"]
-    if len(oam_entries) != OAM_RELEASE_ARTIFACT_COUNT:
-        raise ValueError("installed release must contain exactly 8 OAM artifacts")
-    expected_host_policy = None
-    if backend == "host":
-        native_fast_math = native_build_info.get("fast_math")
-        if not isinstance(native_fast_math, bool):
-            raise ValueError(
-                "probe native build info must bind host floating-point policy"
-            )
-        expected_host_policy = "fast" if native_fast_math else "strict"
-    architecture_precisions: dict[str, set[str]] = {}
-    installed_paths: list[str] = []
-    generation_revision = _oam_modules()[3].JIT_GENERATION_VERSION
-    for entry in oam_entries:
-        identity = entry["identity"]
-        if identity.get("generation_revision") != generation_revision:
-            raise ValueError("installed OAM generation revision is stale")
-        entry_target = identity.get("target")
-        canonical_entry_target = (
-            _canonical_oam_host_target(entry_target)
-            if backend == "host"
-            else load_build_source_module(
-                "cuda_codegen_common"
-            ).canonical_cuda_target_identity(entry_target)
-        )
-        if (
-            identity.get("backend") != backend
-            or canonical_entry_target != expected_target
-        ):
-            raise ValueError("installed OAM artifact backend or target mismatch")
-        metadata, _ = _oam_generated_metadata(
-            identity["architecture"],
-            backend,
-            expected_target,
-            identity["precision"],
-            identity.get("floating_point_policy"),
-        )
-        expected_identity = _oam_identity(
-            metadata,
-            backend=backend,
-            target=expected_target,
-            generation_revision=generation_revision,
-        )
-        if identity != expected_identity:
-            raise ValueError("installed OAM artifact identity is not canonical")
-        if entry.get("capabilities") != metadata["required_capabilities"]:
-            raise ValueError("installed OAM artifact lacks exact dual capabilities")
-        provenance = entry["build_provenance"]
-        if (
-            provenance.get("source_content_sha256")
-            != "sha256:" + build_info["source_content_sha256"]
-        ):
-            raise ValueError("installed OAM artifact source provenance mismatch")
-        if backend == "host" and provenance.get(
-            "floating_point_policy"
-        ) != identity.get("floating_point_policy"):
-            raise ValueError("installed OAM floating-point policy mismatch")
-        if (
-            backend == "host"
-            and identity.get("floating_point_policy") != expected_host_policy
-        ):
-            raise ValueError(
-                "installed OAM floating-point policy does not match native fast_math"
-            )
-        installed_paths.append(entry["installed_relative_path"])
-        installed_paths.extend(
-            auxiliary["installed_relative_path"]
-            for auxiliary in entry.get("auxiliary_files", ())
-        )
-        architecture_key = identity.get("architecture_fingerprint")
-        architecture_precisions.setdefault(architecture_key, set()).add(
-            identity.get("precision")
-        )
-    if len(installed_paths) != len(set(installed_paths)):
-        raise ValueError("installed OAM artifact paths must be unique")
-    if set(architecture_precisions) != set(
-        OAM_RELEASE_ARCHITECTURE_FINGERPRINTS.values()
-    ):
-        raise ValueError(
-            "installed OAM release must contain only qualified OAM architectures"
-        )
-    if any(
-        precisions != {"float32", "float64"}
-        for precisions in architecture_precisions.values()
-    ):
-        raise ValueError(
-            "installed OAM release must contain four architectures in both precisions"
-        )
-    measurement = audit_oam_release_budgets(
-        {
-            "oam_artifact_count": len(oam_entries),
-            "installed_bytes": build_info.get("installed_bytes"),
-            "build_duration_seconds": build_info.get("build_duration_seconds"),
-            "wheel_bytes": wheel_bytes,
-        }
-    )
-    return {
-        **measurement,
-        "backend": backend,
-        "target": expected_target,
-        "catalog_sha256": validation["catalog_sha256"],
-    }
+    return {"mode": mode, "artifacts": artifacts}
 
 
 def _foundation_requests(
@@ -975,7 +495,7 @@ def _foundation_requests(
     floating_point_policy: str | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     if backend == "host":
-        target = _canonical_oam_host_target(target)
+        target = _canonical_host_target(target)
     foundation, version = _build_modules()
     r0_schedule = "host-owner" if backend == "host" else "receiver-edge16"
     requests: list[tuple[str, dict[str, Any]]] = [
@@ -1048,7 +568,7 @@ def render_foundation_operator_artifact(
     """Render one exact verified R1, R0, or M0 artifact."""
 
     if backend == "host":
-        target = _canonical_oam_host_target(target)
+        target = _canonical_host_target(target)
     foundation, version = _build_modules()
     manifest = foundation.load_foundation_operator_manifest(manifest_path)
     selected = next(
@@ -1157,7 +677,7 @@ def render_foundation_r0_artifact(
     """Render one exact verified R0 source and its build metadata."""
 
     if backend == "host":
-        target = _canonical_oam_host_target(target)
+        target = _canonical_host_target(target)
 
     plan = plan_foundation_operator_artifacts(
         manifest_path=manifest_path,
@@ -1230,93 +750,6 @@ def render_foundation_r0_artifact(
     )
 
 
-def render_foundation_oam_artifact(
-    *,
-    oam_manifest_path: Path | str,
-    architecture_id: str,
-    backend: str,
-    target: str,
-    precision: str,
-    source_content_sha256: str,
-    compiler_id: str,
-    compiler_version: str,
-    source_path: Path | str,
-    metadata_path: Path | str,
-    companion_manifest_path: Path | str,
-    floating_point_policy: str | None = None,
-) -> None:
-    """Render one model-independent known-OAM artifact and loader manifest."""
-
-    manifest = _load_oam_manifest(oam_manifest_path)
-    selected = next(
-        (
-            entry
-            for entry in manifest["architectures"]
-            if entry["id"] == architecture_id
-        ),
-        None,
-    )
-    if selected is None:
-        raise ValueError(f"unknown OAM architecture {architecture_id!r}")
-    metadata, source = _oam_generated_metadata(
-        selected["architecture"],
-        backend,
-        target,
-        precision,
-        floating_point_policy,
-    )
-    _, version = _build_modules()
-    generated_identity = _oam_identity(
-        metadata,
-        backend=backend,
-        target=target,
-        generation_revision=version.JIT_GENERATION_VERSION,
-    )
-    catalog_metadata = {
-        **metadata,
-        "operator": "OAM",
-        "schema": metadata["abi"],
-        "capabilities": metadata["required_capabilities"],
-        "generated_identity": generated_identity,
-        "architecture_id": architecture_id,
-        "source_contract_sha256": selected["source_contract_sha256"],
-        "binary_format": {
-            "host": "shared-library",
-            "cuda": "cubin",
-        }[backend],
-        "build_provenance": {
-            "source_content_sha256": source_content_sha256,
-            "compiler_id": compiler_id,
-            "compiler_version": compiler_version,
-            **(
-                {"floating_point_policy": metadata["floating_point_policy"]}
-                if backend == "host"
-                else {}
-            ),
-        },
-    }
-    source_path = Path(source_path)
-    metadata_path = Path(metadata_path)
-    companion_manifest_path = Path(companion_manifest_path)
-    source_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    companion_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    source_path.write_text(source, encoding="utf-8")
-    metadata_path.write_text(
-        json.dumps(catalog_metadata, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    companion_manifest_path.write_text(
-        json.dumps(
-            {"key_inputs": {"build": {"metadata": metadata}}},
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1324,20 +757,15 @@ def _parser() -> argparse.ArgumentParser:
     render = commands.add_parser("render")
     for command in (plan, render):
         command.add_argument("--manifest", type=Path, required=True)
-        command.add_argument("--oam-manifest", type=Path)
         command.add_argument("--backend", choices=_BACKENDS, required=True)
         command.add_argument("--target", required=True)
         command.add_argument("--source-content-sha256", required=True)
         command.add_argument(
             "--floating-point-policy", choices=("strict", "fast", "cuda-fast-math")
         )
-    plan.add_argument("--oam-floating-point-policy", choices=("strict", "fast"))
     plan.add_argument("--mode", choices=_MODES, required=True)
-    plan.add_argument("--oam-mode", choices=_OAM_MODES, default="off")
     plan.add_argument("--output", type=Path, required=True)
-    render.add_argument(
-        "--operator", choices=("R1", "R0", "M0", "M1", "OAM"), default="R0"
-    )
+    render.add_argument("--operator", choices=("R1", "R0", "M0", "M1"), default="R0")
     render.add_argument("--artifact-id")
     render.add_argument("--artifact-input-id")
     render.add_argument("--precision", choices=("float32", "float64"), required=True)
@@ -1345,8 +773,6 @@ def _parser() -> argparse.ArgumentParser:
     render.add_argument("--compiler-version", required=True)
     render.add_argument("--source", type=Path, required=True)
     render.add_argument("--metadata", type=Path, required=True)
-    render.add_argument("--architecture-id")
-    render.add_argument("--companion-manifest", type=Path)
     catalog = commands.add_parser("catalog")
     catalog.add_argument(
         "--artifact",
@@ -1355,7 +781,7 @@ def _parser() -> argparse.ArgumentParser:
         metavar="ARTIFACT_FIELD",
         required=True,
     )
-    catalog.add_argument("--mode", choices=("r0", "full", "oam"), required=True)
+    catalog.add_argument("--mode", choices=("off", "r0", "full"), required=True)
     catalog.add_argument("--backend", choices=_BACKENDS, required=True)
     catalog.add_argument("--target", required=True)
     catalog.add_argument("--source-content-sha256", required=True)
@@ -1385,9 +811,6 @@ def main(argv: list[str] | None = None) -> int:
             target=args.target,
             source_content_sha256=args.source_content_sha256,
             floating_point_policy=args.floating_point_policy,
-            oam_manifest_path=args.oam_manifest,
-            oam_mode=args.oam_mode,
-            oam_floating_point_policy=args.oam_floating_point_policy,
         )
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(
@@ -1406,31 +829,7 @@ def main(argv: list[str] | None = None) -> int:
             "metadata_path": args.metadata,
             "floating_point_policy": args.floating_point_policy,
         }
-        if args.operator == "OAM":
-            if (
-                args.oam_manifest is None
-                or args.architecture_id is None
-                or args.companion_manifest is None
-            ):
-                raise ValueError(
-                    "OAM render requires --oam-manifest, --architecture-id, "
-                    "and --companion-manifest"
-                )
-            render_foundation_oam_artifact(
-                oam_manifest_path=args.oam_manifest,
-                architecture_id=args.architecture_id,
-                backend=args.backend,
-                target=args.target,
-                precision=args.precision,
-                source_content_sha256=args.source_content_sha256,
-                compiler_id=args.compiler_id,
-                compiler_version=args.compiler_version,
-                source_path=args.source,
-                metadata_path=args.metadata,
-                companion_manifest_path=args.companion_manifest,
-                floating_point_policy=args.floating_point_policy,
-            )
-        elif args.artifact_id:
+        if args.artifact_id:
             render_foundation_operator_artifact(
                 **common, operator=args.operator, artifact_id=args.artifact_id
             )
@@ -1478,14 +877,9 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "OAM_RELEASE_ARCHITECTURE_FINGERPRINTS",
-    "audit_installed_oam_release_catalog",
-    "audit_oam_release_budgets",
-    "audit_oam_release_plan",
     "main",
     "plan_foundation_operator_artifacts",
     "render_foundation_operator_artifact",
-    "render_foundation_oam_artifact",
     "render_foundation_r0_artifact",
     "sha256_file",
     "validate_generated_operator_catalog",

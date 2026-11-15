@@ -1,10 +1,10 @@
 """Shared CUDA input normalization helpers.
 
-The generated OAM path owns no ordinary-NequIP implementation details, but it
-still needs the same target, precision, and launch-size normalization used by
-the CUDA artifact boundary.  Keep those small, neutral helpers here so the OAM
-path remains independent of retired adapters.  The ``SYMMETRIX_JIT_POLICY``
-selection is framework policy and lives in :mod:`symmetrix.jit`.
+Every generated CUDA path needs the same target, precision, and launch-size
+normalization used by the CUDA artifact boundary.  Keep those small, neutral
+helpers here so each family's codegen stays independent of the others.  The
+``SYMMETRIX_JIT_POLICY`` selection is framework policy and lives in
+:mod:`symmetrix.jit`.
 """
 
 from __future__ import annotations

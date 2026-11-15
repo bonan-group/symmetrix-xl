@@ -44,7 +44,6 @@ def cmake_definitions(
         "SYMMETRIX_PARTICLE_MESH": manifest.particle_mesh_policy.upper(),
         "SYMMETRIX_CUFFT_LINKAGE": manifest.cufft_linkage,
         "SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS": (manifest.prebuilt_operator_artifacts),
-        "SYMMETRIX_PREBUILT_OAM_ARTIFACTS": manifest.prebuilt_oam_artifacts,
         # Reset a development configure that reused this fingerprinted cache;
         # package installs and wheels must never inherit the runtime-only path.
         "SYMMETRIX_ENABLE_DEVELOPMENT_RUNTIME_COMPONENT": "OFF",

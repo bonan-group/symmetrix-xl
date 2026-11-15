@@ -15,7 +15,6 @@ def test_publication_guide_covers_implemented_method_families():
         "10.1038/s41524-025-01577-7",  # LES
         "10.1021/acs.jctc.5c01400",  # MACELES integration
         "10.48550/arXiv.2602.19411",  # MACE-POLAR-1
-        "10.1038/s41467-022-29939-5",  # NequIP
         "10.1002/jcc.20495",  # DFT-D2
         "10.1063/1.3382344",  # DFT-D3
         "10.1002/jcc.21759",  # DFT-D3(BJ)
@@ -34,8 +33,6 @@ def test_publication_guide_credits_numerical_reference_software():
         "ACEsuit/mace",
         "mdi-group/mace-field",
         "ChengUCB/les",
-        "mir-group/nequip",
-        "e3nn/e3nn",
         "pfnet-research/torch-dftd",
         "NVIDIA/nvalchemi-toolkit-ops",
         "WillBaldwin0/graph_electrostatics",

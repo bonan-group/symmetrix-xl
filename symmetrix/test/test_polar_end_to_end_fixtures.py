@@ -1037,7 +1037,7 @@ def test_the_family_stress_is_its_own_energy_derivative():
     """The authoritative stress gate: the family's own finite strain.
 
     No analytic serial stress oracle ships for the long-range layer, so the
-    stress is gated the way the OAM precedent gates it: six symmetric strain
+    stress is gated the way the legacy precedent gates it: six symmetric strain
     components about the record's evaluated cell, positions scaled with it,
     and the central difference of the family's *own* composed energy against
     the stress the frontend serves.  The check is the frontend's, so it

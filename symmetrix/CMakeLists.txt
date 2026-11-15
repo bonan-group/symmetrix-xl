@@ -58,26 +58,14 @@ set(SYMMETRIX_DEVELOPMENT_DESCRIPTOR_SELECTOR "" CACHE STRING
     "Architecture-qualified selector for development runtime metadata.")
 set(SYMMETRIX_DEVELOPMENT_TOOLKIT "" CACHE STRING
     "Normalized toolkit name for development runtime metadata.")
-set(SYMMETRIX_PREBUILT_OAM_ARTIFACTS "off" CACHE STRING
-    "Build-tree OAM architecture artifacts: off or known.")
 set_property(CACHE SYMMETRIX_DEVICE_BACKEND PROPERTY STRINGS AUTO NONE CUDA HIP)
 set_property(CACHE SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS PROPERTY STRINGS off r0 full)
-set_property(CACHE SYMMETRIX_PREBUILT_OAM_ARTIFACTS PROPERTY STRINGS off known)
 string(TOUPPER "${SYMMETRIX_DEVICE_BACKEND}" SYMMETRIX_DEVICE_BACKEND)
 set(_symmetrix_valid_device_backends AUTO NONE CUDA HIP)
 if(NOT SYMMETRIX_DEVICE_BACKEND IN_LIST _symmetrix_valid_device_backends)
   message(FATAL_ERROR
     "Invalid SYMMETRIX_DEVICE_BACKEND='${SYMMETRIX_DEVICE_BACKEND}'; "
     "expected AUTO, NONE, CUDA, or HIP.")
-endif()
-string(TOLOWER "${SYMMETRIX_PREBUILT_OAM_ARTIFACTS}"
-  SYMMETRIX_PREBUILT_OAM_ARTIFACTS)
-set(_symmetrix_valid_prebuilt_oam_modes off known)
-if(NOT SYMMETRIX_PREBUILT_OAM_ARTIFACTS IN_LIST
-    _symmetrix_valid_prebuilt_oam_modes)
-  message(FATAL_ERROR
-    "Invalid SYMMETRIX_PREBUILT_OAM_ARTIFACTS="
-    "'${SYMMETRIX_PREBUILT_OAM_ARTIFACTS}'; expected off or known.")
 endif()
 string(TOLOWER "${SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS}"
   SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS)
@@ -493,7 +481,6 @@ set(SYMMETRIX_BINDINGS
     source/cpp/cubic_spline.cpp
     source/cpp/cubic_spline_set.cpp
     source/cpp/e3nn.cpp
-    source/cpp/oam_schema.cpp
     source/cpp/multilayer_perceptron.cpp
     source/cpp/multivariate_polynomial.cpp
     source/cpp/spherical_harmonic.cpp
@@ -509,7 +496,6 @@ set(SYMMETRIX_BINDINGS_KOKKOS
     source/cpp/mace_kokkos.cpp
     source/cpp/mace_les_kokkos.cpp
     source/cpp/mace_nonlinear_kokkos.cpp
-    source/cpp/oam_kokkos.cpp
     source/cpp/multilayer_perceptron_kokkos.cpp
     source/cpp/multivariate_polynomial_kokkos.cpp
     # source/spherical_harmonic_kokkos.cpp

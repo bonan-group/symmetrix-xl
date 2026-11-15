@@ -1840,7 +1840,7 @@ def test_jit_rejects_a_model_type_no_family_declares(jit_harness, tmp_path):
 
     model_path = tmp_path / "undeclared.json"
     model_path.write_text(
-        json.dumps({**jit_harness["model"], "model_type": "NequIP"}),
+        json.dumps({**jit_harness["model"], "model_type": "UndeclaredFamily"}),
         encoding="utf-8",
     )
 

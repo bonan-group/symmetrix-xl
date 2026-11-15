@@ -13,18 +13,7 @@ function(symmetrix_add_prebuilt_operator_artifacts)
             "SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS must be off, r0, or full; "
             "got '${SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS}'")
     endif()
-    if(NOT DEFINED SYMMETRIX_PREBUILT_OAM_ARTIFACTS)
-        set(SYMMETRIX_PREBUILT_OAM_ARTIFACTS "off")
-    endif()
-    string(TOLOWER "${SYMMETRIX_PREBUILT_OAM_ARTIFACTS}"
-        _symmetrix_prebuilt_oam_mode)
-    if(NOT _symmetrix_prebuilt_oam_mode MATCHES "^(off|known)$")
-        message(FATAL_ERROR
-            "SYMMETRIX_PREBUILT_OAM_ARTIFACTS must be off or known; got "
-            "'${SYMMETRIX_PREBUILT_OAM_ARTIFACTS}'")
-    endif()
-    if(_symmetrix_prebuilt_mode STREQUAL "off"
-            AND _symmetrix_prebuilt_oam_mode STREQUAL "off")
+    if(_symmetrix_prebuilt_mode STREQUAL "off")
         set(SYMMETRIX_PREBUILT_OPERATOR_CATALOG_HEADER "" CACHE INTERNAL
             "Generated installed-operator provenance header" FORCE)
         message(STATUS "Symmetrix: prebuilt operator artifacts disabled")
@@ -66,16 +55,6 @@ function(symmetrix_add_prebuilt_operator_artifacts)
         message(FATAL_ERROR
             "Symmetrix production operator manifest is unavailable: "
             "${SYMMETRIX_PREBUILT_OPERATOR_MANIFEST}")
-    endif()
-    if(NOT DEFINED SYMMETRIX_PREBUILT_OAM_MANIFEST)
-        set(SYMMETRIX_PREBUILT_OAM_MANIFEST
-            "${_symmetrix_operator_source}/foundation_oam_architectures.json")
-    endif()
-    if(_symmetrix_prebuilt_oam_mode STREQUAL "known"
-            AND NOT EXISTS "${SYMMETRIX_PREBUILT_OAM_MANIFEST}")
-        message(FATAL_ERROR
-            "Symmetrix OAM architecture manifest is unavailable: "
-            "${SYMMETRIX_PREBUILT_OAM_MANIFEST}")
     endif()
     string(LENGTH "${SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256}"
         _symmetrix_source_hash_length)
@@ -300,18 +279,6 @@ function(symmetrix_add_prebuilt_operator_artifacts)
     else()
         set(_symmetrix_r0_floating_point_policy strict)
     endif()
-    if(_symmetrix_artifact_backend STREQUAL "host" AND SYMMETRIX_FAST_MATH)
-        if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
-            message(FATAL_ERROR
-                "SYMMETRIX_FAST_MATH host prebuilts require a supported GNU, "
-                "Clang, or AppleClang C++ compiler; detected "
-                "'${CMAKE_CXX_COMPILER_ID}'")
-        endif()
-        set(_symmetrix_oam_floating_point_policy fast)
-    else()
-        set(_symmetrix_oam_floating_point_policy strict)
-    endif()
-
     set(_symmetrix_generation_dependencies
         "${SYMMETRIX_PREBUILT_OPERATOR_TOOL}"
         "${_symmetrix_tool_package}/generated_operator_codegen.py"
@@ -332,17 +299,6 @@ function(symmetrix_add_prebuilt_operator_artifacts)
         "${_symmetrix_operator_source}/mace_jit_m1_host_plugin_abi.h"
         "${_symmetrix_operator_source}/mace_jit_r0_host_plugin_abi.h"
         "${_SYMMETRIX_PREBUILT_OPERATOR_CMAKE_DIR}/../source/jit_generation_version.hpp")
-    if(_symmetrix_prebuilt_oam_mode STREQUAL "known")
-        list(APPEND _symmetrix_generation_dependencies
-            "${SYMMETRIX_PREBUILT_OAM_MANIFEST}"
-            "${_symmetrix_operator_source}/oam_architecture.py"
-            "${_symmetrix_operator_source}/oam_receiver_codegen.py"
-            "${_symmetrix_operator_source}/oam_cuda_codegen.py"
-            "${_symmetrix_operator_source}/oam_jit_codegen.py"
-            "${_symmetrix_operator_source}/oam_jit_host_plugin_abi.h"
-            "${_symmetrix_operator_source}/oam_cuda_plugin_abi.h"
-            "${_symmetrix_operator_source}/nequip_schema.py")
-    endif()
     foreach(_symmetrix_dependency IN LISTS _symmetrix_generation_dependencies)
         if(NOT EXISTS "${_symmetrix_dependency}")
             message(FATAL_ERROR
@@ -358,12 +314,6 @@ function(symmetrix_add_prebuilt_operator_artifacts)
     file(MAKE_DIRECTORY "${_symmetrix_artifact_directory}")
     file(SHA256 "${SYMMETRIX_PREBUILT_OPERATOR_MANIFEST}"
         _symmetrix_manifest_sha256)
-    if(_symmetrix_prebuilt_oam_mode STREQUAL "known")
-        file(SHA256 "${SYMMETRIX_PREBUILT_OAM_MANIFEST}"
-            _symmetrix_oam_manifest_sha256)
-    else()
-        set(_symmetrix_oam_manifest_sha256 "off")
-    endif()
     file(SHA256
         "${_SYMMETRIX_PREBUILT_OPERATOR_CMAKE_DIR}/../source/jit_generation_version.hpp"
         _symmetrix_generation_version_header_sha256)
@@ -371,15 +321,12 @@ function(symmetrix_add_prebuilt_operator_artifacts)
         "${_symmetrix_artifact_directory}/build-inputs.txt")
     string(CONCAT _symmetrix_build_inputs_content
         "mode=${_symmetrix_prebuilt_mode}\n"
-        "oam_mode=${_symmetrix_prebuilt_oam_mode}\n"
         "backend=${_symmetrix_artifact_backend}\n"
         "target=${SYMMETRIX_PREBUILT_OPERATOR_TARGET}\n"
         "source_content_sha256=${SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256}\n"
         "native_source_content_sha256=${SYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256}\n"
         "manifest=${SYMMETRIX_PREBUILT_OPERATOR_MANIFEST}\n"
-        "oam_manifest=${SYMMETRIX_PREBUILT_OAM_MANIFEST}\n"
         "manifest_sha256=${_symmetrix_manifest_sha256}\n"
-        "oam_manifest_sha256=${_symmetrix_oam_manifest_sha256}\n"
         "generation_version_header_sha256=${_symmetrix_generation_version_header_sha256}\n"
         "python_executable=${Python_EXECUTABLE}\n"
         "python_version=${Python_VERSION}\n"
@@ -395,8 +342,7 @@ function(symmetrix_add_prebuilt_operator_artifacts)
         "host_arch=${SYMMETRIX_HOST_ARCH}\n"
         "openmp=${Kokkos_ENABLE_OPENMP}\n")
     string(APPEND _symmetrix_build_inputs_content
-        "r0_floating_point_policy=${_symmetrix_r0_floating_point_policy}\n"
-        "oam_host_floating_point_policy=${_symmetrix_oam_floating_point_policy}\n")
+        "r0_floating_point_policy=${_symmetrix_r0_floating_point_policy}\n")
     file(CONFIGURE
         OUTPUT "${_symmetrix_build_inputs}"
         CONTENT "${_symmetrix_build_inputs_content}"
@@ -410,15 +356,11 @@ function(symmetrix_add_prebuilt_operator_artifacts)
             "${Python_EXECUTABLE}" "${SYMMETRIX_PREBUILT_OPERATOR_TOOL}"
             plan
             --manifest "${SYMMETRIX_PREBUILT_OPERATOR_MANIFEST}"
-            --oam-manifest "${SYMMETRIX_PREBUILT_OAM_MANIFEST}"
             --mode "${_symmetrix_prebuilt_mode}"
-            --oam-mode "${_symmetrix_prebuilt_oam_mode}"
             --backend "${_symmetrix_artifact_backend}"
             --target "${SYMMETRIX_PREBUILT_OPERATOR_TARGET}"
             --source-content-sha256 "${SYMMETRIX_BUILD_SOURCE_CONTENT_SHA256}"
             --floating-point-policy "${_symmetrix_r0_floating_point_policy}"
-            --oam-floating-point-policy
-                "${_symmetrix_oam_floating_point_policy}"
             --output "${_symmetrix_plan}"
         RESULT_VARIABLE _symmetrix_plan_status
         ERROR_VARIABLE _symmetrix_plan_error)
@@ -436,13 +378,9 @@ function(symmetrix_add_prebuilt_operator_artifacts)
     else()
         set(_symmetrix_expected_artifact_count 0)
     endif()
-    if(_symmetrix_prebuilt_oam_mode STREQUAL "known")
-        math(EXPR _symmetrix_expected_artifact_count
-            "${_symmetrix_expected_artifact_count}+8")
-    endif()
     if(NOT _symmetrix_artifact_count EQUAL _symmetrix_expected_artifact_count)
         message(FATAL_ERROR
-            "Verified ${_symmetrix_prebuilt_mode}/${_symmetrix_prebuilt_oam_mode} "
+            "Verified ${_symmetrix_prebuilt_mode} "
             "mode must plan exactly "
             "${_symmetrix_expected_artifact_count} "
             "artifacts for one backend target; planned ${_symmetrix_artifact_count}")
@@ -480,25 +418,8 @@ function(symmetrix_add_prebuilt_operator_artifacts)
         set(_symmetrix_generated_outputs
             "${_symmetrix_generated_source}"
             "${_symmetrix_generated_metadata}")
-        set(_symmetrix_oam_render_arguments "")
-        if(_symmetrix_operator STREQUAL "OAM")
-            string(JSON _symmetrix_architecture_id GET
-                "${_symmetrix_plan_json}" artifacts ${_symmetrix_index}
-                architecture_id)
-            set(_symmetrix_companion_manifest
-                "${_symmetrix_artifact_directory}/${_symmetrix_stem}.manifest.json")
-            list(APPEND _symmetrix_generated_outputs
-                "${_symmetrix_companion_manifest}")
-            list(APPEND _symmetrix_oam_render_arguments
-                --oam-manifest "${SYMMETRIX_PREBUILT_OAM_MANIFEST}"
-                --architecture-id "${_symmetrix_architecture_id}"
-                --companion-manifest "${_symmetrix_companion_manifest}")
-            set(_symmetrix_artifact_floating_point_policy
-                "${_symmetrix_oam_floating_point_policy}")
-        else()
-            set(_symmetrix_artifact_floating_point_policy
-                "${_symmetrix_r0_floating_point_policy}")
-        endif()
+        set(_symmetrix_artifact_floating_point_policy
+            "${_symmetrix_r0_floating_point_policy}")
         add_custom_command(
             OUTPUT ${_symmetrix_generated_outputs}
             COMMAND "${CMAKE_COMMAND}" -E env PYTHONDONTWRITEBYTECODE=1
@@ -509,7 +430,6 @@ function(symmetrix_add_prebuilt_operator_artifacts)
                 "${Python_EXECUTABLE}"
                 "${SYMMETRIX_PREBUILT_OPERATOR_TOOL}" render
                 --manifest "${SYMMETRIX_PREBUILT_OPERATOR_MANIFEST}"
-                ${_symmetrix_oam_render_arguments}
                 --operator "${_symmetrix_operator}"
                 --artifact-id "${_symmetrix_artifact_id}"
                 --backend "${_symmetrix_artifact_backend}"
@@ -562,8 +482,7 @@ function(symmetrix_add_prebuilt_operator_artifacts)
                 target_compile_options(${_symmetrix_binary_target} PRIVATE
                     "$<$<COMPILE_LANGUAGE:CXX>:-ffast-math>")
             endif()
-            if(_symmetrix_operator STREQUAL "R1"
-                    OR _symmetrix_operator STREQUAL "OAM")
+            if(_symmetrix_operator STREQUAL "R1")
                 target_compile_options(${_symmetrix_binary_target} PRIVATE
                     "$<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wno-pragma-once-outside-header>")
             endif()
@@ -593,65 +512,29 @@ function(symmetrix_add_prebuilt_operator_artifacts)
                 VERBATIM)
             add_dependencies(symmetrix_prebuilt_operator_artifacts
                 ${_symmetrix_binary_target})
-            if(_symmetrix_operator STREQUAL "OAM")
-                set(_symmetrix_installed_binary
-                    "oam/${_symmetrix_artifact_id}/plugin${CMAKE_SHARED_MODULE_SUFFIX}")
-                set(_symmetrix_installed_manifest
-                    "oam/${_symmetrix_artifact_id}/manifest.json")
-                list(APPEND _symmetrix_catalog_arguments
-                    --artifact
-                    "${_symmetrix_generated_metadata}"
-                    "$<TARGET_FILE:${_symmetrix_binary_target}>"
-                    "${_symmetrix_installed_binary}"
-                    "${_symmetrix_build_started}"
-                    "${_symmetrix_companion_manifest}"
-                    "${_symmetrix_installed_manifest}")
-            else()
                 list(APPEND _symmetrix_catalog_arguments
                     --artifact
                     "${_symmetrix_generated_metadata}"
                     "$<TARGET_FILE:${_symmetrix_binary_target}>"
                     "${_symmetrix_operator_directory}/${_symmetrix_stem}${CMAKE_SHARED_MODULE_SUFFIX}"
                     "${_symmetrix_build_started}")
-            endif()
             list(APPEND _symmetrix_catalog_dependencies
                 "${_symmetrix_generated_metadata}"
                 ${_symmetrix_binary_target}
                 "$<TARGET_FILE:${_symmetrix_binary_target}>")
-            if(_symmetrix_operator STREQUAL "OAM")
-                list(APPEND _symmetrix_catalog_dependencies
-                    "${_symmetrix_companion_manifest}")
-            endif()
             list(APPEND _symmetrix_catalog_binary_targets
                 ${_symmetrix_binary_target})
             # Install the exact file that the catalog hashes.  install(TARGETS)
             # participates in CMake's --strip step and would silently mutate
             # release-wheel bytes after the checksum was recorded.
-            if(_symmetrix_operator STREQUAL "OAM")
-                if(SYMMETRIX_PYTHON_INSTALL_PACKAGE)
-                    install(FILES "$<TARGET_FILE:${_symmetrix_binary_target}>"
-                        DESTINATION
-                        "${_symmetrix_install_root}/oam/${_symmetrix_artifact_id}"
-                        RENAME "plugin${CMAKE_SHARED_MODULE_SUFFIX}")
-                    install(FILES "${_symmetrix_companion_manifest}"
-                        DESTINATION
-                        "${_symmetrix_install_root}/oam/${_symmetrix_artifact_id}"
-                        RENAME manifest.json)
-                endif()
-            else()
                 list(APPEND _symmetrix_${_symmetrix_operator_directory}_install_files
                     "$<TARGET_FILE:${_symmetrix_binary_target}>")
-            endif()
             set(_symmetrix_lane_target ${_symmetrix_binary_target})
         elseif(_symmetrix_artifact_backend STREQUAL "cuda")
             set(_symmetrix_cuda_math_options "")
             set(_symmetrix_cuda_module_options "")
             if(_symmetrix_operator STREQUAL "R0" AND SYMMETRIX_FAST_MATH)
                 set(_symmetrix_cuda_math_options --use_fast_math)
-            endif()
-            if(_symmetrix_operator STREQUAL "OAM")
-                set(_symmetrix_cuda_module_options
-                    -DSYMMETRIX_OAM_CUDA_MODULE=1)
             endif()
             set(_symmetrix_binary
                 "${_symmetrix_artifact_directory}/${_symmetrix_stem}.cubin")
@@ -679,51 +562,19 @@ function(symmetrix_add_prebuilt_operator_artifacts)
                 ${_symmetrix_generate_target})
             add_dependencies(symmetrix_prebuilt_operator_artifacts
                 symmetrix_compile_${_symmetrix_artifact_token})
-            if(_symmetrix_operator STREQUAL "OAM")
-                set(_symmetrix_installed_binary
-                    "oam/${_symmetrix_artifact_id}/plugin.cubin")
-                set(_symmetrix_installed_manifest
-                    "oam/${_symmetrix_artifact_id}/manifest.json")
-                list(APPEND _symmetrix_catalog_arguments
-                    --artifact
-                    "${_symmetrix_generated_metadata}"
-                    "${_symmetrix_binary}"
-                    "${_symmetrix_installed_binary}"
-                    "${_symmetrix_build_started}"
-                    "${_symmetrix_companion_manifest}"
-                    "${_symmetrix_installed_manifest}")
-            else()
                 list(APPEND _symmetrix_catalog_arguments
                     --artifact
                     "${_symmetrix_generated_metadata}"
                     "${_symmetrix_binary}"
                     "${_symmetrix_operator_directory}/${_symmetrix_stem}.cubin"
                     "${_symmetrix_build_started}")
-            endif()
             list(APPEND _symmetrix_catalog_dependencies
                 "${_symmetrix_generated_metadata}"
                 "${_symmetrix_binary}")
-            if(_symmetrix_operator STREQUAL "OAM")
-                list(APPEND _symmetrix_catalog_dependencies
-                    "${_symmetrix_companion_manifest}")
-            endif()
             list(APPEND _symmetrix_catalog_binary_targets
                 symmetrix_compile_${_symmetrix_artifact_token})
-            if(_symmetrix_operator STREQUAL "OAM")
-                if(SYMMETRIX_PYTHON_INSTALL_PACKAGE)
-                    install(FILES "${_symmetrix_binary}"
-                        DESTINATION
-                        "${_symmetrix_install_root}/oam/${_symmetrix_artifact_id}"
-                        RENAME plugin.cubin)
-                    install(FILES "${_symmetrix_companion_manifest}"
-                        DESTINATION
-                        "${_symmetrix_install_root}/oam/${_symmetrix_artifact_id}"
-                        RENAME manifest.json)
-                endif()
-            else()
                 list(APPEND _symmetrix_${_symmetrix_operator_directory}_install_files
                     "${_symmetrix_binary}")
-            endif()
             set(_symmetrix_lane_target
                 symmetrix_compile_${_symmetrix_artifact_token})
         else()
@@ -781,11 +632,7 @@ function(symmetrix_add_prebuilt_operator_artifacts)
 
     set(_symmetrix_catalog_header
         "${CMAKE_BINARY_DIR}/generated/prebuilt_operator_build_info.hpp")
-    if(_symmetrix_prebuilt_mode STREQUAL "off")
-        set(_symmetrix_catalog_mode oam)
-    else()
-        set(_symmetrix_catalog_mode "${_symmetrix_prebuilt_mode}")
-    endif()
+    set(_symmetrix_catalog_mode "${_symmetrix_prebuilt_mode}")
     add_custom_command(
         OUTPUT "${_symmetrix_catalog}" "${_symmetrix_catalog_header}"
         COMMAND "${CMAKE_COMMAND}" -E env PYTHONDONTWRITEBYTECODE=1

@@ -663,7 +663,6 @@ set(SYMMETRIX_SOURCE_FILES
     source/dispersion_parameters.cpp
     source/mace_nonlinear_schema.cpp
     source/mace_polar_schema.cpp
-    source/oam_schema.cpp
     source/multilayer_perceptron.cpp
     source/multivariate_polynomial.cpp
     source/spherical_harmonic.cpp
@@ -675,15 +674,12 @@ list(APPEND SYMMETRIX_SOURCE_FILES
     source/mace_nonlinear_jit_cuda_plugin.cpp
     source/mace_nonlinear_jit_host_plugin.cpp
     source/mace_nonlinear_split_phase_admission.cpp
-    source/oam_cuda_plugin.cpp
     source/mace_jit_hip_plugin.cpp
     source/jit_hiprtc.cpp
     source/jit_nvrtc.cpp
     source/mace_jit_host_plugin.cpp
     source/mace_jit_m0_host_plugin.cpp
     source/mace_jit_r0_host_plugin.cpp)
-list(APPEND SYMMETRIX_SOURCE_FILES
-    source/oam_jit_host_plugin.cpp)
 if(NOT UNIX)
     message(STATUS "Symmetrix: Execution runtime plugins require POSIX dynamic loading; building disabled stubs.")
 endif()
@@ -727,10 +723,6 @@ if(SYMMETRIX_KOKKOS)
         source/mace_nonlinear_kokkos_components.cpp
         source/mace_nonlinear_kokkos_runtime.cpp
         source/mace_nonlinear_kokkos_evaluate.cpp
-        source/oam_kokkos.cpp
-        source/oam_kokkos_forward.cpp
-        source/oam_kokkos_reverse.cpp
-        source/oam_radial.cpp
         source/multilayer_perceptron_kokkos.cpp
         source/multivariate_polynomial_kokkos.cpp
         source/radial_function_set_kokkos.cpp

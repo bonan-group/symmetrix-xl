@@ -16,7 +16,6 @@ import pytest
         "test_family_mace_conformance_cases",
         "test_family_mace_nonlinear_conformance_cases",
         "test_family_mace_polar_conformance_cases",
-        "test_family_oam_conformance_cases",
     ),
 )
 def test_family_discovery_keeps_field_instances_when_a_family_imports_first(first):

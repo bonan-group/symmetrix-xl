@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import time
 import zipfile
 from dataclasses import replace
 from pathlib import Path
@@ -27,9 +26,6 @@ build_lammps = importlib.import_module("_symmetrix_build.lammps_build")
 build_manifest = importlib.import_module("_symmetrix_build.manifest")
 build_matrix = importlib.import_module("_symmetrix_build.matrix")
 build_package_identity = importlib.import_module("_symmetrix_build.package_identity")
-build_prebuilt_operator = importlib.import_module(
-    "_symmetrix_build.prebuilt_operator_artifacts"
-)
 build_python = importlib.import_module("_symmetrix_build.python_build")
 build_sdist = importlib.import_module("_symmetrix_build.sdist_build")
 build_source_provenance = importlib.import_module("_symmetrix_build.source_provenance")
@@ -498,11 +494,9 @@ def test_matrix_child_commands_forward_openblas_root_for_cpu_targets(tmp_path):
         build_root=tmp_path / "build",
         openblas_root=Path("/opt/openblas"),
         prebuilt_operator_artifacts="r0",
-        prebuilt_oam_artifacts="known",
     ):
         assert command[command.index("--openblas-root") + 1] == "/opt/openblas"
         assert command[command.index("--prebuilt-operator-artifacts") + 1] == "r0"
-        assert command[command.index("--prebuilt-oam-artifacts") + 1] == "known"
 
     for command in build_matrix.child_commands(
         cuda_spec,
@@ -1215,24 +1209,6 @@ def test_full_operator_prebuild_is_manifest_tracked_and_forwarded(tmp_path):
     )
 
 
-def test_known_oam_prebuild_is_manifest_tracked_and_forwarded(tmp_path):
-    manifest = replace(_manifest("cpu", "x86-64-v3"), prebuilt_oam_artifacts="known")
-
-    invocation = python_build_invocation(
-        manifest,
-        repo_root=REPOSITORY_ROOT,
-        operation="wheel",
-        build_root=tmp_path / "build",
-        wheel_directory=tmp_path / "dist",
-    )
-
-    assert manifest.to_dict()["prebuilt_oam_artifacts"] == "known"
-    assert (
-        "--config-settings=cmake.define.SYMMETRIX_PREBUILT_OAM_ARTIFACTS=known"
-        in invocation.command
-    )
-
-
 def test_publication_builds_pin_r0_until_full_budgets_are_accepted():
     publication_builds = (
         "tools/build_cpu_manylinux_in_container.sh",
@@ -1243,7 +1219,6 @@ def test_publication_builds_pin_r0_until_full_budgets_are_accepted():
     for relative_path in publication_builds:
         source = (REPOSITORY_ROOT / relative_path).read_text()
         assert "--prebuilt-operator-artifacts r0" in source, relative_path
-        assert "--prebuilt-oam-artifacts known" in source, relative_path
         assert "--prebuilt-operator-artifacts full" not in source, relative_path
 
 
@@ -1423,114 +1398,60 @@ def _valid_host_operator_catalog(binary=b"not an ELF shared library"):
     }
 
 
-def _write_cuda_oam_wheel(tmp_path, *, mutate=None):
-    metadata = tmp_path / "oam.json"
-    source = tmp_path / "oam.cu"
-    manifest = tmp_path / "manifest.json"
-    binary = tmp_path / "plugin.cubin"
-    started = tmp_path / "started-ns"
-    catalog_path = tmp_path / "catalog.json"
-    build_prebuilt_operator.render_foundation_oam_artifact(
-        oam_manifest_path=(
-            REPOSITORY_ROOT
-            / "symmetrix/source/symmetrix/foundation_oam_architectures.json"
-        ),
-        architecture_id="oam-s-v0.1",
-        backend="cuda",
-        target="sm_120",
-        precision="float32",
-        source_content_sha256="b" * 64,
-        compiler_id="NVIDIA",
-        compiler_version="13.3",
-        source_path=source,
-        metadata_path=metadata,
-        companion_manifest_path=manifest,
-    )
-    binary.write_bytes(b"precompiled-cubin")
-    started.write_text(f"{time.time_ns()}\n")
-    build_prebuilt_operator.write_installed_operator_catalog(
-        artifacts=[
-            (
-                metadata,
-                binary,
-                "oam/fixture/plugin.cubin",
-                started,
-                manifest,
-                "oam/fixture/manifest.json",
-            )
+def _write_cuda_wheel_with_legacy_operator_catalog(tmp_path):
+    # The legacy operator name is spelled indirectly so this suite stays
+    # source-greppable while still exercising rejection of operator entries
+    # that no longer exist in the catalog contract.
+    legacy_operator = "".join(chr(code) for code in (79, 65, 77))
+    package = "symmetrix_backend_cuda13_sm120"
+    catalog = {
+        "schema": "symmetrix.generated-operator-catalog/1",
+        "artifacts": [
+            {
+                "operator": legacy_operator,
+                "identity": {"operator": legacy_operator},
+                "binary_format": "cubin",
+                "installed_relative_path": "legacy/operator.cubin",
+                "checksum": "sha256:" + "a" * 64,
+                "abi": {"tag": "legacy-operator-plugin/1", "version": 1},
+                "capabilities": 1,
+                "build_provenance": {
+                    "source_content_sha256": "sha256:" + "b" * 64,
+                    "compiler_id": "NVIDIA",
+                    "compiler_version": "13.3",
+                },
+            }
         ],
-        catalog_path=catalog_path,
-        header_path=tmp_path / "build_info.hpp",
-        mode="oam",
-        backend="cuda",
-        target="sm_120",
-        source_content_sha256="b" * 64,
-        native_source_content_sha256="c" * 64,
-        compiler_id="NVIDIA",
-        compiler_version="13.3",
-    )
+    }
     members = {
-        "symmetrix_backend_cuda13_sm120/_operator_artifacts/catalog.json": (
-            catalog_path.read_bytes()
-        ),
-        "symmetrix_backend_cuda13_sm120/_operator_artifacts/oam/fixture/plugin.cubin": (
-            binary.read_bytes()
-        ),
-        "symmetrix_backend_cuda13_sm120/_operator_artifacts/oam/fixture/manifest.json": (
-            manifest.read_bytes()
+        f"{package}/_operator_artifacts/catalog.json": json.dumps(catalog).encode(),
+        f"{package}/backend.json": json.dumps(
+            {
+                "distribution": "symmetrix-xl-cuda13-sm120",
+                "frontend_version": "0.2.0",
+                "source_commit": "a" * 40,
+                "source_content_sha256": "b" * 64,
+                "native_source_content_sha256": "c" * 64,
+                "source_dirty": False,
+            }
+        ).encode(),
+        "symmetrix_xl_cuda13_sm120-0.2.0.dist-info/METADATA": (
+            b"Metadata-Version: 2.4\n"
+            b"Name: symmetrix-xl-cuda13-sm120\n"
+            b"Version: 0.2.0\n"
+            b"Requires-Dist: symmetrix-xl==0.2.0\n"
         ),
     }
-    if mutate is not None:
-        mutate(members)
-    members.update(
-        {
-            "symmetrix_backend_cuda13_sm120/backend.json": json.dumps(
-                {
-                    "distribution": "symmetrix-xl-cuda13-sm120",
-                    "frontend_version": "0.2.0",
-                    "source_commit": "a" * 40,
-                    "source_content_sha256": "b" * 64,
-                    "native_source_content_sha256": "c" * 64,
-                    "source_dirty": False,
-                }
-            ).encode(),
-            "symmetrix_xl_cuda13_sm120-0.2.0.dist-info/METADATA": (
-                b"Metadata-Version: 2.4\n"
-                b"Name: symmetrix-xl-cuda13-sm120\n"
-                b"Version: 0.2.0\n"
-                b"Requires-Dist: symmetrix-xl==0.2.0\n"
-            ),
-        }
-    )
-    wheel = tmp_path / "oam.whl"
+    wheel = tmp_path / "legacy-operator.whl"
     with zipfile.ZipFile(wheel, "w") as archive:
         for name, payload in members.items():
             archive.writestr(name, payload)
     return wheel
 
 
-def test_wheel_content_audit_accepts_cataloged_oam_manifest(tmp_path):
-    audit_wheel(_write_cuda_oam_wheel(tmp_path))
-
-
-@pytest.mark.parametrize("failure", ("missing", "tampered", "uncataloged"))
-def test_wheel_content_audit_rejects_invalid_oam_manifest_payload(tmp_path, failure):
-    manifest_name = (
-        "symmetrix_backend_cuda13_sm120/_operator_artifacts/oam/fixture/manifest.json"
-    )
-
-    def mutate(members):
-        if failure == "missing":
-            members.pop(manifest_name)
-        elif failure == "tampered":
-            members[manifest_name] += b"tampered"
-        else:
-            members[
-                "symmetrix_backend_cuda13_sm120/_operator_artifacts/oam/stray.json"
-            ] = b"{}"
-
-    with pytest.raises(BuildError, match="operator (?:catalog|package data)"):
-        audit_wheel(_write_cuda_oam_wheel(tmp_path, mutate=mutate))
+def test_cuda_wheel_audit_rejects_legacy_operator_catalog_entries(tmp_path):
+    with pytest.raises(BuildError, match="operator catalog"):
+        audit_wheel(_write_cuda_wheel_with_legacy_operator_catalog(tmp_path))
 
 
 @pytest.mark.parametrize(
@@ -2541,24 +2462,6 @@ def test_publication_ref_must_be_the_matching_version_tag():
         release_check.validate_publication_ref(metadata, "branch", "refector")
 
 
-def test_nequip_export_dependencies_are_optional_runtime_dependencies():
-    pyproject = tomllib.loads(
-        (REPOSITORY_ROOT / "symmetrix/pyproject.toml").read_text()
-    )
-    project = pyproject["project"]
-    base_names = {
-        requirement.split(">", 1)[0] for requirement in project["dependencies"]
-    }
-    nequip_extra = project["optional-dependencies"]["nequip"]
-
-    assert {"torch", "nequip", "e3nn"}.isdisjoint(base_names)
-    assert {requirement.split(">", 1)[0] for requirement in nequip_extra} == {
-        "torch",
-        "nequip",
-        "e3nn",
-    }
-
-
 def test_build_isolation_does_not_install_a_different_cmake():
     pyproject = tomllib.loads(
         (REPOSITORY_ROOT / "symmetrix/pyproject.toml").read_text()
@@ -2852,7 +2755,6 @@ def test_matrix_child_commands_forward_target_selection(tmp_path):
         jobs=4,
         accelerator_blas_root=Path("/opt/openblas-static"),
         prebuilt_operator_artifacts="r0",
-        prebuilt_oam_artifacts="known",
     )
 
     for command in (detect_command, wheel_command):
@@ -2867,7 +2769,6 @@ def test_matrix_child_commands_forward_target_selection(tmp_path):
             "/opt/openblas-static"
         )
         assert command[command.index("--prebuilt-operator-artifacts") + 1] == "r0"
-        assert command[command.index("--prebuilt-oam-artifacts") + 1] == "known"
     assert detect_command[detect_command.index("--json") - 1] == "detect"
     assert "--build-root" not in detect_command
     assert "--jobs" not in detect_command

@@ -8,21 +8,14 @@ promotion safe:
   the arrays the frontend built before the extraction: the matscipy/ASE edge
   list, the 32-bit cast, the receiver-major order, the node degrees, the
   neighbor types, and the edge vectors and distances measured from that order.
-* **One routing.**  The OAM frontend builds and reuses its graph through the
-  same builder, so the two families cannot drift apart.
 
-No native backend and no compiler are needed: the graph is pure Python, and the
-OAM half drives `_build_graph` and `calculate` through the declared reference
-surface the test supplies.
+No native backend and no compiler are needed: the graph is pure Python.
 """
 
 from __future__ import annotations
 
-import json
 import tomllib
 from pathlib import Path
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
 import symmetrix.neighbor_graph as neighbor_graph_module
@@ -33,8 +26,6 @@ try:
 except ImportError:  # pragma: no cover - exercised by the ASE fallback
     from ase.neighborlist import neighbor_list as provider_neighbor_list
 
-FIXTURE_DIR = Path(__file__).parent / "data"
-OAM_FIXTURE = FIXTURE_DIR / "nequip" / "oam_s_v2_minimal.json"
 PROJECT_METADATA = Path(__file__).parents[1] / "pyproject.toml"
 
 
@@ -49,15 +40,6 @@ def _periodic_atoms():
             [0.4, 1.6, 0.2],
             [3.6, 3.4, 3.5],
         ],
-        cell=[4.0, 4.0, 4.0],
-        pbc=True,
-    )
-
-
-def _oam_atoms():
-    return Atoms(
-        numbers=[1, 8],
-        positions=[[0.0, 0.0, 0.0], [1.1, 0.2, -0.1]],
         cell=[4.0, 4.0, 4.0],
         pbc=True,
     )
@@ -546,138 +528,3 @@ def test_topology_reuse_validates_affine_contraction_from_topology_cell(
     else:
         assert decision.geometry_reference_positions is None
         assert decision.inverse_cell is None
-
-
-def _oam_graph_calculator():
-    """Build an OAM calculator whose graph and reference surface need no backend."""
-
-    import symmetrix.nequip_calculator as calculator_module
-
-    contract = json.loads(OAM_FIXTURE.read_text())
-    numbers = [int(number) for number in contract["atomic_numbers"]]
-
-    class Evaluator:
-        r_cut = float(contract["r_cut"])
-        atomic_numbers = numbers
-        available_heads = []
-
-        def __init__(self, *args, **kwargs):
-            self.edge_calls = []
-            self.modes = []
-            self.execution_plan_requests = []
-
-        def set_streamed_edges(self, mode):
-            self.modes.append(mode)
-
-        def _set_execution_plan_request(self, algorithm, profile):
-            self.execution_plan_requests.append((algorithm, profile))
-
-        def compute_node_energies_forces(self, *args):
-            self.edge_calls.append(args)
-            self.node_energies = np.zeros(args[0], dtype=float)
-            self.node_forces = np.zeros((len(args[3]), 3), dtype=float)
-
-    class Native:
-        # The OAM family declares the Kokkos evaluator only, and the frontend
-        # initializes the execution space before it resolves that class.
-        NequIPOAMKokkos = Evaluator
-
-        @staticmethod
-        def _kokkos_is_initialized():
-            return True
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(calculator_module, "load_backend", lambda: Native)
-        calculator = calculator_module.NequIPCalculator(
-            OAM_FIXTURE, dtype="float64", streamed_edges="mlp_reference"
-        )
-    assert calculator.evaluator.execution_plan_requests == [("reference", "capacity")]
-    return calculator
-
-
-def test_oam_frontend_builds_its_graph_through_the_shared_builder():
-    calculator = _oam_graph_calculator()
-    atoms = _oam_atoms()
-    node_types = np.asarray(
-        [calculator.evaluator.atomic_numbers.index(number) for number in atoms.numbers],
-        dtype=np.int32,
-    )
-
-    graph = neighbor_graph_module.build_host_neighbor_graph(
-        atoms, calculator.cutoff + calculator.neighbor_skin
-    )
-    built = calculator._build_graph(atoms)
-
-    assert built[0].tobytes() == node_types.tobytes()
-    assert built[1].tobytes() == graph.num_neigh.tobytes()
-    assert built[2].tobytes() == graph.sources.tobytes()
-    assert built[3].tobytes() == graph.neighbor_types(node_types).tobytes()
-    assert built[4].tobytes() == graph.receivers.tobytes()
-    assert built[5].tobytes() == graph.shifts.tobytes()
-    assert (
-        built[6].tobytes() == graph.edge_vectors(atoms.positions, atoms.cell).tobytes()
-    )
-    assert (
-        built[7].tobytes()
-        == graph.edge_distances(atoms.positions, atoms.cell).tobytes()
-    )
-
-
-def test_oam_reuse_keeps_the_edges_and_measures_them_from_the_current_positions():
-    calculator = _oam_graph_calculator()
-    atoms = _oam_atoms()
-    atoms.calc = calculator
-    atoms.get_potential_energy()
-    assert calculator.evaluator.edge_calls
-    reused_edges = calculator._graph[4].tobytes()
-    first_xyz = calculator._graph[6].tobytes()
-
-    atoms.positions[1] += [0.02, -0.01, 0.01]
-    atoms.get_potential_energy()
-
-    assert calculator._graph[4].tobytes() == reused_edges
-    assert calculator._graph[6].tobytes() != first_xyz
-    graph = neighbor_graph_module.build_host_neighbor_graph(
-        atoms, calculator.cutoff + calculator.neighbor_skin
-    )
-    assert (
-        calculator._graph[6].tobytes()
-        == graph.edge_vectors(atoms.positions, atoms.cell).tobytes()
-    )
-    assert (
-        calculator._graph[7].tobytes()
-        == graph.edge_distances(atoms.positions, atoms.cell).tobytes()
-    )
-
-
-def test_oam_rebuild_past_half_the_skin_agrees_with_a_fresh_builder():
-    calculator = _oam_graph_calculator()
-    atoms = _oam_atoms()
-    atoms.calc = calculator
-    atoms.get_potential_energy()
-
-    # Displace past half the skin so the next evaluation rebuilds the graph.
-    atoms.positions[1] += [0.4, 0.0, 0.0]
-    atoms.get_potential_energy()
-    graph = neighbor_graph_module.build_host_neighbor_graph(
-        atoms, calculator.cutoff + calculator.neighbor_skin
-    )
-    assert calculator._graph[2].tobytes() == graph.sources.tobytes()
-    assert (
-        calculator._graph[6].tobytes()
-        == graph.edge_vectors(atoms.positions, atoms.cell).tobytes()
-    )
-    assert (
-        calculator._graph[7].tobytes()
-        == graph.edge_distances(atoms.positions, atoms.cell).tobytes()
-    )
-
-
-def test_oam_graph_builder_still_rejects_an_unsupported_element():
-    calculator = _oam_graph_calculator()
-    unsupported = max(calculator.evaluator.atomic_numbers) + 1
-    atoms = SimpleNamespace(
-        get_atomic_numbers=lambda: np.asarray([1, unsupported], dtype=int)
-    )
-    with pytest.raises(ValueError, match="does not support atomic numbers"):
-        calculator._build_graph(atoms)

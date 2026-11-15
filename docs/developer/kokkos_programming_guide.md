@@ -152,7 +152,7 @@ The main layers are:
 | Runtime utilities | initialization, finalization, copies, host conversion, scratch admission | `libsymmetrix/source/tools_kokkos.{hpp,cpp}` |
 | Small numerical components | focused examples of views and kernels | `cubic_spline_kokkos.cpp`, `zbl_kokkos.cpp`, `multilayer_perceptron_kokkos.cpp` |
 | Graph construction | count/scan/fill algorithms and growable topology | `neighbor_graph_kokkos.cpp`, `dispersion_graph_kokkos.cpp` |
-| Model evaluators | retained state, execution streams, reductions, and backend specialization | `mace_kokkos*.{hpp,cpp}`, `mace_nonlinear_kokkos*`, `oam_kokkos*` |
+| Model evaluators | retained state, execution streams, reductions, and backend specialization | `mace_kokkos*.{hpp,cpp}`, `mace_nonlinear_kokkos*` |
 | Python boundary | NumPy validation, upload, execution, and result download | `symmetrix/source/cpp/utilities_kokkos.hpp`, `symmetrix/source/cpp/*kokkos.cpp` |
 | LAMMPS integration | dual views, communication, MPI ownership, and device-aware execution | `pair_symmetrix/pair_symmetrix_mace_kokkos.{h,cpp}` |
 
@@ -352,8 +352,8 @@ auto values = Kokkos::View<double*>(
 `Kokkos::realloc` may replace the allocation and discard or reinitialize its
 contents. The retained evaluators generally use grow-only capacity: reuse a
 large enough buffer, otherwise replace it with
-`Kokkos::realloc(Kokkos::WithoutInitializing, ...)`. See
-`symmetrix_oam_detail::ensure_view_capacity` in `oam_kokkos.hpp`. Launch bounds
+`Kokkos::realloc(Kokkos::WithoutInitializing, ...)`, as the retained MACE and
+dispersion evaluators do. Launch bounds
 describe the active extent; the allocation may be larger.
 
 This is the Kokkos equivalent of maintaining a reusable NumPy workspace rather

@@ -26,8 +26,6 @@ editing this block.
 | `MACE_Polar` (polar-mace) | `auto` | `auto` | `model_type` `MACE_Polar` | Kokkos (float32, float64) | Serial, OpenMP, CUDA, HIP | As resolved below | `symmetrix/mace/polar/kk`; no artifact uses the portable `pair_spline_v1` backbone and one optional artifact selects the generated/direct backbone; the qualified deployment uses exactly one MPI rank owning the complete system and rejects domain decomposition |
 | `MACE_Polar` (polar-mace) | `direct` | `direct` (public), `direct_streamed` (alias), `factorized` (alias) | `model_type` `MACE_Polar` | Kokkos (float32, float64) | Serial, OpenMP, CUDA, HIP | The generated MH-1 backbone subprogram; a host or device plugin artifact is required, while the long-range polar program remains native | `symmetrix/mace/polar/kk` with one matching generated/direct artifact for the host or device target; exactly one MPI rank must own the complete system, and domain decomposition is rejected |
 | `MACE_Polar` (polar-mace) | `reference` | `reference` (public), `all_interactions` (deprecated), `generic` (deprecated), `materialized` (alias), `non-compiled` (alias) | `model_type` `MACE_Polar` | Kokkos (float32, float64) | Serial, OpenMP, CUDA, HIP | None | `symmetrix/mace/polar/kk` uses the artifact-free portable `pair_spline_v1` backbone with the same one MPI rank, complete system admission boundary and rejects domain decomposition |
-| `OAM` (OAM v2 contract) | `direct` | `direct` | `architecture` `oam` | Kokkos (float32, float64) | Serial, OpenMP, CUDA; HIP package rejects this family | The architecture-bound, full-message-only receiver artifact: a host ABI v7 spline plugin, a CUDA ABI v3 NVRTC cubin, or an nvcc shared library | Not supported |
-| `OAM` (OAM v2 contract) | `reference` | `reference` (public), `debug_v1` (alias), `mlp_reference` (alias) | `architecture` `oam` | Kokkos (float32, float64) | Serial, OpenMP, CUDA; HIP package rejects this family | None | Not supported |
 
 ## Declared evaluator capabilities
 
@@ -63,16 +61,6 @@ editing this block.
 | `MACE_Polar` (polar-mace) | `parameter_gradients` | unsupported | - | not implemented for this family |
 | `MACE_Polar` (polar-mace) | `host_artifact` | qualified | every build | none |
 | `MACE_Polar` (polar-mace) | `device_artifact` | build-dependent | device execution spaces | a CUDA-capable build is required |
-| `OAM` (OAM v2 contract) | `target` | build-dependent | the default execution space | host or CUDA; HIP is unsupported |
-| `OAM` (OAM v2 contract) | `precision` | build-dependent | float32 and float64 implementations on host and CUDA | current full-message-only artifact release-matrix qualification is pending |
-| `OAM` (OAM v2 contract) | `reference` | build-dependent | the artifact-free same-spline Kokkos oracle on host and CUDA | current release-matrix qualification is pending; same-spline parity does not establish upstream-NequIP parity |
-| `OAM` (OAM v2 contract) | `portable` | build-dependent | the compiler-free Kokkos edge product | the current runtime matrix is pending; this is the same-spline reference, not the optimized production route |
-| `OAM` (OAM v2 contract) | `generated` | build-dependent | the full-message-only host ABI v7 artifact or CUDA ABI v3 receiver cubin | a prepared exact artifact is required; the current CUDA artifact is compile-qualified, but fresh runtime qualification is pending |
-| `OAM` (OAM v2 contract) | `stress` | requalification pending | implemented on the current host and CUDA routes | full-message-only ABI-v7/ABI-v3 runtime qualification is pending; HIP is unsupported |
-| `OAM` (OAM v2 contract) | `field` | unsupported | - | the OAM contract carries no field coupling |
-| `OAM` (OAM v2 contract) | `parameter_gradients` | unsupported | - | not implemented for this family |
-| `OAM` (OAM v2 contract) | `host_artifact` | build-dependent | source generation and compilation of the full-message-only ABI-v7 artifact | fresh host runtime qualification and repaired-wheel inclusion gates are pending |
-| `OAM` (OAM v2 contract) | `device_artifact` | build-dependent | source generation and compilation of the full-message-only CUDA ABI-v3 artifact | fresh CUDA runtime qualification and repaired-wheel inclusion gates are pending; HIP is unavailable |
 <!-- END GENERATED EXECUTION SUPPORT MATRIX -->
 
 For MACE Polar, `direct` and `reference` select the generated or portable
@@ -112,14 +100,10 @@ evidence.
 
 Every family declares exactly two frontend routings. `direct` is the generated
 (T3) implementation and needs a prepared artifact; `reference` executes the
-generic implementation and needs no artifact at all. OAM runs that generic
-Kokkos implementation in the selected host or CUDA execution space. There is
+generic implementation and needs no artifact at all. There is
 one evaluator stack: the retired non-Kokkos
 evaluator and its `use_kokkos=False` selector are gone, so a request that cannot
 reach the prepared path resolves to `reference` instead of running a second
-implementation. The OAM frontend resolves the same way. Its `reference` routing
-selects the native `reference` spelling explicitly; artifact-free `direct`
-remains unavailable and fails closed rather than reporting a portable
 implementation.
 
 MACE_Nonlinear device plugins retain capacity for two interaction slots.
@@ -132,26 +116,11 @@ count-agnostic composed ABI-v7 host plugin does not imply support for arbitrary
 interaction counts on devices. HIP runtime and released Polar-L remain
 unqualified.
 
-OAM v2 `direct` execution separately supports the architecture-bound,
-full-message-only host ABI-v7 plugin and CUDA ABI-v3 cubin/shared-library
-artifact. FP32 and FP64 generation and compilation are available, but fresh
-runtime qualification is pending after the artifact-contract change. The
-independent upstream comparison remains narrower and does not establish live
-upstream FP64 parity. HIP and multi-GPU are unsupported.
 Periodic stress derivatives are reduced, symmetrized, and volume-scaled on the
 execution device. CUDA transfers only the final nine-double tensor, and a
-stress request after cached energy/forces reuses the completed graph. The
-artifact-free OAM `reference` routing does not reduce stress.
+stress request after cached energy/forces reuses the completed graph.
 See {doc}`/user/models` for artifact controls, and
 {doc}`publications` for citation guidance.
-
-The full-message-only host and CUDA artifacts are source-buildable in FP32 and
-FP64, but their current release qualification matrix and repaired-wheel gates
-are pending. Resolution is by an exact comparison of
-the ordered layer and irrep/channel/angular layout, tensor-product structure,
-radial dimensions, and normalization; paths, package labels, and learned
-weights do not select an artifact. An unmatched valid architecture retains the
-runtime-generation path and therefore needs the corresponding compiler.
 
 `materialized`, `non-compiled`, `generic`, and `all_interactions` are aliases
 for `reference`; `generic` and `all_interactions` emit a deprecation warning and
@@ -163,9 +132,8 @@ The removed `receiver_factorized` selector is rejected.
 
 The accepted spellings are compact-family vocabulary, and each frontend
 resolves its own accepted set from the family declaration it serves before any
-native call: `NequIPCalculator` accepts only the literal OAM set, `direct`,
-`reference`, `debug_v1`, and `mlp_reference`, so no MACE alias resolves there
-and both OAM compatibility spellings resolve to `reference`. The compact
+native call: a compact-family calculator accepts only its own literal set,
+so no alias from another family resolves there. The compact
 MACE-MH-1 evaluator admits the `direct` and `reference` routings. The literal
 `materialized` string
 is still refused when it is handed to a native evaluator directly, but no public

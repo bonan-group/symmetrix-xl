@@ -140,34 +140,6 @@ All notable changes to Symmetrix-XL are documented in this file.
   wrong units, without a message, under unit styles other than `metal`. They
   now require `units metal` and stop with an error otherwise.
 
-### NequIP-OAM support
-
-- Bound runtime OAM artifact preparation to the backend's verified full source
-  fingerprint in cache keys and `_src<fullhash>` artifact basenames. The three
-  `prepare_nequip_oam_{cuda,host,receiver_host}_artifact` adapters require the
-  caller's explicit `native_module`; normal frontend calls already provide
-  it. Strict installed-prebuilt behavior is unchanged, and compatible learned
-  weights still share artifacts within one package identity. Kernels, model
-  architecture, ABI and numerical tolerances are unchanged.
-- Added the OAM v2 JSON contract, `NequIPCalculator`, and
-  `symmetrix_extract_nequip`. JSON-only evaluation depends on ASE and the native
-  Symmetrix backend; PyTorch, NequIP, and e3nn are optional exporter/reference
-  dependencies. This is support for the OAM S/M/L/XL graph family, not an
-  arbitrary NequIP graph compiler.
-- Added a release build plan for FP32/FP64 OAM-S/M/L/XL artifacts in CPU and
-  CUDA wheels. Loading requires an exact match of the resolved layer,
-  irrep/channel, angular-order, tensor-product, radial, target, and
-  floating-point-policy identity; custom architectures continue to use runtime
-  generation when a compiler is available. Repaired-wheel inclusion remains a
-  release gate.
-- Added full-message-only generated host ABI-v7 and CUDA ABI-v3 artifacts
-  with energy, forces, and stress. The artifact-free `reference` route serves
-  energy and forces. Fresh correctness, performance, capacity, and repaired-wheel
-  qualification remain release gates for the current artifact contracts.
-- Added OAM-XL graph support, including degree-four real harmonics, analytic
-  derivatives, and ZBL. Live upstream-reference FP64 parity, HIP, multi-GPU,
-  and LAMMPS/MPI remain outside the current qualified boundary.
-
 ### Dispersion corrections
 
 - Added native DFT-D2 and two-body DFT-D3 through `D2Correction` and
@@ -268,8 +240,7 @@ All notable changes to Symmetrix-XL are documented in this file.
   (clang 20). GCC and nvcc builds are unchanged.
 - Retained architecture-qualified CPU, CUDA, and HIP backend packages with
   exact frontend-version dependencies and source/native provenance. HIP support
-  for ordinary MACE remains available, but NequIP-OAM HIP execution is not part
-  of this release.
+  for ordinary MACE remains available.
 - Fixed MACE export for checkpoints whose stored symmetric-contraction U
   matrices differ in sign from the recomputed ones, such as MACE-MP-0b2-large
   (`mace-large-density-agnesi-stress.model`). The exporter takes each recomputed
@@ -312,7 +283,7 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ### Migration
 
-- Remove `use_kokkos` from `Symmetrix(...)` and `NequIPCalculator(...)`. Use
+- Remove `use_kokkos` from `Symmetrix(...)`. Use
   `streamed_edges="direct"` for generated execution or
   `streamed_edges="reference"` for the artifact-free generic route.
 - Re-export original Symmetrix pair-spline (v1) models with

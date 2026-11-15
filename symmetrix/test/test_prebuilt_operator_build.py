@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import hashlib
 import json
 import os
 import shlex
@@ -10,7 +9,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -20,7 +18,6 @@ sys.path.insert(0, str(TOOLS))
 
 prebuilt = importlib.import_module("_symmetrix_build.prebuilt_operator_artifacts")
 wheel_audit = importlib.import_module("_symmetrix_build.wheel_audit")
-OAM_MANIFEST = ROOT / "symmetrix/source/symmetrix/foundation_oam_architectures.json"
 
 
 def _cpu_plan(mode: str):
@@ -82,102 +79,6 @@ def test_off_mode_plans_no_operator_artifacts():
     plan = _cpu_plan("off")
 
     assert plan == {"mode": "off", "artifacts": []}
-
-
-def test_known_oam_plan_uses_explicit_architectures_for_both_precisions():
-    plan = prebuilt.plan_foundation_operator_artifacts(
-        manifest_path=(
-            ROOT / "symmetrix/source/symmetrix/foundation_operator_manifest.json"
-        ),
-        mode="off",
-        backend="host",
-        target="x86-64-v3",
-        source_content_sha256="a" * 64,
-        oam_manifest_path=OAM_MANIFEST,
-        oam_mode="known",
-        oam_floating_point_policy="strict",
-    )
-    fast = prebuilt.plan_foundation_operator_artifacts(
-        manifest_path=(
-            ROOT / "symmetrix/source/symmetrix/foundation_operator_manifest.json"
-        ),
-        mode="off",
-        backend="host",
-        target="x86-64-v3",
-        source_content_sha256="a" * 64,
-        oam_manifest_path=OAM_MANIFEST,
-        oam_mode="known",
-        oam_floating_point_policy="fast",
-    )
-
-    assert len(plan["artifacts"]) == 8
-    assert {item["operator"] for item in plan["artifacts"]} == {"OAM"}
-    assert {item["architecture_id"] for item in plan["artifacts"]} == {
-        "oam-s-v0.1",
-        "oam-m-v0.1",
-        "oam-l-v0.1",
-        "oam-xl-v0.1",
-    }
-    assert {item["precision"] for item in plan["artifacts"]} == {
-        "float32",
-        "float64",
-    }
-    assert {item["floating_point_policy"] for item in plan["artifacts"]} == {"strict"}
-    assert {item["floating_point_policy"] for item in fast["artifacts"]} == {"fast"}
-    assert {item["artifact_id"] for item in plan["artifacts"]}.isdisjoint(
-        {item["artifact_id"] for item in fast["artifacts"]}
-    )
-
-
-def test_known_oam_render_publishes_architecture_and_loader_manifest(tmp_path):
-    from symmetrix.oam_architecture import (
-        oam_architecture_fingerprint,
-        oam_tensor_product_architecture_fingerprint,
-    )
-
-    source = tmp_path / "oam.cpp"
-    metadata_path = tmp_path / "oam.json"
-    manifest_path = tmp_path / "manifest.json"
-    prebuilt.render_foundation_oam_artifact(
-        oam_manifest_path=OAM_MANIFEST,
-        architecture_id="oam-s-v0.1",
-        backend="host",
-        target="x86-64-v3",
-        precision="float64",
-        source_content_sha256="a" * 64,
-        compiler_id="GNU",
-        compiler_version="15",
-        source_path=source,
-        metadata_path=metadata_path,
-        companion_manifest_path=manifest_path,
-        floating_point_policy="strict",
-    )
-
-    metadata = json.loads(metadata_path.read_text())
-    identity = metadata["generated_identity"]
-    assert identity["operator"] == "OAM"
-    assert identity["target"] == "host-isa-x86-64-v3"
-    assert metadata["host_target"] == "host-isa-x86-64-v3"
-    assert metadata["floating_point_policy"] == "strict"
-    assert identity["floating_point_policy"] == "strict"
-    assert metadata["build_provenance"]["floating_point_policy"] == "strict"
-    assert identity["architecture"]["layer_count"] == 2
-    assert identity["architecture_fingerprint"] == (
-        oam_tensor_product_architecture_fingerprint(identity["architecture"])
-    )
-    assert identity["architecture_fingerprint"] != oam_architecture_fingerprint(
-        identity["architecture"]
-    )
-    assert metadata["contract_fingerprint"].startswith("sha256:")
-    assert identity["architecture_fingerprint"] == metadata["contract_fingerprint"]
-    loader = json.loads(manifest_path.read_text())
-    assert (
-        loader["key_inputs"]["build"]["metadata"]["artifact_id"]
-        == metadata["artifact_id"]
-    )
-    rendered = source.read_text()
-    assert "NequIP-OAM" not in rendered
-    assert "host-isa-x86-64-v3" in rendered
 
 
 @pytest.mark.parametrize(
@@ -458,7 +359,6 @@ def _write_fixture_project(
     manifest: Path,
     mode: str,
     *,
-    oam_mode: str = "off",
     extra: str = "",
 ) -> None:
     source.mkdir()
@@ -468,11 +368,9 @@ cmake_minimum_required(VERSION 3.27)
 project(prebuilt_operator_fixture LANGUAGES CXX)
 find_package(Python COMPONENTS Interpreter REQUIRED)
 set(SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS {mode} CACHE STRING "")
-set(SYMMETRIX_PREBUILT_OAM_ARTIFACTS {oam_mode} CACHE STRING "")
 set(SYMMETRIX_PREBUILT_OPERATOR_BACKEND host)
 set(SYMMETRIX_PREBUILT_OPERATOR_TARGET x86-64-v3)
 set(SYMMETRIX_PREBUILT_OPERATOR_MANIFEST {manifest.as_posix()})
-set(SYMMETRIX_PREBUILT_OAM_MANIFEST {OAM_MANIFEST.as_posix()})
 set(SYMMETRIX_HOST_ARCH x86-64-v3)
 set(SYMMETRIX_PYTHON_INSTALL_PACKAGE fixture_package)
 {extra}
@@ -490,11 +388,9 @@ cmake_minimum_required(VERSION 3.27)
 project(prebuilt_operator_cuda_fixture LANGUAGES CXX)
 find_package(Python COMPONENTS Interpreter REQUIRED)
 set(SYMMETRIX_PREBUILT_OPERATOR_ARTIFACTS {mode} CACHE STRING "")
-set(SYMMETRIX_PREBUILT_OAM_ARTIFACTS known CACHE STRING "")
 set(SYMMETRIX_PREBUILT_OPERATOR_BACKEND cuda)
 set(SYMMETRIX_PREBUILT_OPERATOR_TARGET sm_120)
 set(SYMMETRIX_PREBUILT_OPERATOR_MANIFEST {manifest.as_posix()})
-set(SYMMETRIX_PREBUILT_OAM_MANIFEST {OAM_MANIFEST.as_posix()})
 set(SYMMETRIX_PYTHON_INSTALL_PACKAGE fixture_package)
 include({(ROOT / "libsymmetrix/cmake/prebuilt_operator_artifacts.cmake").as_posix()})
 symmetrix_add_prebuilt_operator_artifacts()
@@ -622,92 +518,6 @@ def test_host_prebuilt_target_binds_ambient_isa_flags(tmp_path):
     assert generated_commands
     assert all("-mavx512f" in command for command in generated_commands)
     assert all("-march=x86-64-v3" in command for command in generated_commands)
-
-
-@pytest.mark.parametrize("enabled", (False, True), ids=("strict", "fast"))
-def test_known_oam_host_prebuilts_bind_fast_math_policy(tmp_path, enabled):
-    cmake = shutil.which("cmake")
-    if cmake is None:
-        pytest.skip("CMake is required")
-    source = tmp_path / "source"
-    manifest = ROOT / "symmetrix/source/symmetrix/foundation_operator_manifest.json"
-    _write_fixture_project(
-        source,
-        manifest,
-        "off",
-        oam_mode="known",
-        extra=f"set(SYMMETRIX_FAST_MATH {'ON' if enabled else 'OFF'})",
-    )
-    build = tmp_path / "build"
-
-    configured = _run(
-        cmake,
-        "-S",
-        source,
-        "-B",
-        build,
-        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-        f"-DSYMMETRIX_BUILD_SOURCE_CONTENT_SHA256={'b' * 64}",
-        f"-DSYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256={'e' * 64}",
-    )
-
-    assert configured.returncode == 0, configured.stderr
-    commands = json.loads((build / "compile_commands.json").read_text())
-    generated_commands = [
-        entry["command"]
-        for entry in commands
-        if "generated-operator-artifacts" in entry["file"]
-    ]
-    assert len(generated_commands) == 8
-    assert all(("-ffast-math" in command) is enabled for command in generated_commands)
-    plan = json.loads((build / "generated-operator-artifacts/plan.json").read_text())
-    expected = "fast" if enabled else "strict"
-    assert {item["floating_point_policy"] for item in plan["artifacts"]} == {expected}
-    compiled = _run(cmake, "--build", build, "--parallel", "2")
-    assert compiled.returncode == 0, compiled.stderr
-    catalog = json.loads(
-        (build / "generated-operator-artifacts/catalog.json").read_text()
-    )
-    assert len(catalog["artifacts"]) == 8
-    assert {
-        entry["identity"]["floating_point_policy"] for entry in catalog["artifacts"]
-    } == {expected}
-    assert {
-        entry["build_provenance"]["floating_point_policy"]
-        for entry in catalog["artifacts"]
-    } == {expected}
-    assert {entry["identity"]["artifact_id"] for entry in catalog["artifacts"]} == {
-        item["artifact_id"] for item in plan["artifacts"]
-    }
-
-
-def test_host_fast_math_rejects_an_unsupported_compiler_identity(tmp_path):
-    cmake = shutil.which("cmake")
-    if cmake is None:
-        pytest.skip("CMake is required")
-    source = tmp_path / "source"
-    manifest = ROOT / "symmetrix/source/symmetrix/foundation_operator_manifest.json"
-    _write_fixture_project(
-        source,
-        manifest,
-        "off",
-        oam_mode="known",
-        extra="set(SYMMETRIX_FAST_MATH ON)\nset(CMAKE_CXX_COMPILER_ID Unsupported)",
-    )
-
-    configured = _run(
-        cmake,
-        "-S",
-        source,
-        "-B",
-        tmp_path / "build",
-        f"-DSYMMETRIX_BUILD_SOURCE_CONTENT_SHA256={'b' * 64}",
-        f"-DSYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256={'e' * 64}",
-    )
-
-    assert configured.returncode != 0
-    assert "host prebuilts require a supported GNU" in configured.stderr
-    assert "detected 'Unsupported'" in configured.stderr
 
 
 def test_host_prebuilt_rejects_config_dependent_compile_flags(tmp_path):
@@ -917,326 +727,6 @@ target_include_directories(provenance_probe PRIVATE ${{CMAKE_BINARY_DIR}}/genera
         probed = _run(build / "provenance_probe")
         assert probed.returncode == 0, probed.stderr
         assert probed.stdout == "r0"
-
-
-def test_full_cpu_catalog_builds_with_all_known_oam_artifacts(monkeypatch, tmp_path):
-    from benchmarks import oam_release_qualification
-
-    compiler = shutil.which("c++")
-    cmake = shutil.which("cmake")
-    if compiler is None or cmake is None:
-        pytest.skip("CMake and a C++ compiler are required")
-    source = tmp_path / "source"
-    build = tmp_path / "build"
-    manifest = ROOT / "symmetrix/source/symmetrix/foundation_operator_manifest.json"
-    source_fingerprint = oam_release_qualification._current_source_provenance(
-        str(ROOT)
-    )["source_fingerprint"]
-    mode = "full"
-    _write_fixture_project(source, manifest, mode, oam_mode="known")
-
-    configured = _run(
-        cmake,
-        "-S",
-        source,
-        "-B",
-        build,
-        "-DCMAKE_BUILD_TYPE=Release",
-        f"-DCMAKE_CXX_COMPILER={compiler}",
-        f"-DSYMMETRIX_BUILD_SOURCE_CONTENT_SHA256={source_fingerprint}",
-        f"-DSYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256={'e' * 64}",
-    )
-    assert configured.returncode == 0, configured.stderr
-    compiled = _run(cmake, "--build", build, "--parallel", "2")
-    assert compiled.returncode == 0, compiled.stderr
-    install = tmp_path / "install"
-    installed = _run(cmake, "--install", build, "--prefix", install)
-    assert installed.returncode == 0, installed.stderr
-
-    root = install / "fixture_package/_operator_artifacts"
-    catalog = json.loads((root / "catalog.json").read_text())
-    expected_standard = 6 if mode == "r0" else 32
-    assert len(catalog["artifacts"]) == expected_standard + 8
-    assert sum(entry["operator"] == "OAM" for entry in catalog["artifacts"]) == 8
-    assert sum(entry["operator"] == "R0" for entry in catalog["artifacts"]) == 6
-    oam_entries = [
-        entry for entry in catalog["artifacts"] if entry["operator"] == "OAM"
-    ]
-    assert {entry["identity"]["precision"] for entry in oam_entries} == {
-        "float32",
-        "float64",
-    }
-    assert (
-        len({entry["identity"]["architecture_fingerprint"] for entry in oam_entries})
-        == 4
-    )
-    assert {
-        entry["identity"]["architecture"]["layer_count"] for entry in oam_entries
-    } == {2, 4, 6}
-    assert len(list((root / "oam").glob("*/plugin.so"))) == 8
-    assert len(list((root / "oam").glob("*/manifest.json"))) == 8
-    for entry in oam_entries:
-        assert entry["identity"]["architecture"]["layers"]
-        assert entry["auxiliary_files"][0]["role"] == "manifest"
-        for record in [entry, entry["auxiliary_files"][0]]:
-            path = root / record["installed_relative_path"]
-            assert path.is_file()
-            assert prebuilt.sha256_file(path) == record["checksum"]
-    installed_module = importlib.import_module("symmetrix.oam_installed_artifact")
-    compiler_provenance = oam_entries[0]["build_provenance"]
-    installed_files = [root / "catalog.json"]
-    for entry in catalog["artifacts"]:
-        installed_files.append(root / entry["installed_relative_path"])
-        installed_files.extend(
-            root / auxiliary["installed_relative_path"]
-            for auxiliary in entry.get("auxiliary_files", ())
-        )
-    build_info = {
-        "mode": mode,
-        "backend": "host",
-        "target": "host-isa-x86-64-v3",
-        "catalog_relative_path": "_operator_artifacts/catalog.json",
-        "catalog_sha256": hashlib.sha256(
-            (root / "catalog.json").read_bytes()
-        ).hexdigest(),
-        "artifact_count": len(catalog["artifacts"]),
-        "installed_bytes": sum(path.stat().st_size for path in installed_files),
-        "source_content_sha256": source_fingerprint,
-        "native_source_content_sha256": "e" * 64,
-        "compiler_id": compiler_provenance["compiler_id"],
-        "compiler_version": compiler_provenance["compiler_version"],
-        "build_duration_seconds": 0.1,
-    }
-    native = SimpleNamespace(
-        __package__="fixture_package",
-        _backend_build_info=lambda: {"prebuilt_operator_artifacts": build_info},
-    )
-    monkeypatch.setattr(
-        installed_module.resources,
-        "files",
-        lambda package_name: install / "fixture_package",
-    )
-    for entry in oam_entries:
-        identity = entry["identity"]
-        resolved = installed_module.resolve_installed_oam_artifact(
-            architecture=identity["architecture"],
-            precision=identity["precision"],
-            backend="host",
-            host_target=identity["target"],
-            floating_point_policy=identity["floating_point_policy"],
-            artifact_id=identity["artifact_id"],
-            required_capabilities=entry["capabilities"],
-            native_module=native,
-        )
-        assert resolved.available
-        assert resolved.artifact_path == root / entry["installed_relative_path"]
-
-    import test_oam_release_qualification as qualification_fixture
-    from benchmarks import oam_cuda_r1_timing
-    from benchmarks.oam_release_qualification import (
-        build_declared_cells,
-        build_driver_command,
-    )
-    from symmetrix.oam_jit_artifact import OAMHostArtifactResult
-
-    qualification_root = tmp_path / "qualification-fixture"
-    qualification_root.mkdir()
-    qualification_manifest = qualification_fixture._manifest(qualification_root)
-    qualification_manifest["models"]["S"]["path"] = str(
-        ROOT / "symmetrix/test/data/nequip/oam_s_v2_minimal.json"
-    )
-    qualification_manifest["direct_baselines_us_per_atom"] = {}
-    for cell in build_declared_cells(qualification_manifest):
-        qualification_manifest["direct_baselines_us_per_atom"][cell["cell_id"]] = {
-            "identity": f"approved/{cell['cell_id']}",
-            "sha256": "b" * 64,
-            "us_per_atom": 8.0,
-        }
-    request = next(
-        cell
-        for cell in build_declared_cells(qualification_manifest)
-        if cell["model_size"] == "S"
-        and cell["backend"] == "host"
-        and cell["precision"] == "float32"
-    )
-    request["host_floating_point_policy"] = "strict"
-    qualification_fixture._rebind_request(request)
-    command = build_driver_command({}, request, "direct")
-    cache = Path(request["jit_cache_path"])
-    cache.mkdir(parents=True, mode=0o700)
-    cache.chmod(0o700)
-    native_info = qualification_fixture._qualification_native(
-        request
-    )._backend_build_info()
-    native_info["native_source_content_sha256"] = "e" * 64
-    native_info["prebuilt_operator_artifacts"] = build_info
-    maintained_native = SimpleNamespace(
-        __package__="fixture_package",
-        _backend_build_info=lambda: native_info,
-    )
-    monkeypatch.setattr(
-        oam_release_qualification,
-        "_current_native_source_fingerprint",
-        lambda source_root: "e" * 64,
-    )
-    maintained_entry = min(
-        (entry for entry in oam_entries if entry["identity"]["precision"] == "float32"),
-        key=lambda entry: (
-            entry["identity"]["architecture"]["layer_count"],
-            entry["identity"]["architecture"]["layers"][0]["source_dimension"],
-        ),
-    )
-
-    def prepare_maintained_artifact(path, precision, **arguments):
-        identity = maintained_entry["identity"]
-        resolved = installed_module.resolve_installed_oam_artifact(
-            architecture=identity["architecture"],
-            precision=precision,
-            backend="host",
-            host_target=identity["target"],
-            floating_point_policy=identity["floating_point_policy"],
-            artifact_id=identity["artifact_id"],
-            required_capabilities=maintained_entry["capabilities"],
-            native_module=arguments["native_module"],
-        )
-        assert arguments["installed_prebuilt_required"] is True
-        assert resolved.available
-        companion = json.loads(resolved.manifest_path.read_text(encoding="utf-8"))
-        metadata = companion["key_inputs"]["build"]["metadata"]
-        return OAMHostArtifactResult(
-            status="installed",
-            precision=precision,
-            model_path=Path(path),
-            artifact_path=resolved.artifact_path,
-            manifest_path=resolved.manifest_path,
-            cache_key="",
-            artifact_id=identity["artifact_id"],
-            semantic_fingerprint=identity["semantic_fingerprint"],
-            structure_fingerprint=identity["structure_fingerprint"],
-            generation_fingerprint=identity["generation_fingerprint"],
-            metadata=metadata,
-            diagnostics=resolved.diagnostics,
-            cache_hit=False,
-            compiler_command=(),
-            artifact_origin="prebuilt",
-            active_host_target=identity["target"],
-            expected_host_target=identity["target"],
-            expected_artifact_origin="prebuilt",
-            floating_point_policy=identity["floating_point_policy"],
-            expected_artifact_id=identity["artifact_id"],
-        )
-
-    qualification = oam_cuda_r1_timing._qualification_execution_entry(
-        request,
-        artifact_preparer=prepare_maintained_artifact,
-        contract=Path(request["model_path"]),
-        native=maintained_native,
-        target=request["host_target"],
-        compiler=None,
-        threads_per_block=None,
-        generation_policy=None,
-        **qualification_fixture._qualification_entry_live_arguments(
-            request, command, maintained_native, cache
-        ),
-    )
-    evidence = qualification["artifact_evidence"]
-    assert evidence["expected_target"] == "x86-64-v3"
-    assert evidence["native_build_target"] == "host-isa-x86-64-v3"
-    assert evidence["active_host_target"] == "host-isa-x86-64-v3"
-    assert qualification["artifact"].artifact_path.is_file()
-
-
-def test_full_cuda_catalog_builds_installs_and_resolves_all_known_oam(
-    monkeypatch, tmp_path
-):
-    cmake = shutil.which("cmake")
-    nvcc = shutil.which("nvcc") or "/usr/local/cuda-13.3/bin/nvcc"
-    if cmake is None or not Path(nvcc).is_file():
-        pytest.skip("CMake and nvcc are required")
-    source = tmp_path / "source"
-    build = tmp_path / "build"
-    manifest = ROOT / "symmetrix/source/symmetrix/foundation_operator_manifest.json"
-    mode = "full"
-    _write_cuda_fixture_project(source, manifest, mode)
-    configured = _run(
-        cmake,
-        "-S",
-        source,
-        "-B",
-        build,
-        f"-DCMAKE_CUDA_COMPILER={nvcc}",
-        f"-DSYMMETRIX_BUILD_SOURCE_CONTENT_SHA256={'b' * 64}",
-        f"-DSYMMETRIX_BUILD_NATIVE_SOURCE_CONTENT_SHA256={'e' * 64}",
-    )
-    assert configured.returncode == 0, configured.stderr
-    compiled = _run(cmake, "--build", build, "--parallel", "2")
-    assert compiled.returncode == 0, compiled.stderr
-    install = tmp_path / "install"
-    installed = _run(cmake, "--install", build, "--prefix", install)
-    assert installed.returncode == 0, installed.stderr
-
-    root = install / "fixture_package/_operator_artifacts"
-    catalog_path = root / "catalog.json"
-    catalog = json.loads(catalog_path.read_text())
-    oam_entries = [
-        entry for entry in catalog["artifacts"] if entry["operator"] == "OAM"
-    ]
-    assert len(oam_entries) == 8
-    assert {entry["identity"]["target"] for entry in oam_entries} == {"sm_120"}
-    assert {entry["identity"]["precision"] for entry in oam_entries} == {
-        "float32",
-        "float64",
-    }
-    assert (
-        len({entry["identity"]["architecture_fingerprint"] for entry in oam_entries})
-        == 4
-    )
-    assert all(entry["operator"] != "OAM" for entry in catalog["artifacts"][:6])
-    installed_files = [catalog_path]
-    for entry in catalog["artifacts"]:
-        installed_files.append(root / entry["installed_relative_path"])
-        installed_files.extend(
-            root / auxiliary["installed_relative_path"]
-            for auxiliary in entry.get("auxiliary_files", ())
-        )
-    provenance = oam_entries[0]["build_provenance"]
-    build_info = {
-        "mode": mode,
-        "backend": "cuda",
-        "target": "sm_120",
-        "catalog_relative_path": "_operator_artifacts/catalog.json",
-        "catalog_sha256": hashlib.sha256(catalog_path.read_bytes()).hexdigest(),
-        "artifact_count": len(catalog["artifacts"]),
-        "installed_bytes": sum(path.stat().st_size for path in installed_files),
-        "source_content_sha256": "b" * 64,
-        "native_source_content_sha256": "e" * 64,
-        "compiler_id": provenance["compiler_id"],
-        "compiler_version": provenance["compiler_version"],
-        "build_duration_seconds": 0.1,
-    }
-    native = SimpleNamespace(
-        __package__="fixture_package",
-        _backend_build_info=lambda: {"prebuilt_operator_artifacts": build_info},
-    )
-    installed_module = importlib.import_module("symmetrix.oam_installed_artifact")
-    monkeypatch.setattr(
-        installed_module.resources,
-        "files",
-        lambda package_name: install / "fixture_package",
-    )
-    for entry in oam_entries:
-        identity = entry["identity"]
-        resolved = installed_module.resolve_installed_oam_artifact(
-            architecture=identity["architecture"],
-            precision=identity["precision"],
-            backend="cuda",
-            target="sm120",
-            artifact_id=identity["artifact_id"],
-            required_capabilities=entry["capabilities"],
-            native_module=native,
-        )
-        assert resolved.available
-        assert resolved.artifact_path == root / entry["installed_relative_path"]
 
 
 def test_cpu_verified_build_is_noop_until_manifest_dependency_changes(tmp_path):
@@ -1823,12 +1313,3 @@ symmetrix_add_prebuilt_operator_artifacts()
 
     assert configured.returncode != 0
     assert f"{backend.upper()} compiler is unavailable" in configured.stderr
-
-
-def test_offline_oam_cuda_build_selects_the_module_identity_branch():
-    cmake_source = (
-        ROOT / "libsymmetrix/cmake/prebuilt_operator_artifacts.cmake"
-    ).read_text(encoding="utf-8")
-
-    assert '_symmetrix_operator STREQUAL "OAM"' in cmake_source
-    assert "-DSYMMETRIX_OAM_CUDA_MODULE=1" in cmake_source

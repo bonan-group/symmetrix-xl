@@ -5,8 +5,8 @@
 // E3TensorProductKokkosT (e3nn_kokkos.hpp) keeps only an opaque handle to this
 // type: `std::shared_ptr<DirectExecutionPlan> direct_execution_plan_`.  The
 // plan layout, the admission rules that install it, and every kernel that
-// consumes it live in the owning family layer, so the shared header and the
-// OAM owners that include it carry no MH-1 state.
+// consumes it live in the owning family layer, so the shared header and its
+// consumers carry no MH-1 state.
 //
 // This header is consumed only by mace_nonlinear_mh1_fast_path.cpp, which
 // defines the corresponding E3TensorProductKokkosT members.

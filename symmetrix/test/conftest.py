@@ -66,8 +66,6 @@ _EXTENDED_MODULES = frozenset(
 _STANDARD_E2E_NODEIDS = frozenset(
     {
         "test/test_symmetrix_calc.py::test_symmetrix_vs_pytorch",
-        "test/test_oam_cuda_r1.py::test_public_calculator_executes_generated_cuda",
-        "test/test_nequip_oam_kokkos_forward.py::test_oam_float32_evaluates_a_certified_float64_export",
         "test/test_mh1.py::test_generalized_mh1_generated_cuda_execution_matches_generic[c4-e2-b4-l2-linear]",
         "test/test_polar_end_to_end_fixtures.py::test_the_family_evaluates_the_total_energy_force_and_dipole[singlet-mol_h2o-S]",
         "test/test_polar_end_to_end_fixtures.py::test_the_family_evaluates_the_total_energy_force_and_dipole[field-bulk_w4-S]",
@@ -194,7 +192,7 @@ def accelerator_capabilities():
 
 def pytest_collection_modifyitems(config, items):
     global _REQUIRED_NODES, _REQUIRED_PASSED_CALLS
-    backend_markers = {"cuda", "hip", "gpu", "host", "oam_runtime"}
+    backend_markers = {"cuda", "hip", "gpu", "host"}
     if any(backend_markers.intersection(item.keywords) for item in items):
         capabilities = _native_capabilities()
         backend = capabilities.get("backend", "unavailable")
@@ -209,12 +207,6 @@ def pytest_collection_modifyitems(config, items):
                 )
             if "host" in item.keywords and backend != "host":
                 item.add_marker(pytest.mark.skip(reason="requires a host backend"))
-            if "oam_runtime" in item.keywords and backend == "hip":
-                item.add_marker(
-                    pytest.mark.skip(
-                        reason="OAM execution is unsupported on the HIP backend"
-                    )
-                )
 
     if _required_test_manifest() is None:
         _mark_extended_matrix_cases(items)

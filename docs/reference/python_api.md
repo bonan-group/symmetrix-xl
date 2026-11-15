@@ -40,44 +40,6 @@ Symmetrix(
 )
 ```
 
-## NequIPCalculator (OAM v2)
-
-```python
-NequIPCalculator(
-    model_file, *, dtype="float32", neighbor_skin=0.5,
-    streamed_edges="direct", head=None, **ase_kwargs,
-)
-```
-
-`NequIPCalculator` accepts exported OAM v2 JSON only. The `direct` routing
-requires a validated, architecture-bound full-message-only host ABI-v7 or CUDA
-ABI-v3 artifact and exposes energy, forces, and stress; `reference` is
-artifact-free and exposes energy and forces only. Source generation supports
-FP32 and FP64 on host and CUDA. Fresh runtime and repaired-wheel qualification
-is pending after the artifact-contract change. HIP,
-multi-GPU execution, and arbitrary NequIP graphs are outside the implementation
-boundary.
-PyTorch, NequIP, and e3nn are used by the optional
-exporter/reference workflow and are not runtime imports for JSON-only
-evaluation. See {doc}`publications` for citation guidance.
-
-For runtime artifact preparation, `prepare_nequip_oam_cuda_artifact`,
-`prepare_nequip_oam_host_artifact`, and
-`prepare_nequip_oam_receiver_host_artifact` require an explicit
-`native_module` carrying the backend's verified full source fingerprint.
-Pass the native module already owned by the caller; normal frontend calls
-already do this. Preparation does not autoload a backend or accept an
-environment variable or arbitrary hash as a substitute. The cache key and
-`_src<fullhash>` artifact basename bind this full fingerprint, preventing reuse
-across packages with different full source hashes. Learned weights still
-share an architecture-compatible artifact within the same package identity.
-
-Strict installed-prebuilt catalog returns and required-artifact failure
-paths are unchanged. This requirement applies to these OAM runtime
-preparation adapters; generic low-level JIT compiler APIs may still accept
-raw inputs with optional `None` context. Kernels, model layout, generation
-architecture, ABI, arithmetic and numerical tolerances are unchanged.
-
 `Symmetrix` is an ASE calculator. `dtype` defaults to `"float32"` and also
 accepts `"float64"`. Select float64 explicitly for high-precision calculations.
 `streamed_edges` accepts the routing `direct` (default) or `reference`, plus
@@ -89,27 +51,18 @@ compatibility aliases for `direct`. In the Python frontend the compatibility
 aliases preserve the former throughput behavior by changing an
 otherwise-`capacity` request to the `speed` profile. Use literal `direct` for
 capacity behavior. The removed `receiver_factorized` selector is rejected.
-`NequIPCalculator` is a separate frontend that accepts only its own literal
-set, `direct`, `reference`, `debug_v1`, and `mlp_reference`, of which
-`debug_v1` and `mlp_reference` resolve to `reference`; no MACE alias resolves
-here. It reports the same `streamed_edges`, `streamed_edges_requested`, and
-`streamed_edges_alias` triple as the compact frontend, and it reads its
-accepted spellings from the same declaration, so the rejection message lists
-the family's own set.
 
 `direct` runs the prepared plan against a contract-bound generated (T3)
 artifact and fails at graph preparation when none is qualified. `reference` is
 single-thread execution of the generic implementation on the default host
 execution space, needs no artifact, and is the routing the removed standalone
 CPU-native evaluators were consolidated onto. The third positional argument of
-`Symmetrix` and the `use_kokkos` keyword of both frontends are retired and
-rejected explicitly.
+`Symmetrix` and the `use_kokkos` keyword are retired and rejected explicitly.
 
 Both frontends prepare the artifact a `direct` request executes through from
 the family's declared adapter for the target the build binds, and both read the
-family's declared evaluator surface rather than probing the evaluator.
-`NequIPCalculator` also surfaces the family's own capability query as
-`calculator.capabilities`. A preparation that cannot produce a qualified
+family's declared evaluator surface rather than probing the evaluator. A
+preparation that cannot produce a qualified
 artifact fails there — before any evaluator is constructed — and reports the
 same four-way diagnostic (empty cache with a working compiler, no compiler, a
 missing prebuilt artifact, or a cached artifact rejected as stale) for every
@@ -121,14 +74,14 @@ the declared family registry
 model type or architecture string. Each family declares one entry beside its
 own modules — `mace_family.py` for the compact models and their field variant,
 `mace_nonlinear_family.py` for the nonlinear models, `mace_polar_family.py` for
-the polarisable long-range models, and `oam_family.py` for
-OAM — and that entry owns the family's detection keys, evaluator variants per
+the polarisable long-range models — and that entry owns the family's detection
+keys, evaluator variants per
 precision and execution space, contract route, its schema, extractor,
 generator, and artifact-adapter declarations, and the evaluator surface each
 execution mode reads. The execution-mode vocabulary is not an entry's: the two
 compact families share `family_registry.COMPACT_MODE_VOCABULARY`, declared
 beside the entry data model the declarations are written against and read by
-the calculator as `_MODE_VOCABULARY`, while OAM declares its own. A mode that
+the calculator as `_MODE_VOCABULARY`. A mode that
 needs a prepared-path method the evaluator does not provide fails naming the
 family, the capability, and the method; no request silently resolves to a
 slower path.
@@ -257,10 +210,7 @@ whether the artifact is therefore required (`artifact_required`). Version 0 with
 an empty list is the pre-binding state a report carries while the prepared
 direct path is not the active mode.
 
-`NequIPCalculator` exposes the same `execution_plan` report for its compiled
-program: `binding_report_version` is 1, `bindings` carries one entry per
-operator node, and `selected_id` names the implementation the execution path
-dispatches, which the execution diagnostic also reports. A family that
+A family that
 declares no plan candidate space reports the single implementation it selected
 as its one implicit candidate, so the report is never an empty plan.
 

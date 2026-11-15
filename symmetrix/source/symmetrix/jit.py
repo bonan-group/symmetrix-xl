@@ -1657,7 +1657,7 @@ class ArtifactEnvelope:
     ``abi_key`` names the key the ABI tag is published under,
     ``identity_fingerprint`` the family's own name for the fingerprint that
     identifies the generated revision (``contract_fingerprint`` for the R1
-    families, ``generation_fingerprint`` for the non-linear and OAM families, and
+    families, ``generation_fingerprint`` for the non-linear families, and
     ``None`` for the operator modules, whose ABI publishes only a structure
     fingerprint), and ``capabilities_key`` the capability word when the family
     publishes one.

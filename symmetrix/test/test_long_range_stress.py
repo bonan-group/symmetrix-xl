@@ -1,7 +1,7 @@
 """Finite-strain oracle for the long-range cell adjoint (the virial/stress).
 
 The reciprocal-space virial has no analytic serial oracle, so its gate is
-the OAM precedent (``test_nequip_oam_stress.py``): the finite-strain
+the suite's standing finite-strain precedent: the finite-strain
 derivative of this kernel's own forward, on the fixture geometries.  Both
 fixtures carry a cell (``pbc4`` the bulk graph, ``mol5`` a molecule in its
 vacuum box, where the analytic correction is active), so the battery runs
@@ -29,11 +29,11 @@ Conventions this battery pins (the design note's Adjoint set, the
   contributions cancel between the two terms -- which the agreement of
   both surfaces with their own finite-difference oracle demonstrates.
 * **Strain spelling.**  ``cell @ (I + eps)`` with row-vector lattice
-  rows, exactly the OAM oracle's deformation.  Single-entry strains
+  rows, exactly the legacy oracle's deformation.  Single-entry strains
   measure the full (possibly asymmetric) tensor -- the l=1 multipoles are
   pinned cartesian data, so dE/deps need not be symmetric -- and the
   symmetric Voigt probe of the composed stress uses symmetric strains,
-  the OAM test's convention.
+  the legacy oracle's convention.
 
 Tolerance: fp64 central differences at step 1e-6, the adjoints battery's
 gate (1e-6 relative, absolute floor tied to the gradient scale); the
@@ -118,7 +118,7 @@ def assert_fd_parity(grad, fd, context: str) -> None:
 
 
 def deformed(cell: np.ndarray, eps: np.ndarray) -> np.ndarray:
-    """The OAM oracle's deformation: lattice rows right-multiplied."""
+    """The legacy oracle's deformation: lattice rows right-multiplied."""
     return cell @ (np.eye(3) + eps)
 
 
@@ -199,14 +199,14 @@ def test_energy_cell_adjoint_fixed_positions_matches_finite_strain(fixture):
 
 
 # ---------------------------------------------------------------------------
-# The composed stress: the affine finite-strain oracle (the OAM pattern)
+# The composed stress: the affine finite-strain oracle (the standing pattern)
 # ---------------------------------------------------------------------------
 
 
 def test_coulomb_stress_matches_the_affine_finite_strain_oracle(fixture):
     """sigma = (1/Omega) dE/deps under the affine deformation.
 
-    The OAM gate's pattern: deform the cell with symmetric strains, scale
+    The standing gate's pattern: deform the cell with symmetric strains, scale
     the positions with it, central-difference the forward energy, and
     divide by the volume (the self-interaction subtraction is
     cell-independent, so it carries no stress and no FD signal).

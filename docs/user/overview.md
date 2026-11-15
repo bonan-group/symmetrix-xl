@@ -44,11 +44,9 @@ corrections.
 ### v0.2.0 support contract
 
 The public contract separates implementation availability, artifact availability,
-runtime qualification, wheel inclusion, and published support. OAM S/M/L/XL are
-single-GPU host/CUDA only where qualified. HIP, multi-GPU, and LAMMPS/MPI are
-unsupported; live upstream FP64 parity and repaired-wheel inclusion remain open
-gates. Ordinary MACE HIP does not imply OAM or Polar HIP support, and OAM remains
-single-GPU by decision.
+runtime qualification, wheel inclusion, and published support. HIP, multi-GPU,
+and LAMMPS/MPI are unsupported where not stated below; repaired-wheel inclusion
+remains an open gate. Ordinary MACE HIP does not imply Polar HIP support.
 
 Released Polar-M CPU/CUDA FP32/FP64 remains qualified. Polar S/M/L HIP
 `gfx1151` source-build/runtime evidence covers FP32/FP64, `reference` and

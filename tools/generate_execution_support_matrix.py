@@ -41,9 +41,7 @@ END_MARKER = "<!-- END GENERATED EXECUTION SUPPORT MATRIX -->"
 #: The execution spaces the shipped Kokkos backends provide.  This is a build
 #: fact rather than a family fact, so it is stated once for every family.
 KOKKOS_BACKENDS = "Serial, OpenMP, CUDA, HIP"
-FAMILY_KOKKOS_BACKENDS = {
-    "OAM": "Serial, OpenMP, CUDA; HIP package rejects this family",
-}
+FAMILY_KOKKOS_BACKENDS = {}
 
 
 @dataclass(frozen=True)
@@ -175,26 +173,6 @@ FAMILY_REQUESTS: Mapping[str, tuple[RequestRow, ...]] = {
                 "`pair_spline_v1` backbone with the same one MPI rank, complete "
                 "system admission boundary and rejects domain decomposition"
             ),
-        ),
-    ),
-    "OAM": (
-        RequestRow(
-            mode="direct",
-            label="`direct`",
-            admitted=True,
-            artifact=(
-                "The architecture-bound, full-message-only receiver artifact: "
-                "a host ABI v7 spline plugin, a CUDA ABI v3 NVRTC cubin, or an "
-                "nvcc shared library"
-            ),
-            lammps="Not supported",
-        ),
-        RequestRow(
-            mode="reference",
-            label="`reference`",
-            admitted=True,
-            artifact="None",
-            lammps="Not supported",
         ),
     ),
 }
@@ -341,62 +319,6 @@ FAMILY_CAPABILITIES: Mapping[str, tuple[CapabilityRow, ...]] = {
             "build-dependent",
             "device execution spaces",
             "a CUDA-capable build is required",
-        ),
-    ),
-    "OAM": (
-        CapabilityRow(
-            "target",
-            "build-dependent",
-            "the default execution space",
-            "host or CUDA; HIP is unsupported",
-        ),
-        CapabilityRow(
-            "precision",
-            "build-dependent",
-            "float32 and float64 implementations on host and CUDA",
-            "current full-message-only artifact release-matrix qualification is pending",
-        ),
-        CapabilityRow(
-            "reference",
-            "build-dependent",
-            "the artifact-free same-spline Kokkos oracle on host and CUDA",
-            "current release-matrix qualification is pending; same-spline parity does not establish upstream-NequIP parity",
-        ),
-        CapabilityRow(
-            "portable",
-            "build-dependent",
-            "the compiler-free Kokkos edge product",
-            "the current runtime matrix is pending; this is the same-spline reference, not the optimized production route",
-        ),
-        CapabilityRow(
-            "generated",
-            "build-dependent",
-            "the full-message-only host ABI v7 artifact or CUDA ABI v3 receiver cubin",
-            "a prepared exact artifact is required; the current CUDA artifact is compile-qualified, but fresh runtime qualification is pending",
-        ),
-        CapabilityRow(
-            "stress",
-            "requalification pending",
-            "implemented on the current host and CUDA routes",
-            "full-message-only ABI-v7/ABI-v3 runtime qualification is pending; HIP is unsupported",
-        ),
-        CapabilityRow(
-            "field", "unsupported", "-", "the OAM contract carries no field coupling"
-        ),
-        CapabilityRow(
-            "parameter_gradients", "unsupported", "-", "not implemented for this family"
-        ),
-        CapabilityRow(
-            "host_artifact",
-            "build-dependent",
-            "source generation and compilation of the full-message-only ABI-v7 artifact",
-            "fresh host runtime qualification and repaired-wheel inclusion gates are pending",
-        ),
-        CapabilityRow(
-            "device_artifact",
-            "build-dependent",
-            "source generation and compilation of the full-message-only CUDA ABI-v3 artifact",
-            "fresh CUDA runtime qualification and repaired-wheel inclusion gates are pending; HIP is unavailable",
         ),
     ),
 }
