@@ -85,7 +85,9 @@ the strict periodic frozen-oracle configuration explicitly selects
 The table describes implementation availability. Accelerator qualification is
 backend- and architecture-specific: required CUDA/HIP tests must run on a
 matching installed backend and visible device. CPU-only test results are not
-accelerator execution or performance evidence. See
+accelerator execution or performance evidence. The device graph-reuse and
+precision-parity gates exercise the `bj` damping configuration; the `zero`,
+`zerom`, and `bjm` variants are covered by the host-side D3 suite. See
 {doc}`/user/dispersion_corrections` for neighbor-building policy and explicit
 D3-ATM, D4, and MBD limitations.
 
@@ -113,8 +115,8 @@ CPU and CUDA sm120 FP32/FP64 checks passed before final integration; final
 combined-source release qualification remains pending, and the generated
 table above retains the earlier released-M qualification boundary. The
 count-agnostic composed ABI-v7 host plugin does not imply support for arbitrary
-interaction counts on devices. HIP runtime and released Polar-L remain
-unqualified.
+interaction counts on devices. MACE_Nonlinear execution on HIP and released
+Polar-L remain unqualified.
 
 Periodic stress derivatives are reduced, symmetrized, and volume-scaled on the
 execution device. CUDA transfers only the final nine-double tensor, and a
