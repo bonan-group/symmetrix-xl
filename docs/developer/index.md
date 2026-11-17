@@ -20,5 +20,6 @@ architecture
 execution_planner
 adding_a_family
 jit_and_artifacts
+release
 openmp_simd
 ```

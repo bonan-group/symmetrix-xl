@@ -44,16 +44,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/release-metadata
         with:
-          python-version: "3.12"
-      - name: Validate version sources and release tag
-        run: |
-          python tools/check_release_metadata.py
-          if [[ "${{ inputs.publish_pypi }}" == "true" ]]; then
-            python tools/check_release_metadata.py --require-tag
-          fi
+          publish_pypi: ${{ inputs.publish_pypi }}
 
   build-cpu-v4:
     name: Build cpu avx512 ${{ matrix.python }}
