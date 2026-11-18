@@ -34,19 +34,29 @@ RUN curl -fsSL -o /tmp/openblas.tar.gz \
 # The CPU wheel publishes the reciprocal-space D3 correction, so the build
 # requires an FFTW3 provider (SYMMETRIX_PARTICLE_MESH=ON) and auditwheel
 # grafts these libraries into the manylinux wheel.
+# FFTW builds one precision per configure, so double and float need
+# separate out-of-tree passes into the same prefix.
 RUN curl -fsSL -o /tmp/fftw.tar.gz \
       "https://www.fftw.org/fftw-${FFTW_VERSION}.tar.gz" \
     && echo "${FFTW_SHA256}  /tmp/fftw.tar.gz" | sha256sum -c - \
     && tar xzf /tmp/fftw.tar.gz -C /tmp \
-    && cd "/tmp/fftw-${FFTW_VERSION}" \
-    && ./configure --prefix=/opt/symmetrix-fftw --enable-shared --disable-static \
-      --enable-threads --enable-float CFLAGS="-O2 -fPIC" \
+    && mkdir /tmp/fftw-double /tmp/fftw-single \
+    && cd /tmp/fftw-double \
+    && "/tmp/fftw-${FFTW_VERSION}/configure" --prefix=/opt/symmetrix-fftw \
+      --enable-shared --disable-static --enable-threads CFLAGS="-O2 -fPIC" \
+    && make -s -j8 \
+    && make -s install \
+    && cd /tmp/fftw-single \
+    && "/tmp/fftw-${FFTW_VERSION}/configure" --prefix=/opt/symmetrix-fftw \
+      --enable-shared --disable-static --enable-threads --enable-float \
+      CFLAGS="-O2 -fPIC" \
     && make -s -j8 \
     && make -s install \
     && test -f /opt/symmetrix-fftw/lib/libfftw3.so \
     && test -f /opt/symmetrix-fftw/lib/libfftw3f.so \
     && test -f /opt/symmetrix-fftw/include/fftw3.h \
-    && rm -rf /tmp/fftw.tar.gz "/tmp/fftw-${FFTW_VERSION}"
+    && rm -rf /tmp/fftw.tar.gz "/tmp/fftw-${FFTW_VERSION}" /tmp/fftw-double \
+      /tmp/fftw-single
 
 ENV CMAKE_PREFIX_PATH=/opt/symmetrix-openblas:/opt/symmetrix-fftw \
     PATH=/usr/local/bin:${PATH}
