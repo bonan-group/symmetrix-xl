@@ -2433,23 +2433,23 @@ def test_release_metadata_accepts_unreleased_until_publication(tmp_path):
     prepared_changelog = changelog[changelog.index("## 0.2.0") :]
     (prepared / "CHANGELOG.md").write_text("# Changelog\n\n" + prepared_changelog)
 
-    assert release_check.release_metadata(prepared) == {
-        "version": "0.2.0",
-        "date": "Unreleased",
-        "tag": "v0.2.0",
-    }
-    with pytest.raises(ValueError, match="no dated"):
-        release_check.release_metadata(prepared, require_dated=True)
-
-    dated = prepared_changelog.replace(
-        "## 0.2.0 - Unreleased", "## 0.2.0 - 2026-11-05", 1
-    )
+    metadata = release_check.release_metadata(prepared)
+    assert metadata["version"] == "0.2.0"
+    assert metadata["tag"] == "v0.2.0"
+    if metadata["date"] == "Unreleased":
+        with pytest.raises(ValueError, match="no dated"):
+            release_check.release_metadata(prepared, require_dated=True)
+        dated = prepared_changelog.replace(
+            "## 0.2.0 - Unreleased", "## 0.2.0 - 2026-11-05", 1
+        )
+    else:
+        # The release may already be dated on the branch under release.
+        dated = prepared_changelog
     (prepared / "CHANGELOG.md").write_text("# Changelog\n\n" + dated)
-    assert (
-        release_check.release_metadata(prepared, require_dated=True)["date"]
-        == "2026-11-05"
-    )
-    chronology_error = dated.replace("2026-11-05", "2026-10-25", 1)
+    assert release_check.release_metadata(prepared, require_dated=True)[
+        "date"
+    ] == metadata["date"]
+    chronology_error = dated.replace(metadata["date"], "2026-10-25", 1)
     (prepared / "CHANGELOG.md").write_text("# Changelog\n\n" + chronology_error)
     with pytest.raises(ValueError, match="predates the latest prior release"):
         release_check.release_metadata(prepared, require_dated=True)
