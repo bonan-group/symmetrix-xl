@@ -43,17 +43,20 @@ RUN curl -fsSL -o /tmp/fftw.tar.gz \
     && mkdir /tmp/fftw-double /tmp/fftw-single \
     && cd /tmp/fftw-double \
     && "/tmp/fftw-${FFTW_VERSION}/configure" --prefix=/opt/symmetrix-fftw \
-      --enable-shared --disable-static --enable-threads CFLAGS="-O2 -fPIC" \
+      --enable-shared --disable-static --enable-openmp \
+      CFLAGS="-O2 -fPIC -fopenmp" \
     && make -s -j8 \
     && make -s install \
     && cd /tmp/fftw-single \
     && "/tmp/fftw-${FFTW_VERSION}/configure" --prefix=/opt/symmetrix-fftw \
-      --enable-shared --disable-static --enable-threads --enable-float \
-      CFLAGS="-O2 -fPIC" \
+      --enable-shared --disable-static --enable-openmp --enable-float \
+      CFLAGS="-O2 -fPIC -fopenmp" \
     && make -s -j8 \
     && make -s install \
     && test -f /opt/symmetrix-fftw/lib/libfftw3.so \
     && test -f /opt/symmetrix-fftw/lib/libfftw3f.so \
+    && test -f /opt/symmetrix-fftw/lib/libfftw3_omp.so \
+    && test -f /opt/symmetrix-fftw/lib/libfftw3f_omp.so \
     && test -f /opt/symmetrix-fftw/include/fftw3.h \
     && rm -rf /tmp/fftw.tar.gz "/tmp/fftw-${FFTW_VERSION}" /tmp/fftw-double \
       /tmp/fftw-single
