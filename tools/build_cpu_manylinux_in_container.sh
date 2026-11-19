@@ -23,9 +23,10 @@ if find "$OUTPUT_DIR" -maxdepth 1 -name '*.whl' -print -quit | grep -q .; then
 fi
 
 export PATH="${PYTHON_ROOT}/bin:/usr/local/bin:${PATH}"
-export CMAKE_PREFIX_PATH=/opt/symmetrix-openblas
-export LIBRARY_PATH=/opt/symmetrix-openblas/lib
-export LD_LIBRARY_PATH=/opt/symmetrix-openblas/lib
+export CMAKE_PREFIX_PATH=/opt/symmetrix-openblas:/opt/symmetrix-fftw
+export FFTW_ROOT=/opt/symmetrix-fftw
+export LIBRARY_PATH=/opt/symmetrix-openblas/lib:/opt/symmetrix-fftw/lib
+export LD_LIBRARY_PATH=/opt/symmetrix-openblas/lib:/opt/symmetrix-fftw/lib
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 
 work_root="$(mktemp -d /tmp/symmetrix-cpu-wheel.XXXXXX)"
@@ -41,6 +42,7 @@ mkdir -p "$raw_dir" "$grafted_dir" "$repaired_dir"
 "$build_python" tools/symmetrix_build.py wheel \
   --backend cpu \
   --cpu-target "$CPU_TARGET" \
+  --particle-mesh on \
   --prebuilt-operator-artifacts r0 \
   --build-root /tmp/build \
   --wheel-dir "$raw_dir" \

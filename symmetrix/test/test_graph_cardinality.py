@@ -179,10 +179,18 @@ def test_calculator_uses_exact_m0_resolution_for_package_mode(
                 installed_operator_build_target,
             )
 
-            assert m0["target"] == installed_operator_build_target(
-                native_module=native_symmetrix, backend="host"
-            )
-            assert m0["target"] != "host"
+            if m0["origin"] == "prebuilt":
+                assert m0["target"] == installed_operator_build_target(
+                    native_module=native_symmetrix, backend="host"
+                )
+                assert m0["target"] != "host"
+            else:
+                # An r0-only package ships no prebuilt M0, so the host plugin
+                # is JIT-compiled and carries the runtime host JIT policy's
+                # target, not the installed catalog's.
+                assert m0["origin"] in ("cache", "runtime")
+                assert m0["compiler"] == "host-cxx"
+                assert m0["target"].startswith(("host-isa-", "host-native-sha256-"))
             assert calculator.evaluator.m0_host_plugin_ready
             assert calculator.evaluator.m0_host_plugin_artifact_id == m0["artifact_id"]
         else:
