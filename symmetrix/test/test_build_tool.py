@@ -2446,9 +2446,10 @@ def test_release_metadata_accepts_unreleased_until_publication(tmp_path):
         # The release may already be dated on the branch under release.
         dated = prepared_changelog
     (prepared / "CHANGELOG.md").write_text("# Changelog\n\n" + dated)
-    assert release_check.release_metadata(prepared, require_dated=True)[
-        "date"
-    ] == metadata["date"]
+    assert (
+        release_check.release_metadata(prepared, require_dated=True)["date"]
+        == metadata["date"]
+    )
     chronology_error = dated.replace(metadata["date"], "2026-10-25", 1)
     (prepared / "CHANGELOG.md").write_text("# Changelog\n\n" + chronology_error)
     with pytest.raises(ValueError, match="predates the latest prior release"):
