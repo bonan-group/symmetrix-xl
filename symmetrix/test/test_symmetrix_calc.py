@@ -2291,6 +2291,59 @@ def test_stress_uses_the_cell_volume_on_nonperiodic_axes(
         )
 
 
+def test_native_results_are_new_float64_arrays(generated_standard_mace_zbl_model):
+    calc = Symmetrix(
+        generated_standard_mace_zbl_model,
+        dtype="float64",
+        streamed_edges="reference",
+    )
+    # ZBL-only fixture energy: keep the H-O contacts inside 2 A.
+    atoms = Atoms(
+        "OHOH",
+        positions=[[0.2, 0.3, 0.4], [1.4, 0.5, 0.8], [1.6, 1.9, 1.3], [0.4, 1.7, 2.0]],
+        cell=[3.2, 3.3, 3.4],
+        pbc=True,
+    )
+    atoms.calc = calc
+    start = atoms.copy()
+    forces = atoms.get_forces()
+    stress = atoms.get_stress()
+    energies = atoms.get_potential_energies()
+
+    node_energies = calc.evaluator.node_energies
+    assert isinstance(node_energies, np.ndarray)
+    assert node_energies.dtype == np.float64
+    assert node_energies.shape == (len(atoms),)
+    np.testing.assert_array_equal(node_energies, energies)
+    assert np.sum(node_energies, dtype=np.float64) == atoms.get_potential_energy()
+    assert calc.evaluator.node_energies is not node_energies
+    assert np.any(forces != 0.0) and np.any(stress != 0.0)
+
+    # Every evaluation publishes new arrays; results already held stay as
+    # they were.
+    held = {name: calc.results[name] for name in ("energies", "forces", "stress")}
+    copies = {name: np.array(value, copy=True) for name, value in held.items()}
+    held_node_energies = np.array(node_energies, copy=True)
+    atoms.positions[1] += [0.05, -0.03, 0.02]
+    moved_forces = atoms.get_forces()
+    assert not np.array_equal(moved_forces, forces)
+    for name, value in held.items():
+        assert calc.results[name] is not value
+        np.testing.assert_array_equal(value, copies[name])
+    # The array read from the evaluator itself is not a view of its storage.
+    assert not np.array_equal(calc.evaluator.node_energies, held_node_energies)
+    np.testing.assert_array_equal(node_energies, held_node_energies)
+
+    # Stress read after forces is the stress of a direct stress request.
+    fresh = Symmetrix(
+        generated_standard_mace_zbl_model,
+        dtype="float64",
+        streamed_edges="reference",
+    )
+    fresh.calculate(start, ["stress"])
+    np.testing.assert_allclose(fresh.results["stress"], stress, rtol=1e-12, atol=0.0)
+
+
 @pytest.mark.skipif(mace is None, reason="mace-torch is not available")
 def test_mace_onthefly_calc_finite_diff(mace_foundation_model):
     atoms = Atoms("O", cell=[2] * 3, pbc=[True] * 3)

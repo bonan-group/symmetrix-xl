@@ -26,6 +26,7 @@ using ContiguousDoubleArray =
 using symmetrix::python::detail::shaped_array;
 using symmetrix::python::detail::view_prefix_1d;
 using symmetrix::python::detail::view_prefix_3d;
+using symmetrix::python::detail::view_prefix_array;
 
 // Serialization of the neutral family-interface data the evaluators expose.
 // The dict keys are the cross-language spelling of the interface, so they live
@@ -2354,7 +2355,10 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
         // node energies
         .def_property("node_energies",
             [] (MACEKokkos<Precision>& self) {
-                return view2vector(self.node_energies);
+                const auto nodes = self.node_energies.extent(0);
+                return view_prefix_array(
+                    self.node_energies, nodes,
+                    {static_cast<py::ssize_t>(nodes)});
             },
             [] (MACEKokkos<Precision>& self, ContiguousDoubleArray node_energies) {
                 set_kokkos_view(self.node_energies, node_energies);
@@ -2389,10 +2393,9 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                         create_kokkos_view("edge_receivers", edge_receivers),
                         create_kokkos_view("edge_sources", edge_sources));
                 }
-                return shaped_array(
-                    view_prefix_1d(
-                        self.atom_forces,
-                        3*static_cast<std::size_t>(num_nodes)),
+                return view_prefix_array(
+                    self.atom_forces,
+                    3*static_cast<std::size_t>(num_nodes),
                     {num_nodes, 3});
             },
             py::arg("num_nodes"), py::arg("edge_receivers"),
@@ -2414,8 +2417,7 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                     self.reduce_stress(
                         volume, create_kokkos_view("stress xyz", xyz));
                 }
-                return shaped_array(
-                    view_prefix_1d(self.stress_tensor, 9), {3, 3});
+                return view_prefix_array(self.stress_tensor, 9, {3, 3});
             },
             py::arg("volume"), py::arg("xyz"),
             py::arg("execution_graph_generation") = 0)
@@ -2436,8 +2438,8 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                 self.reduce_prepared_batched_stress(
                     std::span<const double>(volumes.data(), volumes.size()),
                     graph_generation);
-                return shaped_array(
-                    view_prefix_1d(self.stress_tensor, 9*volumes.size()),
+                return view_prefix_array(
+                    self.stress_tensor, 9*volumes.size(),
                     {volumes.size(), 3, 3});
             },
             py::arg("volumes"), py::arg("graph_generation"))
@@ -2466,8 +2468,8 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
                 self.reduce_prepared_batched_stress(
                     std::span<const double>(volumes.data(), volumes.size()),
                     self.factorized_completed_evaluation_graph_generation);
-                return shaped_array(
-                    view_prefix_1d(self.stress_tensor, 9*volumes.size()),
+                return view_prefix_array(
+                    self.stress_tensor, 9*volumes.size(),
                     {volumes.size(), 3, 3});
             },
             py::arg("volumes"), py::arg("edge_offsets"), py::arg("xyz"))

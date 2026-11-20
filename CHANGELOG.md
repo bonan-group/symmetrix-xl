@@ -31,6 +31,23 @@ All notable changes to Symmetrix-XL are documented in this file.
   that fits the stored list is reused as before. The reuse check used to test
   the raised skin against the shorter list, which could drop a pair that had
   moved inside the cutoff.
+- Native evaluators return node energies, atom forces and stresses as NumPy
+  `float64` arrays filled by one copy from the evaluator's result view, without
+  a host mirror, an element loop or a Python list; on a GPU the one
+  device-to-host transfer now lands in the array. This covers every native
+  family: MACE, MACEField and MACE-LES share the MACE binding, MACE-MH-1 and
+  MACE-Polar the MH-1 binding. `evaluator.node_energies` is now an ndarray of
+  shape `(N,)` instead of a list in every family. The MH-1 and Polar force
+  and stress reductions return flat arrays (`(3N,)`, `(9,)`, `(9B,)`) instead
+  of lists; the MACE reductions keep their shapes (`(N, 3)`, `(3, 3)`,
+  `(B, 3, 3)`). Values and element order are unchanged, and every read returns
+  a new array, so results already held are never modified. Code that needs a
+  list can call `.tolist()`. Built-in `sum()` over the array adds NumPy
+  scalars without the compensated summation Python 3.12 applies to a list of
+  floats, so it can differ in the last digits (by 2.3e-10 eV over 135,000
+  atom energies); `np.sum` and the calculator's FP64 energy sum are unchanged.
+  On a 135,000-atom frame the result marshalling of a call (reductions
+  excluded) falls from 3.7 ms to 0.3 ms (one CPU thread).
 
 ## 0.2.0 - 2026-11-17
 

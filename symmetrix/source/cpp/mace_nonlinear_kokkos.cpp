@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 
 #include "device_environment.hpp"
+#include "mace_kokkos_binding_helpers.hpp"
 
 #include "family_interface.hpp"
 #include "implementation_registry.hpp"
@@ -20,6 +21,14 @@ using Int64Array=py::array_t<std::int64_t,py::array::c_style|py::array::forcecas
 using DoubleArray=py::array_t<double,py::array::c_style|py::array::forcecast>;
 
 namespace {
+
+// A whole result view as a new flat NumPy array, filled by one deep copy.
+py::array_t<double> result_array(const Kokkos::View<double*>& view)
+{
+    const auto extent=view.extent(0);
+    return symmetrix::python::detail::view_prefix_array(
+        view,extent,{static_cast<py::ssize_t>(extent)});
+}
 
 // The neutral artifact envelope as the dict every readiness binding reports, so
 // the readiness property and the artifact loader cannot drift apart.
@@ -704,7 +713,7 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
         .def_property_readonly("precision_workspace_bytes",&Evaluator::precision_workspace_bytes)
         .def_property_readonly("atomic_numbers",[](Evaluator& self){return self.atomic_numbers_host;})
         .def_property_readonly("atomic_energies",[](Evaluator& self){return view2vector(self.atomic_energies);})
-        .def_property_readonly("node_energies",[](Evaluator& self){return view2vector(self.node_energies);})
+        .def_property_readonly("node_energies",[](Evaluator& self){return result_array(self.node_energies);})
         .def_property_readonly("node_forces",[](Evaluator& self){return view2vector(self.node_forces);})
         .def("_prepare_factorized_graph",
             [] (Evaluator& self,const int num_nodes,IntArray node_types,
@@ -824,7 +833,7 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
                     !=3*static_cast<std::size_t>(num_nodes))
                     throw py::value_error(
                         "MH-1 atom-force reduction node extent is inconsistent.");
-                return view2vector(self.atom_forces);
+                return result_array(self.atom_forces);
             },
             py::arg("num_nodes"),py::arg("edge_receivers"),
             py::arg("edge_sources"),py::arg("graph_generation")=0)
@@ -839,7 +848,7 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
                 if(self.stress_tensor.size()!=9)
                     throw py::value_error(
                         "MH-1 stress reduction tensor extent is inconsistent.");
-                return view2vector(self.stress_tensor);
+                return result_array(self.stress_tensor);
             },
             py::arg("volume"),py::arg("xyz"),
             py::arg("graph_generation")=0)
@@ -861,7 +870,7 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
                 if(self.stress_tensor.size()!=9*volumes.size())
                     throw py::value_error(
                         "MH-1 batched stress tensor extent is inconsistent.");
-                return view2vector(self.stress_tensor);
+                return result_array(self.stress_tensor);
             },
             py::arg("volumes"),py::arg("graph_generation"))
         .def("_reduce_segmented_stress",
@@ -888,7 +897,7 @@ py::class_<Evaluator> bind_mace_nonlinear_kokkos_evaluator(
                 if(self.stress_tensor.size()!=9*volumes.size())
                     throw py::value_error(
                         "Segmented stress tensor extent is inconsistent.");
-                return view2vector(self.stress_tensor);
+                return result_array(self.stress_tensor);
             },
             py::arg("volumes"),py::arg("edge_offsets"),py::arg("xyz"))
         .def("compute_node_energies_forces",
