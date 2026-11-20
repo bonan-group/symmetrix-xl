@@ -25,6 +25,7 @@ from ase.calculators.calculator import (
     compare_atoms,
     equal,
 )
+from ase.data import chemical_symbols
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from . import family_registry, neighbor_graph, symmetrix
@@ -36,8 +37,12 @@ from .mace_alchemical import (
     validate_alchemical_model,
 )
 from .neighbor_graph import (
+    FixedCellReuseLimit,
+    NeighborReuseDecision,
     NeighborTopologyReference,
     build_host_neighbor_graph,
+    fixed_cell_reuse_holds,
+    fixed_cell_reuse_limit,
     minimum_image_displacements,
     neighbor_topology_reuse,
     validate_graph_cardinality,
@@ -261,12 +266,50 @@ class _NeighborCache:
     generation: int
     geometry_generation: int
     host_geometry_generation: int
+    # Cutoff plus skin of the topology's candidate list.
+    list_cutoff: float
     device_graph_generation: int = 0
     device_geometry_generation: int = 0
     num_edges: int = 0
     source_key: tuple[str, int] | None = None
     deferred_distances: np.ndarray | None = None
     deferred_xyz: np.ndarray | None = None
+    fixed_cell_reuse: FixedCellReuseLimit | None = None
+
+
+def _unsupported_atomic_numbers(atomic_numbers, supported):
+    """Return, sorted, the atomic numbers present that ``supported`` lacks."""
+
+    atomic_numbers = np.asarray(atomic_numbers).reshape(-1)
+    if (
+        atomic_numbers.size
+        and atomic_numbers.min() >= 0
+        and atomic_numbers.max() < len(chemical_symbols)
+    ):
+        # One counting pass instead of a Python set of every atom.  Counting
+        # is limited to the chemical elements: its memory grows with the
+        # largest value, so any other value takes the sorting path.
+        present = np.flatnonzero(np.bincount(atomic_numbers))
+    else:
+        present = np.unique(atomic_numbers)
+    return sorted(set(present.tolist()) - set(supported))
+
+
+def _neighbor_topology_reference(cache):
+    return NeighborTopologyReference(
+        atomic_numbers=cache.atomic_numbers,
+        pbc=cache.pbc,
+        topology_cell=cache.topology_cell,
+        topology_reference_positions=cache.topology_reference_positions,
+        topology_fractional_positions=cache.topology_fractional_positions,
+        cell=cache.cell,
+        reference_positions=cache.reference_positions,
+    )
+
+
+# The decision the general check reaches on a geometry the fixed-cell limit
+# certifies: reusable, at the same cell.
+_FIXED_CELL_REUSE = NeighborReuseDecision(True, False, None, None, None)
 
 
 @dataclass
@@ -2269,12 +2312,18 @@ class Symmetrix(Calculator):
         cache.device_graph_generation = int(device_graph["generation"])
         cache.device_geometry_generation = cache.geometry_generation
         cache.num_edges = num_edges
+        cache.list_cutoff = self.cutoff + self.neighbor_skin
         cache.topology_cell = np.array(cache.cell, copy=True)
         cache.topology_reference_positions = np.array(positions, copy=True)
         cache.topology_fractional_positions = np.ascontiguousarray(
             positions @ cache.inverse_cell, dtype=float
         )
         cache.reference_positions = np.array(positions, copy=True)
+        cache.fixed_cell_reuse = fixed_cell_reuse_limit(
+            _neighbor_topology_reference(cache),
+            cutoff=self.cutoff,
+            skin=self.neighbor_skin,
+        )
 
     def _sync_low_memory_policy_state(self):
         if not getattr(self, "low_memory_request", False) and not getattr(
@@ -4519,22 +4568,37 @@ class Symmetrix(Calculator):
             # The evaluator released this device graph (an execution-profile
             # change invalidates it), so its token cannot be reused.
             cache = None
+        if cache is not None and self.cutoff + topology_skin > cache.list_cutoff:
+            # The cutoff or skin was raised after this topology was built: its
+            # candidate list is shorter than the one now requested.
+            cache = None
         displacements = None
+        native_reuse = False
         cell_changed = False
         geometry_reference_positions = None
         if cache is not None and (
             allow_device_neighbor_graph or cache.device_graph_generation == 0
         ):
-            reference = NeighborTopologyReference(
-                atomic_numbers=cache.atomic_numbers,
-                pbc=cache.pbc,
-                topology_cell=cache.topology_cell,
-                topology_reference_positions=cache.topology_reference_positions,
-                topology_fractional_positions=cache.topology_fractional_positions,
-                cell=cache.cell,
-                reference_positions=cache.reference_positions,
+            reference = _neighbor_topology_reference(cache)
+            native_route = native_geometry and cache.native_geometry_eligible
+            # The fixed-cell certificate is qualified for direct fixed-weight
+            # evaluation of one structure under native geometry, whether the
+            # host or the device built the graph; joined, explicit-edge,
+            # field-coupled and stateful evaluations keep the general check.
+            fixed_cell_route = (
+                native_route
+                and allow_device_neighbor_graph
+                and source_key is None
+                and not self._has_native_field_coupling()
+                and getattr(
+                    self.evaluator,
+                    "factorized_execution_profile",
+                    "direct_fixed_weight",
+                )
+                == "direct_fixed_weight"
             )
-            reuse = neighbor_topology_reuse(
+            if fixed_cell_route and fixed_cell_reuse_holds(
+                cache.fixed_cell_reuse,
                 reference=reference,
                 atomic_numbers=atomic_numbers,
                 positions=positions,
@@ -4542,12 +4606,28 @@ class Symmetrix(Calculator):
                 pbc=pbc,
                 cutoff=self.cutoff,
                 skin=topology_skin,
-            )
+            ):
+                reuse = _FIXED_CELL_REUSE
+            else:
+                reuse = neighbor_topology_reuse(
+                    reference=reference,
+                    atomic_numbers=atomic_numbers,
+                    positions=positions,
+                    cell=cell,
+                    pbc=pbc,
+                    cutoff=self.cutoff,
+                    skin=topology_skin,
+                )
             cell_changed = reuse.cell_changed
             geometry_reference_positions = reuse.geometry_reference_positions
             if reuse.reusable:
                 if cell_changed:
                     displacements = np.zeros_like(positions)
+                elif native_route:
+                    # Native geometry measures each displacement on the
+                    # device from its own reference; only host edge geometry
+                    # reads host displacements.
+                    native_reuse = True
                 else:
                     displacement_reference = (
                         cache.reference_positions
@@ -4559,7 +4639,7 @@ class Symmetrix(Calculator):
                     )
                 self.neighbor_cache_reuse_count += 1
 
-        if displacements is None:
+        if displacements is None and not native_reuse:
             native_geometry_eligible = True
             fractional_geometry_eligible = bool(np.all(pbc))
             if np.any(pbc):
@@ -4680,6 +4760,7 @@ class Symmetrix(Calculator):
                 generation=self.neighbor_cache_build_count + 1,
                 geometry_generation=self.neighbor_cache_geometry_update_count + 1,
                 host_geometry_generation=0,
+                list_cutoff=self.cutoff + topology_skin,
                 device_graph_generation=device_graph_generation,
                 device_geometry_generation=(
                     self.neighbor_cache_geometry_update_count + 1
@@ -4689,6 +4770,12 @@ class Symmetrix(Calculator):
                 num_edges=num_edges,
                 source_key=source_key,
             )
+            if native_geometry and fractional_geometry_eligible and source_key is None:
+                cache.fixed_cell_reuse = fixed_cell_reuse_limit(
+                    _neighbor_topology_reference(cache),
+                    cutoff=self.cutoff,
+                    skin=topology_skin,
+                )
             self._neighbor_cache = cache
             self.neighbor_cache_build_count += 1
             self.neighbor_cache_geometry_update_count += 1
@@ -4848,9 +4935,9 @@ class Symmetrix(Calculator):
     ):
         if self.alchemical is not None:
             return self._alchemical_inputs(atoms)
-        ase_atomic_numbers = atoms.get_atomic_numbers().tolist()
+        atomic_numbers = atoms.get_atomic_numbers()
         mace_atomic_numbers = self.evaluator.atomic_numbers
-        unsupported = sorted(set(ase_atomic_numbers) - set(mace_atomic_numbers))
+        unsupported = _unsupported_atomic_numbers(atomic_numbers, mace_atomic_numbers)
         if unsupported:
             raise ValueError(
                 f"Model does not support atomic numbers {unsupported}. "
@@ -4909,6 +4996,7 @@ class Symmetrix(Calculator):
             atomic_number: index
             for index, atomic_number in enumerate(mace_atomic_numbers)
         }
+        ase_atomic_numbers = atomic_numbers.tolist()
         node_types = [type_by_atomic_number[value] for value in ase_atomic_numbers]
         num_neigh = np.bincount(i_list, minlength=num_nodes)
         neigh_types = [type_by_atomic_number[ase_atomic_numbers[j]] for j in j_list]

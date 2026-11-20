@@ -4,6 +4,34 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ## 0.2.1 - Unreleased
 
+- A warm ASE call on a fully periodic cell admits its cached neighbor topology
+  with less host work. While the cell equals the cell the topology was built
+  at, a fixed-cell limit precomputed with the topology admits geometries whose
+  largest Cartesian displacement component stays inside both a skin bound and
+  an image bound (no fractional displacement reaches half a cell, so
+  minimum-image rounding keeps every stored image). The limit applies under
+  native geometry whether the host or the device built the graph, and only at
+  the cutoff and skin it was computed for. Everything else (cell changes,
+  partial periodicity, wraps, larger moves, a changed skin, and joined,
+  explicit-edge, field-coupled and stateful evaluations) takes the existing
+  check, which no longer forms host displacements that native geometry never
+  reads. The limit only admits geometries the existing check admits, so
+  rebuild decisions, and therefore energies, forces and stresses, are
+  unchanged. On a 135,000-atom cubic frame the host admission of a warm call
+  falls from 16.8 ms to 0.5 ms at unchanged positions and to 0.8 ms with every
+  atom moved (one CPU thread); a geometry the limit declines pays about 6 ms
+  instead of about 12 ms for the existing check. On a fully periodic cell,
+  `NeighborReuseDecision.maximum_displacement` of a reusable geometry is now
+  the non-affine displacement the check tested (from the topology reference)
+  rather than a second minimum-image displacement from the current geometry
+  reference, and `None` when the limit certified the reuse; the two differ
+  after a cell change.
+- A neighbor topology is rebuilt when a raised `neighbor_skin` (or cutoff)
+  asks for a longer candidate list than the one it was built with; a raise
+  that fits the stored list is reused as before. The reuse check used to test
+  the raised skin against the shorter list, which could drop a pair that had
+  moved inside the cutoff.
+
 ## 0.2.0 - 2026-11-17
 
 ### Execution and JIT

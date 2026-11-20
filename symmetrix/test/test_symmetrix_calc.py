@@ -910,6 +910,208 @@ def test_periodic_direct_neighbor_cache_stays_device_resident(monkeypatch):
     assert calculator.neighbor_cache_reuse_count == 1
 
 
+class _DeviceGraphEvaluator:
+    atomic_numbers = (1,)
+    streamed_edges_mode = "direct"
+
+    def __init__(self):
+        self.graph_calls = 0
+
+    def _prepare_periodic_factorized_graph(self, *_args):
+        self.graph_calls += 1
+        return {"generation": 31, "num_edges": 14}
+
+
+def _count_reuse_checks(monkeypatch):
+    calls = {"general": 0, "minimum_image": 0}
+    general = calculator_module.neighbor_topology_reuse
+    minimum_image = calculator_module.minimum_image_displacements
+
+    def counted_general(**kwargs):
+        calls["general"] += 1
+        return general(**kwargs)
+
+    def counted_minimum_image(*args):
+        calls["minimum_image"] += 1
+        return minimum_image(*args)
+
+    monkeypatch.setattr(calculator_module, "neighbor_topology_reuse", counted_general)
+    monkeypatch.setattr(
+        calculator_module, "minimum_image_displacements", counted_minimum_image
+    )
+    return calls
+
+
+def test_periodic_direct_reuse_takes_the_fixed_cell_certificate(monkeypatch):
+    atoms = Atoms(
+        "H2",
+        scaled_positions=[[0.1, 0.2, 0.3], [0.6, 0.2, 0.3]],
+        cell=[4.0, 4.0, 4.0],
+        pbc=True,
+    )
+    calculator = _bare_neighbor_cache_calculator(cutoff=2.0, skin=0.5)
+    calculator.evaluator = _DeviceGraphEvaluator()
+    calculator._sync_low_memory_policy_state = lambda: None
+    monkeypatch.setenv("SYMMETRIX_NEIGHBOR_BACKEND", "kokkos")
+    calls = _count_reuse_checks(monkeypatch)
+
+    calculator._mace_inputs(atoms, native_geometry=True)
+    assert calculator._neighbor_cache.fixed_cell_reuse is not None
+    built = atoms.positions.copy()
+
+    # Unchanged, then moved inside the 0.5 / (2 sqrt 3) component bound: the
+    # certificate decides and no host displacement is formed.
+    calculator._mace_inputs(atoms, native_geometry=True)
+    atoms.positions[0] += [0.05, -0.05, 0.05]
+    reused = calculator._mace_inputs(atoms, native_geometry=True)
+    assert calls == {"general": 0, "minimum_image": 0}
+    assert calculator.neighbor_cache_reuse_count == 2
+    assert len(reused[3]) == len(reused[7]) == 0
+    assert reused[5] is None and reused[6] is None
+
+    # Beyond the certificate but inside the skin, and a periodic wrap: the
+    # general check decides, still without host displacements.
+    atoms.positions[0] = built[0] + [0.2, 0.0, 0.0]
+    calculator._mace_inputs(atoms, native_geometry=True)
+    atoms.positions[1, 0] -= 4.0
+    calculator._mace_inputs(atoms, native_geometry=True)
+    assert calls == {"general": 2, "minimum_image": 0}
+    assert calculator.neighbor_cache_reuse_count == 4
+
+    # A cell change is the general check's, and so is the next call at the
+    # changed cell; the topology is still the first one.
+    atoms.set_cell([4.004, 4.0, 4.0], scale_atoms=True)
+    calculator._mace_inputs(atoms, native_geometry=True)
+    calculator._mace_inputs(atoms, native_geometry=True)
+    assert calls["general"] == 4
+    assert calculator.neighbor_cache_geometry_update_count == 2
+    assert calculator.neighbor_cache_build_count == 1
+    assert calculator.evaluator.graph_calls == 1
+
+    # Back at the topology cell, one general check moves the cache back to
+    # it; the limit then decides again.
+    atoms.set_cell([4.0, 4.0, 4.0])
+    atoms.positions = built
+    calculator._mace_inputs(atoms, native_geometry=True)
+    calculator._mace_inputs(atoms, native_geometry=True)
+    assert calls == {"general": 5, "minimum_image": 0}
+    assert calculator.neighbor_cache_geometry_update_count == 3
+    assert calculator.neighbor_cache_build_count == 1
+
+
+def test_host_built_periodic_graph_takes_the_fixed_cell_certificate(monkeypatch):
+    atoms = Atoms(
+        "H2",
+        scaled_positions=[[0.1, 0.2, 0.3], [0.6, 0.2, 0.3]],
+        cell=[4.0, 4.0, 4.0],
+        pbc=True,
+    )
+    calculator = _bare_neighbor_cache_calculator(cutoff=2.0, skin=0.5)
+    calculator.evaluator = _DeviceGraphEvaluator()
+    monkeypatch.setenv("SYMMETRIX_NEIGHBOR_BACKEND", "host")
+    calls = _count_reuse_checks(monkeypatch)
+
+    calculator._mace_inputs(atoms, native_geometry=True)
+    atoms.positions[0] += [0.05, -0.05, 0.05]
+    calculator._mace_inputs(atoms, native_geometry=True)
+
+    assert calculator.neighbor_graph_backend == "host"
+    assert calculator.evaluator.graph_calls == 0
+    assert calls == {"general": 0, "minimum_image": 0}
+    assert calculator.neighbor_cache_reuse_count == 1
+
+
+def test_fixed_cell_certificate_leaves_other_routes_to_the_general_check(
+    monkeypatch,
+):
+    calls = _count_reuse_checks(monkeypatch)
+    # One test rather than a parametrization: the routine test selection keeps
+    # only the first case of a parametrized test, and every route matters.
+    for route in ("field", "stateful", "explicit_host_edges", "partial_pbc"):
+        atoms = Atoms(
+            "H2",
+            scaled_positions=[[0.1, 0.2, 0.3], [0.6, 0.2, 0.3]],
+            cell=[4.0, 4.0, 4.0],
+            pbc=[True, True, route != "partial_pbc"],
+        )
+        calculator = _bare_neighbor_cache_calculator(cutoff=2.0, skin=0.5)
+        evaluator = _DeviceGraphEvaluator()
+        if route == "field":
+            evaluator.has_field_coupling = True
+        if route == "stateful":
+            evaluator.factorized_execution_profile = "stateful"
+        calculator.evaluator = evaluator
+        calculator._sync_low_memory_policy_state = lambda: None
+        # A caller that supplies its own host edges does not allow a device
+        # graph.
+        allow_device = route != "explicit_host_edges"
+        calls.update(general=0, minimum_image=0)
+        with monkeypatch.context() as patch:
+            if route == "field":
+                patch.setenv("SYMMETRIX_NEIGHBOR_BACKEND", "kokkos")
+            else:
+                patch.delenv("SYMMETRIX_NEIGHBOR_BACKEND", raising=False)
+            for _ in range(2):
+                calculator._mace_inputs(
+                    atoms,
+                    native_geometry=True,
+                    allow_device_neighbor_graph=allow_device,
+                )
+
+        assert calls["general"] == 1, route
+        assert calculator.neighbor_cache_reuse_count == 1, route
+        assert calculator.neighbor_cache_build_count == 1, route
+
+
+def test_fixed_cell_certificate_follows_the_neighbor_skin(monkeypatch):
+    atoms = Atoms(
+        "H2",
+        positions=[[1.0, 1.0, 1.0], [4.0, 1.0, 1.0]],
+        cell=[12.0, 12.0, 12.0],
+        pbc=True,
+    )
+    calculator = _bare_neighbor_cache_calculator(cutoff=6.0, skin=0.5)
+    calculator.evaluator = _DeviceGraphEvaluator()
+    calculator._sync_low_memory_policy_state = lambda: None
+    monkeypatch.setenv("SYMMETRIX_NEIGHBOR_BACKEND", "kokkos")
+    calls = _count_reuse_checks(monkeypatch)
+    calculator._mace_inputs(atoms, native_geometry=True)
+
+    # The limit was computed for skin 0.5.  At skin 0.1 a 0.1 A move needs
+    # the general check, which rejects it, so the topology is rebuilt.
+    calculator.neighbor_skin = 0.1
+    atoms.positions[0, 0] += 0.1
+    calculator._mace_inputs(atoms, native_geometry=True)
+    assert calls["general"] == 1
+    assert calculator.neighbor_cache_reuse_count == 0
+    assert calculator.neighbor_cache_build_count == 2
+
+    # A raised skin asks for a longer candidate list than the topology built
+    # at skin 0.1 holds, so the topology is rebuilt before any reuse check.
+    calculator.neighbor_skin = 0.5
+    atoms.positions[0, 0] += 0.01
+    calculator._mace_inputs(atoms, native_geometry=True)
+    assert calls["general"] == 1
+    assert calculator.neighbor_cache_build_count == 3
+    assert calculator.evaluator.graph_calls == 3
+
+    # At the skin it was built for, the new topology takes the certificate.
+    atoms.positions[0, 0] += 0.01
+    calculator._mace_inputs(atoms, native_geometry=True)
+    assert calls == {"general": 1, "minimum_image": 0}
+    assert calculator.neighbor_cache_reuse_count == 1
+
+
+def test_unsupported_atomic_number_is_named_whatever_its_size():
+    calculator = _bare_neighbor_cache_calculator()
+    atoms = Atoms(numbers=[2147483647], positions=[[0.0, 0.0, 0.0]])
+
+    with pytest.raises(ValueError, match="2147483647"):
+        calculator._mace_inputs(atoms)
+    assert calculator_module._unsupported_atomic_numbers([1, 1, 8, 1], [1]) == [8]
+    assert calculator_module._unsupported_atomic_numbers([-3, 1], [1]) == [-3]
+
+
 @pytest.mark.parametrize(
     ("backend_request", "eligible", "num_atoms", "execution_space", "expected"),
     (
