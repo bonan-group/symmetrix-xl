@@ -19,9 +19,17 @@ and dispatch **from the matching tag** (`v<version>`).
 
 ## One-time repository setup
 
-* Trusted Publisher on PyPI for `symmetrix-xl` (and each add-on project)
-  scoped to this repository, workflow file name, and the `pypi` environment.
-* GitHub environments `pypi` and `testpypi` with any required approvers.
+* Trusted Publisher on PyPI for `symmetrix-xl` scoped to this repository,
+  `release-cpu-wheels.yaml`, and the `pypi` environment, plus the same for
+  `testpypi` if the rehearsal is used.
+* Trusted Publisher on each CUDA add-on project (`symmetrix-xl-cuda12-*`,
+  `symmetrix-xl-cuda13-*`) scoped to `release-cuda-wheels.yaml` and its
+  environment: `pypi-cuda<MAJOR>-<TARGET>` for PyPI (for example
+  `pypi-cuda13-sm120`) and `testpypi-cuda<MAJOR>-<TARGET>` for the TestPyPI
+  rehearsal. The publishing jobs request these environment names in their
+  OIDC claims; a publisher scoped to plain `pypi` is rejected.
+* GitHub environments `pypi`, `testpypi`, and the per-target CUDA names
+  above, with any required approvers.
 * A self-hosted CUDA runner registered with labels
   `self-hosted,linux,x64,cuda` for qualification (see below).
 

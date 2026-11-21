@@ -46,7 +46,8 @@ jobs:
     name: Build CUDA ${{ matrix.cuda_major }} ${{ matrix.target }}
     needs: release-metadata
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Recorded CUDA release builds run 150-240 minutes per ABI/target.
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
