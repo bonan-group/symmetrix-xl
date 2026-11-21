@@ -282,6 +282,7 @@ jobs:
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -c "import torch; assert torch.cuda.is_available() is False"
+          pip install mace-torch e3nn
           python -m pytest -q -m "not extended" symmetrix/test/test_family_registry.py symmetrix/test/test_mace_polar_frontend.py
 
   publish:
