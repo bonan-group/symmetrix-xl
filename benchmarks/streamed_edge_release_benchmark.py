@@ -290,7 +290,6 @@ def make_calculator(args):
     else:
         calculator = Symmetrix(
             args.compact_model,
-            use_kokkos=True,
             dtype=args.dtype,
             streamed_edges=args.mode,
             low_memory=args.low_memory,

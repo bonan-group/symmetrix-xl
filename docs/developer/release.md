@@ -82,3 +82,11 @@ Never point `self-hosted` labels at workflows that run fork pull requests.
 * CUDA and HIP qualification steps are manifest-driven: they run from
   `symmetrix` and pass the `required_nodes` of
   `symmetrix/test/*_required_tests.json` directly to pytest.
+* Known issue (vendored gpulite, targeted 0.2.1): the sphericart CUDA
+  runtime-compile path resolves NVRTC by prefix-matching loaded modules
+  against `libnvrtc`, which also matches `libnvrtc-builtins.so`; when the
+  builtins library is mapped before the real NVRTC library, device-graph
+  construction fails with `Failed to load function: nvrtcCreateProgram` (an
+  `undefined symbol` naming the builtins path). Until the sphericart pin is
+  bumped, work around it on CUDA by preloading a real NVRTC library, e.g.
+  `LD_PRELOAD=/usr/local/cuda-13.3/lib64/libnvrtc.so.13`.
