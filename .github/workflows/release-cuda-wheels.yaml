@@ -62,6 +62,13 @@ jobs:
         with:
           submodules: recursive
 
+      # ubuntu-latest may not ship a python3.12 binary (the 26.04 image
+      # moved past it); provision the exact interpreter the wheel check
+      # installs the cp312 wheel with.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
       - name: Build and repair in the manylinux CUDA container
         env:
           CUDA_MAJOR: ${{ matrix.cuda_major }}
