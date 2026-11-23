@@ -46,6 +46,13 @@ def _canonical_host_target(target: str) -> str:
     return load_build_source_module("jit").canonical_host_artifact_target(target)
 
 
+def _canonical_cuda_target(target: str) -> str:
+    # The CMake bake passes the nvcc spelling (``sm_120``) while release
+    # tooling and wheel descriptors use the selector spelling (``sm120``);
+    # artifact identities must not depend on which spelling was used.
+    return re.sub(r"\Asm_(\d+)\Z", r"sm\1", target.strip().lower())
+
+
 def effective_prebuilt_host_target(
     *, declared_target: str, host_arch: str, compile_flags: list[str] | tuple[str, ...]
 ) -> str:
@@ -237,6 +244,8 @@ def write_installed_operator_catalog(
         raise ValueError("target must not be empty")
     if backend == "host":
         target = _canonical_host_target(target)
+    elif backend == "cuda":
+        target = _canonical_cuda_target(target)
     source_content_sha256 = _complete_sha256(
         source_content_sha256, "source_content_sha256"
     )
@@ -379,6 +388,8 @@ def plan_foundation_operator_artifacts(
         raise ValueError("target must not be empty")
     if backend == "host":
         target = _canonical_host_target(target)
+    elif backend == "cuda":
+        target = _canonical_cuda_target(target)
     if _SOURCE_SHA256.fullmatch(source_content_sha256) is None:
         raise ValueError("source_content_sha256 must be a SHA-256 digest")
 
@@ -496,6 +507,8 @@ def _foundation_requests(
 ) -> list[tuple[str, dict[str, Any]]]:
     if backend == "host":
         target = _canonical_host_target(target)
+    elif backend == "cuda":
+        target = _canonical_cuda_target(target)
     foundation, version = _build_modules()
     r0_schedule = "host-owner" if backend == "host" else "receiver-edge16"
     requests: list[tuple[str, dict[str, Any]]] = [
@@ -569,6 +582,8 @@ def render_foundation_operator_artifact(
 
     if backend == "host":
         target = _canonical_host_target(target)
+    elif backend == "cuda":
+        target = _canonical_cuda_target(target)
     foundation, version = _build_modules()
     manifest = foundation.load_foundation_operator_manifest(manifest_path)
     selected = next(
@@ -678,6 +693,8 @@ def render_foundation_r0_artifact(
 
     if backend == "host":
         target = _canonical_host_target(target)
+    elif backend == "cuda":
+        target = _canonical_cuda_target(target)
 
     plan = plan_foundation_operator_artifacts(
         manifest_path=manifest_path,
