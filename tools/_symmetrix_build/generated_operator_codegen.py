@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -136,9 +137,10 @@ def generated_r1_metadata(
             contract, precision=precision, target=target
         )
     elif backend == "cuda":
-        if not target.startswith("sm_") or not target[3:].isdigit():
+        match = re.fullmatch(r"sm_?(\d+)", target.strip().lower())
+        if match is None:
             raise ValueError("CUDA R1 target must use sm_NN spelling")
-        compute_capability = int(target[3:])
+        compute_capability = int(match.group(1))
         metadata = codegen.jit_r1_cuda_plugin_metadata(
             contract, compute_capability, precision=precision
         )
