@@ -2,7 +2,7 @@
 
 All notable changes to Symmetrix-XL are documented in this file.
 
-## Unreleased
+## 0.1.3 - 2026-11-24
 
 - Fixed a race in the built-in R0 reverse prepare on GPUs
   (`StandardR0::reverse_prepare`): with the precomputed scale adjoint of the
