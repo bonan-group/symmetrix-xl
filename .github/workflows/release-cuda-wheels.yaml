@@ -139,6 +139,7 @@ jobs:
         run: |
           mkdir -p release-manifest
           (cd wheelhouse/release && sha256sum *.whl) > release-manifest/SHA256SUMS
+          cp wheelhouse/release/*.auditwheel.txt release-manifest/
           cat release-manifest/SHA256SUMS
 
       - name: Upload wheel and audit manifest artifacts
@@ -152,9 +153,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cuda${{ matrix.cuda_major }}-${{ matrix.target }}-audit
-          path: |
-            wheelhouse/release/*.auditwheel.txt
-            release-manifest/SHA256SUMS
+          path: release-manifest
           if-no-files-found: error
 
 
