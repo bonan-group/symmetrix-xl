@@ -356,6 +356,16 @@ void MACEKokkos<Precision>::compute_node_energies_forces(
     } else if (mace_uses_prepared_execution(streamed_edges)) {
         factorized_fallback_evaluation_count += 1;
     }
+    // Tiled plans rebuild edge geometry per tile from a registered source and return
+    // per-atom forces; edge vectors that are neither registered nor the prepared
+    // workspace would be ignored.
+    if ((single_layer_tiled_plan_active || dual_layer_tiled_plan_active)
+        && xyz.extent(0) != 0
+        && xyz.data() != single_layer_explicit_xyz_device.data()
+        && xyz.data() != execution_prepared_xyz.data())
+        throw std::invalid_argument(
+            "A fixed-workspace tiled plan rebuilds edge geometry from positions and "
+            "does not read edge vectors passed to compute_node_energies_forces.");
 
     validate_graph_cardinality(
         static_cast<std::size_t>(num_nodes),

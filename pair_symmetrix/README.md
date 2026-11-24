@@ -119,6 +119,8 @@ Bounded fixed-workspace plans are disabled by default. Add
 `allow_fixed_workspace yes` alongside `profile capacity` to permit their
 selection when the planner determines that they reduce the graph memory
 requirement. The option permits selection and does not force a tiled plan.
+Fixed-workspace plans run under `mpi_message_passing`;
+`no_domain_decomposition` refuses them during `pair_style`.
 
 Single-layer direct MPI evaluates owned receivers and local-plus-ghost sources
 without communicating H1 or H1 adjoints. Retained single-layer plans are

@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import json
 import logging
@@ -537,3 +538,137 @@ def test_compact_radial_values_and_derivatives_match_pair_splines(
         )
         assert np.all(np.isfinite(getattr(compact_model, values_name)))
         assert np.all(np.isfinite(getattr(compact_model, derivatives_name)))
+
+
+def _two_layer_correlation3_mace_model():
+    from mace import modules
+
+    with torch.serialization.safe_globals([slice]):
+        from e3nn import o3
+
+    torch.manual_seed(123)
+    model = modules.ScaleShiftMACE(
+        r_max=5.0,
+        num_bessel=3,
+        num_polynomial_cutoff=5,
+        max_ell=3,
+        interaction_cls=modules.interaction_classes[
+            "RealAgnosticResidualInteractionBlock"
+        ],
+        interaction_cls_first=modules.interaction_classes[
+            "RealAgnosticInteractionBlock"
+        ],
+        num_interactions=2,
+        num_elements=3,
+        hidden_irreps=o3.Irreps("2x0e + 2x1o"),
+        MLP_irreps=o3.Irreps("2x0e"),
+        gate=torch.nn.functional.silu,
+        atomic_energies=np.array([-13.6, -1000.0, -2040.0]),
+        avg_num_neighbors=8.0,
+        atomic_numbers=[1, 6, 8],
+        correlation=3,
+        radial_type="bessel",
+        atomic_inter_shift=0.0,
+        atomic_inter_scale=1.0,
+    )
+    return model.eval()
+
+
+def _flip_u_column(contraction, correlation, column):
+    # Negating one U column and its weights leaves the MACE function unchanged,
+    # but a recomputed U no longer matches the fitted weights.
+    if correlation == contraction.correlation:
+        weights = contraction.weights_max
+    else:
+        weights = contraction.weights[contraction.correlation - correlation - 1]
+    with torch.no_grad():
+        getattr(contraction, f"U_matrix_{correlation}")[..., column] *= -1
+        weights[:, column, :] *= -1
+
+
+def _symmetrix_energy_forces(data, path):
+    from ase import Atoms
+    from symmetrix import Symmetrix
+
+    path.write_text(json.dumps(data, separators=(",", ":")))
+    atoms = Atoms(
+        "COHHO",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.21, 0.05, -0.03],
+            [-0.62, 0.91, 0.12],
+            [-0.58, -0.94, 0.21],
+            [2.3, 1.1, 0.6],
+        ],
+        cell=[14.0, 14.0, 14.0],
+        pbc=True,
+    )
+    atoms.calc = Symmetrix(str(path), dtype="float64", streamed_edges="non-compiled")
+    return atoms.get_potential_energy(), atoms.get_forces().copy()
+
+
+@pytest.mark.parametrize(
+    ("product", "contraction", "correlation", "column"),
+    [(0, 1, 1, 0), (0, 1, 3, 2), (1, 0, 1, 0), (1, 0, 3, 3)],
+    ids=["M0-l1-nu1", "M0-l1-nu3", "M1-nu1", "M1-nu3"],
+)
+def test_export_takes_u_column_signs_from_the_checkpoint(
+    tmp_path, product, contraction, correlation, column
+):
+    from symmetrix.extract_mace_data import _extract_single_head_data
+
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        model = _two_layer_correlation3_mace_model()
+        reference = _extract_single_head_data(
+            model, radial_format="compact", num_spline_points=64
+        )
+        target = model.products[product].symmetric_contractions.contractions[
+            contraction
+        ]
+        _flip_u_column(target, correlation, column)
+        flipped = _extract_single_head_data(
+            model, radial_format="compact", num_spline_points=64
+        )
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+    reference_energy, reference_forces = _symmetrix_energy_forces(
+        reference, tmp_path / "reference.json"
+    )
+    flipped_energy, flipped_forces = _symmetrix_energy_forces(
+        flipped, tmp_path / "flipped.json"
+    )
+    assert flipped_energy == pytest.approx(reference_energy, abs=1e-12)
+    np.testing.assert_allclose(flipped_forces, reference_forces, rtol=0, atol=1e-12)
+    # Byte-identical export; compare digests so a failure prints no weights.
+    digests = [
+        hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in ("flipped.json", "reference.json")
+    ]
+    assert digests[0] == digests[1]
+
+
+def test_export_refuses_a_u_buffer_in_another_basis():
+    from symmetrix.extract_mace_data import _extract_single_head_data
+
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        model = _two_layer_correlation3_mace_model()
+        target = model.products[0].symmetric_contractions.contractions[1]
+        with torch.no_grad():
+            target.U_matrix_3[..., [0, 1]] = target.U_matrix_3[..., [1, 0]].clone()
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"products\[0\] contraction 1 \(irrep 1o\), correlation 3 does "
+                r"not match the checkpoint's U_matrix_3 buffer in column\(s\) \[0, 1\]"
+            ),
+        ):
+            _extract_single_head_data(
+                model, radial_format="compact", num_spline_points=64
+            )
+    finally:
+        torch.set_default_dtype(previous_dtype)

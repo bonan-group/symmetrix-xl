@@ -291,6 +291,27 @@ def test_dual_layer_rejects_host_backend(dual_layer_model):
         calculator.calculate(_atoms(3), properties=["energy"])
 
 
+def test_dual_layer_rejects_edge_vector_entry(dual_layer_model):
+    _require_cuda_backend()
+    calculator = _calculator(dual_layer_model, PLAN, capacity=4)
+    evaluator = calculator.evaluator
+    inputs = calculator._mace_inputs(_atoms(5))
+    generation = evaluator._prepare_factorized_graph(*inputs[:5])
+    assert calculator.execution_plan["selected_id"] == PLAN
+    empty = np.empty(0, dtype=np.int32)
+    with pytest.raises(ValueError, match="does not read edge vectors"):
+        evaluator.compute_node_energies_forces(
+            inputs[0],
+            empty,
+            empty,
+            empty,
+            empty,
+            np.ascontiguousarray(inputs[5], dtype=np.float64).reshape(-1),
+            np.ascontiguousarray(inputs[6], dtype=np.float64).reshape(-1),
+            generation,
+        )
+
+
 @pytest.mark.parametrize("skin", (0.0, 0.5))
 def test_normal_two_layer_execution_does_not_select_dual_plan(dual_layer_model, skin):
     _require_cuda_backend()

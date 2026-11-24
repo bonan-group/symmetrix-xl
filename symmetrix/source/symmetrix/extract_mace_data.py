@@ -1,6 +1,8 @@
 import importlib
 import itertools
 import logging
+import sys
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +35,9 @@ from .h1_affine import (
 _MACE_FIELD_MODULE = "mace.modules.extensions"
 _MACE_MODELS_MODULE = "mace.modules.models"
 _OMAT24_AVG_NUM_NEIGHBORS = 61.964672446250916
+# Models rebuilt from a packed CuEq training state.  That state stores no U
+# matrices, so their U buffers come from the installed MACE, not the checkpoint.
+_RECONSTRUCTED_U_BUFFER_MODELS = weakref.WeakSet()
 
 
 def _is_single_layer_training_checkpoint(value):
@@ -153,6 +158,7 @@ def _reconstruct_single_layer_training_checkpoint(checkpoint, model_path, device
             )
         target_state[key] = source.reshape(target.shape)
     model.load_state_dict(target_state)
+    _RECONSTRUCTED_U_BUFFER_MODELS.add(model)
     return model.to(device)
 
 
@@ -271,6 +277,75 @@ def _compact_irreps_to_native(values, num_channels, L_max):
         ].reshape(values.shape[0], num_channels, components).transpose(0, 2, 1)
         offset += block_size
     return native
+
+
+# Largest |aligned - checkpoint| accepted for a recomputed U column, relative to
+# max|checkpoint U|.  It admits a float32 checkpoint buffer next to a float64
+# recomputation and refuses any other basis.
+_U_MATRIX_ALIGNMENT_RTOL = 1e-6
+
+
+def _align_u_matrix_to_checkpoint(u_matrix, contraction, correlation, site, warned):
+    """Return the recomputed ``u_matrix`` with each column's sign taken from the
+    checkpoint's own ``U_matrix_<correlation>`` buffer.
+
+    The weights of a symmetric contraction were fitted against the U stored in
+    the checkpoint.  A recomputed U can choose the opposite sign for some
+    coupling paths, and the exported polynomial would then be a different
+    function.  Columns are matched by position only; the recomputed values are
+    kept, so a float64 recomputation stays exact for a float32 checkpoint.  A
+    column that matches neither sign refuses the export.
+    """
+
+    buffer = getattr(contraction, f"U_matrix_{correlation}", None)
+    if not isinstance(buffer, torch.Tensor):
+        if not warned:
+            print(
+                f"symmetrix: warning: {site} has no checkpoint U_matrix_{correlation} "
+                "buffer; the recomputed U is used without a basis check.",
+                file=sys.stderr,
+            )
+        warned.append((site, correlation))
+        return u_matrix
+    location = f"{site}, correlation {correlation}"
+    if tuple(buffer.shape) != tuple(u_matrix.shape):
+        raise RuntimeError(
+            f"The recomputed U matrix of {location} has shape "
+            f"{tuple(u_matrix.shape)}, but the checkpoint stores "
+            f"{tuple(buffer.shape)}."
+        )
+    if u_matrix.numel() == 0:
+        return u_matrix
+    columns = u_matrix.shape[-1]
+    recomputed = u_matrix.detach().to(device="cpu", dtype=torch.float64)
+    recomputed = recomputed.reshape(-1, columns)
+    stored = buffer.detach().to(device="cpu", dtype=torch.float64)
+    stored = stored.reshape(-1, columns)
+    flip = (recomputed * stored).sum(dim=0) < 0
+    aligned = torch.where(flip, -recomputed, recomputed)
+    bound = _U_MATRIX_ALIGNMENT_RTOL * float(stored.abs().max())
+    deviation = (aligned - stored).abs().amax(dim=0)
+    rejected = torch.nonzero(~(deviation <= bound)).flatten().tolist()
+    if rejected:
+        raise RuntimeError(
+            f"The recomputed U matrix of {location} does not match the "
+            f"checkpoint's U_matrix_{correlation} buffer in column(s) "
+            f"{rejected[:8]}{' ...' if len(rejected) > 8 else ''} of {columns}: "
+            f"max |difference| {float(deviation.max()):.3e} exceeds "
+            f"{bound:.3e} under either sign. The checkpoint was built with a "
+            "different coupling basis; refusing to export."
+        )
+    if not bool(flip.any()):
+        return u_matrix
+    logging.info(
+        "%s: took the sign of %d of %d U columns from the checkpoint",
+        location,
+        int(flip.sum()),
+        columns,
+    )
+    flipped = u_matrix.clone()
+    flipped[..., flip.to(device=u_matrix.device)] *= -1
+    return flipped
 
 
 def _remove_prediction_head(model, head, device):
@@ -1010,7 +1085,16 @@ def _extract_single_head_data(
     #   * `irrep_out` is essentially l_out
     #   * `irreps_in` essentially provides l_in_max
     #   * `corr_in_max` is the max correlation order
-    def U_sparse(irrep_out, irreps_in, corr_in_max, input_l_max=l_max):
+    # One stderr line per export if a contraction has no checkpoint U buffer.
+    u_buffer_warned = []
+    u_buffers_from_checkpoint = model not in _RECONSTRUCTED_U_BUFFER_MODELS
+
+    def checkpoint_contraction(contraction):
+        return contraction if u_buffers_from_checkpoint else None
+
+    def U_sparse(
+        irrep_out, irreps_in, corr_in_max, input_l_max=l_max, *, contraction, site
+    ):
         U = [[]]  # list of lists because U[0] should be empty
         use_reduced_cg = bool(getattr(model, "use_reduced_cg", False))
         for corr in range(1, corr_in_max + 1):
@@ -1024,6 +1108,9 @@ def _extract_single_head_data(
                 )[1]
             except TypeError:
                 U_matrix = U_matrix_real(irreps_in, [irrep_out], corr)[1]
+            U_matrix = _align_u_matrix_to_checkpoint(
+                U_matrix, contraction, corr, site, u_buffer_warned
+            )
             if irrep_out.l == 0:  # makes U_matrix.shape consistent with l>0 cases
                 U_matrix = U_matrix.unsqueeze(0)
             num_eta = U_matrix.shape[-1]
@@ -1055,15 +1142,24 @@ def _extract_single_head_data(
     # for foundation models with many elements.
     u_sparse_cache = {}
 
-    def cached_u_sparse(irrep_out):
+    def cached_u_sparse(index, irrep_out):
         key = (
+            index,
             str(irrep_out),
             tuple(str(value) for value in irreps_in),
             correlation,
             l_max,
         )
         if key not in u_sparse_cache:
-            u_sparse_cache[key] = U_sparse(irrep_out, irreps_in, correlation)
+            u_sparse_cache[key] = U_sparse(
+                irrep_out,
+                irreps_in,
+                correlation,
+                contraction=checkpoint_contraction(
+                    model.products[0].symmetric_contractions.contractions[index]
+                ),
+                site=f"products[0] contraction {index} (irrep {irrep_out})",
+            )
         return u_sparse_cache[key]
 
     C = {}
@@ -1073,7 +1169,7 @@ def _extract_single_head_data(
         C[i] = {}
         for l, irrep_out in enumerate(irreps_out):
             # extract U in sparse format
-            U = cached_u_sparse(irrep_out)
+            U = cached_u_sparse(l, irrep_out)
             # extract weights from model
             # warning: slightly odd order of the contractions weights due to reverse countdown
             W = [[]]  # list of lists because W[0] should be empty
@@ -1111,7 +1207,7 @@ def _extract_single_head_data(
     output["M0_weights"] = C
     output["M0_monomials"] = M
 
-    def extract_scalar_contraction(product, input_l_max):
+    def extract_scalar_contraction(product, input_l_max, product_name):
         contraction = product.symmetric_contractions.contractions[0]
         contraction_correlation = contraction.correlation
         irreps_in = Irreps([ir[1] for ir in product.symmetric_contractions.irreps_in])
@@ -1120,6 +1216,8 @@ def _extract_single_head_data(
             irreps_in,
             contraction_correlation,
             input_l_max,
+            contraction=checkpoint_contraction(contraction),
+            site=f"{product_name} contraction 0 (irrep 0e)",
         )
 
         weights = [[]]
@@ -1231,7 +1329,7 @@ def _extract_single_head_data(
         output["single_layer_readout"] = True
         output["readout_correlation"] = readout_correlation
         output["M1_weights"], output["M1_monomials"] = extract_scalar_contraction(
-            readout_product, L_max
+            readout_product, L_max, "readout_products[0]"
         )
         # No second interaction: the first readout and the skip are zero.
         output[h2_skip_key] = [
@@ -1530,6 +1628,15 @@ def _extract_single_head_data(
             )[1]
         except TypeError:
             U_matrix = U_matrix_real(irreps_in, irreps_out, corr)[1]
+        U_matrix = _align_u_matrix_to_checkpoint(
+            U_matrix,
+            checkpoint_contraction(
+                model.products[1].symmetric_contractions.contractions[0]
+            ),
+            corr,
+            "products[1] contraction 0 (irrep 0e)",
+            u_buffer_warned,
+        )
         num_nu = U_matrix.shape[-1]
         U_matrix = U_matrix.flatten()
         # extract sparse U for this correlation order

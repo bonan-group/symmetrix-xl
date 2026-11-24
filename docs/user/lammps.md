@@ -232,6 +232,8 @@ enables fixed workspace.
 `allow_fixed_workspace` defaults to `no`. Set it to `yes` only with
 `profile capacity` to permit bounded tiled workspace selection; it does not
 force that plan when another qualified capacity plan is preferred.
+Fixed-workspace plans run under `mpi_message_passing`;
+`no_domain_decomposition` refuses `allow_fixed_workspace yes`.
 Single-layer direct MPI does not require an R1 artifact. Its retained plan is
 backend-independent; its fixed-workspace plan currently requires CUDA.
 Dual-layer fixed-workspace MPI requires an ordinary two-layer standard-MACE
