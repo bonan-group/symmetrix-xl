@@ -181,8 +181,11 @@ def _kokkos_arguments():
     return [*arguments, "-sf", "kk"]
 
 
-def _run_case(tmp_path, label, model, pair_style, atom_map, package_options=""):
+def _run_case(
+    tmp_path, label, model, pair_style, atom_map, package_options="", coeff_style=""
+):
     log_path = tmp_path / f"{label}.log"
+    coeff = f"{coeff_style} {model}".strip()
     atoms = "\n".join(
         f"create_atoms {kind} single {x} {y} {z} units box"
         for kind, x, y, z in _POSITIONS
@@ -200,7 +203,7 @@ create_box      2 box
 mass            1 1.008
 mass            2 15.999
 pair_style      {pair_style}
-pair_coeff      * * {model} H O
+pair_coeff      * * {coeff} H O
 neighbor        1.0 bin
 neigh_modify    every 2 delay 0 check no
 timestep        0.0001
@@ -399,4 +402,40 @@ def test_kokkos_hashed_atom_map_matches_array_map(
         )
         np.testing.assert_allclose(
             hashed[stage]["forces"], expected_forces, rtol=1.0e-12, atol=1.0e-10
+        )
+
+
+def test_hybrid_overlay_message_passing_matches_the_plain_style(
+    tmp_path, compact_model_path
+):
+    # Comm::init sizes the host communication buffers from force->pair, which
+    # under pair_style hybrid/overlay is the wrapper. The wrapper copies its
+    # sub-styles' message sizes in settings(), before pair_coeff loads the
+    # model, so the pair style raises them in init_style(). This model sends 96
+    # values per atom, against 6 for the atomic style's borders; on one rank
+    # every swap goes through those buffers, and a wrapper left at the atom
+    # style's size made the per-atom message passing write past them. The plain
+    # style sizes the buffers itself and is the reference.
+    style = "symmetrix/mace mpi_message_passing streamed_edges generic"
+    plain = _run_case(tmp_path, "plain-mpi", compact_model_path, style, "array")
+    hybrid = _run_case(
+        tmp_path,
+        "hybrid-overlay-mpi",
+        compact_model_path,
+        f"hybrid/overlay {style}",
+        "array",
+        coeff_style="symmetrix/mace",
+    )
+
+    for result in (plain, hybrid):
+        assert result["natoms"] == len(_POSITIONS)
+        assert "resolved='generic'" in result["log_text"]
+    for stage in ("initial", "final"):
+        expected_forces = np.asarray(plain[stage]["forces"])
+        assert np.max(np.abs(expected_forces)) > 0.0
+        assert hybrid[stage]["pe"] == pytest.approx(
+            plain[stage]["pe"], rel=1.0e-12, abs=1.0e-10
+        )
+        np.testing.assert_allclose(
+            hybrid[stage]["forces"], expected_forces, rtol=1.0e-12, atol=1.0e-10
         )
