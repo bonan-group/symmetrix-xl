@@ -4,6 +4,12 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ## Unreleased
 
+- Fixed a race in the built-in R0 reverse prepare on GPUs
+  (`StandardR0::reverse_prepare`): with the precomputed scale adjoint of the
+  MH-0 adjoint reuse, a warp or wave could read `density_state(receiver)`
+  after another had overwritten it, giving wrong forces with correct energies
+  on models with A0 density scaling such as OMAT-0. A team barrier now
+  orders the two; the values are otherwise unchanged.
 - Fixed the A1 channel-tile kernels of the Phi1 `channel-tiled-64` policy,
   which the CUDA dual-layer fixed-workspace plan selects: they read the
   evaluator's channel count through the host object pointer, which a GPU can
