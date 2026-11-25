@@ -265,7 +265,7 @@ def test_cuda_chunk32_product_metadata_is_disjoint_only(operator, precision):
     source, metadata = render(
         contract, precision=precision, target=target, schedule="chunk32"
     )
-    assert metadata["schedule_revision"] == (2 if operator == "M0" else 3)
+    assert metadata["schedule_revision"] == 3
     assert metadata["capabilities"] & (1 << 2) == 0
     assert f"symmetrix_operator_capabilities_v1 = {metadata['capabilities']}u" in source
 
@@ -1079,8 +1079,8 @@ def test_cuda_low_memory_runtime_specializes_custom_m0_r0(
             (
                 "old-schedule-revision",
                 m0_source.replace(
+                    "symmetrix_operator_schedule_revision_v1 = 3;",
                     "symmetrix_operator_schedule_revision_v1 = 2;",
-                    "symmetrix_operator_schedule_revision_v1 = 1;",
                 ),
                 "schedule profile|launch geometry",
             ),

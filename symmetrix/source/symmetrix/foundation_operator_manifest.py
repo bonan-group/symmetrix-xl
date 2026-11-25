@@ -678,11 +678,7 @@ def foundation_m0_artifact_inputs(
                 ),
                 schedule=schedule,
                 schedule_revision=(
-                    3
-                    if schedule == "tiled128x4-v1"
-                    else 2
-                    if schedule == "chunk32"
-                    else 1
+                    2 if backend == "host" or schedule == "table" else 3
                 ),
             )
             request = requests.setdefault(
