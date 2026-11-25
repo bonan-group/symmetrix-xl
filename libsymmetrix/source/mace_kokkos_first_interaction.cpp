@@ -1943,19 +1943,24 @@ void MACEKokkos<Precision>::compute_M0(int num_nodes, Kokkos::View<const int*> n
         Kokkos::deep_copy(execution_space, M0, Precision(0));
     else
         Kokkos::deep_copy(M0, Precision(0));
+    bool regrown = M0_poly_values_device.extent(0) != M0_poly_values.extent(0);
     for (int LM=0; LM<num_LM; ++LM) {
-        if (M0_poly_values(LM).extent(0) < num_nodes)
+        if (M0_poly_values(LM).extent(0) < num_nodes) {
             M0_poly_values(LM) = Kokkos::View<Precision***,Kokkos::LayoutRight>(
                 Kokkos::view_alloc(std::string("M0_poly_values_")+std::to_string(LM),Kokkos::WithoutInitializing),
                 num_nodes, M0_poly_coeff(LM).extent(1), num_channels);
+            regrown = true;
+        }
     }
+    if (regrown)
+        fill_device_handles(
+            M0_poly_values_device, M0_poly_values,
+            "M0_poly_values device handles");
 
     const auto A0 = this->A0;
-    const auto M0_monomials = this->M0_monomials;
-    const auto M0_weights = this->M0_weights;
-    const auto M0_poly_spec = this->M0_poly_spec;
-    const auto M0_poly_coeff = this->M0_poly_coeff;
-    const auto M0_poly_values = this->M0_poly_values;
+    const auto M0_poly_spec = this->M0_poly_spec_device;
+    const auto M0_poly_coeff = this->M0_poly_coeff_device;
+    const auto M0_poly_values = this->M0_poly_values_device;
     const auto num_channels = this->num_channels;
     const auto num_lm = this->num_lm;
     const auto num_LM = this->num_LM;
@@ -2003,19 +2008,26 @@ void MACEKokkos<Precision>::reverse_M0(int num_nodes, Kokkos::View<const int*> n
         Kokkos::deep_copy(execution_space, A0_adj, Precision(0));
     else
         Kokkos::deep_copy(A0_adj, Precision(0));
+    bool regrown = M0_poly_adjoints_device.extent(0) != M0_poly_adjoints.extent(0);
     for (int LM=0; LM<num_LM; ++LM) {
-        if (M0_poly_adjoints(LM).extent(0) < num_nodes)
+        if (M0_poly_adjoints(LM).extent(0) < num_nodes) {
             M0_poly_adjoints(LM) = Kokkos::View<Precision***,Kokkos::LayoutRight>(
                 Kokkos::view_alloc(std::string("M0_poly_adjoints_")+std::to_string(LM),Kokkos::WithoutInitializing),
                 num_nodes, M0_poly_coeff(LM).extent(1), num_channels);
+            regrown = true;
+        }
     }
+    if (regrown)
+        fill_device_handles(
+            M0_poly_adjoints_device, M0_poly_adjoints,
+            "M0_poly_adjoints device handles");
 
     // TODO: prune
     const auto M0_adj = this->M0_adj;
-    const auto M0_poly_spec = this->M0_poly_spec;
-    const auto M0_poly_coeff = this->M0_poly_coeff;
-    const auto M0_poly_adjoints = this->M0_poly_adjoints;
-    const auto M0_poly_values = this->M0_poly_values;
+    const auto M0_poly_spec = this->M0_poly_spec_device;
+    const auto M0_poly_coeff = this->M0_poly_coeff_device;
+    const auto M0_poly_adjoints = this->M0_poly_adjoints_device;
+    const auto M0_poly_values = this->M0_poly_values_device;
     const auto num_channels = this->num_channels;
     const auto num_lm = this->num_lm;
     const auto num_LM = this->num_LM;

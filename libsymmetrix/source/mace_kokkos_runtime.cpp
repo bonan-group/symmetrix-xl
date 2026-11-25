@@ -728,16 +728,25 @@ MACEKokkos<Precision>::~MACEKokkos()
     node_energies_storage = {};
     node_forces_storage = {};
 
-    M0_monomials = Kokkos::View<Kokkos::View<int**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
-    M0_weights = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
-    M0_poly_spec = Kokkos::View<Kokkos::View<int**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
-    M0_poly_coeff = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
-    M0_poly_values = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
-    M0_poly_adjoints = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
+    M0_monomials = Kokkos::View<Kokkos::View<int**,Kokkos::LayoutRight>*,Kokkos::HostSpace>();
+    M0_weights = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::HostSpace>();
+    M0_poly_spec = Kokkos::View<Kokkos::View<int**,Kokkos::LayoutRight>*,Kokkos::HostSpace>();
+    M0_poly_coeff = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::HostSpace>();
+    M0_poly_values = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::HostSpace>();
+    M0_poly_adjoints = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::HostSpace>();
+    M0_poly_spec_device = decltype(M0_poly_spec_device)();
+    M0_poly_coeff_device = decltype(M0_poly_coeff_device)();
+    M0_poly_values_device = decltype(M0_poly_values_device)();
+    M0_poly_adjoints_device = decltype(M0_poly_adjoints_device)();
     standard_m0_module_weights = decltype(standard_m0_module_weights)();
 
-    A1_weights = Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
-    A1_weights_trans = Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>();
+    A1_weights = Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::HostSpace>();
+    A1_weights_trans = Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::HostSpace>();
+    A1_weights_device = decltype(A1_weights_device)();
+    A1_weights_trans_device = decltype(A1_weights_trans_device)();
+    A1_channel_tile_weights_device = decltype(A1_channel_tile_weights_device)();
+    A1_channel_tile_weights_trans_device =
+        decltype(A1_channel_tile_weights_trans_device)();
     A1_channel_tile_weights = decltype(A1_channel_tile_weights)();
     A1_channel_tile_weights_trans =
         decltype(A1_channel_tile_weights_trans)();
@@ -2527,7 +2536,7 @@ template <typename Precision>
 void MACEKokkos<Precision>::ensure_m0_polynomial_workspace()
 {
     using workspace_type =
-        Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>;
+        Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::HostSpace>;
     if (M0_poly_values.extent(0) != static_cast<std::size_t>(num_LM))
         M0_poly_values = workspace_type(
             Kokkos::view_alloc("M0_poly_values",Kokkos::SequentialHostInit),
@@ -2546,6 +2555,8 @@ void MACEKokkos<Precision>::release_m0_polynomial_workspace()
     Kokkos::fence("Release M0 polynomial workspace");
     M0_poly_values = decltype(M0_poly_values)();
     M0_poly_adjoints = decltype(M0_poly_adjoints)();
+    M0_poly_values_device = decltype(M0_poly_values_device)();
+    M0_poly_adjoints_device = decltype(M0_poly_adjoints_device)();
 }
 
 template <typename Precision>

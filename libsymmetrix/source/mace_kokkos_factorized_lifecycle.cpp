@@ -556,21 +556,23 @@ std::uint64_t MACEKokkos<Precision>::prepare_all_interactions_graph(
         edge_offset += prepared_num_neigh[receiver];
     }
 
-    all_interactions_candidate_node_types = toKokkosView(
-        "Streamed all candidate node types", prepared_node_types);
-    all_interactions_candidate_num_neigh = toKokkosView(
-        "Streamed all candidate receiver degrees", prepared_num_neigh);
-    all_interactions_candidate_first_neigh = toKokkosView(
-        "Streamed all candidate receiver offsets", candidate_first_neigh);
-    all_interactions_candidate_edge_receivers = toKokkosView(
-        "Streamed all candidate receivers", candidate_edge_receivers);
-    all_interactions_candidate_neigh_indices = toKokkosView(
-        "Streamed all candidate source indices", prepared_neigh_indices);
-    all_interactions_candidate_neigh_types = toKokkosView(
-        "Streamed all candidate neighbor types", prepared_neigh_types);
-
     const int num_edges = static_cast<int>(prepared_neigh_indices.size());
     if (all_interactions_capacity_nodes < num_nodes) {
+        all_interactions_candidate_node_types_storage = Kokkos::View<int*>(
+            Kokkos::view_alloc(
+                Kokkos::WithoutInitializing,
+                "Streamed all candidate node types"),
+            num_nodes);
+        all_interactions_candidate_num_neigh_storage = Kokkos::View<int*>(
+            Kokkos::view_alloc(
+                Kokkos::WithoutInitializing,
+                "Streamed all candidate receiver degrees"),
+            num_nodes);
+        all_interactions_candidate_first_neigh_storage = Kokkos::View<int*>(
+            Kokkos::view_alloc(
+                Kokkos::WithoutInitializing,
+                "Streamed all candidate receiver offsets"),
+            num_nodes);
         all_interactions_active_num_neigh = Kokkos::View<int*>(
             Kokkos::view_alloc(
                 Kokkos::WithoutInitializing,
@@ -587,6 +589,21 @@ std::uint64_t MACEKokkos<Precision>::prepare_all_interactions_graph(
         all_interactions_capacity_nodes = num_nodes;
     }
     if (all_interactions_capacity_edges < num_edges) {
+        all_interactions_candidate_edge_receivers_storage = Kokkos::View<int*>(
+            Kokkos::view_alloc(
+                Kokkos::WithoutInitializing,
+                "Streamed all candidate receivers"),
+            num_edges);
+        all_interactions_candidate_neigh_indices_storage = Kokkos::View<int*>(
+            Kokkos::view_alloc(
+                Kokkos::WithoutInitializing,
+                "Streamed all candidate source indices"),
+            num_edges);
+        all_interactions_candidate_neigh_types_storage = Kokkos::View<int*>(
+            Kokkos::view_alloc(
+                Kokkos::WithoutInitializing,
+                "Streamed all candidate neighbor types"),
+            num_edges);
         all_interactions_candidate_active = Kokkos::View<int*>(
             Kokkos::view_alloc(
                 Kokkos::WithoutInitializing, "Streamed all active flags"),
@@ -627,6 +644,27 @@ std::uint64_t MACEKokkos<Precision>::prepare_all_interactions_graph(
             num_edges);
         all_interactions_capacity_edges = num_edges;
     }
+    // This route reads the candidate views only on the default instance, so a
+    // rebuild that fits overwrites the retained storage in stream order.
+    const auto execution_space = Kokkos::DefaultExecutionSpace();
+    copy_int_prefix(
+        execution_space, all_interactions_candidate_node_types_storage,
+        all_interactions_candidate_node_types, prepared_node_types);
+    copy_int_prefix(
+        execution_space, all_interactions_candidate_num_neigh_storage,
+        all_interactions_candidate_num_neigh, prepared_num_neigh);
+    copy_int_prefix(
+        execution_space, all_interactions_candidate_first_neigh_storage,
+        all_interactions_candidate_first_neigh, candidate_first_neigh);
+    copy_int_prefix(
+        execution_space, all_interactions_candidate_edge_receivers_storage,
+        all_interactions_candidate_edge_receivers, candidate_edge_receivers);
+    copy_int_prefix(
+        execution_space, all_interactions_candidate_neigh_indices_storage,
+        all_interactions_candidate_neigh_indices, prepared_neigh_indices);
+    copy_int_prefix(
+        execution_space, all_interactions_candidate_neigh_types_storage,
+        all_interactions_candidate_neigh_types, prepared_neigh_types);
     if (all_interactions_geometry_invalid.extent(0) != 1)
         all_interactions_geometry_invalid = Kokkos::View<int*>(
             "Streamed all geometry invalid", 1);
@@ -4762,7 +4800,7 @@ void MACEKokkos<Precision>::prepare_factorized_model(
     }
 
     using Matrix = Kokkos::View<Precision**,Kokkos::LayoutRight>;
-    using MatrixArray = Kokkos::View<Matrix*,Kokkos::SharedSpace>;
+    using MatrixArray = Kokkos::View<Matrix*,Kokkos::HostSpace>;
     auto projection = MatrixArray(
         Kokkos::view_alloc("Execution R1 projections", Kokkos::SequentialHostInit),
         l_max+1);

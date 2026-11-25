@@ -108,8 +108,10 @@ template<typename T>
 Kokkos::View<T*> toKokkosView(const char* name,const std::vector<T>& stdVector) {
 
     std::string label(name);
-    // Create a Kokkos::View with the same size as the std::vector
-    Kokkos::View<T*,Kokkos::SharedSpace> kokkosView(label, stdVector.size());
+    // Create a Kokkos::View with the same size as the std::vector, in the
+    // default memory space: kernels are its readers, and managed memory would
+    // migrate between host and device while they read it.
+    Kokkos::View<T*> kokkosView(label, stdVector.size());
 
     // Create a host mirror of the Kokkos View
     auto hostMirror = Kokkos::create_mirror_view(kokkosView);
@@ -123,6 +125,33 @@ Kokkos::View<T*> toKokkosView(const char* name,const std::vector<T>& stdVector) 
     Kokkos::deep_copy(kokkosView, hostMirror);
 
     return kokkosView;
+}
+
+// A View-of-Views lives on the host (HostSpace outer array,
+// Kokkos::SequentialHostInit), where host code builds and reads it.  A kernel
+// that indexes one reads this device array of unmanaged handles to the same
+// inner Views instead, filled from a host mirror at load and again after an
+// inner View is replaced; the owning Views stay in the host array.  Both
+// arrays are value-initialized: under the legacy View, assigning a View into
+// an unconstructed element reads its tracker.  On host backends the mirror is
+// the array itself.
+template <class Inner>
+using DeviceHandles = Kokkos::View<Kokkos::View<
+    typename Inner::data_type, typename Inner::array_layout,
+    typename Inner::memory_space, Kokkos::MemoryUnmanaged>*>;
+
+template <class Inner>
+void fill_device_handles(
+    DeviceHandles<Inner>& handles,
+    const Kokkos::View<Inner*, Kokkos::HostSpace>& owners,
+    const std::string& label)
+{
+    if (handles.extent(0) != owners.extent(0))
+        handles = DeviceHandles<Inner>(label, owners.extent(0));
+    auto host = Kokkos::create_mirror_view(handles);
+    for (std::size_t i = 0; i < owners.extent(0); ++i)
+        host(i) = owners(i);
+    Kokkos::deep_copy(handles, host);
 }
 
 template<typename T>

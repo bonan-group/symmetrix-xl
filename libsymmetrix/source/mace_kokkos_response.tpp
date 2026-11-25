@@ -669,7 +669,7 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         }
 
         const auto phi_l = Phi1_l;
-        const auto A1_matrix = A1_weights;
+        const auto A1_matrix = A1_weights_device;
         Kokkos::parallel_for(
             "MACEField analytic A1 tangent",
             Kokkos::TeamPolicy<>(num_nodes*(lmax+1), Kokkos::AUTO),
@@ -1244,8 +1244,8 @@ void MACEKokkos<Precision>::compute_electric_field_response(
         // full-width dPhi1 pair. The tile weights are the model's pre-tiled
         // transposes; the tile buffer keeps the (m, eta, local) flat packing,
         // so a (row, channel) read is lme*tile_channels + local.
-        const auto A1_matrix_trans = A1_weights_trans;
-        const auto A1_tile_matrix_trans = A1_channel_tile_weights_trans;
+        const auto A1_matrix_trans = A1_weights_trans_device;
+        const auto A1_tile_matrix_trans = A1_channel_tile_weights_trans_device;
         const int phi1_tile = phi1_channel_tile_size;
         const bool phi1_tile_ready =
             phi1_tile < channels && A1_tile_matrix_trans.size() > 0;

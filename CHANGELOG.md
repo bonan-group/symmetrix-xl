@@ -4,6 +4,17 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ## 0.2.1 - Unreleased
 
+- Moved the MACE and MACEField model tables out of managed memory on CUDA
+  and HIP. Kernels read them at every evaluation while host code touches the
+  same pages, so the pages migrated between host and device during MD.
+  Tables loaded through the one-dimensional `toKokkosView` are now device
+  arrays, the View-of-Views keep their owning outer arrays on the host with
+  device handle arrays for the kernels that index them, and the streamed
+  candidate graph of the `non-compiled` route reuses its device storage
+  across rebuilds; the values are unchanged. The one-dimensional converter is
+  shared, so its other callers (for example ZBL, the e3nn helpers, MACE-MH-1
+  and LES) also get device arrays.
+
 ## 0.2.0 - 2026-11-17
 
 ### Execution and JIT

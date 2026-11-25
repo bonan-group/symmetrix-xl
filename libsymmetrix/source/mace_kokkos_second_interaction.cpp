@@ -645,6 +645,7 @@ void MACEKokkos<Precision>::compute_A1(
     }
 #endif
 
+    const auto A1_weights_device = this->A1_weights_device;
     Kokkos::parallel_for("Compute A1",
         Kokkos::TeamPolicy<>(
             factorized_execution_space,
@@ -679,7 +680,7 @@ void MACEKokkos<Precision>::compute_A1(
                                     KokkosBatched::Trans::NoTranspose,
                                     KokkosBatched::Trans::NoTranspose,
                                     KokkosBatched::Algo::Gemm::Blocked>
-                ::invoke(team_member, 1.0, Phi1_il, A1_weights(l), 0.0, A1_il);
+                ::invoke(team_member, 1.0, Phi1_il, A1_weights_device(l), 0.0, A1_il);
         });
     if (completion_fence)
         factorized_execution_space.fence("Compute A1 completion");
@@ -704,7 +705,7 @@ void MACEKokkos<Precision>::compute_A1_channel_tile(
     const auto num_channels = this->num_channels;
     const auto Phi1_l = this->Phi1_l;
     const auto Phi1 = this->Phi1;
-    const auto tile_weights = this->A1_channel_tile_weights;
+    const auto tile_weights = this->A1_channel_tile_weights_device;
     auto A1 = this->A1;
     const Precision* const phi1_data = Phi1.data();
     Precision* const a1_data = A1.data();
@@ -782,7 +783,7 @@ void MACEKokkos<Precision>::reverse_A1_channel_tile(
     const auto num_channels = this->num_channels;
     const auto Phi1_l = this->Phi1_l;
     auto Phi1 = this->Phi1;
-    const auto tile_weights_trans = this->A1_channel_tile_weights_trans;
+    const auto tile_weights_trans = this->A1_channel_tile_weights_trans_device;
     const auto A1_adj = this->A1_adj;
     const Precision* const a1_adj_data = A1_adj.data();
     Precision* const phi1_data = Phi1.data();
@@ -1403,6 +1404,7 @@ void MACEKokkos<Precision>::reverse_A1_from(
     }
 #endif
 
+    const auto A1_weights_trans_device = this->A1_weights_trans_device;
     Kokkos::parallel_for("Reverse A1",
         Kokkos::TeamPolicy<>(
             factorized_execution_space,
@@ -1436,7 +1438,7 @@ void MACEKokkos<Precision>::reverse_A1_from(
                                     KokkosBatched::Trans::NoTranspose,
                                     KokkosBatched::Trans::NoTranspose,
                                     KokkosBatched::Algo::Gemm::Blocked>
-                ::invoke(team_member, 1.0, dA1_il, A1_weights_trans(l), 0.0, dPhi1_il);
+                ::invoke(team_member, 1.0, dA1_il, A1_weights_trans_device(l), 0.0, dPhi1_il);
         });
     if (completion_fence)
         factorized_execution_space.fence("Reverse A1 completion");
