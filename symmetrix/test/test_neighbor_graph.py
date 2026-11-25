@@ -528,3 +528,236 @@ def test_topology_reuse_validates_affine_contraction_from_topology_cell(
     else:
         assert decision.geometry_reference_positions is None
         assert decision.inverse_cell is None
+
+
+def _general_reuse(reference, atoms, cutoff, skin):
+    return neighbor_graph_module.neighbor_topology_reuse(
+        reference=reference,
+        atomic_numbers=atoms.numbers,
+        positions=atoms.positions,
+        cell=np.asarray(atoms.cell),
+        pbc=np.asarray(atoms.pbc),
+        cutoff=cutoff,
+        skin=skin,
+    )
+
+
+def _fixed_cell_hit(limit, reference, atoms, cutoff=None, skin=None):
+    # By default at the cutoff and skin the limit was computed for.
+    if limit is not None:
+        cutoff = limit.cutoff if cutoff is None else cutoff
+        skin = limit.skin if skin is None else skin
+    return neighbor_graph_module.fixed_cell_reuse_holds(
+        limit,
+        reference=reference,
+        atomic_numbers=atoms.numbers,
+        positions=atoms.positions,
+        cell=np.asarray(atoms.cell),
+        pbc=np.asarray(atoms.pbc),
+        cutoff=cutoff,
+        skin=skin,
+    )
+
+
+def test_fixed_cell_reuse_certifies_unchanged_and_small_moves_only():
+    atoms = Atoms(
+        "H3",
+        positions=[[1.0, 1.0, 1.0], [3.0, 1.5, 1.0], [5.0, 5.0, 5.0]],
+        cell=[10.0] * 3,
+        pbc=True,
+    )
+    reference = _topology_reference(atoms)
+    limit = neighbor_graph_module.fixed_cell_reuse_limit(
+        reference, cutoff=8.0, skin=1.0
+    )
+    assert limit is not None
+    # The skin bound 1 / (2 sqrt 3) binds; the image bound of a 10 A cube is 5.
+    assert limit.maximum_displacement == pytest.approx(
+        1.0 / (2.0 * np.sqrt(3.0)), rel=1e-5
+    )
+    assert _fixed_cell_hit(limit, reference, atoms)
+
+    atoms.positions[1] += [0.2, -0.2, 0.1]
+    assert _fixed_cell_hit(limit, reference, atoms)
+    assert _general_reuse(reference, atoms, 8.0, 1.0).reusable
+
+    # Beyond the component bound the certificate declines; the general check
+    # still admits a 0.3 A move, so the decision is unchanged.
+    atoms.positions[1] = [3.3, 1.5, 1.0]
+    assert not _fixed_cell_hit(limit, reference, atoms)
+    assert _general_reuse(reference, atoms, 8.0, 1.0).reusable
+
+
+def test_fixed_cell_reuse_holds_only_at_its_own_cutoff_and_skin():
+    atoms = Atoms(
+        "H2",
+        positions=[[1.0, 1.0, 1.0], [4.0, 1.0, 1.0]],
+        cell=[12.0] * 3,
+        pbc=True,
+    )
+    reference = _topology_reference(atoms)
+    limit = neighbor_graph_module.fixed_cell_reuse_limit(
+        reference, cutoff=6.0, skin=0.5
+    )
+    atoms.positions[0, 0] += 0.1
+    assert _fixed_cell_hit(limit, reference, atoms)
+
+    # A limit computed for skin 0.5 says nothing at skin 0.1, where the
+    # general check rejects the same 0.1 A move.
+    assert not _fixed_cell_hit(limit, reference, atoms, skin=0.1)
+    assert not _general_reuse(reference, atoms, 6.0, 0.1).reusable
+    assert not _fixed_cell_hit(limit, reference, atoms, skin=0.6)
+    assert not _fixed_cell_hit(limit, reference, atoms, cutoff=5.0)
+
+
+def test_fixed_cell_reuse_declines_a_thin_skew_cell_image_change():
+    # A small Cartesian move that crosses half a cell in fractional
+    # coordinates: minimum-image rounding then selects another image of the
+    # source, so the general check rejects the cached topology.  The skin
+    # bound alone (2 sqrt(3) 0.13 < 0.5) would admit it.
+    atoms = Atoms(
+        "H2",
+        positions=[[0.0, 0.0, 0.0], [0.5, 0.02, 0.4]],
+        cell=[[8.0, 0.0, 0.0], [3.0, 0.2, 0.0], [0.0, 0.0, 8.0]],
+        pbc=True,
+    )
+    cutoff, skin = 6.0, 0.5
+    reference = _topology_reference(atoms)
+    limit = neighbor_graph_module.fixed_cell_reuse_limit(
+        reference, cutoff=cutoff, skin=skin
+    )
+    atoms.positions[1] += [0.0, 0.13, 0.0]
+
+    assert 2.0 * np.sqrt(3.0) * 0.13 < skin
+    assert limit is not None and limit.maximum_displacement < 0.1
+    assert not _fixed_cell_hit(limit, reference, atoms)
+    assert not _general_reuse(reference, atoms, cutoff, skin).reusable
+
+
+def test_fixed_cell_reuse_leaves_wraps_cell_and_species_changes_to_the_check():
+    atoms = Atoms(
+        "H2",
+        positions=[[0.1, 1.0, 1.0], [4.0, 1.0, 1.0]],
+        cell=[10.0] * 3,
+        pbc=True,
+    )
+    reference = _topology_reference(atoms)
+    limit = neighbor_graph_module.fixed_cell_reuse_limit(
+        reference, cutoff=4.0, skin=0.5
+    )
+
+    wrapped = atoms.copy()
+    wrapped.positions[0, 0] += 10.0
+    assert not _fixed_cell_hit(limit, reference, wrapped)
+    assert _general_reuse(reference, wrapped, 4.0, 0.5).reusable
+
+    strained = atoms.copy()
+    strained.set_cell([10.01, 10.0, 10.0], scale_atoms=True)
+    assert not _fixed_cell_hit(limit, reference, strained)
+    assert _general_reuse(reference, strained, 4.0, 0.5).cell_changed
+
+    species = atoms.copy()
+    species.numbers[1] = 8
+    assert not _fixed_cell_hit(limit, reference, species)
+    assert not _general_reuse(reference, species, 4.0, 0.5).reusable
+
+    nonfinite = atoms.copy()
+    nonfinite.positions[1, 2] = np.nan
+    assert not _fixed_cell_hit(limit, reference, nonfinite)
+
+    partial = atoms.copy()
+    partial.pbc = [True, True, False]
+    assert not _fixed_cell_hit(limit, reference, partial)
+    assert (
+        neighbor_graph_module.fixed_cell_reuse_limit(
+            _topology_reference(partial), cutoff=4.0, skin=0.5
+        )
+        is None
+    )
+
+    # A geometry reference already moved to another cell (a rebased cache).
+    rebased = neighbor_graph_module.NeighborTopologyReference(
+        **{**reference.__dict__, "cell": np.diag([10.01, 10.0, 10.0])}
+    )
+    assert (
+        neighbor_graph_module.fixed_cell_reuse_limit(rebased, cutoff=4.0, skin=0.5)
+        is None
+    )
+    assert not _fixed_cell_hit(limit, rebased, atoms)
+
+
+def _random_cell(rng, kind):
+    lengths = rng.uniform(4.0, 16.0, size=3)
+    if kind == "cubic":
+        return np.diag(lengths)
+    cell = np.diag(lengths)
+    if kind == "skew":
+        cell[1, 0] = rng.uniform(-0.5, 0.5) * lengths[0]
+        cell[2, :2] = rng.uniform(-0.5, 0.5, size=2) * lengths[:2]
+        return cell
+    # thin: one lattice vector nearly parallel to another
+    cell[1] = [rng.uniform(1.0, 4.0), rng.uniform(0.1, 1.0), 0.0]
+    cell[2, :2] = rng.uniform(-0.3, 0.3, size=2) * lengths[:2]
+    return cell
+
+
+def test_fixed_cell_reuse_never_admits_what_the_general_check_rejects():
+    rng = np.random.default_rng(20261121)
+    hits = declined_admits = 0
+    trials = 4000
+    for trial in range(trials):
+        kind = ("cubic", "skew", "thin")[trial % 3]
+        cell = _random_cell(rng, kind)
+        count = int(rng.integers(1, 9))
+        numbers = rng.choice((1, 8, 22)[: int(rng.integers(1, 4))], size=count)
+        atoms = Atoms(
+            numbers=numbers,
+            scaled_positions=rng.uniform(0.0, 1.0, size=(count, 3)),
+            cell=cell,
+            pbc=True,
+        )
+        cutoff = float(rng.uniform(1.5, 6.0))
+        skin = float(rng.uniform(0.05, 1.0))
+        reference = _topology_reference(atoms)
+        limit = neighbor_graph_module.fixed_cell_reuse_limit(
+            reference, cutoff=cutoff, skin=skin
+        )
+        bound = 1.0 if limit is None else limit.maximum_displacement
+        moved = atoms.copy()
+        # Every move kind meets every cell kind.
+        move = (trial // 3) % 6
+        if move == 1:
+            moved.positions += rng.uniform(-1.0, 1.0, size=(count, 3)) * bound * 0.5
+        elif move == 2:
+            # Worst cases at the certificate's edge: every component at the
+            # limit, signed along one row of the inverse cell (the image
+            # bound) or uniformly (the skin bound).
+            inverse = np.linalg.inv(cell)
+            axis = int(np.argmax(np.abs(inverse).sum(axis=0)))
+            signs = (
+                np.sign(inverse[:, axis])
+                if rng.uniform() < 0.5
+                else rng.choice((-1.0, 1.0), size=3)
+            )
+            moved.positions[int(rng.integers(count))] += signs * bound * (1.0 - 1e-12)
+        elif move == 3:
+            moved.positions += rng.uniform(-1.0, 1.0, size=(count, 3)) * bound * 4.0
+        elif move == 4:
+            moved.positions[int(rng.integers(count))] += cell[
+                int(rng.integers(3))
+            ] * rng.choice((-1.0, 1.0))
+        elif move == 5:
+            moved.set_cell(cell * (1.0 + rng.uniform(-0.01, 0.01)), scale_atoms=True)
+
+        hit = _fixed_cell_hit(limit, reference, moved, cutoff, skin)
+        decision = _general_reuse(reference, moved, cutoff, skin)
+        if hit:
+            hits += 1
+            assert (
+                decision.reusable and not decision.cell_changed
+            ), f"trial {trial}: certified a geometry the general check rejects"
+        elif decision.reusable and not decision.cell_changed:
+            declined_admits += 1
+    # Both outcomes occur, so the battery exercises the certificate's edges.
+    assert hits > trials // 4
+    assert declined_admits > trials // 20

@@ -4,6 +4,51 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ## 0.2.1 - Unreleased
 
+- A warm ASE call on a fully periodic cell admits its cached neighbor topology
+  with less host work. While the cell equals the cell the topology was built
+  at, a fixed-cell limit precomputed with the topology admits geometries whose
+  largest Cartesian displacement component stays inside both a skin bound and
+  an image bound (no fractional displacement reaches half a cell, so
+  minimum-image rounding keeps every stored image). The limit applies under
+  native geometry whether the host or the device built the graph, and only at
+  the cutoff and skin it was computed for. Everything else (cell changes,
+  partial periodicity, wraps, larger moves, a changed skin, and joined,
+  explicit-edge, field-coupled and stateful evaluations) takes the existing
+  check, which no longer forms host displacements that native geometry never
+  reads. The limit only admits geometries the existing check admits, so
+  rebuild decisions, and therefore energies, forces and stresses, are
+  unchanged. On a 135,000-atom cubic frame the host admission of a warm call
+  falls from 16.8 ms to 0.5 ms at unchanged positions and to 0.8 ms with every
+  atom moved (one CPU thread); a geometry the limit declines pays about 6 ms
+  instead of about 12 ms for the existing check. On a fully periodic cell,
+  `NeighborReuseDecision.maximum_displacement` of a reusable geometry is now
+  the non-affine displacement the check tested (from the topology reference)
+  rather than a second minimum-image displacement from the current geometry
+  reference, and `None` when the limit certified the reuse; the two differ
+  after a cell change.
+- A neighbor topology is rebuilt when a raised `neighbor_skin` (or cutoff)
+  asks for a longer candidate list than the one it was built with; a raise
+  that fits the stored list is reused as before. The reuse check used to test
+  the raised skin against the shorter list, which could drop a pair that had
+  moved inside the cutoff.
+- Native evaluators return node energies, atom forces and stresses as NumPy
+  `float64` arrays filled by one copy from the evaluator's result view, without
+  a host mirror, an element loop or a Python list; on a GPU the one
+  device-to-host transfer now lands in the array. This covers every native
+  family: MACE, MACEField and MACE-LES share the MACE binding, MACE-MH-1 and
+  MACE-Polar the MH-1 binding. `evaluator.node_energies` is now an ndarray of
+  shape `(N,)` instead of a list in every family. The MH-1 and Polar force
+  and stress reductions return flat arrays (`(3N,)`, `(9,)`, `(9B,)`) instead
+  of lists; the MACE reductions keep their shapes (`(N, 3)`, `(3, 3)`,
+  `(B, 3, 3)`). Values and element order are unchanged, and every read returns
+  a new array, so results already held are never modified. Code that needs a
+  list can call `.tolist()`. Built-in `sum()` over the array adds NumPy
+  scalars without the compensated summation Python 3.12 applies to a list of
+  floats, so it can differ in the last digits (by 2.3e-10 eV over 135,000
+  atom energies); `np.sum` and the calculator's FP64 energy sum are unchanged.
+  On a 135,000-atom frame the result marshalling of a call (reductions
+  excluded) falls from 3.7 ms to 0.3 ms (one CPU thread).
+
 ## 0.2.0 - 2026-11-17
 
 ### Execution and JIT

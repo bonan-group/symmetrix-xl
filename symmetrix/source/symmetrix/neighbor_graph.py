@@ -29,6 +29,7 @@ neighbor_list = (
 )
 
 __all__ = [
+    "FixedCellReuseLimit",
     "HostNeighborGraph",
     "INT32_MAX",
     "NEIGHBOR_EDGE_ORDERS",
@@ -38,6 +39,8 @@ __all__ = [
     "build_host_neighbor_graph",
     "host_neighbor_list",
     "edge_vectors",
+    "fixed_cell_reuse_holds",
+    "fixed_cell_reuse_limit",
     "minimum_image_displacements",
     "neighbor_list",
     "neighbor_topology_reuse",
@@ -72,7 +75,15 @@ class NeighborTopologyReference:
 
 @dataclass(frozen=True)
 class NeighborReuseDecision:
-    """Outcome and geometry updates from a topology-reuse check."""
+    """Outcome and geometry updates from a topology-reuse check.
+
+    ``maximum_displacement`` is the largest displacement the check measured:
+    the minimum-image non-affine displacement from the topology reference on
+    a fully periodic cell, and the minimum-image displacement from the
+    topology reference positions otherwise.  It is ``None`` when nothing was
+    measured: the check rejected the geometry before measuring, or a
+    :class:`FixedCellReuseLimit` certified the reuse without the check.
+    """
 
     reusable: bool
     cell_changed: bool
@@ -166,11 +177,9 @@ def neighbor_topology_reuse(
                 geometry_reference_positions,
                 np.linalg.inv(cell),
             )
-        displacements = minimum_image_displacements(
-            positions, reference.reference_positions, cell, pbc
+        return NeighborReuseDecision(
+            True, False, maximum_non_affine_displacement, None, None
         )
-        maximum_displacement = _maximum_norm(displacements)
-        return NeighborReuseDecision(True, False, maximum_displacement, None, None)
 
     if cell_changed:
         return NeighborReuseDecision(False, True, None, None, None)
@@ -187,6 +196,151 @@ def neighbor_topology_reuse(
         None,
         None,
     )
+
+
+@dataclass(frozen=True)
+class FixedCellReuseLimit:
+    """A cheap sufficient condition for reusing a fully periodic topology.
+
+    While the cell stays bit-identical to the topology cell, a geometry whose
+    largest Cartesian displacement component from the topology reference
+    positions is below ``maximum_displacement`` is one that
+    :func:`neighbor_topology_reuse` admits.  The limit is the smaller of two
+    bounds, each kept inside by a relative margin and reduced by the
+    reconstruction error of the fractional reference:
+
+    * the skin bound: a component bound ``m`` bounds every displacement norm
+      by ``sqrt(3) m``, so ``2 sqrt(3) m`` must stay within the skin the
+      general check allows at the topology cell's own contraction;
+    * the image bound: on every periodic axis ``a`` the fractional
+      displacement is at most ``m sum_b |(H^-1)_ba|``, which must stay below
+      one half.  Without it a small Cartesian move in a thin, skewed cell can
+      cross half a cell in fractional coordinates; minimum-image rounding
+      then selects another image for every stored edge of that atom, and the
+      general check correctly rejects a geometry the skin bound alone admits.
+
+    Cells whose condition number exceeds
+    :data:`FIXED_CELL_REUSE_MAXIMUM_CONDITION` receive no limit, so the
+    rounding of the general check's solve stays far inside the margin.  The
+    limit holds only for the ``cutoff`` and ``skin`` it was computed with.
+    """
+
+    cell: np.ndarray
+    reference_positions: np.ndarray
+    maximum_displacement: float
+    cutoff: float
+    skin: float
+
+
+#: Relative margin by which the fixed-cell limit stays inside both bounds.
+FIXED_CELL_REUSE_MARGIN = 1.0e-6
+
+#: Largest cell condition number for which a fixed-cell limit is issued.
+FIXED_CELL_REUSE_MAXIMUM_CONDITION = 1.0e6
+
+
+def fixed_cell_reuse_limit(
+    reference: NeighborTopologyReference, *, cutoff, skin
+) -> FixedCellReuseLimit | None:
+    """Return the fixed-cell reuse limit of a fully periodic topology.
+
+    ``None`` means the reference has no such limit (partial periodicity, a
+    cell already moved away from the topology cell, a singular or
+    ill-conditioned cell, or no skin left), and every geometry takes
+    :func:`neighbor_topology_reuse`.
+    """
+
+    pbc = np.asarray(reference.pbc, dtype=bool)
+    cell = np.asarray(reference.topology_cell, dtype=float)
+    positions = np.asarray(reference.topology_reference_positions, dtype=float)
+    fractional = np.asarray(reference.topology_fractional_positions, dtype=float)
+    if (
+        pbc.shape != (3,)
+        or not np.all(pbc)
+        or cell.shape != (3, 3)
+        or fractional.shape != positions.shape
+        or not np.array_equal(np.asarray(reference.cell, dtype=float), cell)
+        or not np.all(np.isfinite(cell))
+    ):
+        return None
+    try:
+        # The contraction the general check computes at this cell, by the
+        # same expression.
+        contraction = float(np.linalg.norm(np.linalg.solve(cell, cell), ord=2))
+        inverse_cell = np.linalg.inv(cell)
+    except np.linalg.LinAlgError:
+        return None
+    condition = float(np.linalg.cond(cell))
+    if not condition <= FIXED_CELL_REUSE_MAXIMUM_CONDITION:
+        return None
+    skin_bound = ((float(cutoff) + float(skin)) / contraction - float(cutoff)) / (
+        2.0 * np.sqrt(3.0)
+    )
+    image_bound = 0.5 / float(np.abs(inverse_cell).sum(axis=0).max())
+    reconstruction = (
+        0.0
+        if len(positions) == 0
+        else float(np.abs(positions - fractional @ cell).max())
+    )
+    maximum_displacement = (
+        min(skin_bound, image_bound) * (1.0 - FIXED_CELL_REUSE_MARGIN) - reconstruction
+    )
+    if not maximum_displacement > 0.0:
+        return None
+    return FixedCellReuseLimit(
+        cell=np.array(cell, copy=True),
+        reference_positions=reference.topology_reference_positions,
+        maximum_displacement=maximum_displacement,
+        cutoff=float(cutoff),
+        skin=float(skin),
+    )
+
+
+def fixed_cell_reuse_holds(
+    limit: FixedCellReuseLimit | None,
+    *,
+    reference: NeighborTopologyReference,
+    atomic_numbers,
+    positions,
+    cell,
+    pbc,
+    cutoff,
+    skin,
+) -> bool:
+    """Report whether ``limit`` certifies reuse of ``reference`` for a geometry.
+
+    ``True`` implies that :func:`neighbor_topology_reuse` with the same
+    ``cutoff`` and ``skin`` reuses the topology without a cell change.
+    ``False`` decides nothing; the caller then runs the general check.  The
+    limit applies only to the reference and the cutoff and skin it was
+    computed for, and only while the reference and current cells both equal
+    its cell.
+    """
+
+    if (
+        limit is None
+        or limit.reference_positions is not reference.topology_reference_positions
+        or float(cutoff) != limit.cutoff
+        or float(skin) != limit.skin
+    ):
+        return False
+    positions = np.asarray(positions, dtype=float)
+    if (
+        positions.shape != limit.reference_positions.shape
+        or not np.array_equal(np.asarray(cell, dtype=float), limit.cell)
+        or not np.array_equal(np.asarray(reference.cell, dtype=float), limit.cell)
+        or not np.array_equal(np.asarray(pbc, dtype=bool), reference.pbc)
+        or not np.array_equal(
+            np.asarray(atomic_numbers, dtype=int), reference.atomic_numbers
+        )
+    ):
+        return False
+    if np.array_equal(positions, limit.reference_positions):
+        return True
+    difference = positions - limit.reference_positions
+    bound = limit.maximum_displacement
+    # Written as two comparisons so a non-finite component never certifies.
+    return bool(difference.max() < bound and -difference.min() < bound)
 
 
 def validate_graph_cardinality(num_atoms, num_edges):
