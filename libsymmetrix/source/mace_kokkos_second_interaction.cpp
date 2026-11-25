@@ -2324,6 +2324,61 @@ void MACEKokkos<Precision>::compute_M1(int num_nodes, Kokkos::View<const int*> n
     complete_device_stage("MACEKokkos::compute_M1");
 }
 template <typename Precision>
+void MACEKokkos<Precision>::reduce_generated_m1_scale_adjoint(
+    const Kokkos::DefaultExecutionSpace& execution_space,
+    const int num_nodes,
+    Kokkos::View<const Precision***,Kokkos::LayoutRight> input,
+    Kokkos::View<const Precision***,Kokkos::LayoutRight> input_adjoint)
+{
+    // A1 . A1_adj per node: products of two values widened to FP64, summed in
+    // a fixed order (one team per node on a device, one worker per node on
+    // the host), assigned to every node of the evaluation.
+    const auto scale_adjoint = mh0_a1_scale_adjoint;
+    const int components = num_lm;
+    const int channels = num_channels;
+    if constexpr (symmetrix::execution::host_execution_space<
+            Kokkos::DefaultExecutionSpace>) {
+        Kokkos::parallel_for(
+            "ExecutionM1::generated_scale_adjoint",
+            Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace>(
+                execution_space, 0, num_nodes),
+            [=] (const int node) {
+                double sum = 0.0;
+                for (int component=0; component<components; ++component)
+                    for (int channel=0; channel<channels; ++channel)
+                        sum += static_cast<double>(
+                            input(node,component,channel))
+                            *static_cast<double>(
+                                input_adjoint(node,component,channel));
+                scale_adjoint(node) = sum;
+            });
+    } else {
+        using TeamPolicy = Kokkos::TeamPolicy<Kokkos::DefaultExecutionSpace>;
+        Kokkos::parallel_for(
+            "ExecutionM1::generated_scale_adjoint",
+            TeamPolicy(execution_space, num_nodes, 8, 32),
+            KOKKOS_LAMBDA (const typename TeamPolicy::member_type& member) {
+                const int node = member.league_rank();
+                double sum = 0.0;
+                Kokkos::parallel_reduce(
+                    Kokkos::TeamVectorRange(member, components*channels),
+                    [=] (const int item, double& local) {
+                        const int component = item/channels;
+                        const int channel = item%channels;
+                        local += static_cast<double>(
+                            input(node,component,channel))
+                            *static_cast<double>(
+                                input_adjoint(node,component,channel));
+                    }, sum);
+                Kokkos::single(Kokkos::PerTeam(member), [=] () {
+                    scale_adjoint(node) = sum;
+                });
+            });
+    }
+    generated_m1_scale_adjoint_reduction_count += 1;
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::reverse_M1(int num_nodes, Kokkos::View<const int*> node_types)
 {
     const auto execution_space = use_factorized_async_inference()
@@ -2353,27 +2408,21 @@ void MACEKokkos<Precision>::reverse_M1(int num_nodes, Kokkos::View<const int*> n
         }
         polynomial_adjoint = single_layer_readout ? H1_adj : A1_adj;
     }
-    const bool generated_capture_scale_adjoint = reuse_adjoint && A1_scaled;
+    // Under adjoint reuse the consumer reads the A1 scale adjoint
+    // A1 . A1_adj per node. The generated M1 keeps A1, so this branch reduces
+    // it after the module, in a fixed order, instead of having the module add
+    // each channel's partial with an FP64 atomic in arrival order.
+    const bool generated_reduce_scale_adjoint = reuse_adjoint && A1_scaled;
     if (selected_m1_implementation == M1Implementation::device_module
         || selected_m1_implementation == M1Implementation::host_plugin) {
-        if (generated_capture_scale_adjoint)
-            Kokkos::deep_copy(
-                Kokkos::subview(
-                    mh0_a1_scale_adjoint,
-                    Kokkos::make_pair(
-                        std::size_t(0), static_cast<std::size_t>(num_nodes))),
-                0.0);
         const SymmetrixJitM1ArgsV1 device_args{
             sizeof(SymmetrixJitM1ArgsV1),
             accumulate_h1_adjoint
                 ? SYMMETRIX_JIT_OPERATOR_M1_ACCUMULATE_INPUT_ADJOINT_V1 : 0u,
-            num_nodes, num_channels,
-            generated_capture_scale_adjoint ? 1 : 0,
+            num_nodes, num_channels, 0,
             node_types.data(), polynomial_input.data(),
             generated_m1_module_weights.data(), M1_adj.data(), nullptr,
-            polynomial_adjoint.data(),
-            generated_capture_scale_adjoint
-                ? mh0_a1_scale_adjoint.data() : nullptr};
+            polynomial_adjoint.data(), nullptr};
         if (selected_m1_implementation == M1Implementation::device_module) {
 #if defined(KOKKOS_ENABLE_CUDA) || defined(KOKKOS_ENABLE_HIP)
             if (!m1_device_module_ready())
@@ -2410,13 +2459,10 @@ void MACEKokkos<Precision>::reverse_M1(int num_nodes, Kokkos::View<const int*> n
                 sizeof(SymmetrixJitM1HostArgsV1),
                 accumulate_h1_adjoint
                     ? SYMMETRIX_JIT_OPERATOR_M1_ACCUMULATE_INPUT_ADJOINT_V1 : 0u,
-                num_nodes, num_channels,
-                generated_capture_scale_adjoint ? 1 : 0,
+                num_nodes, num_channels, 0,
                 node_types.data(), polynomial_input.data(),
                 generated_m1_module_weights.data(), M1_adj.data(), nullptr,
-                polynomial_adjoint.data(),
-                generated_capture_scale_adjoint
-                    ? mh0_a1_scale_adjoint.data() : nullptr};
+                polynomial_adjoint.data(), nullptr};
             Kokkos::parallel_for(
                 "ExecutionM1::host_plugin_reverse",
                 Kokkos::RangePolicy<Kokkos::DefaultExecutionSpace,
@@ -2427,6 +2473,10 @@ void MACEKokkos<Precision>::reverse_M1(int num_nodes, Kokkos::View<const int*> n
                     owner(&host_args, index);
                 });
         }
+        if (generated_reduce_scale_adjoint && num_nodes > 0)
+            reduce_generated_m1_scale_adjoint(
+                execution_space, num_nodes, polynomial_input,
+                polynomial_adjoint);
         generated_m1_module_reverse_launch_count += 1;
         m1_recompute_reverse_launch_count += 1;
         complete_device_stage("MACEKokkos::reverse_M1_generated");

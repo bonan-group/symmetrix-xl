@@ -1925,6 +1925,8 @@ std::string m1_device_module_schedule = "none";
 int m1_device_persistent_blocks_per_compute_unit = 8;
 std::size_t generated_m1_module_forward_launch_count = 0;
 std::size_t generated_m1_module_reverse_launch_count = 0;
+// Fixed-order A1 scale-adjoint reductions after the generated M1 reverse.
+std::size_t generated_m1_scale_adjoint_reduction_count = 0;
 std::size_t standard_m1_module_forward_launch_count = 0;
 std::size_t standard_m1_module_reverse_launch_count = 0;
 // Strided-batched BLAS launches the bound A1 route performed (diagnostic).
@@ -1974,6 +1976,11 @@ Kokkos::View<Precision***,Kokkos::LayoutRight> M1_poly_values;
 Kokkos::View<Precision***,Kokkos::LayoutRight> M1_poly_adjoints;
 void compute_M1(int num_nodes, Kokkos::View<const int*> node_types);
 void reverse_M1(int num_nodes, Kokkos::View<const int*> node_types);
+void reduce_generated_m1_scale_adjoint(
+    const Kokkos::DefaultExecutionSpace& execution_space,
+    int num_nodes,
+    Kokkos::View<const Precision***,Kokkos::LayoutRight> input,
+    Kokkos::View<const Precision***,Kokkos::LayoutRight> input_adjoint);
 void release_m1_polynomial_workspace();
 int macefield_response_m1_recompute_tile_channels_for(int requested) const;
 std::size_t m1_recompute_required_scratch_bytes(

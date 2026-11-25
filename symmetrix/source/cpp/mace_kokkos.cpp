@@ -632,6 +632,10 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
             [] (const MACEKokkos<Precision>& self) {
                 return self.generated_m1_module_reverse_launch_count;
             })
+        .def_property_readonly("generated_m1_scale_adjoint_reduction_count",
+            [] (const MACEKokkos<Precision>& self) {
+                return self.generated_m1_scale_adjoint_reduction_count;
+            })
         .def_property_readonly("m1_model_payload_verified",
             [] (const MACEKokkos<Precision>& self) {
                 return self.m1_model_payload_verified;

@@ -4,6 +4,14 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ## 0.2.1 - Unreleased
 
+- Fixed run-to-run variation of stresses and edge forces on GPUs for
+  A1-scaled models under MH-0 adjoint reuse (the capacity and low-memory
+  plans) with the generated M1: the M1 reverse now reduces the A1 scale
+  adjoint in a fixed order after the module, instead of the module adding each
+  channel's partial with an FP64 atomic in arrival order. The host plugin
+  takes the same reduction. The built-in M1 and the generated module text are
+  unchanged.
+
 ## 0.2.0 - 2026-11-17
 
 ### Execution and JIT

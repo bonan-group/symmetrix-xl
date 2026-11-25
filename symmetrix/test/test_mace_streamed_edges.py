@@ -18,6 +18,7 @@ from symmetrix import (
     prepare_jit_host_artifact,
 )
 from symmetrix import symmetrix as native_symmetrix
+from symmetrix.mace_execution_contract import make_generated_m1_contract
 from symmetrix.mace_execution_contract import make_standard_m0_contract
 
 try:
@@ -2966,6 +2967,106 @@ def test_scalar_standard_m0_low_memory_matches_retained_direct(
             rtol=0.0,
             atol=tolerance,
         )
+
+
+@pytest.fixture(scope="module")
+def a1_scaled_generated_m1_model_path(tmp_path_factory, scalar_standard_model_path):
+    """The scalar standard model with a scaled A1 and a generated M1 contract."""
+
+    model = json.loads(scalar_standard_model_path.read_text())
+    model["execution_contracts"]["M1"] = make_generated_m1_contract(
+        channels=model["num_channels"],
+        type_count=model["num_elements"],
+        input_l_max=model["l_max"],
+        correlation=max(len(term) for term in model["M1_monomials"]),
+        monomials=model["M1_monomials"],
+    )
+    embedding = model["compact_radial"]["networks"]["A0"]["shape"][0]
+    model["A1_scaled"] = True
+    model["compact_radial"]["networks"]["A1"] = {
+        "shape": [embedding, 1],
+        "weights": [[0.02 * (1 + index % 3) for index in range(embedding)]],
+        "activation": "silu",
+        "activation_scale": 1.0,
+        "postprocess": "tanh-square",
+    }
+    output = tmp_path_factory.mktemp("a1-scaled-generated-m1") / "model.json"
+    output.write_text(json.dumps(model, separators=(",", ":")))
+    return output
+
+
+@pytest.mark.parametrize("dtype,tolerance", (("float32", 4e-5), ("float64", 3e-10)))
+def test_generated_m1_reduces_a1_scale_adjoint_in_fixed_order(
+    a1_scaled_generated_m1_model_path,
+    monkeypatch,
+    tmp_path,
+    dtype,
+    tolerance,
+):
+    _require_execution_fixed_weight_backend()
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit-cache"))
+
+    def calculator(profile):
+        return Symmetrix(
+            a1_scaled_generated_m1_model_path,
+            dtype=dtype,
+            streamed_edges="direct",
+            execution_profile=profile,
+        )
+
+    def frames():
+        small = _small_structure()
+        small.set_pbc(True)
+        larger = small * (2, 1, 1)
+        larger.positions += 0.05 * np.sin(np.arange(larger.positions.size)).reshape(
+            -1, 3
+        )
+        return small, larger
+
+    def evaluate(calc, atoms):
+        calc.calculate(atoms, properties=["energy", "forces", "stress"])
+        results = {
+            name: np.array(calc.results[name], copy=True)
+            for name in ("energy", "forces", "stress")
+        }
+        results["node_forces"] = np.array(calc.evaluator.node_forces, copy=True)
+        return results
+
+    reuse = calculator("capacity")
+    evaluator = reuse.evaluator
+    reused = [evaluate(reuse, atoms) for atoms in frames()]
+    assert evaluator.mh0_state_policy == "reuse-adjoints-v1"
+    assert evaluator.m1_host_plugin_ready or evaluator.m1_device_module_ready
+    assert evaluator.generated_m1_module_reverse_launch_count == 2
+    # The generated M1 keeps A1, so reverse_M1 reduces the A1 scale adjoint
+    # after the module, once per evaluation, instead of the module capturing it.
+    assert evaluator.generated_m1_scale_adjoint_reduction_count == 2
+
+    # The scale adjoint is assigned per node, so nothing of the first, smaller
+    # graph can leak into the second: a fresh evaluator agrees bit for bit in
+    # the energy, the stress and the per-edge forces. The atom forces still
+    # come from an FP64 atomic scatter, whose order follows the threads, so
+    # they agree within FP64 rounding of their sums.
+    fresh = calculator("capacity")
+    expected = evaluate(fresh, frames()[1])
+    assert fresh.evaluator.generated_m1_scale_adjoint_reduction_count == 1
+    for name in ("energy", "stress", "node_forces"):
+        np.testing.assert_array_equal(reused[1][name], expected[name])
+    np.testing.assert_allclose(
+        reused[1]["forces"], expected["forces"], rtol=0.0, atol=1e-12
+    )
+
+    # Under full retention reverse_A1_scaled forms the dot itself.
+    retained = calculator("capacity")
+    retained.evaluator._set_mh0_state_policy("full-retention-v1")
+    for atoms, ours in zip(frames(), reused):
+        theirs = evaluate(retained, atoms)
+        for name in ("energy", "forces", "stress"):
+            np.testing.assert_allclose(
+                ours[name], theirs[name], rtol=0.0, atol=tolerance
+            )
+    assert retained.evaluator.mh0_state_policy == "full-retention-v1"
+    assert retained.evaluator.generated_m1_scale_adjoint_reduction_count == 0
 
 
 @pytest.mark.parametrize("streamed_edges", ("factorized", "all_interactions"))
