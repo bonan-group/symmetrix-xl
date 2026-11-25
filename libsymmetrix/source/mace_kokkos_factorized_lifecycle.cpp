@@ -38,6 +38,8 @@
 #include "device_backend.hpp"
 #include "factorized_blas.hpp"
 
+#include <cstring>
+
 using Kokkos::ALL;
 using Kokkos::LayoutRight;
 using Kokkos::make_pair;
@@ -437,6 +439,7 @@ void MACEKokkos<Precision>::invalidate_factorized_operator_benchmark()
 template <typename Precision>
 void MACEKokkos<Precision>::begin_factorized_production_evaluation()
 {
+    reset_kernel_bindings();
     if (alchemical_weights_active())
         validate_alchemical_execution();
     begin_metal_evaluation();
@@ -901,6 +904,7 @@ void MACEKokkos<Precision>::compute_prepared_all_interactions_positions(
 template <typename Precision>
 void MACEKokkos<Precision>::invalidate_factorized_prepared_graph()
 {
+    reset_kernel_bindings();
     if (alchemical_weights_active()) {
         factorized_execution_space.fence("Release alchemical graph coefficients");
         alchemical_node_weights = {};
@@ -4557,6 +4561,33 @@ void MACEKokkos<Precision>::prepare_active_types(std::vector<int> node_types)
         new_active_atomic_numbers.push_back(atomic_numbers_host[node_types[active]]);
     }
     Kokkos::deep_copy(new_type_to_active, h_type_to_active);
+    Kokkos::View<int*> canonical_type_map;
+    if (!kernel_domain_decomposition_ && !R1_values.empty() && pair_count > 1
+            && symmetrix::execution::mace_kernel_device(
+                symmetrix::execution::MaceKernel::r1_slab, kernel_architecture_)) {
+        // The spline spacing and domain are shared. Compare the input words
+        // to the coefficient construction before uploading a canonical map.
+        const auto same_splines = [] (const auto& a, const auto& b) {
+            return std::equal(a.begin(), a.end(), b.begin(), b.end(),
+                [] (const auto& x, const auto& y) {
+                    return x.size() == y.size()
+                        && std::memcmp(x.data(), y.data(), x.size()*sizeof(double)) == 0;
+                });
+        };
+        bool identical = true;
+        for (int pair = 1; pair < pair_count && identical; ++pair)
+            identical = same_splines(R1_values[0], R1_values[pair])
+                && same_splines(R1_derivatives[0], R1_derivatives[pair]);
+        if (identical) {
+            canonical_type_map = Kokkos::View<int*>(
+                "Canonical R1 type map", atomic_numbers_host.size());
+            auto h_canonical = Kokkos::create_mirror(canonical_type_map);
+            Kokkos::deep_copy(h_canonical, -1);
+            for (const int type : node_types)
+                h_canonical(type) = 0;
+            Kokkos::deep_copy(canonical_type_map, h_canonical);
+        }
+    }
     Kokkos::fence();
 
     R0_spline_h = h;
@@ -4573,10 +4604,22 @@ void MACEKokkos<Precision>::prepare_active_types(std::vector<int> node_types)
         prepare_factorized_model(factorized_pair_tables, h, x0);
     else if (uses_prepared_execution(streamed_edges))
         factorized_ready = true;
+    reset_kernel_bindings();
     type_to_active = new_type_to_active;
+    r1_canonical_type_map_ = std::move(canonical_type_map);
     num_active_types = active_count;
     active_atomic_numbers = std::move(new_active_atomic_numbers);
     active_types = std::move(node_types);
+}
+
+template <typename Precision>
+const int* MACEKokkos<Precision>::r1_packet_type_map() const
+{
+    using symmetrix::execution::MaceKernel;
+    if (!r1_canonical_type_map_.data()
+            || optimized_kernel_refusal(MaceKernel::r1_slab))
+        return type_to_active.data();
+    return r1_canonical_type_map_.data();
 }
 
 template <typename Precision>

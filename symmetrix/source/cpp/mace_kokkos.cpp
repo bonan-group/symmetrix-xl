@@ -213,10 +213,11 @@ py::dict factorized_operator_export(
 
 template <typename Precision>
 std::unique_ptr<MACEKokkos<Precision>> load_mace_kokkos(
-    const std::string& filename, const std::string& requested_head)
+    const std::string& filename, const std::string& requested_head,
+    const std::string& kernels)
 {
     auto evaluator = std::make_unique<MACEKokkos<Precision>>(
-        filename, requested_head);
+        filename, requested_head, symmetrix::execution::parse_mace_kernels(kernels));
     if (!evaluator->supports_streamed_edges()) {
         if (PyErr_WarnEx(
                 PyExc_UserWarning,
@@ -271,7 +272,30 @@ void bind_mace_kokkos(py::module_ &m, const char* class_name)
 
     py::class_<MACEKokkos<Precision>>(m, class_name)
         .def(py::init(&load_mace_kokkos<Precision>),
-            py::arg("filename"), py::arg("head") = "")
+            py::arg("filename"), py::arg("head") = "", py::arg("kernels") = "standard")
+        .def("kernel_binding_report", [](const MACEKokkos<Precision>& self) {
+            const auto report = self.kernel_binding_report();
+            py::dict operators, rows, result;
+            operators["M0"] = report.m0;
+            operators["R0"] = report.r0;
+            operators["M1"] = report.m1;
+            for (std::size_t i = 0; i < report.rows.size(); ++i) {
+                const auto& row = report.rows[i];
+                py::dict binding;
+                binding["forward"] = row.forward.form;
+                binding["reverse"] = row.reverse.form;
+                binding["forward_launches"] = row.forward.launches;
+                binding["reverse_launches"] = row.reverse.launches;
+                binding["refusal"] = row.refusal ? py::cast(row.refusal) : py::none();
+                rows[py::str(symmetrix::execution::mace_kernel_names[i])] = std::move(binding);
+            }
+            result["mode"] = report.mode;
+            result["plan"] = report.plan;
+            result["architecture"] = report.architecture;
+            result["operators"] = std::move(operators);
+            result["rows"] = std::move(rows);
+            return result;
+        })
         .def("set_streamed_edges", &MACEKokkos<Precision>::set_streamed_edges)
         .def("_begin_factorized_distributed_evaluation_for_testing",
             [] (MACEKokkos<Precision>& self) {

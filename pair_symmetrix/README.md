@@ -60,6 +60,15 @@ ordinary `symmetrix/mace/kk` pair style rejects these models explicitly at
 `pair_coeff`. `MACE_Polar` is a separate model family with its own pair style
 and native whole-model evaluator.
 
+### Optimized MACE kernels
+
+Add `kernels optimized` to `pair_style symmetrix/mace/float32/kk` to opt in
+to optimized rows for eligible direct evaluations. The default is
+`kernels standard`. A change to the keyword requires a new `pair_coeff`.
+The run summary reports the selected plan, bound M0, R0, and M1
+implementations, and cumulative forward and reverse launches by rank.
+Ineligible rows use the standard implementation and report the reason.
+
 ### MACE Polar
 
 Use `symmetrix/mace/polar/kk` for FP64 or

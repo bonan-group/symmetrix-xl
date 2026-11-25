@@ -55,6 +55,7 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
   void coeff(int, char **) override;
   double init_one(int, int) override;
   void init_style() override;
+  void finish() override;
   void *extract(const char *, int &) override;
   int pack_forward_comm(int, int *, double *, int, int *) override;
   int pack_forward_comm_kokkos(int, DAT::tdual_int_1d, DAT::tdual_double_1d&, int, int*) override;
@@ -71,6 +72,7 @@ class PairSymmetrixMACEKokkos : public Pair, public KokkosBase {
  protected:
   std::string mode;
   std::string prediction_head;
+  symmetrix::execution::MaceKernels kernels = symmetrix::execution::MaceKernels::standard;
   std::string streamed_edges;
   std::string execution_profile = "capacity";
   bool execution_profile_set = false;

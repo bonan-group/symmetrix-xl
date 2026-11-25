@@ -30,6 +30,7 @@
 
 #include "tools_kokkos.hpp"
 #include "mace_kokkos.hpp"
+#include "mace_row_gemm.hpp"
 #ifdef SYMMETRIX_ENABLE_METAL
 #include "metal_m0_module.hpp"
 #include "metal_r1_module.hpp"
@@ -362,10 +363,62 @@ void MACEKokkos<Precision>::add_h1_affine_direct_adjoint(const int num_nodes)
     complete_device_stage("MACEKokkos::add_m0_composite_direct_adjoint");
 }
 
+// Flatten (node, m) into rows while preserving TeamGemm's ordered K FMAs.
+template <typename Precision>
+template <class Input, class Output, class Weights>
+bool MACEKokkos<Precision>::try_h1_row_gemm(
+    const Kokkos::DefaultExecutionSpace& execution_space, const int num_nodes,
+    const Input& input, const Output& output, const Weights& weights,
+    const bool reverse)
+{
+    using symmetrix::execution::MaceKernel;
+    if constexpr (std::is_same_v<Precision, float>
+            && device_execution_space<Kokkos::DefaultExecutionSpace>) {
+        if (num_nodes == 0
+                || optimized_kernel_refusal(MaceKernel::h1_gemm))
+            return false;
+        namespace row = symmetrix::optimized;
+        const auto& device = *symmetrix::execution::mace_kernel_device(
+            MaceKernel::h1_gemm, kernel_architecture_);
+        if (!row::row_gemm_fits<64,64,32,4,4>(device.subgroup_width, device.scratch_limit))
+            return false;
+        if (input.stride(2) != 1 || output.stride(2) != 1
+                || weights.stride(1) != static_cast<std::size_t>(num_channels)
+                || weights.stride(2) != 1
+                || row::ranges_overlap(input.data(), input.span(),
+                    output.data(), output.span()))
+            return false;
+        row::RowGemmBatch batch{};
+        batch.A = input.data();
+        batch.C = output.data();
+        batch.a_ns = input.stride(0);
+        batch.c_ns = output.stride(0);
+        batch.num_nodes = num_nodes;
+        batch.count = L_max+1;
+        for (int l = 0; l <= L_max; ++l) {
+            batch.p[l] = {
+                weights.data() + l*weights.stride(0),
+                l*l*input.stride(1), input.stride(1),
+                l*l*output.stride(1), output.stride(1),
+                num_channels, num_channels, 2*l+1, 0, 0};
+        }
+        if (!row::row_gemm_prepare<64,64,32>(batch))
+            return false;
+        row::row_gemm_launch<64,64,32,4,4>(
+            reverse ? "H1 reverse row GEMM" : "H1 forward row GEMM",
+            execution_space, batch);
+        record_kernel_binding(MaceKernel::h1_gemm, reverse, "row_tiled", 1);
+        return true;
+    }
+    return false;
+}
+
 template <typename Precision>
 void MACEKokkos<Precision>::compute_H1(
     const int num_nodes)
 {
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::h1_gemm, false, "standard");
     if (has_field_coupling)
         throw std::invalid_argument(
             "compute_H1 is the field-free H1 entry; a MACEField model is evaluated "
@@ -429,6 +482,11 @@ void MACEKokkos<Precision>::compute_H1(
             complete_device_stage("MACEKokkos::compute_H1");
             return;
         }
+    }
+
+    if (try_h1_row_gemm(execution_space, num_nodes, M0, H1, H1_weights, false)) {
+        complete_device_stage("MACEKokkos::compute_H1");
+        return;
     }
 
     Kokkos::parallel_for("Compute H1",
@@ -672,6 +730,8 @@ template <typename Precision>
 void MACEKokkos<Precision>::reverse_H1_fused(
     const int num_nodes)
 {
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::h1_gemm, true, "standard");
     const auto execution_space = use_factorized_async_inference()
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
     ensure_mh0_m0_adjoint_capacity();
@@ -712,6 +772,11 @@ void MACEKokkos<Precision>::reverse_H1_fused(
             complete_device_stage("MACEKokkos::reverse_H1");
             return;
         }
+    }
+
+    if (try_h1_row_gemm(execution_space, num_nodes, H1_adj, M0_adj, H1_weights_trans, true)) {
+        complete_device_stage("MACEKokkos::reverse_H1");
+        return;
     }
 
     Kokkos::parallel_for("Reverse H1",
@@ -1183,6 +1248,8 @@ void MACEKokkos<Precision>::compute_Phi1(
     Kokkos::View<const int*> num_neigh,
     Kokkos::View<const int*> neigh_indices)
 {
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, false, "standard");
     // Compute Phi1_lelm1lm2 (named Phi1r)
     if (Phi1r.extent(0) < num_nodes)
         Kokkos::realloc(Phi1r, num_nodes, num_lelm1lm2, num_channels);
@@ -1298,6 +1365,8 @@ void MACEKokkos<Precision>::compute_Phi1_streamed(
     Kokkos::View<const int*> neigh_types,
     Kokkos::View<const double*> r)
 {
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, false, "standard");
     const bool async_inference = use_factorized_async_inference();
     const auto execution_space = async_inference
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
@@ -1416,6 +1485,8 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
     Kokkos::View<const int*> neigh_types,
     Kokkos::View<const double*> r)
 {
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, false, "standard");
     if (!use_factorized_direct_inference())
         throw std::logic_error(
             "Generated Execution R1 forward was called without an admitted artifact.");
@@ -1453,6 +1524,8 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                     "edge count exceeds the CUDA ABI");
                 const int num_edges = static_cast<int>(neigh_indices.extent(0));
                 const int channels = num_channels;
+                const auto* packet_type_map = r1_packet_type_map();
+                const bool canonical_slab = packet_type_map != type_to_active.data();
                 const auto radial = make_execution_device_radial_spline(radial_1);
                 const int expected_edge_types =
                     num_active_types*(num_active_types+1)/2;
@@ -1484,7 +1557,7 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                             streamed_first_neigh.data()),
                         reinterpret_cast<const std::int32_t*>(neigh_indices.data()),
                         reinterpret_cast<const std::int32_t*>(neigh_types.data()),
-                        reinterpret_cast<const std::int32_t*>(type_to_active.data()),
+                        reinterpret_cast<const std::int32_t*>(packet_type_map),
                         r.data(),
                         radial,
                         Y.data(),
@@ -1510,8 +1583,13 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                                     factorized_execution_space)),
                             persistent_blocks),
                         "Launching the projected R1 forward module");
+                    if (num_nodes > 0)
+                        record_kernel_binding(symmetrix::execution::MaceKernel::a1_gemm, false, "projected_r1");
                     factorized_jit_launch_count += 1;
                     factorized_jit_forward_launch_count += 1;
+                    if (num_nodes > 0)
+                        record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, false,
+                            canonical_slab ? "canonical_slab" : "standard", canonical_slab ? 1 : 0);
                     return;
                 }
 
@@ -1569,8 +1647,7 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                                 neigh_indices.data()),
                             reinterpret_cast<const std::int32_t*>(
                                 neigh_types.data()),
-                            reinterpret_cast<const std::int32_t*>(
-                                type_to_active.data()),
+                            reinterpret_cast<const std::int32_t*>(packet_type_map),
                             r.data(),
                             radial,
                             Y.data(),
@@ -1589,6 +1666,9 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                         compute_A1_channel_tile(num_nodes, channel_begin);
                         factorized_jit_launch_count += 1;
                         factorized_jit_forward_launch_count += 1;
+                        if (num_nodes > 0)
+                            record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, false,
+                                canonical_slab ? "canonical_slab" : "standard", canonical_slab ? 1 : 0);
                     }
                     return;
                 }
@@ -1675,7 +1755,7 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                         streamed_first_neigh.data()),
                     reinterpret_cast<const std::int32_t*>(neigh_indices.data()),
                     reinterpret_cast<const std::int32_t*>(neigh_types.data()),
-                    reinterpret_cast<const std::int32_t*>(type_to_active.data()),
+                    reinterpret_cast<const std::int32_t*>(packet_type_map),
                     r.data(),
                     radial,
                     Y.data(),
@@ -1702,6 +1782,9 @@ void MACEKokkos<Precision>::compute_Phi1_streamed_jit(
                     "Launching the Execution device R1 forward plugin");
                 factorized_jit_launch_count += 1;
                 factorized_jit_forward_launch_count += 1;
+                if (num_nodes > 0)
+                    record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, false,
+                        canonical_slab ? "canonical_slab" : "standard", canonical_slab ? 1 : 0);
                 return;
             }
         }
@@ -1884,6 +1967,8 @@ void MACEKokkos<Precision>::reverse_Phi1(
     bool zero_dxyz,
     bool zero_H1_adj)
 {
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, true, "standard");
     if (dPhi1r.extent(0) < Phi1r.extent(0))
         Kokkos::realloc(dPhi1r, Phi1r.extent(0), Phi1r.extent(1), Phi1r.extent(2));
     if (node_forces.size() != xyz.size())
@@ -2015,6 +2100,8 @@ void MACEKokkos<Precision>::reverse_Phi1_streamed(
     bool zero_dxyz,
     bool zero_H1_adj)
 {
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, true, "standard");
     if (dPhi1r.extent(0) < static_cast<std::size_t>(num_nodes))
         Kokkos::realloc(dPhi1r, num_nodes, num_lelm1lm2, num_channels);
     if (node_forces.size() != xyz.size())

@@ -469,6 +469,8 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
     Kokkos::View<const double*> xyz,
     Kokkos::View<const double*> r)
 {
+    if (num_nodes > 0 && neigh_indices.extent(0) > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, true, "standard");
     const auto execution_space = factorized_execution_space;
     const int num_feature_nodes = execution_schedule_num_feature_nodes;
     const bool compact_geometry = use_compact_edge_geometry();
@@ -497,6 +499,8 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                 "edge count exceeds the CUDA ABI");
             const int num_edges = static_cast<int>(neigh_indices.extent(0));
             const int channels = num_channels;
+            const auto* packet_type_map = r1_packet_type_map();
+            const bool canonical_slab = packet_type_map != type_to_active.data();
             const auto radial = make_execution_device_radial_spline(radial_1);
             const int expected_edge_types =
                 num_active_types*(num_active_types+1)/2;
@@ -537,7 +541,7 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                         streamed_first_neigh.data()),
                     reinterpret_cast<const std::int32_t*>(neigh_indices.data()),
                     reinterpret_cast<const std::int32_t*>(neigh_types.data()),
-                    reinterpret_cast<const std::int32_t*>(type_to_active.data()),
+                    reinterpret_cast<const std::int32_t*>(packet_type_map),
                     compact_geometry
                         ? static_cast<const void*>(unit_direction.data())
                         : static_cast<const void*>(xyz.data()),
@@ -567,9 +571,13 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                             ExecutionDeviceBackend::native_stream(execution_space)),
                         persistent_blocks),
                     "Launching the projected R1 reverse module");
+                if (num_nodes > 0)
+                    record_kernel_binding(symmetrix::execution::MaceKernel::a1_gemm, true, "projected_r1");
                 if (num_edges > 0) {
                     factorized_jit_launch_count += 1;
                     factorized_jit_reverse_launch_count += 1;
+                    record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, true,
+                            canonical_slab ? "canonical_slab" : "standard", canonical_slab ? 1 : 0);
                 }
                 return;
             }
@@ -672,8 +680,7 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                             source_edges.data()),
                         reinterpret_cast<const std::int32_t*>(
                             edge_receivers.data()),
-                        reinterpret_cast<const std::int32_t*>(
-                            type_to_active.data()),
+                        reinterpret_cast<const std::int32_t*>(packet_type_map),
                         r.data(),
                         radial,
                         Y.data(),
@@ -702,8 +709,7 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                         reinterpret_cast<const std::int32_t*>(neigh_types.data()),
                         reinterpret_cast<const std::int32_t*>(
                             edge_receivers.data()),
-                        reinterpret_cast<const std::int32_t*>(
-                            type_to_active.data()),
+                        reinterpret_cast<const std::int32_t*>(packet_type_map),
                         compact_geometry
                             ? static_cast<const void*>(unit_direction.data())
                             : static_cast<const void*>(xyz.data()),
@@ -728,6 +734,8 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                     if (num_edges > 0) {
                         factorized_jit_launch_count += 1;
                         factorized_jit_reverse_launch_count += 1;
+                        record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, true,
+                                canonical_slab ? "canonical_slab" : "standard", canonical_slab ? 1 : 0);
                     }
 
                 }
@@ -855,7 +863,7 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                     execution_direct_source_edges.data()),
                 reinterpret_cast<const std::int32_t*>(
                     execution_edge_receivers.data()),
-                reinterpret_cast<const std::int32_t*>(type_to_active.data()),
+                reinterpret_cast<const std::int32_t*>(packet_type_map),
                 r.data(),
                 radial,
                 Y.data(),
@@ -877,7 +885,7 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                 reinterpret_cast<const std::int32_t*>(neigh_types.data()),
                 reinterpret_cast<const std::int32_t*>(
                     execution_edge_receivers.data()),
-                reinterpret_cast<const std::int32_t*>(type_to_active.data()),
+                reinterpret_cast<const std::int32_t*>(packet_type_map),
                 compact_geometry
                     ? static_cast<const void*>(unit_direction.data())
                     : static_cast<const void*>(xyz.data()),
@@ -917,6 +925,8 @@ void MACEKokkos<Precision>::reverse_factorized_direct(
                     jit_device_plugin->r1_reverse_physical_launch_count();
                 factorized_jit_launch_count += launch_count;
                 factorized_jit_reverse_launch_count += launch_count;
+                record_kernel_binding(symmetrix::execution::MaceKernel::r1_slab, true,
+                        canonical_slab ? "canonical_slab" : "standard", canonical_slab ? launch_count : 0);
             }
             return;
         }

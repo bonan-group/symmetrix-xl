@@ -144,6 +144,11 @@ FAMILY_ENTRY = FamilyEntry(
     # surfaces are the whole-evaluator entry points every routing can reach.
     surfaces=(
         EvaluatorSurface(
+            key="kernel_bindings",
+            methods=("kernel_binding_report",),
+            kokkos=True,
+        ),
+        EvaluatorSurface(
             key="mode_handshake",
             methods=("set_streamed_edges",),
             kokkos=True,
