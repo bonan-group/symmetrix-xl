@@ -1168,3 +1168,26 @@ def test_invalid_native_coefficients_preserve_weighted_evaluation(
         np.testing.assert_allclose(
             evaluator.node_energies, expected, rtol=0, atol=2e-14
         )
+
+
+def test_optimized_kernels_report_live_alchemical_refusal(
+    alchemical_model_path, monkeypatch, tmp_path
+):
+    from symmetrix import Symmetrix
+
+    monkeypatch.setenv("SYMMETRIX_JIT_POLICY", "required")
+    monkeypatch.setenv("SYMMETRIX_JIT_CACHE", str(tmp_path / "jit"))
+    atoms = _atoms()
+    calc = Symmetrix(
+        alchemical_model_path,
+        dtype="float32",
+        kernels="optimized",
+        alchemical=_config([0.35, 0.65]),
+        kernel_launch_policy="static",
+    )
+    calc.calculate(atoms, ["energy", "forces"])
+    assert calc.evaluator.alchemical_weights_active
+    rows = calc.kernel_binding_report()["rows"]
+    assert set(binding["refusal"] for binding in rows.values()) == {
+        "live alchemical weights"
+    }

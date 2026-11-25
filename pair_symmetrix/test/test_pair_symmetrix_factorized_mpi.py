@@ -1,5 +1,5 @@
 import functools
-import importlib
+import importlib.util
 import itertools
 import json
 import os
@@ -75,6 +75,93 @@ def _host_artifact_arguments(precision):
             arguments["jit_m0_device_schedule"] = os.environ[schedule_name]
         return arguments
     pytest.skip(f"Set {precision_name} for direct {precision} MPI tests.")
+
+
+@pytest.mark.parametrize("kernels", ["standard", "optimized"])
+def test_two_rank_kernel_binding_report(tmp_path, kernels):
+    executable = _required_path("SYMMETRIX_LAMMPS_EXECUTABLE", "the MPI LAMMPS build")
+    mpiexec = os.environ.get("MPIEXEC_EXECUTABLE") or shutil.which("mpiexec")
+    if not mpiexec:
+        _skip_or_fail("mpiexec is unavailable")
+    # The reference MPI schedule exchanges H1 between both interactions.
+    tests = Path(__file__).resolve().parents[2] / "symmetrix/test"
+    spec = importlib.util.spec_from_file_location(
+        "compact_r1_model", tests / "compact_r1_model.py"
+    )
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    contract = tests / "data/execution_contracts/jit_r1_fixture_c4_e3_l0_contract.json"
+    model = tmp_path / "compact.json"
+    model_data = builder.foundation_r1_test_model(
+        json.loads(contract.read_text()), atomic_numbers=(13, 7)
+    )
+    model.write_text(json.dumps(model_data))
+    deck, log = tmp_path / "in.binding", tmp_path / "lammps.log"
+    deck.write_text(
+        f"""
+units metal
+processors 2 1 1
+atom_style atomic/kk
+atom_modify map yes
+boundary p p p
+newton on
+package kokkos neigh half newton on
+region box block 0 20 0 20 0 20
+create_box 2 box
+create_atoms 1 single 9 10 10 units box
+create_atoms 2 single 8 10 10 units box
+mass 1 26.9815
+mass 2 14.0067
+pair_style symmetrix/mace/float32/kk mpi_message_passing streamed_edges non-compiled kernels {kernels}
+pair_coeff * * "{model}" Al N
+compute pressure_virial all pressure NULL virial
+thermo_style custom step atoms pe c_pressure_virial
+run 0
+"""
+    )
+    completed = subprocess.run(
+        [
+            mpiexec,
+            "-n",
+            "2",
+            str(executable),
+            "-k",
+            "on",
+            "t",
+            "1",
+            "-sf",
+            "kk",
+            "-screen",
+            "none",
+            "-log",
+            str(log),
+            "-in",
+            str(deck),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={
+            **os.environ,
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_PROC_BIND": "false",
+        },
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    text = log.read_text()
+    assert re.search(r"Loop time of .* on 2 procs for 0 steps with 2 atoms", text)
+    lines = [line for line in text.splitlines() if line.startswith("Symmetrix rank ")]
+    names = ("r1_type_map", "h1_contraction", "a1_contraction", "a1_scale_divide")
+    expected = []
+    for rank in (0, 1):
+        expected.append(f"Symmetrix rank {rank} kernels {kernels}:")
+        expected.extend(f"Symmetrix rank {rank} {name} " for name in names)
+    assert len(lines) == len(expected), lines
+    for line, prefix in zip(lines, expected, strict=True):
+        assert line.startswith(prefix), lines
+        if kernels == "optimized" and " kernels " not in prefix:
+            assert "refusal=domain decomposition requires standard kernels" in line
 
 
 def _read_dump(path):

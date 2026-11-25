@@ -986,3 +986,111 @@ def test_pair_style_requires_metal_units(tmp_path, compact_model_path):
     )
     assert completed.returncode != 0, log_text[-2000:]
     assert "requires 'units metal'" in log_text + completed.stderr, log_text[-2000:]
+
+
+@pytest.mark.parametrize("mode", ["no_domain_decomposition", "mpi_message_passing"])
+def test_kernel_selection_reports_reference_binding(tmp_path, compact_model_path, mode):
+    base = f"symmetrix/mace/float32/kk {mode} streamed_edges non-compiled"
+    records = {}
+    for label in ("omitted", "standard", "optimized"):
+        pair_style = base if label == "omitted" else f"{base} kernels {label}"
+        completed, log_text = _run_deck(
+            tmp_path,
+            label,
+            _static_deck(compact_model_path, pair_style),
+            stages=[["initial", "run 0"], ["reuse", "run 0"]],
+        )
+        records[label] = _case_result(label, completed, log_text)
+        binding = "optimized" if label == "optimized" else "standard"
+        assert log_text.count(f"Symmetrix rank 0 kernels {binding}: plan=generic") == 2
+        assert "M0=generic_m0" in log_text
+        assert "R0=generic_r0" in log_text
+        assert (
+            log_text.count(
+                "Symmetrix rank 0 h1_contraction forward=standard reverse=standard "
+                "forward_launches=0 reverse_launches=0"
+            )
+            == 2
+        )
+    for stage in ("initial", "reuse"):
+        omitted = records["omitted"][stage]
+        for label in ("standard", "optimized"):
+            actual = records[label][stage]
+            assert actual["pe"] == omitted["pe"]
+            np.testing.assert_array_equal(actual["forces"], omitted["forces"])
+
+
+def test_kernel_selection_refuses_domain_decomposition(tmp_path, compact_model_path):
+    style = (
+        "symmetrix/mace/float32/kk mpi_message_passing "
+        "streamed_edges non-compiled kernels optimized"
+    )
+    completed, log_text = _run_deck(
+        tmp_path,
+        "dd-refusal",
+        _static_deck(compact_model_path, style),
+        stages=[["initial", "run 0"]],
+    )
+    _case_result("dd-refusal", completed, log_text)
+    reason = "refusal=domain decomposition requires standard kernels"
+    assert reason in log_text
+    rows = {
+        line.split()[3]
+        for line in log_text.splitlines()
+        if line.startswith("Symmetrix rank 0 ") and reason in line
+    }
+    assert rows == {
+        "r1_type_map",
+        "h1_contraction",
+        "a1_contraction",
+        "a1_scale_divide",
+    }
+
+
+def test_kernel_selection_reports_binding_after_pair_coeff(
+    tmp_path, compact_model_path
+):
+    def reissue(mode):
+        return (
+            f"pair_style {_REISSUE_BASE} kernels {mode}\n"
+            f"pair_coeff * * {compact_model_path} H O\nrun 0"
+        )
+
+    completed, log_text = _run_deck(
+        tmp_path,
+        "reissue-binding",
+        _static_deck(compact_model_path, _REISSUE_BASE),
+        stages=[
+            ["initial", "run 0"],
+            ["optimized", reissue("optimized")],
+            ["standard", reissue("standard")],
+        ],
+    )
+    result = _case_result("reissue-binding", completed, log_text)
+    reports = [
+        line.split()[4].rstrip(":")
+        for line in log_text.splitlines()
+        if line.startswith("Symmetrix rank 0 kernels")
+    ]
+    assert reports == ["standard", "optimized", "standard"]
+    for label in ("optimized", "standard"):
+        assert result[label]["pe"] == result["initial"]["pe"]
+        np.testing.assert_array_equal(
+            result[label]["forces"], result["initial"]["forces"]
+        )
+
+
+def test_kernel_selection_change_requires_pair_coeff(tmp_path, compact_model_path):
+    completed, log_text = _run_deck(
+        tmp_path,
+        "reissue-kernels",
+        _static_deck(compact_model_path, _REISSUE_BASE),
+        stages=[
+            ["first", "run 0"],
+            ["second", f"pair_style {_REISSUE_BASE} kernels optimized\nrun 0"],
+        ],
+    )
+    assert completed.returncode != 0
+    assert "options changed after pair_coeff; issue pair_coeff again" in (
+        log_text + completed.stderr
+    )

@@ -698,3 +698,9 @@ def test_maceles_plus_additive_correction_composes_energy_and_forces_once(
             combined_calc.results["mace_les_energy"]
             + combined_calc.results["d3_energy"]
         )
+
+
+def test_optimized_kernels_refuse_mace_les(mace_les_json):
+    path, _ = mace_les_json
+    with pytest.raises(ValueError, match="optimized.*unavailable for MACELES"):
+        Symmetrix(path, kernels="optimized", streamed_edges="reference")

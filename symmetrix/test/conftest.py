@@ -66,6 +66,8 @@ _EXTENDED_MODULES = frozenset(
 _STANDARD_E2E_NODEIDS = frozenset(
     {
         "test/test_symmetrix_calc.py::test_symmetrix_vs_pytorch",
+        "test/test_mace_les_calculator.py::test_optimized_kernels_refuse_mace_les",
+        "test/test_mace_alchemical.py::test_optimized_kernels_report_live_alchemical_refusal",
         "test/test_mh1.py::test_generalized_mh1_generated_cuda_execution_matches_generic[c4-e2-b4-l2-linear]",
         "test/test_polar_end_to_end_fixtures.py::test_the_family_evaluates_the_total_energy_force_and_dipole[singlet-mol_h2o-S]",
         "test/test_polar_end_to_end_fixtures.py::test_the_family_evaluates_the_total_energy_force_and_dipole[field-bulk_w4-S]",

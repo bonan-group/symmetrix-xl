@@ -61,6 +61,8 @@ jobs:
           --config-settings=cmake.define.SYMMETRIX_PARTICLE_MESH=ON
         deactivate
     - name: Run tests
+      env:
+        SYMMETRIX_CPU_TEST_BUILD: ${{ runner.temp }}/symmetrix-cpu-build
       run: |
         source .venv/bin/activate
         python -c "import symmetrix; print(symmetrix.__version__)"
@@ -207,7 +209,7 @@ jobs:
         SYMMETRIX_REQUIRE_LAMMPS_TESTS=1 \
           pytest -q pair_symmetrix/test/test_pair_symmetrix_factorized_mpi.py \
             pair_symmetrix/test/test_pair_symmetrix_hybrid_mpi.py \
-            -k 'test_direct_mpi_rank_without_atoms_matches_single_rank or test_mpi_message_passing_stops_on_a_type_filtered_overlay'
+            -k 'test_direct_mpi_rank_without_atoms_matches_single_rank or test_mpi_message_passing_stops_on_a_type_filtered_overlay or test_two_rank_kernel_binding_report'
         deactivate
 
     - name: Run pair style test suite
@@ -215,7 +217,7 @@ jobs:
         source .venv/bin/activate
         cd pair_symmetrix/test
         TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
-          pytest -q -k 'not test_manual_schedules_match_whole_model_for_residual_first_models and not test_direct_mpi_rank_without_atoms_matches_single_rank and not test_mpi_message_passing_stops_on_a_type_filtered_overlay'
+          pytest -q -k 'not test_manual_schedules_match_whole_model_for_residual_first_models and not test_direct_mpi_rank_without_atoms_matches_single_rank and not test_mpi_message_passing_stops_on_a_type_filtered_overlay and not test_two_rank_kernel_binding_report'
         deactivate
 
     - name: Run required Polar pair style JIT tests
