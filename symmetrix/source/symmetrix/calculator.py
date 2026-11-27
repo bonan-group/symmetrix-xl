@@ -930,6 +930,11 @@ class Symmetrix(Calculator):
         the artifact-free portable backbone. This routing is distinct from
         ``polar_electrostatics``, which is runtime boundary policy and is not
         serialized in the model JSON.
+    kernels : {"standard", "optimized"}, default="standard"
+        Select the kernel mode at construction. Optimized rows participate
+        in eligible direct FP32 MACE evaluations. Call
+        :meth:`kernel_binding_report` after evaluation for the
+        selected plan, operator bindings, refusals, and launch counts.
     execution_profile : {"capacity", "speed"}, default="capacity"
         Resource objective for direct Kokkos execution. ``capacity`` chooses
         the fastest qualified direct policy estimated to fit the device; when
@@ -1194,8 +1199,12 @@ class Symmetrix(Calculator):
         dispersion_device=None,
         metal=False,
         alchemical=None,
+        kernels="standard",
         **kwargs,
     ):
+        if kernels not in ("standard", "optimized"):
+            raise ValueError("kernels must be 'standard' or 'optimized'")
+        self._kernels = kernels
         explicit_polar_options = {
             name
             for name, value in (
@@ -1628,7 +1637,7 @@ class Symmetrix(Calculator):
         )
         jit_model_data = None
         try:
-            self.evaluator = MACE(str(model_file), "" if head is None else head)
+            self.evaluator = self._load_kernel_owner(MACE, str(model_file), head)
         except RuntimeError as error:
             if not self._is_native_json_parse_error(error):
                 raise
@@ -1666,7 +1675,7 @@ class Symmetrix(Calculator):
                 )
                 fout.write(json.dumps(data))
                 fout.flush()
-                self.evaluator = MACE(fout.name, "" if head is None else head)
+                self.evaluator = self._load_kernel_owner(MACE, fout.name, head)
 
         self._model_single_layer_readout = bool(
             getattr(
@@ -3744,6 +3753,34 @@ class Symmetrix(Calculator):
         except Exception as exc:
             diagnostics = (*self.jit_diagnostics, f"{type(exc).__name__}: {exc}")
             self._jit_failed(exc, diagnostics)
+
+    @property
+    def kernels(self):
+        """Kernel mode selected when the native evaluator was constructed."""
+        return self._kernels
+
+    def set(self, **kwargs):
+        if "kernels" in kwargs and kwargs.pop("kernels") != self._kernels:
+            raise ValueError("Changing kernels requires a new Symmetrix calculator")
+        return super().set(**kwargs)
+
+    def _load_kernel_owner(self, evaluator_class, model_path, head):
+        if self._kernels == "standard":
+            return evaluator_class(model_path, "" if head is None else head)
+        if evaluator_class not in (symmetrix.MACEKokkos, symmetrix.MACEKokkosFloat):
+            raise ValueError(
+                f"kernels='optimized' is unavailable for {self._native_model_type}"
+            )
+        return evaluator_class(
+            model_path, "" if head is None else head, kernels="optimized"
+        )
+
+    def kernel_binding_report(self):
+        """Return current bindings and counts, or the family's standard status."""
+        family = self._resolved_family_entry()
+        if family_registry.supports_surface(family, self.evaluator, "kernel_bindings"):
+            return self.evaluator.kernel_binding_report()
+        return {"mode": "standard", "family": family.key, "rows": {}}
 
     @staticmethod
     def _native_evaluator_class(model_type, dtype):

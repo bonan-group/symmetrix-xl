@@ -103,6 +103,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute(int eflag, int vfla
   if (time_pair) Kokkos::fence("Symmetrix timing pair begin");
   const double pair_start = time_pair ? platform::walltime() : 0.0;
   execution_pair_evaluation_count += 1.0;
+  mace->reset_kernel_bindings();
   if (mode == "no_domain_decomposition") {
     compute_no_domain_decomposition(eflag, vflag);
   } else if (mode == "mpi_message_passing") {
@@ -116,6 +117,40 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::compute(int eflag, int vfla
     Kokkos::fence("Symmetrix timing pair end");
     execution_pair_seconds += platform::walltime() - pair_start;
   }
+}
+
+/* ---------------------------------------------------------------------- */
+
+template<class DeviceType, typename Precision>
+void PairSymmetrixMACEKokkos<DeviceType, Precision>::finish()
+{
+  if (!mace)
+    return;
+  std::string report;
+  for (const auto& line : mace->kernel_binding_report().lines())
+    report += fmt::format("Symmetrix rank {} {}\n", comm->me, line);
+  if (comm->nprocs == 1) {
+    utils::logmesg(lmp, "{}", report);
+    return;
+  }
+
+  // Collect once after the run, outside the pair timing and the force loop.
+  const int length = static_cast<int>(report.size());
+  std::vector<int> lengths(comm->nprocs), offsets(comm->nprocs);
+  MPI_Gather(&length, 1, MPI_INT, lengths.data(), 1, MPI_INT, 0, world);
+  int total = 0;
+  if (comm->me == 0)
+    for (int rank = 0; rank < comm->nprocs; ++rank) {
+      offsets[rank] = total;
+      total += lengths[rank];
+    }
+  std::vector<char> reports(static_cast<std::size_t>(total)+1);
+  MPI_Gatherv(report.data(), length, MPI_CHAR, reports.data(), lengths.data(),
+              offsets.data(), MPI_CHAR, 0, world);
+  if (comm->me == 0)
+    for (int rank = 0; rank < comm->nprocs; ++rank)
+      utils::logmesg(lmp, "{}",
+        std::string_view(reports.data()+offsets[rank], lengths[rank]));
 }
 
 /* ---------------------------------------------------------------------- */
@@ -196,6 +231,7 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
   debug_single_layer_workspace_receivers = 0;
   debug_dual_layer_workspace_receivers = 0;
   prediction_head.clear();
+  kernels = symmetrix::execution::MaceKernels::standard;
   jit_host_artifact.clear();
   jit_device_artifact.clear();
   jit_m0_device_artifact.clear();
@@ -231,6 +267,14 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
       Kokkos::deep_copy(electric_field, h_electric_field);
       electric_field_set = true;
       i += 3;
+    } else if (token == "kernels") {
+      if (i+1 >= narg)
+        error->all(FLERR, "pair_style symmetrix/mace/kk kernels requires standard or optimized");
+      try {
+        kernels = symmetrix::execution::parse_mace_kernels(arg[++i]);
+      } catch (const std::invalid_argument &exception) {
+        error->all(FLERR, "pair_style symmetrix/mace/kk {}", exception.what());
+      }
     } else if (token == "streamed_edges") {
       if (i+1 >= narg)
         error->all(FLERR, "pair_style symmetrix/mace/kk streamed_edges requires auto, materialized, non-compiled, or direct");
@@ -480,6 +524,8 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::settings(int narg, char **a
   settings_key.clear();
   for (const std::string &value : {
          mode, streamed_edges, execution_profile,
+         std::string(kernels == symmetrix::execution::MaceKernels::optimized
+           ? "optimized" : "standard"),
          std::string(allow_fixed_workspace ? "1" : "0"), debug_execution_plan,
          std::to_string(debug_single_layer_workspace_receivers),
          std::to_string(debug_dual_layer_workspace_receivers), prediction_head,
@@ -518,7 +564,8 @@ void PairSymmetrixMACEKokkos<DeviceType, Precision>::coeff(int narg, char **arg)
     nonlinear_model = symmetrix_is_nonlinear_model(arg[2]);
     if (!nonlinear_model) {
       utils::logmesg(lmp, "Loading MACEKokkos model from \'{}\' ... ", arg[2]);
-      mace = std::make_unique<MACEKokkos<Precision>>(arg[2], prediction_head);
+      mace = std::make_unique<MACEKokkos<Precision>>(
+        arg[2], prediction_head, kernels, mode == "mpi_message_passing");
       mace->set_allow_fixed_workspace(allow_fixed_workspace);
       if (debug_single_layer_workspace_receivers != 0)
         mace->set_single_layer_workspace_receiver_limit_for_testing(

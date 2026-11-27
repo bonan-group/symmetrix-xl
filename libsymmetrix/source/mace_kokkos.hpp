@@ -28,6 +28,7 @@
 #include "implementation_registry.hpp"
 #include "mace_device_backend.hpp"
 #include "mace_model_document.hpp"
+#include "mace_optimized_kernels.hpp"
 #include "execution_mode.hpp"
 #include "multilayer_perceptron_kokkos.hpp"
 #include "multivariate_polynomial.hpp"//TODO
@@ -108,7 +109,11 @@ class MACEKokkos {
 
 public:
 
-MACEKokkos(std::string filename, std::string requested_head = {});
+MACEKokkos(std::string filename, std::string requested_head = {},
+    symmetrix::execution::MaceKernels kernels = symmetrix::execution::MaceKernels::standard,
+    bool domain_decomposition = false);
+symmetrix::execution::MaceKernelReport kernel_binding_report() const;
+void reset_kernel_bindings();
 virtual ~MACEKokkos();
 void set_streamed_edges(std::string mode);
 std::string streamed_edges_mode() const;
@@ -2019,10 +2024,38 @@ double compute_readouts(
     bool compute_total_energy = true,
     bool completion_fence = true);
 
+private:
+const symmetrix::execution::MaceKernels kernels_;
+const bool kernel_domain_decomposition_;
+std::string kernel_architecture_;
+std::array<symmetrix::execution::MaceKernelBinding,
+    symmetrix::execution::mace_kernel_names.size()> kernel_bindings_{};
+Kokkos::View<int*> r1_canonical_type_map_;
+std::array<int,4> a1_path_counts_{};
+
+const char* optimized_kernel_refusal(symmetrix::execution::MaceKernel kernel) const;
+void record_kernel_binding(symmetrix::execution::MaceKernel kernel,
+    bool reverse, const char* form, std::uint64_t optimized_launches = 0)
+{
+    auto& row = kernel_bindings_[static_cast<std::size_t>(kernel)];
+    auto& direction = reverse ? row.reverse : row.forward;
+    direction.form = form;
+    direction.launches += optimized_launches;
+}
+const int* r1_packet_type_map() const;
+template <class Input, class Output, class Weights>
+bool try_h1_row_gemm(const Kokkos::DefaultExecutionSpace& execution_space,
+    int num_nodes, const Input& input, const Output& output,
+    const Weights& weights, bool reverse);
+bool try_a1_row_gemm(int num_nodes, bool reverse,
+    Kokkos::View<const Precision***,Kokkos::LayoutRight> output_adjoint = {});
+
 protected:
 MACEKokkos(
     const SelectedMACEModel& selected,
-    MACEModelKind expected_kind);
+    MACEModelKind expected_kind,
+    symmetrix::execution::MaceKernels kernels = symmetrix::execution::MaceKernels::standard,
+    bool domain_decomposition = false);
 void load_mace_backbone(const SelectedMACEModel& selected);
 virtual void begin_model_evaluation(int num_nodes);
 virtual void prepare_model_readouts(int num_nodes);

@@ -46,6 +46,8 @@
 #include "host_dense_kernels.hpp"
 #include "mace_standard_m1.hpp"
 #include "host_worker_blas.hpp"
+#include "mace_a1_scale_divide.hpp"
+#include "mace_row_gemm.hpp"
 
 using Kokkos::ALL;
 using Kokkos::LayoutRight;
@@ -115,10 +117,95 @@ HostA1BlockPlan make_host_a1_block_plan(
 }
 
 template <typename Precision>
+bool MACEKokkos<Precision>::try_a1_row_gemm(
+    const int num_nodes, const bool reverse,
+    Kokkos::View<const Precision***,Kokkos::LayoutRight> output_adjoint)
+{
+#if defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_CUDA)
+    using symmetrix::execution::MaceKernel;
+    if constexpr (std::is_same_v<Precision, float>
+            && device_execution_space<Kokkos::DefaultExecutionSpace>) {
+        if (num_nodes == 0
+                || optimized_kernel_refusal(MaceKernel::a1_gemm))
+            return false;
+        namespace row = symmetrix::optimized;
+        const auto& device = *symmetrix::execution::mace_kernel_device(
+            MaceKernel::a1_gemm, kernel_architecture_);
+        if (!row::row_gemm_fits<64,128,16,8,4>(device.subgroup_width, device.scratch_limit))
+            return false;
+        const Kokkos::View<const float***,Kokkos::LayoutRight> input =
+            reverse ? output_adjoint : Kokkos::View<const float***,Kokkos::LayoutRight>(Phi1);
+        const auto output = reverse ? dPhi1 : A1;
+        if (input.extent(0) < static_cast<std::size_t>(num_nodes)
+                || output.extent(0) < static_cast<std::size_t>(num_nodes)
+                || input.extent_int(2) != num_channels
+                || output.extent_int(2) != num_channels
+                || input.stride(2) != 1 || output.stride(2) != 1
+                || row::ranges_overlap(input.data(), input.span(),
+                    output.data(), output.span()))
+            return false;
+        row::RowGemmBatch batch{};
+        batch.A = input.data();
+        batch.C = output.data();
+        batch.a_ns = input.stride(0);
+        batch.c_ns = output.stride(0);
+        batch.num_nodes = num_nodes;
+        batch.count = l_max+1;
+        std::size_t lme = 0;
+        for (int l = 0; l <= l_max; ++l) {
+            const int components = 2*l+1;
+            const auto paths = static_cast<std::size_t>(a1_path_counts_[l]);
+            const auto grouped = paths*num_channels;
+            const auto& weights = reverse ? A1_weights_trans(l) : A1_weights(l);
+            const int k = weights.extent_int(0);
+            const int n = weights.extent_int(1);
+            const auto phi_stride = reverse ? output.stride(1) : input.stride(1);
+            const auto phi_rows = reverse ? output.extent(1) : input.extent(1);
+            if (phi_stride != static_cast<std::size_t>(num_channels)
+                    || weights.stride(0) != static_cast<std::size_t>(n)
+                    || weights.stride(1) != 1
+                    || lme + components*paths > phi_rows
+                    || (reverse ? k != num_channels || n != grouped
+                                : n != num_channels || k != grouped))
+                return false;
+            const auto lm = static_cast<std::size_t>(l*l);
+            batch.p[l] = {
+                weights.data(),
+                reverse ? lm*input.stride(1) : lme*phi_stride,
+                reverse ? input.stride(1) : grouped,
+                reverse ? lme*phi_stride : lm*output.stride(1),
+                reverse ? grouped : output.stride(1),
+                k, n, components, 0, 0};
+            lme += components*paths;
+        }
+        if (!row::row_gemm_prepare<64,128,16>(batch))
+            return false;
+        if (!reverse && a1_scale_factors_ready) {
+            // The normal flattened BLAS path narrows each scaled operand
+            // before contraction. Use the same prepared factors on load.
+            batch.load_scale = A1_inverse_scale.data();
+            row::row_gemm_launch<64,128,16,8,4,row::kRowGemmScaledLoad>(
+                "A1 forward scaled row GEMM", factorized_execution_space, batch);
+        } else {
+            row::row_gemm_launch<64,128,16,8,4>(
+                reverse ? "A1 reverse row GEMM" : "A1 forward row GEMM",
+                factorized_execution_space, batch);
+        }
+        record_kernel_binding(MaceKernel::a1_gemm, reverse,
+            !reverse && a1_scale_factors_ready ? "row_tiled_scaled_load" : "row_tiled", 1);
+        return true;
+    }
+#endif
+    return false;
+}
+
+template <typename Precision>
 void MACEKokkos<Precision>::compute_A1(
     int num_nodes,
     const bool completion_fence)
 {
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::a1_gemm, false, "standard");
     // The core matrix multiplication is:
     //         [A1_il]_mk = \sum_(ek') [Phi1_il]_m(ek') [W_il]_(ek')k
     ensure_mh0_a1_forward_capacity(num_nodes);
@@ -352,6 +439,12 @@ void MACEKokkos<Precision>::compute_A1(
                 factorized_execution_space.fence("Compute A1 completion");
             return;
         }
+    }
+
+    if (try_a1_row_gemm(num_nodes, false)) {
+        if (completion_fence)
+            factorized_execution_space.fence("Compute A1 completion");
+        return;
     }
 
 #if defined(KOKKOS_ENABLE_CUDA) && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)
@@ -690,6 +783,8 @@ void MACEKokkos<Precision>::compute_A1_channel_tile(
     const int num_nodes,
     const int channel_begin)
 {
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::a1_gemm, false, "channel_tiled");
     const int channel_count = std::min(
         phi1_channel_tile_size, num_channels-channel_begin);
     if (channel_begin < 0 || channel_count <= 0
@@ -769,6 +864,8 @@ void MACEKokkos<Precision>::reverse_A1_channel_tile(
     const int num_nodes,
     const int channel_begin)
 {
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::a1_gemm, true, "channel_tiled");
     const int channel_count = std::min(
         phi1_channel_tile_size, num_channels-channel_begin);
     if (channel_begin < 0 || channel_count <= 0
@@ -892,6 +989,8 @@ void MACEKokkos<Precision>::reverse_A1_from(
     Kokkos::View<const Precision***,Kokkos::LayoutRight> output_adjoint,
     const bool completion_fence)
 {
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::a1_gemm, true, "standard");
     // The core matrix multiplication is:
     //         [dE/dPhi1_il]_m(ek) = \sum_k' [dE/dA1_il]_mk' [trans(W_il)]_k'(ek)
     if (use_mh0_adjoint_reuse())
@@ -1135,6 +1234,12 @@ void MACEKokkos<Precision>::reverse_A1_from(
                 factorized_execution_space.fence("Reverse A1 completion");
             return;
         }
+    }
+
+    if (try_a1_row_gemm(num_nodes, true, output_adjoint)) {
+        if (completion_fence)
+            factorized_execution_space.fence("Reverse A1 completion");
+        return;
     }
 
 #if defined(KOKKOS_ENABLE_CUDA) && defined(KOKKOSKERNELS_ENABLE_TPL_CUBLAS)
@@ -1582,7 +1687,11 @@ void MACEKokkos<Precision>::compute_A1_scaled(
     Kokkos::View<const double*> r)
 {
     if (not A1_scaled) return;
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::a1_divide, false, "standard");
     if (a1_scale_factors_ready) {
+        if (num_nodes > 0)
+            record_kernel_binding(symmetrix::execution::MaceKernel::a1_divide, false, "operand_load");
         complete_device_stage("MACEKokkos::compute_A1_scaled_fused");
         a1_scale_factors_ready = false;
         return;
@@ -1669,6 +1778,8 @@ void MACEKokkos<Precision>::compute_A1_scaled(
 #else
     constexpr bool narrow_a1_scale = false;
 #endif
+    if (num_nodes > 0 && narrow_a1_scale)
+        record_kernel_binding(symmetrix::execution::MaceKernel::a1_divide, false, "narrowed_reciprocal");
 #ifdef SYMMETRIX_ENABLE_METAL
     // Host fast path, compiled into the Metal build only.
     if constexpr (std::is_same_v<
@@ -1729,6 +1840,14 @@ void MACEKokkos<Precision>::compute_A1_scaled(
         }
     }
 #endif
+#if defined(KOKKOS_ENABLE_HIP)
+    using symmetrix::execution::MaceKernel;
+    const bool reciprocal = num_nodes > 0
+        && !optimized_kernel_refusal(MaceKernel::a1_divide);
+    if (reciprocal) {
+        record_kernel_binding(MaceKernel::a1_divide, false, "reciprocal", 1);
+    }
+#endif
     Kokkos::parallel_for(
         "MACEKokkos::compute_A1_scaled",
         Kokkos::TeamPolicy<>(
@@ -1758,6 +1877,11 @@ void MACEKokkos<Precision>::compute_A1_scaled(
                         lsum += weight*A1_spline_values(edge,0);
                 }, A1_scale_factor);
             A1_scale_factor += 1.0;
+#if defined(KOKKOS_ENABLE_HIP)
+            const auto divisor = reciprocal
+                ? symmetrix::optimized::a1_scale_divisor(A1_scale_factor)
+                : symmetrix::optimized::A1ScaleDivisor{};
+#endif
             const Precision inverse_scale_factor = static_cast<Precision>(
                 1.0/A1_scale_factor);
             team_member.team_barrier();
@@ -1770,6 +1894,14 @@ void MACEKokkos<Precision>::compute_A1_scaled(
                     const std::size_t k = static_cast<std::size_t>(lmk)
                         -lm*static_cast<std::size_t>(num_channels);
                     Precision& value = A1(node,lm,k);
+#if defined(KOKKOS_ENABLE_HIP)
+                    if constexpr (std::is_same_v<Precision, float>) {
+                        if (reciprocal) {
+                            value = symmetrix::optimized::a1_scale_divide(value, divisor);
+                            return;
+                        }
+                    }
+#endif
                     if (narrow_a1_scale)
                         value *= inverse_scale_factor;
                     else
@@ -1789,6 +1921,8 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
     Kokkos::View<const double*> r)
 {
     if (not A1_scaled) return;
+    if (num_nodes > 0)
+        record_kernel_binding(symmetrix::execution::MaceKernel::a1_divide, true, "standard");
     const bool async_inference = use_factorized_async_inference();
     const auto execution_space = async_inference
         ? factorized_execution_space : Kokkos::DefaultExecutionSpace();
@@ -1843,6 +1977,8 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
 #else
     constexpr bool narrow_a1_scale = false;
 #endif
+    if (num_nodes > 0 && narrow_a1_scale)
+        record_kernel_binding(symmetrix::execution::MaceKernel::a1_divide, true, "narrowed_reciprocal");
 #ifdef SYMMETRIX_ENABLE_METAL
     // Host fast path, compiled into the Metal build only.
     if constexpr (std::is_same_v<
@@ -1937,6 +2073,14 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
         }
     }
 #endif
+#if defined(KOKKOS_ENABLE_HIP)
+    using symmetrix::execution::MaceKernel;
+    const bool reciprocal = num_nodes > 0
+        && !optimized_kernel_refusal(MaceKernel::a1_divide);
+    if (reciprocal) {
+        record_kernel_binding(MaceKernel::a1_divide, true, "reciprocal", 1);
+    }
+#endif
     Kokkos::parallel_for(
         "MACEKokkos::reverse_A1_scaled",
         Kokkos::TeamPolicy<>(
@@ -1966,6 +2110,11 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
                         lsum += weight*A1_spline_values(edge,0);
                 }, A1_scale_factor);
             A1_scale_factor += 1.0;
+#if defined(KOKKOS_ENABLE_HIP)
+            const auto divisor = reciprocal
+                ? symmetrix::optimized::a1_scale_divisor(A1_scale_factor)
+                : symmetrix::optimized::A1ScaleDivisor{};
+#endif
             const Precision inverse_scale_factor = static_cast<Precision>(
                 1.0/A1_scale_factor);
             team_member.team_barrier();
@@ -2024,6 +2173,14 @@ void MACEKokkos<Precision>::reverse_A1_scaled(
                     const std::size_t k = static_cast<std::size_t>(lmk)
                         -lm*static_cast<std::size_t>(num_channels);
                     Precision& value = A1_adj(node,lm,k);
+#if defined(KOKKOS_ENABLE_HIP)
+                    if constexpr (std::is_same_v<Precision, float>) {
+                        if (reciprocal) {
+                            value = symmetrix::optimized::a1_scale_divide(value, divisor);
+                            return;
+                        }
+                    }
+#endif
                     if (narrow_a1_scale)
                         value *= inverse_scale_factor;
                     else

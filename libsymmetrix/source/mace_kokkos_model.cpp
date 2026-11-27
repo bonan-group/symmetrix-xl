@@ -961,6 +961,9 @@ void MACEKokkos<Precision>::load_mace_backbone(
         || file_Phi1_lme.size() != file_Phi1_clebsch_gordan.size())
         throw std::invalid_argument(
             "Phi1 sparse coupling arrays must have equal lengths.");
+    for (const int l : file_Phi1_l)
+        if (l >= 0 && l < static_cast<int>(a1_path_counts_.size()))
+            ++a1_path_counts_[l];
     Phi1_l = toKokkosView("Phi1_l", file_Phi1_l);
     Phi1_l1 = toKokkosView("Phi1_l1", file_Phi1_l1);
     Phi1_l2 = toKokkosView("Phi1_l2", file_Phi1_l2);

@@ -410,8 +410,14 @@ void MACEKokkos<Precision>::validate_graph_cardinality(
 template <typename Precision>
 MACEKokkos<Precision>::MACEKokkos(
     const SelectedMACEModel& selected,
-    const MACEModelKind expected_kind)
+    const MACEModelKind expected_kind,
+    const symmetrix::execution::MaceKernels kernels,
+    const bool domain_decomposition)
+  : kernels_(kernels), kernel_domain_decomposition_(domain_decomposition)
 {
+    if (kernels_ == symmetrix::execution::MaceKernels::optimized
+            && selected.kind == MACEModelKind::mace_les)
+        throw std::invalid_argument("kernels optimized is unavailable for MACELES");
     const bool expected_model = selected.kind == expected_kind
         || (expected_kind == MACEModelKind::mace
             && selected.kind == MACEModelKind::mace_field);
@@ -425,6 +431,11 @@ MACEKokkos<Precision>::MACEKokkos(
             "MACEKokkos.");
     }
 
+    if (kernels_ == symmetrix::execution::MaceKernels::optimized) {
+        if constexpr (std::is_same_v<Precision, float>
+                && device_execution_space<Kokkos::DefaultExecutionSpace>)
+            kernel_architecture_ = execution_device_execution_environment().architecture;
+    }
     factorized_blas_context = std::make_unique<FactorizedBlasContext>();
     load_mace_backbone(selected);
     set_m1_polynomial_policy("automatic");
@@ -437,11 +448,114 @@ MACEKokkos<Precision>::MACEKokkos(
 
 template <typename Precision>
 MACEKokkos<Precision>::MACEKokkos(
-    std::string filename, std::string requested_head)
+    std::string filename, std::string requested_head,
+    const symmetrix::execution::MaceKernels kernels,
+    const bool domain_decomposition)
   : MACEKokkos(
         read_selected_mace_model(filename, requested_head),
-        MACEModelKind::mace)
+        MACEModelKind::mace, kernels, domain_decomposition)
 {}
+
+template <typename Precision>
+const char* MACEKokkos<Precision>::optimized_kernel_refusal(
+    const symmetrix::execution::MaceKernel kernel) const
+{
+    using symmetrix::execution::MaceKernel;
+    if (kernels_ == symmetrix::execution::MaceKernels::standard)
+        return "standard requested";
+    if (kernel_domain_decomposition_)
+        return "domain decomposition requires standard kernels";
+    if (alchemical_node_weights.data() || alchemical_edge_weights.data())
+        return "live alchemical weights";
+    if constexpr (!std::is_same_v<Precision, float>)
+        return "requires FP32";
+    if constexpr (!device_execution_space<Kokkos::DefaultExecutionSpace>)
+        return "requires a device backend";
+    const auto* device = symmetrix::execution::mace_kernel_device(kernel, kernel_architecture_);
+    if (!device)
+        return "unsupported device architecture for this row";
+    if (!device->admitted)
+        return "awaiting device qualification";
+    if (has_field_coupling || factorized_observer_enabled
+            || execution_parameter_gradients_enabled)
+        return "requires ordinary inference";
+    if (!uses_direct_execution(streamed_edges))
+        return "requires direct execution";
+    if (single_layer_tiled_plan_active || dual_layer_tiled_plan_active)
+        return "requires full workspace";
+    if (kernel == MaceKernel::h1_gemm)
+        return L_max >= 0 && L_max <= 3 && num_channels % 64 == 0
+            ? nullptr : "unsupported H1 shape";
+    if (single_layer_readout)
+        return "requires a second interaction";
+    if (kernel == MaceKernel::r1_slab) {
+        if (!jit_device_plugin_ready())
+            return "requires generated device R1";
+        return r1_canonical_type_map_.data() ? nullptr
+            : "requires multiple identical active R1 slabs";
+    }
+    if (kernel == MaceKernel::a1_divide) {
+        if (!A1_scaled)
+            return "model has no A1 density scale";
+        return nullptr;
+    }
+    if (use_receiver_local_phi1() || use_channel_tiled_phi1())
+        return "requires materialized full-width Phi1";
+    if (l_max < 0 || l_max > 3 || num_channels % 128 != 0)
+        return "unsupported A1 shape";
+    for (int l = 0; l <= l_max; ++l)
+        if (a1_path_counts_[l] == 0)
+            return "missing Phi1 degree";
+    return nullptr;
+}
+
+template <typename Precision>
+void MACEKokkos<Precision>::reset_kernel_bindings()
+{
+    for (auto& row : kernel_bindings_) {
+        row.forward.form = "not_run";
+        row.reverse.form = "not_run";
+    }
+}
+
+template <typename Precision>
+symmetrix::execution::MaceKernelReport MACEKokkos<Precision>::kernel_binding_report() const
+{
+    using namespace symmetrix::execution;
+    const ImplementationBinding generic{};
+    MaceKernelReport report{
+        kernels_ == MaceKernels::optimized ? "optimized" : "standard",
+        execution_plan_report().selected_id,
+        kernel_architecture_,
+        dispatched_implementation_id("m0", generic),
+        dispatched_implementation_id("r0", generic),
+        dispatched_implementation_id("m1", generic),
+        kernel_bindings_};
+    if (kernels_ == MaceKernels::optimized)
+        for (std::size_t i = 0; i < report.rows.size(); ++i)
+            report.rows[i].refusal = optimized_kernel_refusal(static_cast<MaceKernel>(i));
+    return report;
+}
+
+std::vector<std::string> symmetrix::execution::MaceKernelReport::lines() const
+{
+    std::vector<std::string> result;
+    result.reserve(rows.size()+1);
+    result.emplace_back("kernels " + std::string(mode) + ": plan=" + plan
+        + " M0=" + m0 + " R0=" + r0 + " M1=" + m1
+        + (architecture.empty() ? "" : " architecture=" + architecture));
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const auto& row = rows[i];
+        std::string line = std::string(mace_kernel_names[i])
+            + " forward=" + row.forward.form + " reverse=" + row.reverse.form
+            + " forward_launches=" + std::to_string(row.forward.launches)
+            + " reverse_launches=" + std::to_string(row.reverse.launches);
+        if (row.refusal)
+            line += " refusal=" + std::string(row.refusal);
+        result.push_back(std::move(line));
+    }
+    return result;
+}
 
 template <typename Precision>
 void MACEKokkos<Precision>::ensure_spherical_harmonics_state()

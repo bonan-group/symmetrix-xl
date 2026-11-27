@@ -4,6 +4,12 @@ All notable changes to Symmetrix-XL are documented in this file.
 
 ## 0.2.1 - Unreleased
 
+- Add explicit `kernels="optimized"` in ASE and `kernels optimized` in the
+  Kokkos LAMMPS MACE pair style. Eligible direct FP32 evaluations use
+  row-tiled contractions, a canonical R1 radial slab when active pairs share
+  identical tables, and guarded A1 scaling on gfx1201. Both frontends expose
+  the selected plan, operator bindings, and direction-specific launch counts.
+
 ## 0.2.0 - 2026-11-17
 
 ### Execution and JIT
