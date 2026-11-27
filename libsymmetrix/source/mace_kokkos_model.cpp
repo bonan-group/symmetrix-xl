@@ -679,9 +679,9 @@ void MACEKokkos<Precision>::load_mace_backbone(
             Kokkos::deep_copy(standard_m0_module_weights, host_weights);
         }
     }
-    M0_weights = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+    M0_weights = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::HostSpace>(
         Kokkos::view_alloc("M0_weights", Kokkos::SequentialHostInit), num_LM);
-    M0_monomials = Kokkos::View<Kokkos::View<int**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+    M0_monomials = Kokkos::View<Kokkos::View<int**,Kokkos::LayoutRight>*,Kokkos::HostSpace>(
         Kokkos::view_alloc("M0_monomials", Kokkos::SequentialHostInit), num_LM);
     for (int LM=0; LM<num_LM; ++LM) {
         M0_weights(LM) = Kokkos::View<Precision***,Kokkos::LayoutRight>(
@@ -707,7 +707,7 @@ void MACEKokkos<Precision>::load_mace_backbone(
     }
 
     // M0_poly_spec
-    M0_poly_spec = Kokkos::View<Kokkos::View<int**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+    M0_poly_spec = Kokkos::View<Kokkos::View<int**,Kokkos::LayoutRight>*,Kokkos::HostSpace>(
         Kokkos::view_alloc("M0_poly_spec",Kokkos::SequentialHostInit), num_LM);
     for (int LM=0; LM<num_LM; ++LM) {
         auto P = MultivariatePolynomial(
@@ -725,7 +725,7 @@ void MACEKokkos<Precision>::load_mace_backbone(
         Kokkos::deep_copy(M0_poly_spec(LM), h_M0_poly_spec_LM);
     }
     // M0_poly_coeff
-    M0_poly_coeff = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+    M0_poly_coeff = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::HostSpace>(
         Kokkos::view_alloc("M0_poly_coeff",Kokkos::SequentialHostInit), num_LM);
     for (int LM=0; LM<num_LM; ++LM) {
         const auto P = MultivariatePolynomial(
@@ -752,9 +752,13 @@ void MACEKokkos<Precision>::load_mace_backbone(
         }
         Kokkos::deep_copy(M0_poly_coeff(LM), h_M0_poly_coeff_LM);
     }
-    M0_poly_values = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+    fill_device_handles(
+        M0_poly_spec_device, M0_poly_spec, "M0_poly_spec device handles");
+    fill_device_handles(
+        M0_poly_coeff_device, M0_poly_coeff, "M0_poly_coeff device handles");
+    M0_poly_values = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::HostSpace>(
         Kokkos::view_alloc("M0_poly_values",Kokkos::SequentialHostInit), num_LM);
-    M0_poly_adjoints = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+    M0_poly_adjoints = Kokkos::View<Kokkos::View<Precision***,Kokkos::LayoutRight>*,Kokkos::HostSpace>(
         Kokkos::view_alloc("M0_poly_adjoints",Kokkos::SequentialHostInit), num_LM);
 
     record_phase("m0_weights_and_polynomials");
@@ -1047,19 +1051,19 @@ void MACEKokkos<Precision>::load_mace_backbone(
     auto h_execution_a1_projection_weights =
         Kokkos::create_mirror_view(execution_a1_projection_weights);
     std::size_t a1_projection_offset = 0;
-    A1_weights = Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+    A1_weights = Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::HostSpace>(
         Kokkos::view_alloc("A1_weights", Kokkos::SequentialHostInit), l_max+1);
-    A1_weights_trans = Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+    A1_weights_trans = Kokkos::View<Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::HostSpace>(
         Kokkos::view_alloc("A1_weights_trans", Kokkos::SequentialHostInit), l_max+1);
     const int a1_tile_phases =
         (num_channels+phi1_channel_tile_size-1)/phi1_channel_tile_size;
     A1_channel_tile_weights = Kokkos::View<
-        Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+        Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::HostSpace>(
             Kokkos::view_alloc(
                 "A1_channel_tile_weights", Kokkos::SequentialHostInit),
             a1_tile_phases*(l_max+1));
     A1_channel_tile_weights_trans = Kokkos::View<
-        Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::SharedSpace>(
+        Kokkos::View<Precision**,Kokkos::LayoutRight>*,Kokkos::HostSpace>(
             Kokkos::view_alloc(
                 "A1_channel_tile_weights_trans", Kokkos::SequentialHostInit),
             a1_tile_phases*(l_max+1));
@@ -1132,6 +1136,17 @@ void MACEKokkos<Precision>::load_mace_backbone(
         }
         a1_projection_offset += A1_weights(l).size();
     }
+    fill_device_handles(
+        A1_weights_device, A1_weights, "A1_weights device handles");
+    fill_device_handles(
+        A1_weights_trans_device, A1_weights_trans,
+        "A1_weights_trans device handles");
+    fill_device_handles(
+        A1_channel_tile_weights_device, A1_channel_tile_weights,
+        "A1_channel_tile_weights device handles");
+    fill_device_handles(
+        A1_channel_tile_weights_trans_device, A1_channel_tile_weights_trans,
+        "A1_channel_tile_weights_trans device handles");
     Kokkos::deep_copy(
         execution_a1_projection_weights,
         h_execution_a1_projection_weights);
